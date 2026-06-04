@@ -1,7 +1,7 @@
 {
   "name": "shape.ai",
   "version": "0.1.0",
-  "description": "A local design-decision workspace that agents can read, edit, and extend through MCP.",
+  "description": "A design-decision workspace that agents can review and extend through MCP.",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "dev:client": "vite --host 127.0.0.1",
     "dev:server": "tsx watch src/server/index.ts",
     "mcp": "tsx src/server/mcp.ts",
-    "start": "tsx src/server/index.ts",
+    "start": "npm run build && tsx src/server/index.ts --open",
     "typecheck": "tsc --noEmit",
     "build": "vite build && tsc -p tsconfig.server.json",
     "test": "vitest run && playwright test",
@@ -25,6 +25,7 @@
     "lucide-react": "^0.556.0",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
+    "sql.js": "^1.14.1",
     "zod": "^4.1.13"
   },
   "devDependencies": {
@@ -32,6 +33,7 @@
     "@types/node": "^24.10.2",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
+    "@types/sql.js": "^1.4.11",
     "concurrently": "^9.2.1",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",

@@ -372,7 +372,7 @@ export default function App() {
           <div className="command-separator" />
           <div className="runtime-chip is-configured">
             <Plug size={14} />
-            {runtime ? `${runtime.mcp.transport} MCP` : "MCP"}
+            {runtime ? `${runtime.mcp.remoteTransport ?? runtime.mcp.transport ?? "MCP"} MCP` : "MCP"}
           </div>
           <button className="secondary-button" disabled={busy} onClick={() => refreshDesigns().catch((error) => setStatus(error.message))}>
             <RefreshCw size={15} />

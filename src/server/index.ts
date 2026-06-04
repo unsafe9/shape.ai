@@ -1,7 +1,9 @@
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 import fastifyStatic from "@fastify/static";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import {
   createCommentRequestSchema,
@@ -25,6 +27,7 @@ import {
   updateComment,
   writeArtifactContent
 } from "./storage";
+import { createShapeMcpServer } from "./mcp";
 
 const port = Number(process.env.SHAPE_AI_PORT ?? 8787);
 const host = process.env.SHAPE_AI_HOST ?? "127.0.0.1";
@@ -50,9 +53,48 @@ export async function buildServer() {
     dataRoot: DATA_ROOT,
     mcp: {
       command: "npm run mcp",
-      transport: "stdio"
+      transport: "streamable_http",
+      stdioTransport: "stdio",
+      remoteTransport: "streamable_http",
+      url: `http://${browserHost(host)}:${port}/mcp`
     }
   }));
+
+  app.all("/mcp", async (request, reply) => {
+    const server = createShapeMcpServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined
+    });
+    reply.hijack();
+    reply.raw.on("close", () => {
+      void transport.close();
+      void server.close();
+    });
+
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(request.raw, reply.raw, request.body);
+    } catch (error) {
+      app.log.error(error);
+      if (!reply.raw.headersSent) {
+        reply.raw.writeHead(500, { "content-type": "application/json" });
+      }
+      if (!reply.raw.writableEnded) {
+        reply.raw.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            error: {
+              code: -32603,
+              message: error instanceof Error ? error.message : "Internal server error"
+            },
+            id: null
+          })
+        );
+      }
+      await transport.close();
+      await server.close();
+    }
+  });
 
   app.get("/api/designs", async () => ({ designs: await listDesigns() }));
 
@@ -199,4 +241,31 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await ensureStorage();
   const app = await buildServer();
   await app.listen({ host, port });
+  const url = `http://${browserHost(host)}:${port}/`;
+  if (shouldOpenBrowser()) {
+    openBrowser(url);
+  }
+}
+
+function shouldOpenBrowser(): boolean {
+  return process.argv.includes("--open") || process.env.SHAPE_AI_OPEN_BROWSER === "1";
+}
+
+function browserHost(value: string): string {
+  if (value === "0.0.0.0" || value === "::") return "127.0.0.1";
+  return value;
+}
+
+function openBrowser(url: string): void {
+  const [command, args] =
+    process.platform === "darwin"
+      ? ["open", [url]]
+      : process.platform === "win32"
+        ? ["cmd", ["/c", "start", "", url]]
+        : ["xdg-open", [url]];
+  const child = spawn(command, args, {
+    detached: true,
+    stdio: "ignore"
+  });
+  child.unref();
 }

@@ -15,7 +15,10 @@ export type RuntimeStatus = {
   dataRoot: string;
   mcp: {
     command: string;
-    transport: string;
+    transport?: string;
+    stdioTransport?: string;
+    remoteTransport?: string;
+    url?: string;
   };
 };
 
