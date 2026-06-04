@@ -190,7 +190,7 @@ export async function createProposal(input: {
   return withWritableDb((db) => {
     const design = getDesignInDb(db, input.designId);
     if (!design) {
-      throw new Error(`Design not found: ${input.designId}`);
+      throw new Error(`Shape not found: ${input.designId}`);
     }
     const baseGraphVersion = input.baseGraphVersion ?? design.graphVersion;
     if (!getGraphVersionInDb(db, design.id, baseGraphVersion)) {
@@ -738,7 +738,7 @@ function getDesignInDb(db: SqlDatabase, id: string): Design | null {
 function getDesignOrThrowInDb(db: SqlDatabase, id: string): Design {
   const design = getDesignInDb(db, id);
   if (!design) {
-    throw new Error(`Design not found: ${id}`);
+    throw new Error(`Shape not found: ${id}`);
   }
   return design;
 }
@@ -843,7 +843,7 @@ function validateProposalInDb(db: SqlDatabase, proposalId: string): ProposalVali
   if (!design) {
     return {
       status: "invalid",
-      messages: [`Design not found: ${proposal.designId}`],
+      messages: [`Shape not found: ${proposal.designId}`],
       baseGraphVersion: proposal.baseGraphVersion,
       currentGraphVersion: proposal.baseGraphVersion
     };

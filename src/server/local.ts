@@ -72,7 +72,7 @@ export function seedDesignGraph(prompt: string): DesignSeedOutput {
       "n-task",
       "task",
       "First vertical slice",
-      "Create design, inspect a node, leave comments, and export Markdown.",
+      "Create a shape, inspect a node, leave comments, and export Markdown.",
       "draft",
       0.61
     ),
@@ -100,7 +100,7 @@ export function seedDesignGraph(prompt: string): DesignSeedOutput {
 
   return {
     title: shortTitle,
-    explanation: "Created a local design graph. Use the MCP server to let an external AI agent refine it.",
+    explanation: "Created a local shape graph. Use the MCP server to let an external AI agent refine it.",
     graph: { version: 1, nodes, edges }
   };
 }
@@ -134,7 +134,7 @@ export function generateLocalExport(graph: DecisionGraph, request: ExportRequest
     };
   }
 
-  const title = request.type === "ai_plan_md" ? `${designTitle} AI Task Plan` : `${designTitle} Design Document`;
+  const title = request.type === "ai_plan_md" ? `${designTitle} AI Task Plan` : `${designTitle} Shape Document`;
   return {
     title: request.type === "ai_plan_md" ? title : `${designTitle} MADR`,
     content: request.type === "ai_plan_md" ? taskPlanSections(scoped, designTitle) : madrSections(scoped, designTitle)
@@ -175,7 +175,7 @@ function edge(id: string, type: GraphEdge["type"], source: string, target: strin
 }
 
 function titleFromPrompt(prompt: string): string {
-  const firstLine = prompt.split(/\n/).find((line) => line.trim())?.trim() ?? "Untitled design";
+  const firstLine = prompt.split(/\n/).find((line) => line.trim())?.trim() ?? "Untitled shape";
   return firstLine.length > 70 ? `${firstLine.slice(0, 67)}...` : firstLine;
 }
 
@@ -292,7 +292,7 @@ function taskPlanSections(graph: DecisionGraph, title: string): string {
     `# ${title} AI Task Plan`,
     "",
     "## Objective",
-    graph.nodes[0]?.summary ?? "Implement the accepted design direction.",
+    graph.nodes[0]?.summary ?? "Implement the accepted shape direction.",
     "",
     "## Tasks",
     ...(tasks.length

@@ -1,12 +1,12 @@
 import type {
   CreateCommentRequest,
   DecisionGraph,
-  Design,
-  DesignArtifact,
   ExportRequest,
   ExportType,
   GraphLayout,
   GraphSelection,
+  Shape,
+  ShapeArtifact,
   UpdateCommentRequest
 } from "../../shared/schema";
 
@@ -22,28 +22,28 @@ export type RuntimeStatus = {
   };
 };
 
-export async function listDesigns(): Promise<Design[]> {
-  const data = await request<{ designs: Design[] }>("/api/designs");
-  return data.designs;
+export async function listShapes(): Promise<Shape[]> {
+  const data = await request<{ shapes: Shape[] }>("/api/shapes");
+  return data.shapes;
 }
 
 export async function getRuntime(): Promise<RuntimeStatus> {
   return request<RuntimeStatus>("/api/health");
 }
 
-export async function createDesign(prompt: string, title?: string): Promise<{ design: Design; message: string }> {
-  return request("/api/designs", {
+export async function createShape(prompt: string, title?: string): Promise<{ shape: Shape; message: string }> {
+  return request("/api/shapes", {
     method: "POST",
     body: JSON.stringify({ prompt, title })
   });
 }
 
-export async function exportDesign(
+export async function exportShape(
   id: string,
   type: ExportType,
   body: ExportRequest["scope"]
-): Promise<{ design: Design; artifact: DesignArtifact }> {
-  return request(`/api/designs/${id}/export`, {
+): Promise<{ shape: Shape; artifact: ShapeArtifact }> {
+  return request(`/api/shapes/${id}/export`, {
     method: "POST",
     body: JSON.stringify({ type, scope: body })
   });
@@ -52,8 +52,8 @@ export async function exportDesign(
 export async function saveGraphEdit(
   id: string,
   body: { graph?: DecisionGraph; layout?: GraphLayout; selection?: GraphSelection }
-): Promise<{ design: Design }> {
-  return request(`/api/designs/${id}/graph`, {
+): Promise<{ shape: Shape }> {
+  return request(`/api/shapes/${id}/graph`, {
     method: "PATCH",
     body: JSON.stringify(body)
   });
@@ -62,8 +62,8 @@ export async function saveGraphEdit(
 export async function createComment(
   id: string,
   body: CreateCommentRequest
-): Promise<{ design: Design }> {
-  return request(`/api/designs/${id}/comments`, {
+): Promise<{ shape: Shape }> {
+  return request(`/api/shapes/${id}/comments`, {
     method: "POST",
     body: JSON.stringify(body)
   });
@@ -73,8 +73,8 @@ export async function updateComment(
   id: string,
   commentId: string,
   body: UpdateCommentRequest
-): Promise<{ design: Design }> {
-  return request(`/api/designs/${id}/comments/${commentId}`, {
+): Promise<{ shape: Shape }> {
+  return request(`/api/shapes/${id}/comments/${commentId}`, {
     method: "PATCH",
     body: JSON.stringify(body)
   });

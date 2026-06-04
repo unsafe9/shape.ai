@@ -1,14 +1,14 @@
 import { FileText, Plus, RefreshCw } from "lucide-react";
-import type { Design } from "../../shared/schema";
+import type { Shape } from "../../shared/schema";
 
 type SidebarProps = {
-  designs: Design[];
-  activeDesignId?: string;
+  shapes: Shape[];
+  activeShapeId?: string;
   prompt: string;
   busy: boolean;
   onPromptChange: (value: string) => void;
   onCreate: () => void;
-  onSelect: (design: Design) => void;
+  onSelect: (shape: Shape) => void;
   onRefresh: () => void;
 };
 
@@ -18,38 +18,38 @@ export function Sidebar(props: SidebarProps) {
       <div className="sidebar-section compose">
         <div className="section-title">
           <FileText size={16} />
-          <h2>New design</h2>
+          <h2>New shape</h2>
         </div>
         <textarea
           value={props.prompt}
           onChange={(event) => props.onPromptChange(event.target.value)}
-          placeholder="Describe the architecture decision, options, constraints, and desired output."
+          placeholder="Describe the shape, options, constraints, and desired output."
         />
         <button className="primary-button" onClick={props.onCreate} disabled={props.busy || !props.prompt.trim()}>
           <Plus size={15} />
-          Create design
+          Create shape
         </button>
       </div>
 
       <div className="sidebar-section">
         <div className="section-title section-title--split">
-          <span>Designs</span>
-          <button className="icon-button" onClick={props.onRefresh} aria-label="Refresh designs">
+          <span>Shapes</span>
+          <button className="icon-button" onClick={props.onRefresh} aria-label="Refresh shapes">
             <RefreshCw size={15} />
           </button>
         </div>
-        <div className="design-list">
-          {props.designs.map((design) => (
+        <div className="shape-list">
+          {props.shapes.map((shape) => (
             <button
-              key={design.id}
-              className={`design-row ${design.id === props.activeDesignId ? "is-active" : ""}`}
-              onClick={() => props.onSelect(design)}
+              key={shape.id}
+              className={`shape-row ${shape.id === props.activeShapeId ? "is-active" : ""}`}
+              onClick={() => props.onSelect(shape)}
             >
-              <strong>{design.title}</strong>
-              <span>{design.graph.nodes.length} nodes / {design.comments.length} comments / {design.artifacts.length} exports</span>
+              <strong>{shape.title}</strong>
+              <span>{shape.graph.nodes.length} nodes / {shape.comments.length} comments / {shape.artifacts.length} exports</span>
             </button>
           ))}
-          {props.designs.length === 0 ? <p className="muted">No designs yet.</p> : null}
+          {props.shapes.length === 0 ? <p className="muted">No shapes yet.</p> : null}
         </div>
       </div>
     </aside>

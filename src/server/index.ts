@@ -96,78 +96,86 @@ export async function buildServer() {
     }
   });
 
-  app.get("/api/designs", async () => ({ designs: await listDesigns() }));
+  registerShapeRoutes(app, "/api/shapes", "shape");
+  registerShapeRoutes(app, "/api/designs", "design");
 
-  app.post("/api/designs", async (request, reply) => {
+  await registerClientIfBuilt(app);
+  return app;
+}
+
+function registerShapeRoutes(app: FastifyInstance, prefix: "/api/shapes" | "/api/designs", responseKey: "shape" | "design") {
+  app.get(prefix, async () => {
+    const shapes = await listDesigns();
+    return responseKey === "shape" ? { shapes } : { designs: shapes };
+  });
+
+  app.post(prefix, async (request, reply) => {
     const body = createDesignRequestSchema.parse(request.body);
     const seed = seedDesignGraph(body.prompt);
-    const design = await createDesign({
+    const shape = await createDesign({
       title: body.title || seed.title,
       prompt: body.prompt,
       graph: decisionGraphSchema.parse(seed.graph)
     });
-    reply.status(201).send({ design, message: seed.explanation });
+    reply.status(201).send({ ...shapeResponse(responseKey, shape), message: seed.explanation });
   });
 
-  app.get<{ Params: { id: string } }>("/api/designs/:id", async (request, reply) => {
-    const design = await loadDesignOr404(request.params.id, reply);
-    if (!design) return;
-    return { design };
+  app.get<{ Params: { id: string } }>(`${prefix}/:id`, async (request, reply) => {
+    const shape = await loadDesignOr404(request.params.id, reply);
+    if (!shape) return;
+    return shapeResponse(responseKey, shape);
   });
 
-  app.patch<{ Params: { id: string } }>("/api/designs/:id/graph", async (request, reply) => {
-    const design = await loadDesignOr404(request.params.id, reply);
-    if (!design) return;
+  app.patch<{ Params: { id: string } }>(`${prefix}/:id/graph`, async (request, reply) => {
+    const shape = await loadDesignOr404(request.params.id, reply);
+    if (!shape) return;
     const body = graphEditRequestSchema.parse(request.body ?? {});
     const graphChanged = Boolean(body.graph);
     const updated = await saveDesign({
-      ...design,
-      graph: body.graph ?? design.graph,
-      layout: body.layout ?? design.layout,
-      selection: body.selection ?? design.selection,
-      graphVersion: graphChanged ? design.graphVersion + 1 : design.graphVersion,
+      ...shape,
+      graph: body.graph ?? shape.graph,
+      layout: body.layout ?? shape.layout,
+      selection: body.selection ?? shape.selection,
+      graphVersion: graphChanged ? shape.graphVersion + 1 : shape.graphVersion,
       updatedAt: new Date().toISOString()
     });
-    return { design: updated };
+    return shapeResponse(responseKey, updated);
   });
 
-  app.post<{ Params: { id: string } }>("/api/designs/:id/comments", async (request, reply) => {
-    const design = await loadDesignOr404(request.params.id, reply);
-    if (!design) return;
+  app.post<{ Params: { id: string } }>(`${prefix}/:id/comments`, async (request, reply) => {
+    const shape = await loadDesignOr404(request.params.id, reply);
+    if (!shape) return;
     const body = createCommentRequestSchema.parse(request.body ?? {});
-    const updated = await addComment(design, body);
-    return { design: updated, comment: updated.comments[0] };
+    const updated = await addComment(shape, body);
+    return { ...shapeResponse(responseKey, updated), comment: updated.comments[0] };
   });
 
-  app.patch<{ Params: { id: string; commentId: string } }>(
-    "/api/designs/:id/comments/:commentId",
-    async (request, reply) => {
-      const design = await loadDesignOr404(request.params.id, reply);
-      if (!design) return;
-      const body = updateCommentRequestSchema.parse(request.body ?? {});
-      if (!design.comments.some((candidate) => candidate.id === request.params.commentId)) {
-        reply.status(404).send({ error: "not_found", message: "Comment not found" });
-        return;
-      }
-      const updated = await updateComment(design, request.params.commentId, body);
-      const comment = updated.comments.find((candidate) => candidate.id === request.params.commentId);
-      return { design: updated, comment };
+  app.patch<{ Params: { id: string; commentId: string } }>(`${prefix}/:id/comments/:commentId`, async (request, reply) => {
+    const shape = await loadDesignOr404(request.params.id, reply);
+    if (!shape) return;
+    const body = updateCommentRequestSchema.parse(request.body ?? {});
+    if (!shape.comments.some((candidate) => candidate.id === request.params.commentId)) {
+      reply.status(404).send({ error: "not_found", message: "Comment not found" });
+      return;
     }
-  );
+    const updated = await updateComment(shape, request.params.commentId, body);
+    const comment = updated.comments.find((candidate) => candidate.id === request.params.commentId);
+    return { ...shapeResponse(responseKey, updated), comment };
+  });
 
-  app.post<{ Params: { id: string } }>("/api/designs/:id/export", async (request, reply) => {
-    const design = await loadDesignOr404(request.params.id, reply);
-    if (!design) return;
+  app.post<{ Params: { id: string } }>(`${prefix}/:id/export`, async (request, reply) => {
+    const shape = await loadDesignOr404(request.params.id, reply);
+    if (!shape) return;
     const body = exportRequestSchema.parse(request.body ?? {});
-    const generated = generateLocalExport(design.graph, body, design.title);
+    const generated = generateLocalExport(shape.graph, body, shape.title);
     const persisted = await writeArtifactContent({
-      designId: design.id,
+      designId: shape.id,
       type: body.type,
       title: generated.title,
       content: generated.content,
       contentType: contentTypeFor(body.type)
     });
-    const updated = await addArtifact(design, {
+    const updated = await addArtifact(shape, {
       type: body.type,
       title: generated.title,
       scope: body.scope.kind === "whole_graph" ? "whole_graph" : `${body.scope.kind}:${body.scope.id ?? ""}`,
@@ -175,37 +183,35 @@ export async function buildServer() {
       contentType: persisted.contentType
     });
     const artifact = updated.artifacts[0];
-    return { design: updated, artifact };
+    return { ...shapeResponse(responseKey, updated), artifact };
   });
 
-  app.get<{ Params: { id: string; artifactId: string } }>(
-    "/api/designs/:id/artifacts/:artifactId",
-    async (request, reply) => {
-      const design = await loadDesignOr404(request.params.id, reply);
-      if (!design) return;
-      const artifact = design.artifacts.find((candidate) => candidate.id === request.params.artifactId);
-      if (!artifact) {
-        reply.status(404).send({ error: "not_found", message: "Artifact not found" });
-        return;
-      }
-      if (!isExportPath(artifact.path)) {
-        reply.status(403).send({ error: "forbidden", message: "Artifact path is outside export directory" });
-        return;
-      }
-      reply.header("Content-Disposition", `attachment; filename="${artifact.title.replace(/[^a-z0-9.-]+/gi, "-")}"`);
-      reply.type(artifact.contentType);
-      return reply.send(createReadStream(artifact.path));
+  app.get<{ Params: { id: string; artifactId: string } }>(`${prefix}/:id/artifacts/:artifactId`, async (request, reply) => {
+    const shape = await loadDesignOr404(request.params.id, reply);
+    if (!shape) return;
+    const artifact = shape.artifacts.find((candidate) => candidate.id === request.params.artifactId);
+    if (!artifact) {
+      reply.status(404).send({ error: "not_found", message: "Artifact not found" });
+      return;
     }
-  );
+    if (!isExportPath(artifact.path)) {
+      reply.status(403).send({ error: "forbidden", message: "Artifact path is outside export directory" });
+      return;
+    }
+    reply.header("Content-Disposition", `attachment; filename="${artifact.title.replace(/[^a-z0-9.-]+/gi, "-")}"`);
+    reply.type(artifact.contentType);
+    return reply.send(createReadStream(artifact.path));
+  });
+}
 
-  await registerClientIfBuilt(app);
-  return app;
+function shapeResponse(responseKey: "shape" | "design", shape: NonNullable<Awaited<ReturnType<typeof readDesign>>>) {
+  return responseKey === "shape" ? { shape } : { design: shape };
 }
 
 async function loadDesignOr404(id: string, reply: FastifyReply) {
   const design = await readDesign(id);
   if (!design) {
-    reply.status(404).send({ error: "not_found", message: "Design not found" });
+    reply.status(404).send({ error: "not_found", message: "Shape not found" });
     return null;
   }
   return design;

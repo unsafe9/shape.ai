@@ -1,7 +1,7 @@
 {
   "name": "shape.ai",
   "version": "0.1.0",
-  "description": "A design-decision workspace that agents can review and extend through MCP.",
+  "description": "A shape workspace that agents can review and extend through MCP.",
   "private": true,
   "type": "module",
   "scripts": {

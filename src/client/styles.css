@@ -96,14 +96,14 @@ p {
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.95), var(--shadow-low);
 }
 
-.floating-designs,
+.floating-shapes,
 .export-drawer,
 .canvas-status {
   position: absolute;
   z-index: 10;
 }
 
-.floating-designs,
+.floating-shapes,
 .export-drawer,
 .canvas-status {
   border: 1px solid rgb(255 255 255 / 0.72);
@@ -264,7 +264,7 @@ p {
   z-index: 20 !important;
 }
 
-.floating-designs {
+.floating-shapes {
   top: 28px;
   left: 34px;
   z-index: 12;
@@ -277,24 +277,24 @@ p {
     box-shadow 180ms ease;
 }
 
-.floating-designs.is-open {
+.floating-shapes.is-open {
   width: 320px;
   height: min(660px, calc(100vh - 76px));
   border-radius: 22px;
 }
 
-.floating-designs.is-closed {
+.floating-shapes.is-closed {
   box-shadow: var(--shadow-low);
 }
 
-.design-panel-toggle {
+.shape-panel-toggle {
   position: absolute;
   top: 5px;
   left: 5px;
   z-index: 2;
 }
 
-.floating-designs-body {
+.floating-shapes-body {
   height: 100%;
   padding-top: 48px;
   opacity: 0;
@@ -303,13 +303,13 @@ p {
   transition: opacity 160ms ease 40ms, transform 180ms cubic-bezier(0.22, 1, 0.36, 1) 40ms;
 }
 
-.floating-designs.is-open .floating-designs-body {
+.floating-shapes.is-open .floating-shapes-body {
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0) scale(1);
 }
 
-.floating-designs.is-open ~ .export-drawer {
+.floating-shapes.is-open ~ .export-drawer {
   pointer-events: none;
   opacity: 0;
   transform: translateX(-50%) translateY(18px) scale(0.98);
@@ -327,7 +327,7 @@ p {
   backdrop-filter: none;
 }
 
-.floating-designs .sidebar {
+.floating-shapes .sidebar {
   max-height: calc(100vh - 124px);
 }
 
@@ -381,7 +381,7 @@ p {
   margin-top: 10px;
 }
 
-.design-list {
+.shape-list {
   display: grid;
   gap: 8px;
   overflow: auto;
@@ -389,7 +389,7 @@ p {
   padding-right: 2px;
 }
 
-.design-row {
+.shape-row {
   width: 100%;
   min-width: 0;
   display: grid;
@@ -403,22 +403,22 @@ p {
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.72);
 }
 
-.design-row:hover,
-.design-row.is-active {
+.shape-row:hover,
+.shape-row.is-active {
   border-color: rgb(21 167 150 / 0.36);
   background: linear-gradient(135deg, rgb(219 247 243 / 0.86), rgb(255 255 255 / 0.78));
 }
 
-.design-row.is-active {
+.shape-row.is-active {
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 12px 24px rgb(21 167 150 / 0.12);
 }
 
-.design-row strong,
-.design-row span {
+.shape-row strong,
+.shape-row span {
   overflow-wrap: anywhere;
 }
 
-.design-row span,
+.shape-row span,
 .muted {
   color: var(--muted);
   font-size: 12px;
@@ -941,12 +941,12 @@ p {
     border-radius: 18px;
   }
 
-  .floating-designs {
+  .floating-shapes {
     top: 18px;
     left: 18px;
   }
 
-  .floating-designs.is-open {
+  .floating-shapes.is-open {
     width: min(320px, calc(100vw - 36px));
     height: min(660px, calc(100vh - 54px));
   }
@@ -964,7 +964,7 @@ p {
     transform: translateY(18px) scale(0.98);
   }
 
-  .floating-designs.is-open ~ .export-drawer {
+  .floating-shapes.is-open ~ .export-drawer {
     transform: translateY(18px) scale(0.98);
   }
 

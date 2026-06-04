@@ -1,12 +1,12 @@
 import { expect, test } from "@playwright/test";
 
-test("creates a design graph, comments on a node, and exports markdown", async ({ page }) => {
+test("creates a shape graph, comments on a node, and exports markdown", async ({ page }) => {
   await page.goto("/");
 
   await expect(page.locator(".canvas-watermark").getByText("shape.ai")).toBeVisible();
-  await page.getByRole("button", { name: "Open designs" }).click();
-  await expect(page.getByRole("button", { name: "Close designs" })).toBeVisible();
-  await page.getByRole("button", { name: "Create design" }).click();
+  await page.getByRole("button", { name: "Open shapes" }).click();
+  await expect(page.getByRole("button", { name: "Close shapes" })).toBeVisible();
+  await page.getByRole("button", { name: "Create shape" }).click();
   await expect(page.locator(".decision-node").first()).toBeVisible();
 
   const firstNode = page.locator(".decision-node").first();

@@ -1,12 +1,12 @@
 import { Download, FileImage, FileText, Network } from "lucide-react";
 import { exportTypeLabels } from "../../shared/graph";
-import type { DesignArtifact, ExportType } from "../../shared/schema";
+import type { ExportType, ShapeArtifact } from "../../shared/schema";
 
 type ExportDrawerProps = {
-  artifacts: DesignArtifact[];
+  artifacts: ShapeArtifact[];
   busy: boolean;
   onExport: (type: ExportType) => void;
-  designId?: string;
+  shapeId?: string;
 };
 
 const exportTypes: ExportType[] = ["madr", "yadr", "mermaid", "image_prompt"];
@@ -18,14 +18,14 @@ const icons: Partial<Record<ExportType, typeof FileText>> = {
   image_prompt: FileImage
 };
 
-export function ExportDrawer({ artifacts, busy, onExport, designId }: ExportDrawerProps) {
+export function ExportDrawer({ artifacts, busy, onExport, shapeId }: ExportDrawerProps) {
   return (
     <section className="export-drawer">
       <div className="export-actions">
         {exportTypes.map((type) => {
           const Icon = icons[type] ?? FileText;
           return (
-            <button key={type} onClick={() => onExport(type)} disabled={busy || !designId}>
+            <button key={type} onClick={() => onExport(type)} disabled={busy || !shapeId}>
               <Icon size={15} />
               {exportTypeLabels[type]}
             </button>
@@ -34,7 +34,7 @@ export function ExportDrawer({ artifacts, busy, onExport, designId }: ExportDraw
       </div>
       <div className="artifact-strip">
         {artifacts.slice(0, 4).map((artifact) => (
-          <a key={artifact.id} href={`/api/designs/${designId}/artifacts/${artifact.id}`}>
+          <a key={artifact.id} href={`/api/shapes/${shapeId}/artifacts/${artifact.id}`}>
             <Download size={14} />
             {artifact.title}
           </a>

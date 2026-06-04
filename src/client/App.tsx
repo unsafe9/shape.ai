@@ -5,9 +5,9 @@ import "@xyflow/react/dist/style.css";
 import { BrainCircuit, Loader2, PanelLeft, X } from "lucide-react";
 import {
   createComment,
-  createDesign,
-  exportDesign,
-  listDesigns,
+  createShape,
+  exportShape,
+  listShapes,
   saveGraphEdit,
   updateComment,
 } from "./lib/api";
@@ -17,7 +17,7 @@ import { Sidebar } from "./components/Sidebar";
 import { ExportDrawer } from "./components/ExportDrawer";
 import type {
   DecisionGraph,
-  Design,
+  Shape,
   EdgeType,
   ExportType,
   GraphComment,
@@ -35,31 +35,31 @@ const cardHeight = 390;
 const viewportEase = (t: number) => 1 - Math.pow(1 - t, 3);
 
 const seedPrompt =
-  "Design an AI-assisted architecture decision tool that extracts propositions, decision points, options, evidence, blockers, tradeoffs, subdecisions, tasks, and exports.";
+  "Shape an AI-assisted architecture decision tool that extracts propositions, decision points, options, evidence, blockers, tradeoffs, subdecisions, tasks, and exports.";
 
 export default function App() {
-  const [designs, setDesigns] = useState<Design[]>([]);
-  const [activeDesign, setActiveDesign] = useState<Design | null>(null);
+  const [shapes, setShapes] = useState<Shape[]>([]);
+  const [activeShape, setActiveShape] = useState<Shape | null>(null);
   const [prompt, setPrompt] = useState(seedPrompt);
   const [selection, setSelection] = useState<GraphSelection>({ kind: "graph" });
   const [commentValue, setCommentValue] = useState("");
   const [status, setStatus] = useState("Ready");
   const [busy, setBusy] = useState(false);
-  const [designPanelOpen, setDesignPanelOpen] = useState(false);
+  const [shapePanelOpen, setShapePanelOpen] = useState(false);
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance<Node<StudioNodeData>, Edge> | null>(null);
 
   const flow = useMemo(() => {
-    if (!activeDesign) return { nodes: [] as Node<StudioNodeData>[], edges: [] as Edge[] };
+    if (!activeShape) return { nodes: [] as Node<StudioNodeData>[], edges: [] as Edge[] };
     return graphToFlow(
-      activeDesign.graph,
-      activeDesign.layout,
+      activeShape.graph,
+      activeShape.layout,
       selection.kind === "graph" ? undefined : selection.id,
       editingNodeId,
-      activeDesign.comments,
+      activeShape.comments,
       updateNode,
       commentValue,
-      busy || !activeDesign,
+      busy || !activeShape,
       setCommentValue,
       runAddComment,
       toggleComment,
@@ -68,18 +68,18 @@ export default function App() {
       setEditingNodeId,
       () => setEditingNodeId(null)
     );
-  }, [activeDesign, selection, editingNodeId, commentValue, busy]);
+  }, [activeShape, selection, editingNodeId, commentValue, busy]);
 
-  const refreshDesigns = useCallback(async () => {
-    const nextDesigns = await listDesigns();
-    const nextActive = activeDesign ? nextDesigns.find((design) => design.id === activeDesign.id) ?? activeDesign : nextDesigns[0] ?? null;
-    setDesigns(nextDesigns);
-    setActiveDesign(nextActive);
+  const refreshShapes = useCallback(async () => {
+    const nextShapes = await listShapes();
+    const nextActive = activeShape ? nextShapes.find((shape) => shape.id === activeShape.id) ?? activeShape : nextShapes[0] ?? null;
+    setShapes(nextShapes);
+    setActiveShape(nextActive);
     setSelection(nextActive ? validSelection(nextActive, nextActive.selection) : { kind: "graph" });
-  }, [activeDesign]);
+  }, [activeShape]);
 
   useEffect(() => {
-    refreshDesigns().catch((error) => setStatus(error.message));
+    refreshShapes().catch((error) => setStatus(error.message));
   }, []);
 
   useEffect(() => {
@@ -121,10 +121,10 @@ export default function App() {
   }, [selection, editingNodeId, flowInstance]);
 
   async function runCreate() {
-    await withBusy("Creating design", async () => {
-      const response = await createDesign(prompt);
-      updateDesign(response.design);
-      setDesignPanelOpen(false);
+    await withBusy("Creating shape", async () => {
+      const response = await createShape(prompt);
+      updateShape(response.shape);
+      setShapePanelOpen(false);
       setEditingNodeId(null);
       setCommentValue("");
       setStatus(response.message);
@@ -132,48 +132,48 @@ export default function App() {
   }
 
   async function runExport(type: ExportType) {
-    if (!activeDesign) return;
+    if (!activeShape) return;
     await withBusy(`Exporting ${type}`, async () => {
       const scope = selection.kind === "graph" ? { kind: "whole_graph" as const } : selection;
-      const response = await exportDesign(activeDesign.id, type, scope);
-      updateDesign(response.design);
+      const response = await exportShape(activeShape.id, type, scope);
+      updateShape(response.shape);
       setStatus(`Export created: ${response.artifact.title}`);
     });
   }
 
   async function runAddComment() {
-    if (!activeDesign || !commentValue.trim()) return;
+    if (!activeShape || !commentValue.trim()) return;
     await withBusy("Adding comment", async () => {
-      const response = await createComment(activeDesign.id, {
+      const response = await createComment(activeShape.id, {
         target: selection,
         body: commentValue.trim()
       });
-      updateDesign(response.design);
+      updateShape(response.shape);
       setCommentValue("");
     });
   }
 
   async function toggleComment(comment: GraphComment) {
-    if (!activeDesign) return;
+    if (!activeShape) return;
     await withBusy("Updating comment", async () => {
-      const response = await updateComment(activeDesign.id, comment.id, { resolved: !comment.resolved });
-      updateDesign(response.design);
+      const response = await updateComment(activeShape.id, comment.id, { resolved: !comment.resolved });
+      updateShape(response.shape);
     });
   }
 
-  function updateDesign(design: Design) {
-    setActiveDesign(design);
-    setSelection(validSelection(design, design.selection));
-    setDesigns((current) => [design, ...current.filter((candidate) => candidate.id !== design.id)]);
+  function updateShape(shape: Shape) {
+    setActiveShape(shape);
+    setSelection(validSelection(shape, shape.selection));
+    setShapes((current) => [shape, ...current.filter((candidate) => candidate.id !== shape.id)]);
   }
 
-  async function saveGraph(graph: DecisionGraph, layout = activeDesign?.layout, nextSelection = selection) {
-    if (!activeDesign) return;
-    const optimistic = { ...activeDesign, graph, layout: layout ?? activeDesign.layout, selection: nextSelection };
-    updateDesign(optimistic);
+  async function saveGraph(graph: DecisionGraph, layout = activeShape?.layout, nextSelection = selection) {
+    if (!activeShape) return;
+    const optimistic = { ...activeShape, graph, layout: layout ?? activeShape.layout, selection: nextSelection };
+    updateShape(optimistic);
     try {
-      const response = await saveGraphEdit(activeDesign.id, { graph, layout, selection: nextSelection });
-      updateDesign(response.design);
+      const response = await saveGraphEdit(activeShape.id, { graph, layout, selection: nextSelection });
+      updateShape(response.shape);
       setStatus("Saved");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Save failed");
@@ -181,11 +181,11 @@ export default function App() {
   }
 
   async function saveLayout(layout: GraphLayout) {
-    if (!activeDesign) return;
-    updateDesign({ ...activeDesign, layout });
+    if (!activeShape) return;
+    updateShape({ ...activeShape, layout });
     try {
-      const response = await saveGraphEdit(activeDesign.id, { layout });
-      updateDesign(response.design);
+      const response = await saveGraphEdit(activeShape.id, { layout });
+      updateShape(response.shape);
       setStatus("Layout saved");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Layout save failed");
@@ -193,49 +193,49 @@ export default function App() {
   }
 
   async function selectGraphItem(nextSelection: GraphSelection) {
-    if (!activeDesign) return;
-    const valid = validSelection(activeDesign, nextSelection);
+    if (!activeShape) return;
+    const valid = validSelection(activeShape, nextSelection);
     if (valid.kind !== "node") {
       setEditingNodeId(null);
     }
     setSelection(valid);
-    setActiveDesign({ ...activeDesign, selection: valid });
+    setActiveShape({ ...activeShape, selection: valid });
     try {
-      const response = await saveGraphEdit(activeDesign.id, { selection: valid });
-      updateDesign(response.design);
+      const response = await saveGraphEdit(activeShape.id, { selection: valid });
+      updateShape(response.shape);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Selection save failed");
     }
   }
 
   function updateNode(node: GraphNode) {
-    if (!activeDesign) return;
+    if (!activeShape) return;
     const graph = {
-      ...activeDesign.graph,
-      nodes: activeDesign.graph.nodes.map((candidate) => (candidate.id === node.id ? node : candidate))
+      ...activeShape.graph,
+      nodes: activeShape.graph.nodes.map((candidate) => (candidate.id === node.id ? node : candidate))
     };
     void saveGraph(graph);
   }
 
   function deleteSelection() {
-    if (!activeDesign || selection.kind === "graph") return;
+    if (!activeShape || selection.kind === "graph") return;
     const graph =
       selection.kind === "node"
         ? {
-            ...activeDesign.graph,
-            nodes: activeDesign.graph.nodes.filter((node) => node.id !== selection.id),
-            edges: activeDesign.graph.edges.filter((edge) => edge.source !== selection.id && edge.target !== selection.id)
+            ...activeShape.graph,
+            nodes: activeShape.graph.nodes.filter((node) => node.id !== selection.id),
+            edges: activeShape.graph.edges.filter((edge) => edge.source !== selection.id && edge.target !== selection.id)
           }
         : {
-            ...activeDesign.graph,
-            edges: activeDesign.graph.edges.filter((edge) => edge.id !== selection.id)
+            ...activeShape.graph,
+            edges: activeShape.graph.edges.filter((edge) => edge.id !== selection.id)
           };
-    void saveGraph(graph, activeDesign.layout, { kind: "graph" });
+    void saveGraph(graph, activeShape.layout, { kind: "graph" });
   }
 
   function addLinkedNode(type: NodeType) {
-    if (!activeDesign) return;
-    const sourceId = selection.kind === "node" ? selection.id : activeDesign.graph.nodes[0]?.id;
+    if (!activeShape) return;
+    const sourceId = selection.kind === "node" ? selection.id : activeShape.graph.nodes[0]?.id;
     const id = `${type.replace(/_/g, "-")}-${crypto.randomUUID().slice(0, 8)}`;
     const node: GraphNode = {
       id,
@@ -260,18 +260,18 @@ export default function App() {
         }
       : null;
     const graph = {
-      ...activeDesign.graph,
-      nodes: [...activeDesign.graph.nodes, node],
-      edges: edge ? [...activeDesign.graph.edges, edge] : activeDesign.graph.edges
+      ...activeShape.graph,
+      nodes: [...activeShape.graph.nodes, node],
+      edges: edge ? [...activeShape.graph.edges, edge] : activeShape.graph.edges
     };
     const basePosition =
-      sourceId && activeDesign.layout.nodePositions[sourceId]
-        ? activeDesign.layout.nodePositions[sourceId]
+      sourceId && activeShape.layout.nodePositions[sourceId]
+        ? activeShape.layout.nodePositions[sourceId]
         : { x: 120, y: 120 };
     const layout = {
-      ...activeDesign.layout,
+      ...activeShape.layout,
       nodePositions: {
-        ...activeDesign.layout.nodePositions,
+        ...activeShape.layout.nodePositions,
         [id]: { x: basePosition.x + 260, y: basePosition.y + 84 }
       }
     };
@@ -279,7 +279,7 @@ export default function App() {
   }
 
   function connectNodes(connection: Connection) {
-    if (!activeDesign || !connection.source || !connection.target || connection.source === connection.target) return;
+    if (!activeShape || !connection.source || !connection.target || connection.source === connection.target) return;
     const edge: GraphEdge = {
       id: `edge-${crypto.randomUUID().slice(0, 8)}`,
       type: "depends_on",
@@ -290,18 +290,18 @@ export default function App() {
       confidence: 0.5
     };
     const graph = {
-      ...activeDesign.graph,
-      edges: [...activeDesign.graph.edges, edge]
+      ...activeShape.graph,
+      edges: [...activeShape.graph.edges, edge]
     };
-    void saveGraph(graph, activeDesign.layout, { kind: "edge", id: edge.id });
+    void saveGraph(graph, activeShape.layout, { kind: "edge", id: edge.id });
   }
 
   function moveNode(node: Node) {
-    if (!activeDesign) return;
+    if (!activeShape) return;
     void saveLayout({
-      ...activeDesign.layout,
+      ...activeShape.layout,
       nodePositions: {
-        ...activeDesign.layout.nodePositions,
+        ...activeShape.layout.nodePositions,
         [node.id]: { x: node.position.x, y: node.position.y }
       }
     });
@@ -364,7 +364,7 @@ export default function App() {
               <span>shape.ai</span>
             </div>
 
-            {activeDesign ? (
+            {activeShape ? (
               <ReactFlow
                 nodes={flow.nodes}
                 edges={flow.edges}
@@ -407,35 +407,35 @@ export default function App() {
               </ReactFlow>
             ) : (
               <div className="empty-canvas">
-                <h2>Create a design graph</h2>
+                <h2>Create a shape graph</h2>
                 <p>Start with a proposition, architecture concern, or implementation plan that needs sharper decisions.</p>
               </div>
             )}
           </div>
 
-          <div className={`floating-designs ${designPanelOpen ? "is-open" : "is-closed"}`}>
+          <div className={`floating-shapes ${shapePanelOpen ? "is-open" : "is-closed"}`}>
             <button
-              className={`design-panel-toggle icon-button ${designPanelOpen ? "is-active" : ""}`}
-              onClick={() => setDesignPanelOpen((open) => !open)}
-              aria-label={designPanelOpen ? "Close designs" : "Open designs"}
+              className={`shape-panel-toggle icon-button ${shapePanelOpen ? "is-active" : ""}`}
+              onClick={() => setShapePanelOpen((open) => !open)}
+              aria-label={shapePanelOpen ? "Close shapes" : "Open shapes"}
             >
-              {designPanelOpen ? <X size={16} /> : <PanelLeft size={16} />}
+              {shapePanelOpen ? <X size={16} /> : <PanelLeft size={16} />}
             </button>
-            <div className="floating-designs-body">
+            <div className="floating-shapes-body">
               <Sidebar
-                designs={designs}
-                activeDesignId={activeDesign?.id}
+                shapes={shapes}
+                activeShapeId={activeShape?.id}
                 prompt={prompt}
                 busy={busy}
                 onPromptChange={setPrompt}
                 onCreate={runCreate}
-                onSelect={(design) => {
-                  setActiveDesign(design);
-                  setSelection(validSelection(design, design.selection));
+                onSelect={(shape) => {
+                  setActiveShape(shape);
+                  setSelection(validSelection(shape, shape.selection));
                   setEditingNodeId(null);
-                  setDesignPanelOpen(false);
+                  setShapePanelOpen(false);
                 }}
-                onRefresh={() => refreshDesigns().catch((error) => setStatus(error.message))}
+                onRefresh={() => refreshShapes().catch((error) => setStatus(error.message))}
               />
             </div>
           </div>
@@ -448,9 +448,9 @@ export default function App() {
           ) : null}
 
           <ExportDrawer
-            artifacts={activeDesign?.artifacts ?? []}
+            artifacts={activeShape?.artifacts ?? []}
             busy={busy}
-            designId={activeDesign?.id}
+            shapeId={activeShape?.id}
             onExport={runExport}
           />
         </section>
@@ -493,9 +493,9 @@ function defaultEdgeLabel(type: NodeType): string {
   return "depends on";
 }
 
-function validSelection(design: Design, selection: GraphSelection): GraphSelection {
+function validSelection(shape: Shape, selection: GraphSelection): GraphSelection {
   if (selection.kind === "graph") return selection;
-  if (selection.kind === "node" && design.graph.nodes.some((node) => node.id === selection.id)) return selection;
-  if (selection.kind === "edge" && design.graph.edges.some((edge) => edge.id === selection.id)) return selection;
+  if (selection.kind === "node" && shape.graph.nodes.some((node) => node.id === selection.id)) return selection;
+  if (selection.kind === "edge" && shape.graph.edges.some((edge) => edge.id === selection.id)) return selection;
   return { kind: "graph" };
 }
