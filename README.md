@@ -1,17 +1,17 @@
 # shape.ai
 
-Visual shaping for humans and AI agents.
+Visual group canvas for humans and AI agents.
 
-shape.ai is a shape workspace that agents can read, review, and extend through MCP. It stores typed shape graphs in SQLite, exposes a React canvas for humans, and serves both a Web UI and a remote Streamable HTTP MCP endpoint from one Fastify server.
+shape.ai stores one infinite `Scene` in SQLite. The only organization unit is a `Group`; nodes and edges live inside groups, and registered tags are attached to groups for filtering, overview tinting, and MCP queries. The same Fastify process serves the Web UI and remote Streamable HTTP MCP at `/mcp`.
 
 ## What It Does
 
-- Creates a shape from a proposition, architecture concern, or implementation plan.
-- Represents each shape as a typed graph with nodes for propositions, decision points, options, evidence, tradeoffs, blockers, subdecisions, tasks, and artifacts.
-- Supports graph editing in the Web UI: node dragging, layout persistence, node and edge inspection, inline field edits, connected-node creation, edge creation, and deletion.
-- Stores comments on the whole graph, a selected node, or a selected edge.
-- Exports the whole graph or selected subgraph as deterministic local artifacts: MADR Markdown, YADR YAML, Mermaid, and image-generation prompts.
-- Exposes MCP tools so AI agents can list/read shapes, propose graph changes, validate diffs, leave review comments, approve/reject proposals, and export shapes.
+- Creates a group from a proposition, architecture concern, or implementation plan.
+- Stores scene objects as `Group`, `Node`, and `Edge` records with scene-space bounds and z-index ordering.
+- Supports a large canvas UI with smooth pan/zoom, pinch zoom, viewport culling, zoom-level LOD, compact overview rendering, inline note editing, copy/paste, comments, and z-order actions.
+- Keeps group tags in a global registry with create, rename, recolor, delete-unused, attach, detach, and filter flows.
+- Exports group, node, edge, or selection scope as MADR Markdown, YADR YAML, Mermaid, and image-generation prompts.
+- Exposes MCP tools so AI agents can query the scene, inspect groups, update group tags, patch scene objects, add comments, and export group content.
 
 ## Local Development
 
@@ -28,7 +28,7 @@ For iterative frontend/backend development, use:
 npm run dev
 ```
 
-The Fastify backend listens on `http://127.0.0.1:8787` by default. Canonical shape data is stored in `.local/shape.sqlite`, legacy `.local/designs/*.json` files are imported when the database is empty, and exported artifacts are stored under `.local/exports/`. The `.local/` directory is intentionally ignored by git.
+The Fastify backend listens on `http://127.0.0.1:8787` by default. Canonical scene data is stored in `.local/shape.sqlite`, and exported artifacts are stored under `.local/exports/`. Legacy snapshots are migrated into top-level groups when an old local database is detected. The `.local/` directory is intentionally ignored by git.
 
 Useful environment variables:
 
@@ -39,6 +39,19 @@ Useful environment variables:
 - `SHAPE_AI_REPO_ROOT`: repository root used when validating local export paths
 - `SHAPE_AI_OPEN_BROWSER`: set to `1` to open the browser when running the server directly
 
+## API
+
+Primary HTTP routes:
+
+- `GET /api/scene?x&y&width&height&zoom&tags`: query visible scene objects for a viewport and optional tag filter.
+- `PATCH /api/scene`: patch groups, nodes, edges, or the current selection.
+- `POST /api/groups`: create a group with seeded nodes and optional tags.
+- `GET /api/groups/:id`: read a group subgraph.
+- `PATCH /api/groups/:id/tags`: replace the tag IDs attached to a group.
+- `POST /api/tags`, `PATCH /api/tags/:id`, `DELETE /api/tags/:id`: manage the tag registry.
+- `POST /api/groups/:id/export`: export group content with optional `scope`.
+- `POST /api/comments`, `PATCH /api/comments/:commentId`: add or resolve comments.
+
 ## MCP Usage
 
 Remote Streamable HTTP MCP is served by the main server:
@@ -47,7 +60,7 @@ Remote Streamable HTTP MCP is served by the main server:
 http://127.0.0.1:8787/mcp
 ```
 
-The stdio MCP server is still available for hosts that need process-based MCP:
+The stdio MCP server is also available for hosts that need process-based MCP:
 
 ```bash
 npm run mcp
@@ -65,40 +78,45 @@ Example MCP host command:
 
 Available tools:
 
-- `list_shapes`
-- `get_shape`
-- `create_shape`
-- `get_selection`
-- `list_open_proposals`
-- `create_proposal`
-- `append_proposal_patch`
-- `validate_proposal`
-- `get_proposal_diff`
-- `comment_on_proposal`
-- `request_proposal_changes`
-- `approve_proposal`
-- `reject_proposal`
-- `export_shape`
+- `query_scene`
+- `list_groups`
+- `get_group`
+- `create_group`
+- `patch_scene`
+- `create_tag`
+- `update_group_tags`
+- `set_selection`
+- `add_comment`
+- `export_group`
 
-The compatibility tools `list_designs`, `get_design`, `create_design`, and `export_design` remain available. Shape-scoped MCP tools accept legacy `designId` input for older clients, but `shapeId` is the preferred field. Direct graph mutation through MCP is intentionally not exposed; graph content changes should go through proposals.
+`export_group` accepts either `type` for one format or `types` for several formats, and returns generated content in preview fields alongside persisted artifact metadata. MCP clients can pass `markdown` as an alias for `madr`.
 
 ## Exports
 
-Exports are generated locally and deterministically from the stored graph:
+Exports are generated locally and deterministically from the stored group subgraph:
 
 - `madr`: Markdown Architectural Decision Record, based on the `adr/madr` template.
 - `yadr`: YAML Architectural Decision Record, based on the `adr/yadr` template.
 - `mermaid`: Mermaid flowchart text.
 - `image_prompt`: Prompt text for an MCP client with its own image-generation capability.
 
-Exports can target the whole graph, a selected node subgraph, or a selected edge subgraph.
+Exports can target `group`, `node`, `edge`, or `selection` scope.
+
+## Performance Model
+
+- The server answers viewport queries using stored bounds, zoom, and tag filters.
+- The client keeps pan/zoom interaction cheap by moving one transformed scene layer and deferring detailed DOM cards until the camera settles.
+- Low zoom renders top-level group overview only.
+- Mid zoom renders group frames and compact node summaries.
+- High zoom mounts editable note cards only for visible nodes near the viewport.
+- Edges are hidden at far zoom levels and only rendered when both endpoints are visible.
 
 ## Constraints
 
-- shape.ai uses SQLite as the canonical store.
-- Primary APIs are under `/api/shapes`; compatibility APIs remain under `/api/designs`.
+- SQLite is the canonical store.
+- `Scene`, `Group`, `Node`, `Edge`, and `Tag` are the canonical model.
 - The Web UI does not embed an OpenAI client, AI chat, shell execution, or code-editing tool.
-- AI integration is intentionally via MCP, with remote Streamable HTTP at `/mcp` and stdio as a compatibility transport.
+- AI integration is via MCP, with remote Streamable HTTP at `/mcp` and stdio as a compatibility transport.
 - Runtime data and exports under `.local/` should stay out of git.
 
 ## Verification
