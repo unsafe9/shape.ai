@@ -1,33 +1,43 @@
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { stat } from "node:fs/promises";
 import fastifyStatic from "@fastify/static";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import {
   createCommentRequestSchema,
-  createDesignRequestSchema,
-  decisionGraphSchema,
+  createGroupRequestSchema,
+  createTagRequestSchema,
   exportRequestSchema,
-  graphEditRequestSchema,
-  updateCommentRequestSchema
+  scenePatchSchema,
+  updateCommentRequestSchema,
+  updateGroupTagsRequestSchema,
+  updateTagRequestSchema,
+  type Bounds,
+  type ExportType
 } from "../shared/schema";
-import { generateLocalExport, seedDesignGraph } from "./local";
+import { sceneGraphForGroup } from "../shared/graph";
+import { generateLocalExport } from "./local";
 import {
   addArtifact,
   addComment,
-  createDesign,
+  artifactReadStream,
+  createGroup,
+  createTag,
   DATA_ROOT,
+  deleteUnusedTag,
   ensureStorage,
   isExportPath,
-  listDesigns,
-  readDesign,
-  saveDesign,
+  readFullScene,
+  readGroup,
+  readScene,
+  saveScenePatch,
   updateComment,
+  updateGroupTags,
+  updateTag,
   writeArtifactContent
 } from "./storage";
-import { createShapeMcpServer } from "./mcp";
+import { createSceneMcpServer } from "./mcp";
 
 const port = Number(process.env.SHAPE_AI_PORT ?? 8787);
 const host = process.env.SHAPE_AI_HOST ?? "127.0.0.1";
@@ -61,7 +71,7 @@ export async function buildServer() {
   }));
 
   app.all("/mcp", async (request, reply) => {
-    const server = createShapeMcpServer();
+    const server = createSceneMcpServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined
     });
@@ -96,101 +106,117 @@ export async function buildServer() {
     }
   });
 
-  registerShapeRoutes(app, "/api/shapes", "shape");
-  registerShapeRoutes(app, "/api/designs", "design");
-
+  registerSceneRoutes(app);
   await registerClientIfBuilt(app);
   return app;
 }
 
-function registerShapeRoutes(app: FastifyInstance, prefix: "/api/shapes" | "/api/designs", responseKey: "shape" | "design") {
-  app.get(prefix, async () => {
-    const shapes = await listDesigns();
-    return responseKey === "shape" ? { shapes } : { designs: shapes };
+function registerSceneRoutes(app: FastifyInstance) {
+  app.get("/api/scene", async (request) => {
+    const query = request.query as Record<string, string | undefined>;
+    return {
+      scene: await readScene({
+        viewport: parseViewport(query),
+        zoom: query.zoom && Number.isFinite(Number(query.zoom)) ? Number(query.zoom) : undefined,
+        tagIds: query.tags?.split(",").map((tag) => tag.trim()).filter(Boolean),
+        focusGroupId: query.focusGroupId
+      })
+    };
   });
 
-  app.post(prefix, async (request, reply) => {
-    const body = createDesignRequestSchema.parse(request.body);
-    const seed = seedDesignGraph(body.prompt);
-    const shape = await createDesign({
-      title: body.title || seed.title,
-      prompt: body.prompt,
-      graph: decisionGraphSchema.parse(seed.graph)
-    });
-    reply.status(201).send({ ...shapeResponse(responseKey, shape), message: seed.explanation });
+  app.patch("/api/scene", async (request) => {
+    const patch = scenePatchSchema.parse(request.body ?? {});
+    return { scene: await saveScenePatch(patch) };
   });
 
-  app.get<{ Params: { id: string } }>(`${prefix}/:id`, async (request, reply) => {
-    const shape = await loadDesignOr404(request.params.id, reply);
-    if (!shape) return;
-    return shapeResponse(responseKey, shape);
+  app.post("/api/groups", async (request, reply) => {
+    const body = createGroupRequestSchema.parse(request.body ?? {});
+    const result = await createGroup(body);
+    reply.status(201).send(result);
   });
 
-  app.patch<{ Params: { id: string } }>(`${prefix}/:id/graph`, async (request, reply) => {
-    const shape = await loadDesignOr404(request.params.id, reply);
-    if (!shape) return;
-    const body = graphEditRequestSchema.parse(request.body ?? {});
-    const graphChanged = Boolean(body.graph);
-    const updated = await saveDesign({
-      ...shape,
-      graph: body.graph ?? shape.graph,
-      layout: body.layout ?? shape.layout,
-      selection: body.selection ?? shape.selection,
-      graphVersion: graphChanged ? shape.graphVersion + 1 : shape.graphVersion,
-      updatedAt: new Date().toISOString()
-    });
-    return shapeResponse(responseKey, updated);
-  });
-
-  app.post<{ Params: { id: string } }>(`${prefix}/:id/comments`, async (request, reply) => {
-    const shape = await loadDesignOr404(request.params.id, reply);
-    if (!shape) return;
-    const body = createCommentRequestSchema.parse(request.body ?? {});
-    const updated = await addComment(shape, body);
-    return { ...shapeResponse(responseKey, updated), comment: updated.comments[0] };
-  });
-
-  app.patch<{ Params: { id: string; commentId: string } }>(`${prefix}/:id/comments/:commentId`, async (request, reply) => {
-    const shape = await loadDesignOr404(request.params.id, reply);
-    if (!shape) return;
-    const body = updateCommentRequestSchema.parse(request.body ?? {});
-    if (!shape.comments.some((candidate) => candidate.id === request.params.commentId)) {
-      reply.status(404).send({ error: "not_found", message: "Comment not found" });
+  app.get<{ Params: { id: string } }>("/api/groups/:id", async (request, reply) => {
+    const group = await readGroup(request.params.id);
+    if (!group) {
+      reply.status(404).send({ error: "not_found", message: "Group not found" });
       return;
     }
-    const updated = await updateComment(shape, request.params.commentId, body);
-    const comment = updated.comments.find((candidate) => candidate.id === request.params.commentId);
-    return { ...shapeResponse(responseKey, updated), comment };
+    return group;
   });
 
-  app.post<{ Params: { id: string } }>(`${prefix}/:id/export`, async (request, reply) => {
-    const shape = await loadDesignOr404(request.params.id, reply);
-    if (!shape) return;
+  app.patch<{ Params: { id: string } }>("/api/groups/:id/tags", async (request) => {
+    const body = updateGroupTagsRequestSchema.parse(request.body ?? {});
+    return updateGroupTags(request.params.id, body.tagIds);
+  });
+
+  app.post("/api/tags", async (request, reply) => {
+    const body = createTagRequestSchema.parse(request.body ?? {});
+    const result = await createTag(body);
+    reply.status(201).send(result);
+  });
+
+  app.patch<{ Params: { id: string } }>("/api/tags/:id", async (request) => {
+    const body = updateTagRequestSchema.parse(request.body ?? {});
+    return updateTag(request.params.id, body);
+  });
+
+  app.delete<{ Params: { id: string } }>("/api/tags/:id", async (request) => ({
+    scene: await deleteUnusedTag(request.params.id)
+  }));
+
+  app.post("/api/comments", async (request) => {
+    const body = createCommentRequestSchema.parse(request.body ?? {});
+    return addComment(body);
+  });
+
+  app.patch<{ Params: { commentId: string } }>("/api/comments/:commentId", async (request) => {
+    const body = updateCommentRequestSchema.parse(request.body ?? {});
+    return updateComment(request.params.commentId, body);
+  });
+
+  app.post<{ Params: { id: string } }>("/api/groups/:id/export", async (request, reply) => {
+    const groupDetail = await readGroup(request.params.id);
+    if (!groupDetail) {
+      reply.status(404).send({ error: "not_found", message: "Group not found" });
+      return;
+    }
     const body = exportRequestSchema.parse(request.body ?? {});
-    const generated = generateLocalExport(shape.graph, body, shape.title);
+    const scene = await readFullScene();
+    const scope = body.scope ?? { kind: "group" as const, id: request.params.id };
+    const graph = sceneGraphForGroup(scene, request.params.id);
+    const generated = generateLocalExport(graph, { type: body.type, scope }, groupDetail.group.title);
     const persisted = await writeArtifactContent({
-      designId: shape.id,
+      groupId: request.params.id,
       type: body.type,
       title: generated.title,
       content: generated.content,
       contentType: contentTypeFor(body.type)
     });
-    const updated = await addArtifact(shape, {
+    const result = await addArtifact(request.params.id, {
       type: body.type,
       title: generated.title,
-      scope: body.scope.kind === "whole_graph" ? "whole_graph" : `${body.scope.kind}:${body.scope.id ?? ""}`,
+      target: { kind: "group", id: request.params.id },
       path: persisted.path,
       contentType: persisted.contentType
     });
-    const artifact = updated.artifacts[0];
-    return { ...shapeResponse(responseKey, updated), artifact };
+    return {
+      scene: result.scene,
+      group: groupDetail.group,
+      artifact: result.artifact,
+      preview: {
+        type: body.type,
+        title: generated.title,
+        content: generated.content,
+        contentType: persisted.contentType,
+        imagePrompt: generated.imagePrompt
+      }
+    };
   });
 
-  app.get<{ Params: { id: string; artifactId: string } }>(`${prefix}/:id/artifacts/:artifactId`, async (request, reply) => {
-    const shape = await loadDesignOr404(request.params.id, reply);
-    if (!shape) return;
-    const artifact = shape.artifacts.find((candidate) => candidate.id === request.params.artifactId);
-    if (!artifact) {
+  app.get<{ Params: { groupId: string; artifactId: string } }>("/api/groups/:groupId/artifacts/:artifactId", async (request, reply) => {
+    const scene = await readFullScene();
+    const artifact = scene.artifacts.find((candidate) => candidate.id === request.params.artifactId);
+    if (!artifact || artifact.target.kind !== "group" || artifact.target.id !== request.params.groupId) {
       reply.status(404).send({ error: "not_found", message: "Artifact not found" });
       return;
     }
@@ -200,24 +226,23 @@ function registerShapeRoutes(app: FastifyInstance, prefix: "/api/shapes" | "/api
     }
     reply.header("Content-Disposition", `attachment; filename="${artifact.title.replace(/[^a-z0-9.-]+/gi, "-")}"`);
     reply.type(artifact.contentType);
-    return reply.send(createReadStream(artifact.path));
+    return reply.send(artifactReadStream(artifact.path));
   });
 }
 
-function shapeResponse(responseKey: "shape" | "design", shape: NonNullable<Awaited<ReturnType<typeof readDesign>>>) {
-  return responseKey === "shape" ? { shape } : { design: shape };
+function parseViewport(query: Record<string, string | undefined>): Bounds | undefined {
+  if (!query.x || !query.y || !query.width || !query.height) return undefined;
+  const bounds = {
+    x: Number(query.x),
+    y: Number(query.y),
+    width: Number(query.width),
+    height: Number(query.height)
+  };
+  if (Object.values(bounds).some((value) => !Number.isFinite(value))) return undefined;
+  return bounds;
 }
 
-async function loadDesignOr404(id: string, reply: FastifyReply) {
-  const design = await readDesign(id);
-  if (!design) {
-    reply.status(404).send({ error: "not_found", message: "Shape not found" });
-    return null;
-  }
-  return design;
-}
-
-function contentTypeFor(type: string): string {
+function contentTypeFor(type: ExportType): string {
   if (type === "yadr") return "application/yaml; charset=utf-8";
   if (type === "image_prompt" || type === "architecture_image") return "text/markdown; charset=utf-8";
   if (type === "confluence_html") return "text/html; charset=utf-8";
@@ -244,35 +269,26 @@ async function registerClientIfBuilt(app: FastifyInstance): Promise<void> {
   });
 }
 
+function browserHost(value: string): string {
+  return value === "0.0.0.0" ? "127.0.0.1" : value;
+}
+
+function openBrowser(url: string) {
+  if (process.env.SHAPE_AI_OPEN_BROWSER === "0") return;
+  if (process.platform === "darwin") {
+    spawn("open", [url], { stdio: "ignore", detached: true }).unref();
+    return;
+  }
+  if (process.platform === "win32") {
+    spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true }).unref();
+    return;
+  }
+  spawn("xdg-open", [url], { stdio: "ignore", detached: true }).unref();
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   await ensureStorage();
   const app = await buildServer();
   await app.listen({ host, port });
-  const url = `http://${browserHost(host)}:${port}/`;
-  if (shouldOpenBrowser()) {
-    openBrowser(url);
-  }
-}
-
-function shouldOpenBrowser(): boolean {
-  return process.argv.includes("--open") || process.env.SHAPE_AI_OPEN_BROWSER === "1";
-}
-
-function browserHost(value: string): string {
-  if (value === "0.0.0.0" || value === "::") return "127.0.0.1";
-  return value;
-}
-
-function openBrowser(url: string): void {
-  const [command, args] =
-    process.platform === "darwin"
-      ? ["open", [url]]
-      : process.platform === "win32"
-        ? ["cmd", ["/c", "start", "", url]]
-        : ["xdg-open", [url]];
-  const child = spawn(command, args, {
-    detached: true,
-    stdio: "ignore"
-  });
-  child.unref();
+  openBrowser(`http://${browserHost(host)}:${port}/`);
 }

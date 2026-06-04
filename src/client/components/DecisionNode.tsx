@@ -1,4 +1,3 @@
-import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { useEffect, useRef, type KeyboardEvent, type PointerEvent, type WheelEvent } from "react";
 import { Pencil } from "lucide-react";
 import { nodeTypeLabels } from "../../shared/graph";
@@ -7,8 +6,8 @@ import type { StudioNodeData } from "../lib/flow";
 import { NodeEditForm } from "./node/NodeEditForm";
 import { NodeReadNote } from "./node/NodeReadNote";
 
-export function DecisionNode({ data }: NodeProps) {
-  const nodeData = data as StudioNodeData;
+export function DecisionNode({ data }: { data: StudioNodeData }) {
+  const nodeData = data;
   const { node, selected, editing } = nodeData;
   const titleInputRef = useRef<HTMLInputElement>(null);
 
@@ -58,7 +57,6 @@ export function DecisionNode({ data }: NodeProps) {
     <div
       className={`decision-node decision-node--${node.status} decision-node-type--${node.type} ${selected ? "is-selected" : ""} ${editing ? "is-editing" : ""}`}
     >
-      <Handle type="target" position={Position.Left} />
       <div className="node-head">
         <span className="node-type">{nodeTypeLabels[node.type]}</span>
         {!editing ? (
@@ -105,8 +103,6 @@ export function DecisionNode({ data }: NodeProps) {
           onWheel={stopWheel}
         />
       )}
-
-      <Handle type="source" position={Position.Right} />
     </div>
   );
 }

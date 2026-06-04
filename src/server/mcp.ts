@@ -1,504 +1,273 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { graphTextDigest } from "../shared/graph";
+import { graphTextDigest, sceneGraphForGroup } from "../shared/graph";
 import {
+  createGroupRequestSchema,
+  createTagRequestSchema,
   exportRequestSchema,
   exportTypeSchema,
-  graphLayoutSchema,
-  graphPatchSchema,
-  graphSelectionSchema
+  scenePatchSchema,
+  sceneSelectionSchema,
+  updateGroupTagsRequestSchema,
+  type ExportType,
+  type Scene
 } from "../shared/schema";
-import { generateLocalExport, seedDesignGraph } from "./local";
+import { generateLocalExport } from "./local";
 import {
   addArtifact,
   addComment,
-  appendProposalPatch,
-  approveProposal,
-  commentOnProposal,
-  createDesign,
-  createProposal,
+  createGroup,
+  createTag,
   ensureStorage,
-  getProposalDiff,
-  listDesigns,
-  listOpenProposals,
-  readDesign,
-  rejectProposal,
-  requestProposalChanges,
-  saveDesign,
-  updateComment,
-  validateProposal,
+  readFullScene,
+  readGroup,
+  readScene,
+  saveScenePatch,
+  updateGroupTags,
   writeArtifactContent
 } from "./storage";
 
-const shapeIdInputSchema = {
-  shapeId: z.string().min(1).optional(),
-  designId: z.string().min(1).optional()
-};
+const mcpExportTypeSchema = z.enum([
+  "madr",
+  "markdown",
+  "yadr",
+  "image_prompt",
+  "ai_plan_md",
+  "design_doc_md",
+  "confluence_html",
+  "mermaid",
+  "architecture_image"
+]);
 
-export function createShapeMcpServer(): McpServer {
+const viewportInputSchema = z
+  .object({
+    x: z.number(),
+    y: z.number(),
+    width: z.number().positive(),
+    height: z.number().positive()
+  })
+  .optional();
+
+const exportScopeInputSchema = z
+  .object({
+    kind: z.enum(["group", "node", "edge", "selection"]),
+    id: z.string().min(1).optional()
+  })
+  .optional();
+
+type McpExportType = z.infer<typeof mcpExportTypeSchema>;
+
+export function createSceneMcpServer(): McpServer {
   const server = new McpServer({
     name: "shape.ai",
     version: "0.1.0"
   });
 
   server.registerTool(
-    "list_shapes",
+    "query_scene",
     {
-      description: "List shape.ai shapes with graph, selection, comment, proposal, and export counts.",
+      description: "Query the infinite scene canvas by viewport, zoom, and optional group tag filters. Low zoom returns overview data only.",
+      inputSchema: {
+        viewport: viewportInputSchema,
+        zoom: z.number().positive().optional(),
+        tagIds: z.array(z.string()).optional()
+      }
+    },
+    async ({ viewport, zoom, tagIds }) => jsonResponse({ scene: await readScene({ viewport, zoom, tagIds }) })
+  );
+
+  server.registerTool(
+    "list_groups",
+    {
+      description: "List top-level and nested groups on the scene canvas.",
       inputSchema: {}
     },
     async () => {
-      const designs = await listDesigns();
-      const openProposals = await listOpenProposals();
+      const scene = await readFullScene();
       return jsonResponse({
-        shapes: designs.map((design) => ({
-          id: design.id,
-          title: design.title,
-          updatedAt: design.updatedAt,
-          graphVersion: design.graphVersion,
-          selection: design.selection,
-          nodes: design.graph.nodes.length,
-          edges: design.graph.edges.length,
-          openProposals: openProposals.filter((proposal) => proposal.designId === design.id).length,
-          unresolvedComments: design.comments.filter((comment) => !comment.resolved).length,
-          artifacts: design.artifacts.length
-        }))
+        groups: scene.groups.map((group) => ({
+          id: group.id,
+          parentGroupId: group.parentGroupId,
+          title: group.title,
+          summary: group.summary,
+          bounds: group.bounds,
+          tagIds: group.tagIds,
+          nodes: scene.nodes.filter((node) => node.groupId === group.id).length,
+          edges: scene.edges.filter((edge) => edge.groupId === group.id).length,
+          artifacts: scene.artifacts.filter((artifact) => artifact.target.kind === "group" && artifact.target.id === group.id).length
+        })),
+        tags: scene.tags
       });
     }
   );
 
   server.registerTool(
-    "list_designs",
+    "get_group",
     {
-      description: "Compatibility alias for list_shapes.",
-      inputSchema: {}
+      description: "Read one group with its nodes, edges, tags, comments, artifacts, and graph digest.",
+      inputSchema: {
+        groupId: z.string().min(1)
+      }
     },
-    async () => {
-      const designs = await listDesigns();
-      const openProposals = await listOpenProposals();
+    async ({ groupId }) => {
+      const detail = await readGroup(groupId);
+      if (!detail) throw new Error(`Group not found: ${groupId}`);
+      const scene = await readFullScene();
+      const graph = sceneGraphForGroup(scene, groupId);
       return jsonResponse({
-        designs: designs.map((design) => ({
-          id: design.id,
-          title: design.title,
-          updatedAt: design.updatedAt,
-          graphVersion: design.graphVersion,
-          selection: design.selection,
-          nodes: design.graph.nodes.length,
-          edges: design.graph.edges.length,
-          openProposals: openProposals.filter((proposal) => proposal.designId === design.id).length,
-          unresolvedComments: design.comments.filter((comment) => !comment.resolved).length,
-          artifacts: design.artifacts.length
-        }))
+        ...detail,
+        digest: graphTextDigest(graph)
       });
     }
   );
 
   server.registerTool(
-    "get_shape",
+    "create_group",
     {
-      description: "Read one shape, including graph, Web UI selection, comments, layout, and artifact metadata.",
-      inputSchema: {
-        shapeId: z.string().min(1)
-      }
+      description: "Create a new group on the infinite scene canvas from a prompt.",
+      inputSchema: createGroupRequestSchema.shape
     },
-    async ({ shapeId }) => {
-      const design = await readShapeOrThrow(shapeId);
-      return jsonResponse({
-        shape: design,
-        digest: graphTextDigest(design.graph)
-      });
-    }
+    async (input) => jsonResponse(await createGroup(input))
   );
 
   server.registerTool(
-    "get_design",
+    "patch_scene",
     {
-      description: "Compatibility alias for get_shape.",
-      inputSchema: {
-        designId: z.string().min(1)
-      }
+      description: "Patch groups, nodes, edges, removals, or selection on the scene canvas.",
+      inputSchema: scenePatchSchema.shape
     },
-    async ({ designId }) => {
-      const design = await readShapeOrThrow(designId);
-      return jsonResponse({
-        design,
-        digest: graphTextDigest(design.graph)
-      });
-    }
+    async (input) => jsonResponse({ scene: await saveScenePatch(input) })
   );
 
   server.registerTool(
-    "get_selection",
+    "create_tag",
     {
-      description: "Read the current Web UI selection for a shape.",
-      inputSchema: {
-        ...shapeIdInputSchema
-      }
+      description: "Create a registered group tag with color and description.",
+      inputSchema: createTagRequestSchema.shape
     },
-    async (input) => {
-      const shapeId = requireShapeId(input);
-      const design = await readShapeOrThrow(shapeId);
-      const selection = design.selection;
-      const selected =
-        selection.kind === "node"
-          ? design.graph.nodes.find((node) => node.id === selection.id)
-          : selection.kind === "edge"
-            ? design.graph.edges.find((edge) => edge.id === selection.id)
-            : undefined;
-      return jsonResponse({ shapeId: design.id, selection: design.selection, selected });
-    }
+    async (input) => jsonResponse(await createTag(input))
   );
 
   server.registerTool(
-    "list_open_proposals",
+    "update_group_tags",
     {
-      description: "List open or changes-requested proposals, optionally scoped to one shape.",
+      description: "Replace the registered tag ids attached to one group.",
       inputSchema: {
-        ...shapeIdInputSchema
+        groupId: z.string().min(1),
+        ...updateGroupTagsRequestSchema.shape
       }
     },
-    async (input) => jsonResponse({ proposals: await listOpenProposals(optionalShapeId(input)) })
-  );
-
-  server.registerTool(
-    "create_proposal",
-    {
-      description: "Create a proposal against a base graph version. This does not mutate the canonical graph.",
-      inputSchema: {
-        ...shapeIdInputSchema,
-        title: z.string().min(1),
-        description: z.string().default("").optional(),
-        baseGraphVersion: z.number().int().nonnegative().optional(),
-        createdBy: z.string().min(1).optional()
-      }
-    },
-    async (input) => {
-      const shapeId = requireShapeId(input);
-      const proposal = await createProposal({
-        designId: shapeId,
-        title: input.title,
-        description: input.description,
-        baseGraphVersion: input.baseGraphVersion,
-        createdBy: input.createdBy
-      });
-      return jsonResponse({ proposal, shapeId: proposal.designId });
-    }
-  );
-
-  server.registerTool(
-    "append_proposal_patch",
-    {
-      description: "Append typed node and edge additions, updates, or removals to a proposal.",
-      inputSchema: {
-        proposalId: z.string().min(1),
-        patch: graphPatchSchema
-      }
-    },
-    async ({ proposalId, patch }) => {
-      const result = await appendProposalPatch({ proposalId, patch });
-      return jsonResponse(result);
-    }
-  );
-
-  server.registerTool(
-    "validate_proposal",
-    {
-      description: "Validate whether a proposal can apply to the current graph version.",
-      inputSchema: {
-        proposalId: z.string().min(1)
-      }
-    },
-    async ({ proposalId }) => jsonResponse(await validateProposal(proposalId))
-  );
-
-  server.registerTool(
-    "get_proposal_diff",
-    {
-      description: "Read proposal patches, comments, validation status, and graph digests before/after the proposal.",
-      inputSchema: {
-        proposalId: z.string().min(1)
-      }
-    },
-    async ({ proposalId }) => jsonResponse(await getProposalDiff(proposalId))
-  );
-
-  server.registerTool(
-    "comment_on_proposal",
-    {
-      description: "Add a review comment to a proposal.",
-      inputSchema: {
-        proposalId: z.string().min(1),
-        body: z.string().min(1),
-        author: z.string().min(1).optional()
-      }
-    },
-    async ({ proposalId, body, author }) => jsonResponse(await commentOnProposal({ proposalId, body, author }))
-  );
-
-  server.registerTool(
-    "request_proposal_changes",
-    {
-      description: "Mark a proposal as needing changes, optionally adding a review comment.",
-      inputSchema: {
-        proposalId: z.string().min(1),
-        body: z.string().min(1).optional(),
-        author: z.string().min(1).optional()
-      }
-    },
-    async ({ proposalId, body, author }) => jsonResponse(await requestProposalChanges({ proposalId, body, author }))
-  );
-
-  server.registerTool(
-    "approve_proposal",
-    {
-      description: "Apply a clean proposal to the canonical shape graph and create a new graph version.",
-      inputSchema: {
-        proposalId: z.string().min(1)
-      }
-    },
-    async ({ proposalId }) => {
-      const result = await approveProposal(proposalId);
-      return jsonResponse({
-        proposal: result.proposal,
-        shape: result.design,
-        validation: result.validation,
-        digest: graphTextDigest(result.design.graph)
-      });
-    }
-  );
-
-  server.registerTool(
-    "reject_proposal",
-    {
-      description: "Reject a proposal without mutating the canonical graph.",
-      inputSchema: {
-        proposalId: z.string().min(1)
-      }
-    },
-    async ({ proposalId }) => jsonResponse(await rejectProposal(proposalId))
-  );
-
-  server.registerTool(
-    "create_shape",
-    {
-      description: "Create a shape graph from a prompt. This does not call an embedded model.",
-      inputSchema: {
-        prompt: z.string().min(1),
-        title: z.string().min(1).optional()
-      }
-    },
-    async ({ prompt, title }) => {
-      const seed = seedDesignGraph(prompt);
-      const shape = await createDesign({
-        title: title || seed.title,
-        prompt,
-        graph: seed.graph
-      });
-      return jsonResponse({ shape, message: seed.explanation });
-    }
-  );
-
-  server.registerTool(
-    "create_design",
-    {
-      description: "Compatibility alias for create_shape.",
-      inputSchema: {
-        prompt: z.string().min(1),
-        title: z.string().min(1).optional()
-      }
-    },
-    async ({ prompt, title }) => {
-      const seed = seedDesignGraph(prompt);
-      const design = await createDesign({
-        title: title || seed.title,
-        prompt,
-        graph: seed.graph
-      });
-      return jsonResponse({ design, message: seed.explanation });
-    }
-  );
-
-  server.registerTool(
-    "save_layout",
-    {
-      description: "Update graph node positions for the Web UI canvas. This does not change graph content.",
-      inputSchema: {
-        ...shapeIdInputSchema,
-        layout: graphLayoutSchema
-      }
-    },
-    async (input) => {
-      const design = await readShapeOrThrow(requireShapeId(input));
-      const updated = await saveDesign({
-        ...design,
-        layout: input.layout,
-        updatedAt: new Date().toISOString()
-      });
-      return jsonResponse({ shape: updated });
-    }
+    async ({ groupId, tagIds }) => jsonResponse(await updateGroupTags(groupId, tagIds))
   );
 
   server.registerTool(
     "set_selection",
     {
-      description: "Set the current Web UI selection that the user or agent is discussing.",
+      description: "Set the current Web UI scene selection.",
       inputSchema: {
-        ...shapeIdInputSchema,
-        selection: graphSelectionSchema
+        selection: sceneSelectionSchema
       }
     },
-    async (input) => {
-      const design = await readShapeOrThrow(requireShapeId(input));
-      const updated = await saveDesign({
-        ...design,
-        selection: input.selection,
-        updatedAt: new Date().toISOString()
-      });
-      return jsonResponse({ shape: updated });
-    }
+    async ({ selection }) => jsonResponse({ scene: await saveScenePatch({ selection }) })
   );
 
   server.registerTool(
     "add_comment",
     {
-      description: "Add a comment to the whole graph, a node, or an edge.",
+      description: "Add a comment to the canvas, a group, a node, or an edge.",
       inputSchema: {
-        ...shapeIdInputSchema,
-        target: graphSelectionSchema,
+        target: sceneSelectionSchema,
         body: z.string().min(1),
         author: z.string().min(1).optional()
       }
     },
-    async (input) => {
-      const design = await readShapeOrThrow(requireShapeId(input));
-      const updated = await addComment(design, { target: input.target, body: input.body, author: input.author || "agent" });
-      return jsonResponse({ shape: updated, comment: updated.comments[0] });
-    }
+    async (input) => jsonResponse(await addComment({ target: input.target, body: input.body, author: input.author ?? "agent" }))
   );
 
   server.registerTool(
-    "update_comment",
+    "export_group",
     {
-      description: "Update graph comment text or resolution state.",
+      description: "Generate local export artifacts from a group. Pass type for one format or types for multiple formats; content is returned in preview fields.",
       inputSchema: {
-        ...shapeIdInputSchema,
-        commentId: z.string().min(1),
-        body: z.string().min(1).optional(),
-        resolved: z.boolean().optional()
+        groupId: z.string().min(1),
+        type: mcpExportTypeSchema.optional(),
+        types: z.array(mcpExportTypeSchema).min(1).optional(),
+        scope: exportScopeInputSchema
       }
     },
-    async (input) => {
-      const design = await readShapeOrThrow(requireShapeId(input));
-      if (!design.comments.some((comment) => comment.id === input.commentId)) {
-        throw new Error(`Comment not found: ${input.commentId}`);
-      }
-      const updated = await updateComment(design, input.commentId, { body: input.body, resolved: input.resolved });
+    async ({ groupId, type, types, scope }) => {
+      const result = await exportGroupContent(groupId, exportTypesFromInput({ type, types }), scope);
       return jsonResponse({
-        shape: updated,
-        comment: updated.comments.find((comment) => comment.id === input.commentId)
+        group: result.group,
+        artifact: result.exports[0]?.artifact,
+        preview: result.exports[0]?.preview,
+        exports: result.exports,
+        imagePrompt: result.exports[0]?.preview.imagePrompt
       });
-    }
-  );
-
-  server.registerTool(
-    "export_shape",
-    {
-      description: "Generate a local export artifact from a whole shape graph or selected subgraph.",
-      inputSchema: {
-        shapeId: z.string().min(1),
-        type: exportTypeSchema,
-        scope: z
-          .object({
-            kind: z.enum(["whole_graph", "node", "edge"]),
-            id: z.string().min(1).optional()
-          })
-          .optional()
-      }
-    },
-    async ({ shapeId, type, scope }) => {
-      const design = await readShapeOrThrow(shapeId);
-      const request = exportRequestSchema.parse({ type, scope });
-      const generated = generateLocalExport(design.graph, request, design.title);
-      const persisted = await writeArtifactContent({
-        designId: design.id,
-        type,
-        title: generated.title,
-        content: generated.content,
-        contentType: contentTypeFor(type)
-      });
-      const updated = await addArtifact(design, {
-        type,
-        title: generated.title,
-        scope: request.scope.kind === "whole_graph" ? "whole_graph" : `${request.scope.kind}:${request.scope.id ?? ""}`,
-        path: persisted.path,
-        contentType: persisted.contentType
-      });
-      return jsonResponse({ shape: updated, artifact: updated.artifacts[0], imagePrompt: generated.imagePrompt });
-    }
-  );
-
-  server.registerTool(
-    "export_design",
-    {
-      description: "Compatibility alias for export_shape.",
-      inputSchema: {
-        designId: z.string().min(1),
-        type: exportTypeSchema,
-        scope: z
-          .object({
-            kind: z.enum(["whole_graph", "node", "edge"]),
-            id: z.string().min(1).optional()
-          })
-          .optional()
-      }
-    },
-    async ({ designId, type, scope }) => {
-      const design = await readShapeOrThrow(designId);
-      const request = exportRequestSchema.parse({ type, scope });
-      const generated = generateLocalExport(design.graph, request, design.title);
-      const persisted = await writeArtifactContent({
-        designId: design.id,
-        type,
-        title: generated.title,
-        content: generated.content,
-        contentType: contentTypeFor(type)
-      });
-      const updated = await addArtifact(design, {
-        type,
-        title: generated.title,
-        scope: request.scope.kind === "whole_graph" ? "whole_graph" : `${request.scope.kind}:${request.scope.id ?? ""}`,
-        path: persisted.path,
-        contentType: persisted.contentType
-      });
-      return jsonResponse({ design: updated, artifact: updated.artifacts[0], imagePrompt: generated.imagePrompt });
     }
   );
 
   return server;
 }
 
-function requireShapeId(input: { shapeId?: string; designId?: string }): string {
-  const shapeId = optionalShapeId(input);
-  if (!shapeId) {
-    throw new Error("shapeId is required");
+function exportTypesFromInput(input: { type?: McpExportType; types?: McpExportType[] }): ExportType[] {
+  const values = [...(input.type ? [input.type] : []), ...(input.types ?? [])].map(normalizeExportType);
+  const unique = Array.from(new Set(values));
+  if (unique.length === 0) throw new Error("type or types is required");
+  return unique;
+}
+
+function normalizeExportType(type: McpExportType): ExportType {
+  return type === "markdown" ? "madr" : type;
+}
+
+async function exportGroupContent(groupId: string, types: ExportType[], scope: unknown) {
+  const detail = await readGroup(groupId);
+  if (!detail) throw new Error(`Group not found: ${groupId}`);
+  let scene: Scene = await readFullScene();
+  const exports = [];
+
+  for (const type of types) {
+    const request = exportRequestSchema.parse({ type, scope: normalizeScope(scope, groupId) });
+    const graph = sceneGraphForGroup(scene, groupId);
+    const generated = generateLocalExport(graph, request, detail.group.title);
+    const persisted = await writeArtifactContent({
+      groupId,
+      type,
+      title: generated.title,
+      content: generated.content,
+      contentType: contentTypeFor(type)
+    });
+    const stored = await addArtifact(groupId, {
+      type,
+      title: generated.title,
+      target: { kind: "group", id: groupId },
+      path: persisted.path,
+      contentType: persisted.contentType
+    });
+    scene = stored.scene;
+    exports.push({
+      artifact: stored.artifact,
+      preview: {
+        type,
+        title: generated.title,
+        content: generated.content,
+        contentType: persisted.contentType,
+        imagePrompt: generated.imagePrompt
+      }
+    });
   }
-  return shapeId;
+
+  return { group: detail.group, scene, exports };
 }
 
-function optionalShapeId(input: { shapeId?: string; designId?: string }): string | undefined {
-  return input.shapeId ?? input.designId;
+function normalizeScope(scope: unknown, groupId: string) {
+  const parsed = exportScopeInputSchema.parse(scope);
+  return parsed ?? { kind: "group" as const, id: groupId };
 }
 
-async function readShapeOrThrow(shapeId: string) {
-  const design = await readDesign(shapeId);
-  if (!design) {
-    throw new Error(`Shape not found: ${shapeId}`);
-  }
-  return design;
-}
-
-function contentTypeFor(type: string): string {
+function contentTypeFor(type: ExportType): string {
   if (type === "yadr") return "application/yaml; charset=utf-8";
   if (type === "image_prompt" || type === "architecture_image") return "text/markdown; charset=utf-8";
   if (type === "confluence_html") return "text/html; charset=utf-8";
@@ -519,7 +288,7 @@ function jsonResponse(value: unknown) {
 
 async function main() {
   await ensureStorage();
-  const server = createShapeMcpServer();
+  const server = createSceneMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("shape.ai MCP server running on stdio");

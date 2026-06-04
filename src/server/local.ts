@@ -1,17 +1,35 @@
-import { makeMermaid, selectedSubgraph, graphTextDigest } from "../shared/graph";
+import { graphTextDigest, makeMermaid, selectedSubgraph } from "../shared/graph";
 import type {
   DecisionGraph,
-  DesignSeedOutput,
   ExportOutput,
   ExportRequest,
   GraphEdge,
-  GraphNode
+  GraphNode,
+  GroupSeedOutput,
+  SceneEdge,
+  SceneGroup,
+  SceneNode
 } from "../shared/schema";
 
-export function seedDesignGraph(prompt: string): DesignSeedOutput {
-  const shortTitle = titleFromPrompt(prompt);
-  const nodes: GraphNode[] = [
-    node("n-proposition", "proposition", shortTitle, "Problem statement and target outcome.", "selected", 0.72),
+const nodeWidth = 390;
+const nodeHeight = 390;
+export const defaultSeedNodePositions: Record<string, { x: number; y: number }> = {
+  "n-proposition": { x: 0, y: 510 },
+  "n-decision-points": { x: 450, y: 510 },
+  "n-option-graph": { x: 900, y: 80 },
+  "n-option-freeform": { x: 900, y: 510 },
+  "n-evidence": { x: 1350, y: 80 },
+  "n-tradeoff": { x: 1350, y: 510 },
+  "n-blocker": { x: 1350, y: 940 },
+  "n-subdecision": { x: 1800, y: 80 },
+  "n-task": { x: 1800, y: 510 },
+  "n-artifact": { x: 1800, y: 940 }
+};
+
+export function seedGroupScene(prompt: string, input: { groupId: string; now: string; parentGroupId?: string | null; tagIds?: string[] }): GroupSeedOutput {
+  const title = titleFromPrompt(prompt);
+  const graphNodes: GraphNode[] = [
+    node("n-proposition", "proposition", title, "Problem statement and target outcome.", "selected", 0.72),
     node(
       "n-decision-points",
       "decision_point",
@@ -72,7 +90,7 @@ export function seedDesignGraph(prompt: string): DesignSeedOutput {
       "n-task",
       "task",
       "First vertical slice",
-      "Create a shape, inspect a node, leave comments, and export Markdown.",
+      "Create a group, inspect a node, leave comments, and export Markdown.",
       "draft",
       0.61
     ),
@@ -86,7 +104,7 @@ export function seedDesignGraph(prompt: string): DesignSeedOutput {
     )
   ];
 
-  const edges: GraphEdge[] = [
+  const graphEdges: GraphEdge[] = [
     edge("e1", "decomposes_to", "n-proposition", "n-decision-points", "decide by"),
     edge("e2", "chooses_between", "n-decision-points", "n-option-graph", "recommended"),
     edge("e3", "chooses_between", "n-decision-points", "n-option-freeform", "alternative"),
@@ -98,27 +116,66 @@ export function seedDesignGraph(prompt: string): DesignSeedOutput {
     edge("e9", "produces", "n-subdecision", "n-artifact", "exports")
   ];
 
+  const nodes: SceneNode[] = graphNodes.map((graphNode, index) => {
+    const position = defaultSeedNodePositions[graphNode.id] ?? { x: index * 520, y: 480 };
+    return {
+      ...graphNode,
+      id: scopedId(input.groupId, graphNode.id),
+      groupId: input.groupId,
+      position,
+      size: { width: nodeWidth, height: nodeHeight },
+      zIndex: index,
+      updatedAt: input.now
+    };
+  });
+
+  const nodeId = (id: string) => scopedId(input.groupId, id);
+  const edges: SceneEdge[] = graphEdges.map((graphEdge) => ({
+    ...graphEdge,
+    id: scopedId(input.groupId, graphEdge.id),
+    source: nodeId(graphEdge.source),
+    target: nodeId(graphEdge.target),
+    groupId: input.groupId,
+    updatedAt: input.now
+  }));
+
+  const group: SceneGroup = {
+    id: input.groupId,
+    parentGroupId: input.parentGroupId ?? null,
+    title,
+    summary: prompt,
+    bounds: boundsForNodes(nodes),
+    tagIds: input.tagIds ?? [],
+    zIndex: 0,
+    collapsed: false,
+    createdAt: input.now,
+    updatedAt: input.now
+  };
+
   return {
-    title: shortTitle,
-    explanation: "Created a local shape graph. Use the MCP server to let an external AI agent refine it.",
-    graph: { version: 1, nodes, edges }
+    title,
+    explanation: "Created a group on the infinite scene canvas.",
+    group,
+    nodes,
+    edges
   };
 }
 
-export function generateLocalExport(graph: DecisionGraph, request: ExportRequest, designTitle: string): ExportOutput {
-  const scoped = selectedSubgraph(graph, request.scope);
+export function generateLocalExport(graph: DecisionGraph, request: ExportRequest, groupTitle: string): ExportOutput {
+  const scope = request.scope?.kind === "selection" ? { kind: "group" } : request.scope ?? { kind: "group" };
+  const scoped = selectedSubgraph(graph, scope);
   if (request.type === "mermaid") {
-    return { title: `${designTitle} Mermaid`, content: makeMermaid(scoped) };
+    return { title: `${groupTitle} Mermaid`, content: makeMermaid(scoped) };
   }
 
   if (request.type === "yadr") {
-    return { title: `${designTitle} YADR`, content: yadrSections(scoped, designTitle) };
+    return { title: `${groupTitle} YADR`, content: yadrSections(scoped, groupTitle) };
   }
 
   if (request.type === "image_prompt" || request.type === "architecture_image") {
-    const prompt = imagePrompt(scoped, designTitle);
+    const prompt = imagePrompt(scoped, groupTitle);
     return {
-      title: `${designTitle} Image Prompt`,
+      title: `${groupTitle} Image Prompt`,
       content: prompt,
       imagePrompt: prompt
     };
@@ -126,18 +183,33 @@ export function generateLocalExport(graph: DecisionGraph, request: ExportRequest
 
   if (request.type === "confluence_html") {
     return {
-      title: `${designTitle} Confluence Draft`,
-      content: `<h1>${escapeHtml(designTitle)}</h1>${madrSections(scoped, designTitle)
+      title: `${groupTitle} Confluence Draft`,
+      content: `<h1>${escapeHtml(groupTitle)}</h1>${madrSections(scoped, groupTitle)
         .split("\n")
         .map((line) => (line.startsWith("#") ? `<h2>${escapeHtml(line.replace(/^#+\s*/, ""))}</h2>` : `<p>${escapeHtml(line)}</p>`))
         .join("\n")}`
     };
   }
 
-  const title = request.type === "ai_plan_md" ? `${designTitle} AI Task Plan` : `${designTitle} Shape Document`;
+  const title = request.type === "ai_plan_md" ? `${groupTitle} AI Task Plan` : `${groupTitle} Group Document`;
   return {
-    title: request.type === "ai_plan_md" ? title : `${designTitle} MADR`,
-    content: request.type === "ai_plan_md" ? taskPlanSections(scoped, designTitle) : madrSections(scoped, designTitle)
+    title: request.type === "ai_plan_md" ? title : `${groupTitle} MADR`,
+    content: request.type === "ai_plan_md" ? taskPlanSections(scoped, groupTitle) : madrSections(scoped, groupTitle)
+  };
+}
+
+export function boundsForNodes(nodes: SceneNode[]) {
+  if (nodes.length === 0) return { x: 0, y: 0, width: 1200, height: 800 };
+  const minX = Math.min(...nodes.map((node) => node.position.x));
+  const minY = Math.min(...nodes.map((node) => node.position.y));
+  const maxX = Math.max(...nodes.map((node) => node.position.x + node.size.width));
+  const maxY = Math.max(...nodes.map((node) => node.position.y + node.size.height));
+  const padding = 160;
+  return {
+    x: minX - padding,
+    y: minY - padding,
+    width: maxX - minX + padding * 2,
+    height: maxY - minY + padding * 2
   };
 }
 
@@ -174,14 +246,18 @@ function edge(id: string, type: GraphEdge["type"], source: string, target: strin
   };
 }
 
+function scopedId(groupId: string, id: string): string {
+  return `${groupId}-${id}`;
+}
+
 function titleFromPrompt(prompt: string): string {
-  const firstLine = prompt.split(/\n/).find((line) => line.trim())?.trim() ?? "Untitled shape";
+  const firstLine = prompt.split(/\n/).find((line) => line.trim())?.trim() ?? "Untitled group";
   return firstLine.length > 70 ? `${firstLine.slice(0, 67)}...` : firstLine;
 }
 
-function madrSections(graph: DecisionGraph, designTitle: string): string {
+function madrSections(graph: DecisionGraph, groupTitle: string): string {
   const selected = graph.nodes.find((node) => node.status === "selected");
-  const decisionTitle = selected?.title ?? designTitle;
+  const decisionTitle = selected?.title ?? groupTitle;
   const options = graph.nodes.filter((node) => node.type === "option");
   const chosen = options.find((node) => node.status === "selected" || node.status === "viable") ?? options[0] ?? selected;
   const blockers = graph.nodes.filter((node) => node.type === "blocker");
@@ -219,7 +295,7 @@ function madrSections(graph: DecisionGraph, designTitle: string): string {
     ...negatives.map((line) => `* Bad, because ${line}`),
     "",
     "### Confirmation",
-    "Review the accepted proposal, graph version, and generated artifacts before implementation.",
+    "Review the accepted group, scene version, and generated artifacts before implementation.",
     "",
     "## Pros and Cons of the Options",
     ...optionProsAndCons(options, evidence, tradeoffs, blockers),
@@ -231,9 +307,9 @@ function madrSections(graph: DecisionGraph, designTitle: string): string {
   ].join("\n");
 }
 
-function yadrSections(graph: DecisionGraph, designTitle: string): string {
+function yadrSections(graph: DecisionGraph, groupTitle: string): string {
   const selected = graph.nodes.find((node) => node.status === "selected");
-  const decisionTitle = selected?.title ?? designTitle;
+  const decisionTitle = selected?.title ?? groupTitle;
   const options = graph.nodes.filter((node) => node.type === "option");
   const chosen = options.find((node) => node.status === "selected" || node.status === "viable") ?? options[0] ?? selected;
   const blockers = graph.nodes.filter((node) => node.type === "blocker");
@@ -279,7 +355,7 @@ function yadrSections(graph: DecisionGraph, designTitle: string): string {
     "    negative:",
     ...yamlList(negatives.map((node) => `${node.title}: ${node.summary}`), 6),
     "  confirmation: |",
-    ...yamlBlock("Review the accepted proposal, graph version, and generated artifacts before implementation.", 4),
+    ...yamlBlock("Review the accepted group, scene version, and generated artifacts before implementation.", 4),
     "",
     "more-information: |",
     ...yamlBlock(graphTextDigest(graph), 2)
@@ -292,7 +368,7 @@ function taskPlanSections(graph: DecisionGraph, title: string): string {
     `# ${title} AI Task Plan`,
     "",
     "## Objective",
-    graph.nodes[0]?.summary ?? "Implement the accepted shape direction.",
+    graph.nodes[0]?.summary ?? "Implement the accepted group direction.",
     "",
     "## Tasks",
     ...(tasks.length
@@ -300,8 +376,8 @@ function taskPlanSections(graph: DecisionGraph, title: string): string {
       : ["1. Use an MCP-connected agent to convert accepted decisions into implementation tasks."]),
     "",
     "## Verification",
-    "- Validate graph schema.",
-    "- Verify exports for the selected graph scope.",
+    "- Validate scene schema.",
+    "- Verify exports for the selected group scope.",
     "- Review blockers before implementation."
   ].join("\n");
 }
@@ -382,9 +458,10 @@ function yamlList(values: string[], indent = 0): string[] {
 
 function yamlBlock(value: string, indent: number): string[] {
   const prefix = " ".repeat(indent);
-  return value.split("\n").map((line) => `${prefix}${line || ""}`);
+  return value.split("\n").map((line) => `${prefix}${line}`);
 }
 
 function yamlString(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
+  if (/^[a-zA-Z0-9 _.-]+$/.test(value)) return value;
+  return JSON.stringify(value);
 }

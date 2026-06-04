@@ -1,48 +1,64 @@
+import { createReadStream } from "node:fs";
 import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, extname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import initSqlJs from "sql.js";
-import { applyGraphPatch, graphTextDigest } from "../shared/graph";
+import { boundsForNodes, defaultSeedNodePositions, seedGroupScene } from "./local";
 import {
   artifactSchema,
-  designSchema,
-  graphCommentSchema,
-  graphPatchSchema,
-  proposalCommentSchema,
-  proposalPatchSchema,
-  proposalSchema,
-  type DecisionGraph,
-  type Design,
-  type DesignArtifact,
+  boundsSchema,
+  createCommentRequestSchema,
+  createGroupRequestSchema,
+  createTagRequestSchema,
+  graphEdgeSchema,
+  graphNodeSchema,
+  sceneCommentSchema,
+  sceneEdgeSchema,
+  sceneGroupSchema,
+  sceneNodeSchema,
+  scenePatchSchema,
+  sceneSchema,
+  sceneSelectionSchema,
+  tagSchema,
+  updateCommentRequestSchema,
+  updateGroupTagsRequestSchema,
+  updateTagRequestSchema,
+  type Bounds,
+  type CreateGroupRequest,
+  type CreateTagRequest,
   type ExportType,
-  type GraphPatch,
-  type Proposal,
-  type ProposalComment,
-  type ProposalPatch,
-  type ProposalValidationStatus
+  type Scene,
+  type SceneArtifact,
+  type SceneComment,
+  type SceneEdge,
+  type SceneGroup,
+  type SceneNode,
+  type ScenePatch,
+  type SceneSelection,
+  type Tag,
+  type UpdateTagRequest
 } from "../shared/schema";
+import { boundsIntersect, expandedBounds, nodeBounds, shouldShowSceneEdges, shouldShowSceneNodes } from "../shared/graph";
 
 type SqlDatabase = initSqlJs.Database;
 type SqlValue = initSqlJs.SqlValue;
 type SqlRow = Record<string, SqlValue | undefined>;
 
-export type ProposalValidation = {
-  status: ProposalValidationStatus;
-  messages: string[];
-  baseGraphVersion: number;
-  currentGraphVersion: number;
-  baseGraph?: DecisionGraph;
-  previewGraph?: DecisionGraph;
+export type SceneQuery = {
+  viewport?: Bounds;
+  zoom?: number;
+  tagIds?: string[];
+  focusGroupId?: string;
 };
 
-export type ProposalDiff = {
-  proposal: Proposal;
-  patches: ProposalPatch[];
-  comments: ProposalComment[];
-  validation: ProposalValidation;
-  beforeDigest: string;
-  afterDigest?: string;
+export type GroupDetail = {
+  group: SceneGroup;
+  nodes: SceneNode[];
+  edges: SceneEdge[];
+  tags: Tag[];
+  comments: SceneComment[];
+  artifacts: SceneArtifact[];
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -50,7 +66,6 @@ const appRoot = resolve(dirname(__filename), "../..");
 
 export const REPO_ROOT = resolve(process.env.SHAPE_AI_REPO_ROOT ?? appRoot);
 export const DATA_ROOT = resolve(process.env.SHAPE_AI_DATA_DIR ?? join(appRoot, ".local"));
-export const DESIGNS_DIR = join(DATA_ROOT, "designs");
 export const EXPORTS_DIR = join(DATA_ROOT, "exports");
 export const DATABASE_PATH = join(DATA_ROOT, "shape.sqlite");
 
@@ -61,441 +76,359 @@ export async function ensureStorage(): Promise<void> {
   await getDb();
 }
 
-export async function listDesigns(): Promise<Design[]> {
-  return withDb((db) =>
-    queryRows(db, "SELECT snapshot_json FROM designs ORDER BY updated_at DESC").map((row) =>
-      designSchema.parse(parseJson(stringValue(row, "snapshot_json")))
-    )
-  );
-}
+export async function readScene(query: SceneQuery = {}): Promise<Scene> {
+  return withDb((db) => {
+    const all = readFullSceneInDb(db);
+    const zoom = query.zoom ?? 1;
+    const viewport = query.viewport ? expandedBounds(query.viewport, Math.max(800, 1600 / Math.max(zoom, 0.02))) : undefined;
+    const tagIds = query.tagIds?.filter(Boolean) ?? [];
+    const groups = all.groups
+      .filter((group) => tagIds.length === 0 || tagIds.every((tagId) => group.tagIds.includes(tagId)))
+      .filter((group) => !viewport || boundsIntersect(group.bounds, viewport));
+    const groupIds = new Set(groups.map((group) => group.id));
+    const focusGroupId = query.focusGroupId && groupIds.has(query.focusGroupId) && zoom >= 0.36 ? query.focusGroupId : undefined;
+    const nodeGroupIds = focusGroupId ? new Set([focusGroupId]) : groupIds;
+    const nodeGroupCount = focusGroupId ? 1 : groups.length;
 
-export async function readDesign(id: string): Promise<Design | null> {
-  return withDb((db) => getDesignInDb(db, id));
-}
+    const includeNodes = shouldShowSceneNodes(zoom, nodeGroupCount);
+    const includeEdges = shouldShowSceneEdges(zoom, nodeGroupCount);
+    const nodes = includeNodes
+      ? all.nodes.filter((node) => nodeGroupIds.has(node.groupId) && (!viewport || boundsIntersect(nodeBounds(node), viewport)))
+      : [];
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    const edges = includeEdges
+      ? all.edges.filter((edge) => nodeGroupIds.has(edge.groupId) && nodeIds.has(edge.source) && nodeIds.has(edge.target))
+      : [];
 
-export async function saveDesign(design: Design): Promise<Design> {
-  const parsed = designSchema.parse(design);
-  return withWritableDb((db) => upsertDesign(db, parsed));
-}
-
-export async function createDesign(input: {
-  title: string;
-  prompt: string;
-  graph: DecisionGraph;
-}): Promise<Design> {
-  const now = new Date().toISOString();
-  return saveDesign({
-    id: randomUUID(),
-    title: input.title,
-    prompt: input.prompt,
-    createdAt: now,
-    updatedAt: now,
-    graphVersion: 0,
-    graph: input.graph,
-    layout: { nodePositions: {}, nodeZOrder: {} },
-    selection: { kind: "graph" },
-    comments: [],
-    artifacts: []
+    return sceneSchema.parse({
+      ...all,
+      groups,
+      nodes,
+      edges
+    });
   });
 }
 
-export async function updateDesignGraph(design: Design, graph: DecisionGraph): Promise<Design> {
-  return saveDesign({
-    ...design,
-    graph,
-    graphVersion: design.graphVersion + 1,
-    updatedAt: new Date().toISOString()
+export async function readFullScene(): Promise<Scene> {
+  return withDb(readFullSceneInDb);
+}
+
+export async function listGroups(): Promise<SceneGroup[]> {
+  return withDb((db) => readGroupsInDb(db));
+}
+
+export async function readGroup(id: string): Promise<GroupDetail | null> {
+  return withDb((db) => {
+    const scene = readFullSceneInDb(db);
+    const group = scene.groups.find((candidate) => candidate.id === id);
+    if (!group) return null;
+    const nodeIds = new Set(scene.nodes.filter((node) => node.groupId === id).map((node) => node.id));
+    return {
+      group,
+      nodes: scene.nodes.filter((node) => node.groupId === id),
+      edges: scene.edges.filter((edge) => edge.groupId === id && nodeIds.has(edge.source) && nodeIds.has(edge.target)),
+      tags: scene.tags.filter((tag) => group.tagIds.includes(tag.id)),
+      comments: scene.comments.filter((comment) => commentTargetsGroup(comment.target, id, nodeIds)),
+      artifacts: scene.artifacts.filter((artifact) => artifact.target.kind === "group" && artifact.target.id === id)
+    };
+  });
+}
+
+export async function createGroup(input: CreateGroupRequest): Promise<{ group: SceneGroup; scene: Scene; message: string }> {
+  const body = createGroupRequestSchema.parse(input);
+  return withWritableDb((db) => {
+    const now = new Date().toISOString();
+    const groupId = `group-${randomUUID().slice(0, 8)}`;
+    assertTagsExist(db, body.tagIds ?? []);
+    const seed = seedGroupScene(body.prompt, {
+      groupId,
+      now,
+      parentGroupId: body.parentGroupId ?? null,
+      tagIds: body.tagIds ?? []
+    });
+    const offset = nextGroupOffset(db, seed.group.bounds);
+    const nodes = seed.nodes.map((node) =>
+      sceneNodeSchema.parse({
+        ...node,
+        position: { x: node.position.x + offset.x, y: node.position.y + offset.y }
+      })
+    );
+    const group = sceneGroupSchema.parse({
+      ...seed.group,
+      title: body.title || seed.title,
+      bounds: boundsForNodes(nodes)
+    });
+    upsertGroupInDb(db, group);
+    for (const node of nodes) upsertNodeInDb(db, node);
+    for (const edge of seed.edges) upsertEdgeInDb(db, edge);
+    setGroupTagsInDb(db, group.id, group.tagIds);
+    bumpSceneVersion(db);
+    return { group, scene: readFullSceneInDb(db), message: seed.explanation };
+  });
+}
+
+export async function saveScenePatch(input: ScenePatch): Promise<Scene> {
+  const patch = scenePatchSchema.parse(input);
+  return withWritableDb((db) => {
+    for (const groupId of patch.removeGroupIds ?? []) removeGroupInDb(db, groupId);
+    const removedNodeGroupIds = new Set<string>();
+    for (const nodeId of patch.removeNodeIds ?? []) {
+      const row = queryOne(db, "SELECT group_id FROM nodes WHERE id = ?", [nodeId]);
+      if (row) removedNodeGroupIds.add(stringValue(row, "group_id"));
+      removeNodeInDb(db, nodeId);
+    }
+    for (const edgeId of patch.removeEdgeIds ?? []) db.run("DELETE FROM edges WHERE id = ?", [edgeId]);
+    for (const group of patch.groups ?? []) upsertGroupInDb(db, group);
+    for (const node of patch.nodes ?? []) upsertNodeInDb(db, { ...node, updatedAt: new Date().toISOString() });
+    for (const edge of patch.edges ?? []) upsertEdgeInDb(db, { ...edge, updatedAt: new Date().toISOString() });
+    if (patch.selection) setMetadata(db, "selection_json", toJson(patch.selection));
+    recomputeTouchedGroupBounds(db, patch, removedNodeGroupIds);
+    bumpSceneVersion(db);
+    return readFullSceneInDb(db);
+  });
+}
+
+export async function createTag(input: CreateTagRequest): Promise<{ tag: Tag; scene: Scene }> {
+  const body = createTagRequestSchema.parse(input);
+  return withWritableDb((db) => {
+    const now = new Date().toISOString();
+    const tag = tagSchema.parse({
+      id: `tag-${slug(body.name)}-${randomUUID().slice(0, 6)}`,
+      name: body.name.trim(),
+      color: body.color,
+      description: body.description ?? "",
+      createdAt: now,
+      updatedAt: now
+    });
+    upsertTagInDb(db, tag);
+    bumpSceneVersion(db);
+    return { tag, scene: readFullSceneInDb(db) };
+  });
+}
+
+export async function updateTag(id: string, input: UpdateTagRequest): Promise<{ tag: Tag; scene: Scene }> {
+  const body = updateTagRequestSchema.parse(input);
+  return withWritableDb((db) => {
+    const current = getTagInDb(db, id);
+    if (!current) throw new Error(`Tag not found: ${id}`);
+    const tag = tagSchema.parse({
+      ...current,
+      name: body.name ?? current.name,
+      color: body.color ?? current.color,
+      description: body.description ?? current.description,
+      updatedAt: new Date().toISOString()
+    });
+    upsertTagInDb(db, tag);
+    bumpSceneVersion(db);
+    return { tag, scene: readFullSceneInDb(db) };
+  });
+}
+
+export async function deleteUnusedTag(id: string): Promise<Scene> {
+  return withWritableDb((db) => {
+    const uses = numberValue(queryOne(db, "SELECT COUNT(*) AS count FROM group_tags WHERE tag_id = ?", [id]), "count");
+    if (uses > 0) throw new Error("Cannot delete a tag that is still attached to groups");
+    db.run("DELETE FROM tags WHERE id = ?", [id]);
+    bumpSceneVersion(db);
+    return readFullSceneInDb(db);
+  });
+}
+
+export async function updateGroupTags(groupId: string, tagIds: string[]): Promise<{ group: SceneGroup; scene: Scene }> {
+  const body = updateGroupTagsRequestSchema.parse({ tagIds });
+  return withWritableDb((db) => {
+    const group = getGroupInDb(db, groupId);
+    if (!group) throw new Error(`Group not found: ${groupId}`);
+    assertTagsExist(db, body.tagIds);
+    const updated = sceneGroupSchema.parse({
+      ...group,
+      tagIds: body.tagIds,
+      updatedAt: new Date().toISOString()
+    });
+    upsertGroupInDb(db, updated);
+    setGroupTagsInDb(db, updated.id, updated.tagIds);
+    bumpSceneVersion(db);
+    return { group: updated, scene: readFullSceneInDb(db) };
+  });
+}
+
+export async function addComment(input: { target: SceneSelection; body: string; author?: string }): Promise<{ comment: SceneComment; scene: Scene }> {
+  const body = createCommentRequestSchema.parse(input);
+  return withWritableDb((db) => {
+    assertTargetExists(db, body.target);
+    const now = new Date().toISOString();
+    const comment = sceneCommentSchema.parse({
+      id: randomUUID(),
+      target: body.target,
+      body: body.body,
+      author: body.author || "human",
+      resolved: false,
+      createdAt: now,
+      updatedAt: now
+    });
+    db.run(
+      "INSERT INTO comments (id, target_json, body, author, resolved, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [comment.id, toJson(comment.target), comment.body, comment.author, comment.resolved ? 1 : 0, comment.createdAt, comment.updatedAt]
+    );
+    bumpSceneVersion(db);
+    return { comment, scene: readFullSceneInDb(db) };
+  });
+}
+
+export async function updateComment(commentId: string, input: { body?: string; resolved?: boolean }): Promise<{ comment: SceneComment; scene: Scene }> {
+  const body = updateCommentRequestSchema.parse(input);
+  return withWritableDb((db) => {
+    const current = getCommentInDb(db, commentId);
+    if (!current) throw new Error(`Comment not found: ${commentId}`);
+    const updated = sceneCommentSchema.parse({
+      ...current,
+      body: body.body ?? current.body,
+      resolved: body.resolved ?? current.resolved,
+      updatedAt: new Date().toISOString()
+    });
+    db.run("UPDATE comments SET target_json = ?, body = ?, author = ?, resolved = ?, updated_at = ? WHERE id = ?", [
+      toJson(updated.target),
+      updated.body,
+      updated.author,
+      updated.resolved ? 1 : 0,
+      updated.updatedAt,
+      updated.id
+    ]);
+    bumpSceneVersion(db);
+    return { comment: updated, scene: readFullSceneInDb(db) };
   });
 }
 
 export async function addArtifact(
-  design: Design,
-  artifact: Omit<DesignArtifact, "id" | "createdAt" | "graphVersion">
-): Promise<Design> {
-  const nextArtifact = artifactSchema.parse({
-    ...artifact,
-    id: randomUUID(),
-    createdAt: new Date().toISOString(),
-    graphVersion: design.graphVersion
-  });
-  return saveDesign({
-    ...design,
-    artifacts: [nextArtifact, ...design.artifacts],
-    updatedAt: new Date().toISOString()
-  });
-}
-
-export async function addComment(
-  design: Design,
-  input: { target: Design["selection"]; body: string; author?: string }
-): Promise<Design> {
-  const now = new Date().toISOString();
-  const comment = graphCommentSchema.parse({
-    id: randomUUID(),
-    target: input.target,
-    body: input.body,
-    author: input.author || "human",
-    resolved: false,
-    createdAt: now,
-    updatedAt: now
-  });
-  return saveDesign({
-    ...design,
-    comments: [comment, ...design.comments],
-    updatedAt: now
-  });
-}
-
-export async function updateComment(
-  design: Design,
-  commentId: string,
-  input: { body?: string; resolved?: boolean }
-): Promise<Design> {
-  if (!design.comments.some((comment) => comment.id === commentId)) {
-    throw new Error(`Comment not found: ${commentId}`);
-  }
-  const now = new Date().toISOString();
-  return saveDesign({
-    ...design,
-    comments: design.comments.map((comment) =>
-      comment.id === commentId
-        ? {
-            ...comment,
-            body: input.body ?? comment.body,
-            resolved: input.resolved ?? comment.resolved,
-            updatedAt: now
-          }
-        : comment
-    ),
-    updatedAt: now
-  });
-}
-
-export async function listOpenProposals(designId?: string): Promise<Proposal[]> {
-  return withDb((db) => {
-    const sql = designId
-      ? "SELECT * FROM proposals WHERE design_id = ? AND status IN ('open', 'changes_requested') ORDER BY updated_at DESC"
-      : "SELECT * FROM proposals WHERE status IN ('open', 'changes_requested') ORDER BY updated_at DESC";
-    return queryRows(db, sql, designId ? [designId] : []).map(parseProposalRow);
-  });
-}
-
-export async function createProposal(input: {
-  designId: string;
-  title: string;
-  description?: string;
-  baseGraphVersion?: number;
-  createdBy?: string;
-}): Promise<Proposal> {
+  groupId: string,
+  artifact: Omit<SceneArtifact, "id" | "createdAt" | "sceneVersion">
+): Promise<{ artifact: SceneArtifact; scene: Scene }> {
   return withWritableDb((db) => {
-    const design = getDesignInDb(db, input.designId);
-    if (!design) {
-      throw new Error(`Shape not found: ${input.designId}`);
-    }
-    const baseGraphVersion = input.baseGraphVersion ?? design.graphVersion;
-    if (!getGraphVersionInDb(db, design.id, baseGraphVersion)) {
-      throw new Error(`Graph version not found: ${design.id}@${baseGraphVersion}`);
-    }
+    if (!getGroupInDb(db, groupId)) throw new Error(`Group not found: ${groupId}`);
     const now = new Date().toISOString();
-    const proposal = proposalSchema.parse({
+    const nextArtifact = artifactSchema.parse({
+      ...artifact,
       id: randomUUID(),
-      designId: design.id,
-      title: input.title,
-      description: input.description ?? "",
-      baseGraphVersion,
-      status: "open",
-      validationStatus: baseGraphVersion === design.graphVersion ? "clean" : "needs_rebase",
-      createdBy: input.createdBy ?? "agent",
       createdAt: now,
-      updatedAt: now
+      sceneVersion: getSceneVersion(db)
     });
-    insertProposalInDb(db, proposal);
-    insertEvent(db, {
-      designId: design.id,
-      proposalId: proposal.id,
-      type: "proposal_created",
-      payload: { title: proposal.title, baseGraphVersion }
-    });
-    return proposal;
-  });
-}
-
-export async function appendProposalPatch(input: {
-  proposalId: string;
-  patch: GraphPatch;
-}): Promise<{ proposal: Proposal; patch: ProposalPatch; validation: ProposalValidation }> {
-  const patch = graphPatchSchema.parse(input.patch);
-  return withWritableDb((db) => {
-    const proposal = getProposalOrThrowInDb(db, input.proposalId);
-    assertProposalWritable(proposal);
-
-    const sequence = nextPatchSequence(db, proposal.id);
-    const now = new Date().toISOString();
-    const proposalPatch = proposalPatchSchema.parse({
-      id: randomUUID(),
-      proposalId: proposal.id,
-      sequence,
-      patch,
-      validationStatus: "clean",
-      createdAt: now
-    });
-    insertProposalPatchInDb(db, proposalPatch);
-
-    const validation = validateProposalInDb(db, proposal.id);
-    updateProposalValidationInDb(db, proposal.id, validation.status);
-    db.run("UPDATE proposal_patches SET validation_status = ? WHERE proposal_id = ?", [validation.status, proposal.id]);
-    insertEvent(db, {
-      designId: proposal.designId,
-      proposalId: proposal.id,
-      type: "proposal_patch_appended",
-      payload: { patchId: proposalPatch.id, sequence, validationStatus: validation.status }
-    });
-
-    return {
-      proposal: getProposalOrThrowInDb(db, proposal.id),
-      patch: { ...proposalPatch, validationStatus: validation.status },
-      validation
-    };
-  });
-}
-
-export async function validateProposal(
-  proposalId: string
-): Promise<{ proposal: Proposal; validation: ProposalValidation }> {
-  return withWritableDb((db) => {
-    const validation = validateProposalInDb(db, proposalId);
-    updateProposalValidationInDb(db, proposalId, validation.status);
-    db.run("UPDATE proposal_patches SET validation_status = ? WHERE proposal_id = ?", [validation.status, proposalId]);
-    return {
-      proposal: getProposalOrThrowInDb(db, proposalId),
-      validation
-    };
-  });
-}
-
-export async function getProposalDiff(proposalId: string): Promise<ProposalDiff> {
-  await validateProposal(proposalId);
-  return withDb((db) => {
-    const proposal = getProposalOrThrowInDb(db, proposalId);
-    const patches = getProposalPatchesInDb(db, proposalId);
-    const comments = getProposalCommentsInDb(db, proposalId);
-    const validation = validateProposalInDb(db, proposalId);
-    const baseGraph = validation.baseGraph ?? { version: 1, nodes: [], edges: [] };
-    return {
-      proposal,
-      patches,
-      comments,
-      validation,
-      beforeDigest: graphTextDigest(baseGraph),
-      afterDigest: validation.previewGraph ? graphTextDigest(validation.previewGraph) : undefined
-    };
-  });
-}
-
-export async function commentOnProposal(input: {
-  proposalId: string;
-  body: string;
-  author?: string;
-}): Promise<{ proposal: Proposal; comment: ProposalComment }> {
-  return withWritableDb((db) => {
-    const proposal = getProposalOrThrowInDb(db, input.proposalId);
-    const comment = insertProposalCommentInDb(db, {
-      proposalId: proposal.id,
-      body: input.body,
-      author: input.author ?? "human"
-    });
-    insertEvent(db, {
-      designId: proposal.designId,
-      proposalId: proposal.id,
-      type: "proposal_comment_added",
-      payload: { commentId: comment.id }
-    });
-    return { proposal: getProposalOrThrowInDb(db, proposal.id), comment };
-  });
-}
-
-export async function requestProposalChanges(input: {
-  proposalId: string;
-  body?: string;
-  author?: string;
-}): Promise<{ proposal: Proposal; comment?: ProposalComment }> {
-  return withWritableDb((db) => {
-    const proposal = getProposalOrThrowInDb(db, input.proposalId);
-    assertProposalWritable(proposal);
-    const now = new Date().toISOString();
-    let comment: ProposalComment | undefined;
-    if (input.body) {
-      comment = insertProposalCommentInDb(db, {
-        proposalId: proposal.id,
-        body: input.body,
-        author: input.author ?? "human"
-      });
-    }
-    db.run("UPDATE proposals SET status = 'changes_requested', updated_at = ? WHERE id = ?", [now, proposal.id]);
-    insertEvent(db, {
-      designId: proposal.designId,
-      proposalId: proposal.id,
-      type: "proposal_changes_requested",
-      payload: { commentId: comment?.id }
-    });
-    return { proposal: getProposalOrThrowInDb(db, proposal.id), comment };
-  });
-}
-
-export async function approveProposal(
-  proposalId: string
-): Promise<{ proposal: Proposal; design: Design; validation: ProposalValidation }> {
-  return withWritableDb((db) => {
-    const proposal = getProposalOrThrowInDb(db, proposalId);
-    assertProposalWritable(proposal);
-
-    const validation = validateProposalInDb(db, proposal.id);
-    updateProposalValidationInDb(db, proposal.id, validation.status);
-    if (validation.status !== "clean" || !validation.previewGraph) {
-      throw new Error(`Proposal is not approvable: ${validation.status}`);
-    }
-
-    const design = getDesignOrThrowInDb(db, proposal.designId);
-    const updated = designSchema.parse({
-      ...design,
-      graph: validation.previewGraph,
-      graphVersion: design.graphVersion + 1,
-      updatedAt: new Date().toISOString()
-    });
-    upsertDesign(db, updated, "proposal_approved");
-    db.run("UPDATE proposals SET status = 'approved', validation_status = 'clean', updated_at = ? WHERE id = ?", [
-      updated.updatedAt,
-      proposal.id
+    db.run("INSERT INTO artifacts (id, target_json, artifact_json, path, created_at) VALUES (?, ?, ?, ?, ?)", [
+      nextArtifact.id,
+      toJson(nextArtifact.target),
+      toJson(nextArtifact),
+      nextArtifact.path,
+      nextArtifact.createdAt
     ]);
-    insertEvent(db, {
-      designId: design.id,
-      proposalId: proposal.id,
-      type: "proposal_approved",
-      payload: { graphVersion: updated.graphVersion }
-    });
-    return {
-      proposal: getProposalOrThrowInDb(db, proposal.id),
-      design: updated,
-      validation
-    };
-  });
-}
-
-export async function rejectProposal(proposalId: string): Promise<{ proposal: Proposal }> {
-  return withWritableDb((db) => {
-    const proposal = getProposalOrThrowInDb(db, proposalId);
-    assertProposalWritable(proposal);
-    const now = new Date().toISOString();
-    db.run("UPDATE proposals SET status = 'rejected', updated_at = ? WHERE id = ?", [now, proposal.id]);
-    insertEvent(db, {
-      designId: proposal.designId,
-      proposalId: proposal.id,
-      type: "proposal_rejected",
-      payload: {}
-    });
-    return { proposal: getProposalOrThrowInDb(db, proposal.id) };
+    bumpSceneVersion(db);
+    return { artifact: nextArtifact, scene: readFullSceneInDb(db) };
   });
 }
 
 export async function writeArtifactContent(input: {
-  designId: string;
+  groupId: string;
   type: ExportType;
   title: string;
-  content: string | Buffer;
+  content: string;
   contentType: string;
 }): Promise<{ path: string; contentType: string }> {
-  const ext = extensionFor(input.type, input.contentType);
-  const filename = `${Date.now()}-${slug(input.title)}${ext}`;
-  const absolutePath = join(EXPORTS_DIR, input.designId, filename);
-  await mkdir(dirname(absolutePath), { recursive: true });
-  await writeFile(absolutePath, input.content);
+  await mkdir(join(EXPORTS_DIR, input.groupId), { recursive: true });
+  const filename = `${Date.now()}-${input.type}-${input.title.replace(/[^a-z0-9.-]+/gi, "-").slice(0, 80)}.${extensionFor(input.type)}`;
+  const absolutePath = join(EXPORTS_DIR, input.groupId, filename);
+  await writeFile(absolutePath, input.content, "utf8");
   return { path: absolutePath, contentType: input.contentType };
 }
 
 export function isExportPath(path: string): boolean {
-  const absolutePath = resolve(path);
-  return absolutePath.startsWith(resolve(EXPORTS_DIR));
+  const normalized = resolve(path);
+  return normalized === EXPORTS_DIR || normalized.startsWith(`${EXPORTS_DIR}/`);
+}
+
+export function artifactReadStream(path: string) {
+  return createReadStream(path);
 }
 
 async function getDb(): Promise<SqlDatabase> {
-  if (!databasePromise) {
-    const pending = openDatabase();
-    pending.catch(() => {
-      if (databasePromise === pending) databasePromise = null;
-    });
-    databasePromise = pending;
-  }
+  if (databasePromise) return databasePromise;
+  databasePromise = (async () => {
+    await ensureStorageDirs();
+    const SQL = await initSqlJs();
+    let db: SqlDatabase;
+    try {
+      const bytes = await readFile(DATABASE_PATH);
+      db = new SQL.Database(bytes);
+    } catch {
+      db = new SQL.Database();
+    }
+    prepareLegacyTables(db);
+    createSchema(db);
+    migrateLegacyDesignsIfNeeded(db);
+    initializeMetadata(db);
+    const previous = currentDbForParse;
+    currentDbForParse = db;
+    try {
+      if (repairSceneLayoutIfNeeded(db)) bumpSceneVersion(db);
+    } finally {
+      currentDbForParse = previous;
+    }
+    await persistDb(db);
+    return db;
+  })();
   return databasePromise;
 }
 
-async function openDatabase(): Promise<SqlDatabase> {
-  await ensureStorageDirs();
-  const SQL = await initSqlJs();
-  let db: SqlDatabase;
-  try {
-    db = new SQL.Database(await readFile(DATABASE_PATH));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-    db = new SQL.Database();
-  }
-  await createSchema(db);
-  await migrateJsonDesignsIfNeeded(db);
-  await persistDb(db);
-  return db;
-}
-
 async function ensureStorageDirs(): Promise<void> {
-  await mkdir(DESIGNS_DIR, { recursive: true });
   await mkdir(EXPORTS_DIR, { recursive: true });
 }
 
-async function createSchema(db: SqlDatabase): Promise<void> {
+function createSchema(db: SqlDatabase): void {
   db.run(`
-    CREATE TABLE IF NOT EXISTS designs (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      prompt TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      graph_version INTEGER NOT NULL,
-      selection_json TEXT NOT NULL,
-      snapshot_json TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS metadata (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS graph_versions (
-      design_id TEXT NOT NULL,
-      version INTEGER NOT NULL,
-      graph_json TEXT NOT NULL,
-      layout_json TEXT NOT NULL,
+    CREATE TABLE IF NOT EXISTS groups (
+      id TEXT PRIMARY KEY,
+      parent_group_id TEXT,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      bounds_json TEXT NOT NULL,
+      z_index REAL NOT NULL,
+      collapsed INTEGER NOT NULL,
       created_at TEXT NOT NULL,
-      source TEXT NOT NULL,
-      PRIMARY KEY (design_id, version)
+      updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS nodes (
-      design_id TEXT NOT NULL,
-      graph_version INTEGER NOT NULL,
-      node_id TEXT NOT NULL,
+      id TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL,
       node_json TEXT NOT NULL,
-      PRIMARY KEY (design_id, graph_version, node_id)
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      width REAL NOT NULL,
+      height REAL NOT NULL,
+      z_index REAL NOT NULL,
+      updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS edges (
-      design_id TEXT NOT NULL,
-      graph_version INTEGER NOT NULL,
-      edge_id TEXT NOT NULL,
+      id TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL,
       edge_json TEXT NOT NULL,
-      PRIMARY KEY (design_id, graph_version, edge_id)
+      updated_at TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS layouts (
-      design_id TEXT NOT NULL,
-      graph_version INTEGER NOT NULL,
-      layout_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (design_id, graph_version)
+    CREATE TABLE IF NOT EXISTS tags (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      color TEXT NOT NULL,
+      description TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS group_tags (
+      group_id TEXT NOT NULL,
+      tag_id TEXT NOT NULL,
+      PRIMARY KEY (group_id, tag_id)
     );
     CREATE TABLE IF NOT EXISTS comments (
       id TEXT PRIMARY KEY,
-      design_id TEXT NOT NULL,
       target_json TEXT NOT NULL,
       body TEXT NOT NULL,
       author TEXT NOT NULL,
@@ -505,98 +438,434 @@ async function createSchema(db: SqlDatabase): Promise<void> {
     );
     CREATE TABLE IF NOT EXISTS artifacts (
       id TEXT PRIMARY KEY,
-      design_id TEXT NOT NULL,
+      target_json TEXT NOT NULL,
       artifact_json TEXT NOT NULL,
+      path TEXT NOT NULL,
       created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS proposals (
-      id TEXT PRIMARY KEY,
-      design_id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      description TEXT NOT NULL,
-      base_graph_version INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      validation_status TEXT NOT NULL,
-      created_by TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS proposal_patches (
-      id TEXT PRIMARY KEY,
-      proposal_id TEXT NOT NULL,
-      sequence INTEGER NOT NULL,
-      patch_json TEXT NOT NULL,
-      validation_status TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      UNIQUE (proposal_id, sequence)
-    );
-    CREATE TABLE IF NOT EXISTS proposal_comments (
-      id TEXT PRIMARY KEY,
-      proposal_id TEXT NOT NULL,
-      body TEXT NOT NULL,
-      author TEXT NOT NULL,
-      resolved INTEGER NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS events (
       id TEXT PRIMARY KEY,
-      design_id TEXT,
-      proposal_id TEXT,
       type TEXT NOT NULL,
       payload_json TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_groups_parent ON groups(parent_group_id);
+    CREATE INDEX IF NOT EXISTS idx_nodes_group ON nodes(group_id);
+    CREATE INDEX IF NOT EXISTS idx_nodes_bounds ON nodes(x, y, width, height);
+    CREATE INDEX IF NOT EXISTS idx_edges_group ON edges(group_id);
+    CREATE INDEX IF NOT EXISTS idx_group_tags_tag ON group_tags(tag_id);
   `);
 }
 
-async function migrateJsonDesignsIfNeeded(db: SqlDatabase): Promise<void> {
-  const existing = numberValue(queryOne(db, "SELECT COUNT(*) AS count FROM designs") ?? { count: 0 }, "count");
-  if (existing > 0) return;
+function prepareLegacyTables(db: SqlDatabase): void {
+  if (tableExists(db, "nodes") && !columnExists(db, "nodes", "group_id")) renameTableIfPossible(db, "nodes", "legacy_nodes");
+  if (tableExists(db, "edges") && !columnExists(db, "edges", "group_id")) renameTableIfPossible(db, "edges", "legacy_edges");
+  if (tableExists(db, "comments") && columnExists(db, "comments", "design_id")) renameTableIfPossible(db, "comments", "legacy_comments");
+  if (tableExists(db, "artifacts") && !columnExists(db, "artifacts", "target_json")) renameTableIfPossible(db, "artifacts", "legacy_artifacts");
+  if (tableExists(db, "layouts") && !columnExists(db, "layouts", "updated_at")) renameTableIfPossible(db, "layouts", "legacy_layouts");
+}
 
-  const entries = await readdir(DESIGNS_DIR).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  });
-  for (const entry of entries.filter((candidate) => candidate.endsWith(".json"))) {
-    const raw = await readFile(join(DESIGNS_DIR, entry), "utf8");
-    const design = designSchema.parse(JSON.parse(raw));
-    upsertDesign(db, design, "legacy_json_import");
+function renameTableIfPossible(db: SqlDatabase, from: string, to: string): void {
+  if (!tableExists(db, from) || tableExists(db, to)) return;
+  db.run(`ALTER TABLE ${from} RENAME TO ${to}`);
+}
+
+function initializeMetadata(db: SqlDatabase): void {
+  if (!getMetadata(db, "scene_version")) setMetadata(db, "scene_version", "0");
+  if (!getMetadata(db, "selection_json")) setMetadata(db, "selection_json", toJson({ kind: "canvas" }));
+}
+
+function migrateLegacyDesignsIfNeeded(db: SqlDatabase): void {
+  if (!tableExists(db, "designs")) return;
+  const groupCount = numberValue(queryOne(db, "SELECT COUNT(*) AS count FROM groups"), "count");
+  if (groupCount > 0) return;
+  const rows = queryRows(db, "SELECT snapshot_json FROM designs ORDER BY updated_at ASC");
+  for (const row of rows) {
+    migrateLegacyDesign(db, parseJson(stringValue(row, "snapshot_json")));
   }
+}
+
+function migrateLegacyDesign(db: SqlDatabase, legacy: unknown): void {
+  if (!legacy || typeof legacy !== "object") return;
+  const value = legacy as Record<string, unknown>;
+  const now = stringOr(value.updatedAt, new Date().toISOString());
+  const groupId = stringOr(value.id, `group-${randomUUID().slice(0, 8)}`);
+  const graph = value.graph as Record<string, unknown> | undefined;
+  const layout = value.layout as Record<string, unknown> | undefined;
+  const nodePositions = (layout?.nodePositions as Record<string, { x?: number; y?: number }> | undefined) ?? {};
+  const nodeZOrder = (layout?.nodeZOrder as Record<string, number> | undefined) ?? {};
+  const idMap = new Map<string, string>();
+  const nodes = ((graph?.nodes as unknown[]) ?? []).map((candidate, index) => {
+    const parsed = graphNodeSchema.parse(candidate);
+    const nextId = `${groupId}-${parsed.id}`;
+    idMap.set(parsed.id, nextId);
+    const position = nodePositions[parsed.id] ?? { x: 80 + index * 160, y: 120 + index * 120 };
+    return sceneNodeSchema.parse({
+      ...parsed,
+      id: nextId,
+      groupId,
+      position: { x: Number(position.x ?? 0), y: Number(position.y ?? 0) },
+      size: { width: 390, height: 390 },
+      zIndex: nodeZOrder[parsed.id] ?? index,
+      updatedAt: now
+    });
+  });
+  const edges = ((graph?.edges as unknown[]) ?? []).map((candidate) => {
+    const parsed = graphEdgeSchema.parse(candidate);
+    return sceneEdgeSchema.parse({
+      ...parsed,
+      id: `${groupId}-${parsed.id}`,
+      source: idMap.get(parsed.source) ?? parsed.source,
+      target: idMap.get(parsed.target) ?? parsed.target,
+      groupId,
+      updatedAt: now
+    });
+  });
+  const group = sceneGroupSchema.parse({
+    id: groupId,
+    parentGroupId: null,
+    title: stringOr(value.title, "Migrated group"),
+    summary: stringOr(value.prompt, ""),
+    bounds: boundsForNodes(nodes),
+    tagIds: [],
+    zIndex: numberValueOr(value.zIndex, 0),
+    collapsed: false,
+    createdAt: stringOr(value.createdAt, now),
+    updatedAt: now
+  });
+  upsertGroupInDb(db, group);
+  for (const node of nodes) upsertNodeInDb(db, node);
+  for (const edge of edges) upsertEdgeInDb(db, edge);
+
+  for (const commentCandidate of (value.comments as unknown[]) ?? []) {
+    const comment = commentCandidate as Record<string, unknown>;
+    const target = migrateLegacyTarget(comment.target, groupId, idMap);
+    const parsed = sceneCommentSchema.parse({
+      id: stringOr(comment.id, randomUUID()),
+      target,
+      body: stringOr(comment.body, ""),
+      author: stringOr(comment.author, "human"),
+      resolved: Boolean(comment.resolved),
+      createdAt: stringOr(comment.createdAt, now),
+      updatedAt: stringOr(comment.updatedAt, now)
+    });
+    db.run(
+      "INSERT OR REPLACE INTO comments (id, target_json, body, author, resolved, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [parsed.id, toJson(parsed.target), parsed.body, parsed.author, parsed.resolved ? 1 : 0, parsed.createdAt, parsed.updatedAt]
+    );
+  }
+
+  for (const artifactCandidate of (value.artifacts as unknown[]) ?? []) {
+    const artifact = artifactCandidate as Record<string, unknown>;
+    const parsed = artifactSchema.parse({
+      id: stringOr(artifact.id, randomUUID()),
+      type: artifact.type,
+      title: stringOr(artifact.title, "Artifact"),
+      target: { kind: "group", id: groupId },
+      path: stringOr(artifact.path, ""),
+      contentType: stringOr(artifact.contentType, "text/plain; charset=utf-8"),
+      createdAt: stringOr(artifact.createdAt, now),
+      sceneVersion: numberValueOr(artifact.graphVersion, 0)
+    });
+    db.run("INSERT OR REPLACE INTO artifacts (id, target_json, artifact_json, path, created_at) VALUES (?, ?, ?, ?, ?)", [
+      parsed.id,
+      toJson(parsed.target),
+      toJson(parsed),
+      parsed.path,
+      parsed.createdAt
+    ]);
+  }
+}
+
+function readFullSceneInDb(db: SqlDatabase): Scene {
+  return sceneSchema.parse({
+    version: 1,
+    sceneVersion: getSceneVersion(db),
+    groups: readGroupsInDb(db),
+    nodes: queryRows(db, "SELECT * FROM nodes ORDER BY z_index ASC").map(parseNodeRow),
+    edges: queryRows(db, "SELECT * FROM edges ORDER BY id ASC").map(parseEdgeRow),
+    tags: readTagsInDb(db),
+    comments: queryRows(db, "SELECT * FROM comments ORDER BY updated_at DESC").map(parseCommentRow),
+    artifacts: queryRows(db, "SELECT artifact_json FROM artifacts ORDER BY created_at DESC").map((row) =>
+      artifactSchema.parse(parseJson(stringValue(row, "artifact_json")))
+    ),
+    selection: sceneSelectionSchema.parse(parseJson(getMetadata(db, "selection_json") ?? toJson({ kind: "canvas" }))),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function readGroupsInDb(db: SqlDatabase): SceneGroup[] {
+  return queryRows(db, "SELECT * FROM groups ORDER BY z_index ASC, updated_at DESC").map(parseGroupRow);
+}
+
+function readTagsInDb(db: SqlDatabase): Tag[] {
+  return queryRows(db, "SELECT * FROM tags ORDER BY updated_at DESC, name ASC").map(parseTagRow);
+}
+
+function upsertGroupInDb(db: SqlDatabase, groupInput: SceneGroup): void {
+  const group = sceneGroupSchema.parse(groupInput);
+  db.run(
+    `
+      INSERT INTO groups (id, parent_group_id, title, summary, bounds_json, z_index, collapsed, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        parent_group_id = excluded.parent_group_id,
+        title = excluded.title,
+        summary = excluded.summary,
+        bounds_json = excluded.bounds_json,
+        z_index = excluded.z_index,
+        collapsed = excluded.collapsed,
+        updated_at = excluded.updated_at
+    `,
+    [
+      group.id,
+      group.parentGroupId,
+      group.title,
+      group.summary,
+      toJson(group.bounds),
+      group.zIndex,
+      group.collapsed ? 1 : 0,
+      group.createdAt,
+      group.updatedAt
+    ]
+  );
+  setGroupTagsInDb(db, group.id, group.tagIds);
+}
+
+function upsertNodeInDb(db: SqlDatabase, nodeInput: SceneNode): void {
+  const node = sceneNodeSchema.parse(nodeInput);
+  db.run(
+    `
+      INSERT INTO nodes (id, group_id, node_json, x, y, width, height, z_index, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        group_id = excluded.group_id,
+        node_json = excluded.node_json,
+        x = excluded.x,
+        y = excluded.y,
+        width = excluded.width,
+        height = excluded.height,
+        z_index = excluded.z_index,
+        updated_at = excluded.updated_at
+    `,
+    [
+      node.id,
+      node.groupId,
+      toJson(node),
+      node.position.x,
+      node.position.y,
+      node.size.width,
+      node.size.height,
+      node.zIndex,
+      node.updatedAt ?? new Date().toISOString()
+    ]
+  );
+}
+
+function upsertEdgeInDb(db: SqlDatabase, edgeInput: SceneEdge): void {
+  const edge = sceneEdgeSchema.parse(edgeInput);
+  db.run(
+    `
+      INSERT INTO edges (id, group_id, edge_json, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        group_id = excluded.group_id,
+        edge_json = excluded.edge_json,
+        updated_at = excluded.updated_at
+    `,
+    [edge.id, edge.groupId, toJson(edge), edge.updatedAt ?? new Date().toISOString()]
+  );
+}
+
+function upsertTagInDb(db: SqlDatabase, tagInput: Tag): void {
+  const tag = tagSchema.parse(tagInput);
+  db.run(
+    `
+      INSERT INTO tags (id, name, color, description, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        color = excluded.color,
+        description = excluded.description,
+        updated_at = excluded.updated_at
+    `,
+    [tag.id, tag.name, tag.color, tag.description, tag.createdAt, tag.updatedAt]
+  );
+}
+
+function setGroupTagsInDb(db: SqlDatabase, groupId: string, tagIds: string[]): void {
+  db.run("DELETE FROM group_tags WHERE group_id = ?", [groupId]);
+  for (const tagId of tagIds) {
+    db.run("INSERT OR IGNORE INTO group_tags (group_id, tag_id) VALUES (?, ?)", [groupId, tagId]);
+  }
+}
+
+function removeGroupInDb(db: SqlDatabase, groupId: string): void {
+  const childRows = queryRows(db, "SELECT id FROM groups WHERE parent_group_id = ?", [groupId]);
+  for (const row of childRows) removeGroupInDb(db, stringValue(row, "id"));
+  db.run("DELETE FROM edges WHERE group_id = ?", [groupId]);
+  db.run("DELETE FROM nodes WHERE group_id = ?", [groupId]);
+  db.run("DELETE FROM group_tags WHERE group_id = ?", [groupId]);
+  db.run("DELETE FROM groups WHERE id = ?", [groupId]);
+}
+
+function removeNodeInDb(db: SqlDatabase, nodeId: string): void {
+  for (const edge of queryRows(db, "SELECT id, edge_json FROM edges").map(parseEdgeRow)) {
+    if (edge.source === nodeId || edge.target === nodeId) {
+      db.run("DELETE FROM edges WHERE id = ?", [edge.id]);
+    }
+  }
+  db.run("DELETE FROM nodes WHERE id = ?", [nodeId]);
+}
+
+function recomputeTouchedGroupBounds(db: SqlDatabase, patch: ScenePatch, removedNodeGroupIds: Set<string>): void {
+  const groupIds = new Set<string>(removedNodeGroupIds);
+  for (const group of patch.groups ?? []) groupIds.add(group.id);
+  for (const node of patch.nodes ?? []) groupIds.add(node.groupId);
+  for (const edge of patch.edges ?? []) groupIds.add(edge.groupId);
+  for (const groupId of groupIds) {
+    const group = getGroupInDb(db, groupId);
+    if (!group) continue;
+    const nodes = queryRows(db, "SELECT * FROM nodes WHERE group_id = ?", [groupId]).map(parseNodeRow);
+    if (nodes.length === 0) continue;
+    upsertGroupInDb(db, { ...group, bounds: boundsForNodes(nodes), updatedAt: new Date().toISOString() });
+  }
+}
+
+function parseGroupRow(row: SqlRow): SceneGroup {
+  const groupId = stringValue(row, "id");
+  const tagRows = queryRowsFromCurrentDb("SELECT tag_id FROM group_tags WHERE group_id = ?", [groupId]);
+  return sceneGroupSchema.parse({
+    id: groupId,
+    parentGroupId: row.parent_group_id === null || row.parent_group_id === undefined ? null : String(row.parent_group_id),
+    title: stringValue(row, "title"),
+    summary: stringValue(row, "summary"),
+    bounds: boundsSchema.parse(parseJson(stringValue(row, "bounds_json"))),
+    tagIds: tagRows.map((tagRow) => stringValue(tagRow, "tag_id")),
+    zIndex: numberValue(row, "z_index"),
+    collapsed: numberValue(row, "collapsed") === 1,
+    createdAt: stringValue(row, "created_at"),
+    updatedAt: stringValue(row, "updated_at")
+  });
+}
+
+let currentDbForParse: SqlDatabase | null = null;
+
+function queryRowsFromCurrentDb(sql: string, params: SqlValue[] = []): SqlRow[] {
+  if (!currentDbForParse) return [];
+  return queryRows(currentDbForParse, sql, params);
+}
+
+function parseNodeRow(row: SqlRow): SceneNode {
+  return sceneNodeSchema.parse(parseJson(stringValue(row, "node_json")));
+}
+
+function parseEdgeRow(row: SqlRow): SceneEdge {
+  return sceneEdgeSchema.parse(parseJson(stringValue(row, "edge_json")));
+}
+
+function parseTagRow(row: SqlRow): Tag {
+  return tagSchema.parse({
+    id: stringValue(row, "id"),
+    name: stringValue(row, "name"),
+    color: stringValue(row, "color"),
+    description: stringValue(row, "description"),
+    createdAt: stringValue(row, "created_at"),
+    updatedAt: stringValue(row, "updated_at")
+  });
+}
+
+function parseCommentRow(row: SqlRow): SceneComment {
+  return sceneCommentSchema.parse({
+    id: stringValue(row, "id"),
+    target: parseJson(stringValue(row, "target_json")),
+    body: stringValue(row, "body"),
+    author: stringValue(row, "author"),
+    resolved: numberValue(row, "resolved") === 1,
+    createdAt: stringValue(row, "created_at"),
+    updatedAt: stringValue(row, "updated_at")
+  });
+}
+
+function getGroupInDb(db: SqlDatabase, id: string): SceneGroup | null {
+  const previous = currentDbForParse;
+  currentDbForParse = db;
+  try {
+    const row = queryOne(db, "SELECT * FROM groups WHERE id = ?", [id]);
+    return row ? parseGroupRow(row) : null;
+  } finally {
+    currentDbForParse = previous;
+  }
+}
+
+function getTagInDb(db: SqlDatabase, id: string): Tag | null {
+  const row = queryOne(db, "SELECT * FROM tags WHERE id = ?", [id]);
+  return row ? parseTagRow(row) : null;
+}
+
+function getCommentInDb(db: SqlDatabase, id: string): SceneComment | null {
+  const row = queryOne(db, "SELECT * FROM comments WHERE id = ?", [id]);
+  return row ? parseCommentRow(row) : null;
+}
+
+function assertTagsExist(db: SqlDatabase, tagIds: string[]): void {
+  for (const tagId of tagIds) {
+    if (!getTagInDb(db, tagId)) throw new Error(`Tag not found: ${tagId}`);
+  }
+}
+
+function assertTargetExists(db: SqlDatabase, target: SceneSelection): void {
+  if (target.kind === "canvas") return;
+  if (target.kind === "group" && getGroupInDb(db, target.id)) return;
+  if (target.kind === "node" && queryOne(db, "SELECT id FROM nodes WHERE id = ?", [target.id])) return;
+  if (target.kind === "edge" && queryOne(db, "SELECT id FROM edges WHERE id = ?", [target.id])) return;
+  throw new Error(`Target not found: ${target.id}`);
+}
+
+function commentTargetsGroup(target: SceneSelection, groupId: string, nodeIds: Set<string>): boolean {
+  if (target.kind === "group") return target.id === groupId;
+  if (target.kind === "node") return nodeIds.has(target.id);
+  return false;
 }
 
 async function withDb<T>(fn: (db: SqlDatabase) => T): Promise<T> {
   const db = await getDb();
-  return fn(db);
+  const previous = currentDbForParse;
+  currentDbForParse = db;
+  try {
+    return fn(db);
+  } finally {
+    currentDbForParse = previous;
+  }
 }
 
 async function withWritableDb<T>(fn: (db: SqlDatabase) => T): Promise<T> {
-  const job = writeQueue.then(async () => {
+  const run = async () => {
     const db = await getDb();
-    db.run("BEGIN");
-    let result: T;
+    const previous = currentDbForParse;
+    currentDbForParse = db;
     try {
-      result = fn(db);
-    } catch (error) {
-      db.run("ROLLBACK");
-      throw error;
-    }
-    db.run("COMMIT");
-    try {
+      const result = fn(db);
       await persistDb(db);
+      return result;
     } catch (error) {
-      resetDatabase(db);
+      databasePromise = null;
       throw error;
+    } finally {
+      currentDbForParse = previous;
     }
-    return result;
-  });
-  writeQueue = job.catch(() => undefined);
-  return job;
+  };
+  const next = writeQueue.then(run, run);
+  writeQueue = next.then(
+    () => undefined,
+    () => undefined
+  );
+  return next;
 }
 
 async function persistDb(db: SqlDatabase): Promise<void> {
-  await ensureStorageDirs();
-  const tempPath = join(DATA_ROOT, `.shape-${process.pid}-${Date.now()}.sqlite.tmp`);
+  await mkdir(dirname(DATABASE_PATH), { recursive: true });
+  const tempPath = `${DATABASE_PATH}.${process.pid}.${Date.now()}.tmp`;
   try {
     await writeFile(tempPath, Buffer.from(db.export()));
     await rename(tempPath, DATABASE_PATH);
@@ -606,411 +875,270 @@ async function persistDb(db: SqlDatabase): Promise<void> {
   }
 }
 
-function resetDatabase(db: SqlDatabase): void {
-  try {
-    db.close();
-  } catch {
-    // Ignore close failures while recovering from a failed persistence write.
-  }
-  databasePromise = null;
+function getSceneVersion(db: SqlDatabase): number {
+  return Number(getMetadata(db, "scene_version") ?? "0");
 }
 
-function upsertDesign(db: SqlDatabase, design: Design, source = "canonical_save"): Design {
-  const parsed = designSchema.parse(design);
+function bumpSceneVersion(db: SqlDatabase): void {
+  setMetadata(db, "scene_version", String(getSceneVersion(db) + 1));
+}
+
+function getMetadata(db: SqlDatabase, key: string): string | undefined {
+  const row = queryOne(db, "SELECT value FROM metadata WHERE key = ?", [key]);
+  return row ? stringValue(row, "value") : undefined;
+}
+
+function setMetadata(db: SqlDatabase, key: string, value: string): void {
   db.run(
-    `
-      INSERT INTO designs (
-        id, title, prompt, created_at, updated_at, graph_version, selection_json, snapshot_json
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        title = excluded.title,
-        prompt = excluded.prompt,
-        updated_at = excluded.updated_at,
-        graph_version = excluded.graph_version,
-        selection_json = excluded.selection_json,
-        snapshot_json = excluded.snapshot_json
-    `,
-    [
-      parsed.id,
-      parsed.title,
-      parsed.prompt,
-      parsed.createdAt,
-      parsed.updatedAt,
-      parsed.graphVersion,
-      toJson(parsed.selection),
-      toJson(parsed)
-    ]
-  );
-  syncGraphVersion(db, parsed, source);
-  syncComments(db, parsed);
-  syncArtifacts(db, parsed);
-  return parsed;
-}
-
-function syncGraphVersion(db: SqlDatabase, design: Design, source: string): void {
-  db.run(
-    `
-      INSERT INTO graph_versions (design_id, version, graph_json, layout_json, created_at, source)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(design_id, version) DO UPDATE SET
-        graph_json = excluded.graph_json,
-        layout_json = excluded.layout_json,
-        source = excluded.source
-    `,
-    [design.id, design.graphVersion, toJson(design.graph), toJson(design.layout), design.updatedAt, source]
-  );
-
-  db.run("DELETE FROM nodes WHERE design_id = ? AND graph_version = ?", [design.id, design.graphVersion]);
-  for (const node of design.graph.nodes) {
-    db.run("INSERT INTO nodes (design_id, graph_version, node_id, node_json) VALUES (?, ?, ?, ?)", [
-      design.id,
-      design.graphVersion,
-      node.id,
-      toJson(node)
-    ]);
-  }
-
-  db.run("DELETE FROM edges WHERE design_id = ? AND graph_version = ?", [design.id, design.graphVersion]);
-  for (const edge of design.graph.edges) {
-    db.run("INSERT INTO edges (design_id, graph_version, edge_id, edge_json) VALUES (?, ?, ?, ?)", [
-      design.id,
-      design.graphVersion,
-      edge.id,
-      toJson(edge)
-    ]);
-  }
-
-  db.run(
-    `
-      INSERT INTO layouts (design_id, graph_version, layout_json, updated_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(design_id, graph_version) DO UPDATE SET
-        layout_json = excluded.layout_json,
-        updated_at = excluded.updated_at
-    `,
-    [design.id, design.graphVersion, toJson(design.layout), design.updatedAt]
+    "INSERT INTO metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    [key, value]
   );
 }
 
-function syncComments(db: SqlDatabase, design: Design): void {
-  db.run("DELETE FROM comments WHERE design_id = ?", [design.id]);
-  for (const comment of design.comments) {
-    db.run(
-      `
-        INSERT INTO comments (
-          id, design_id, target_json, body, author, resolved, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [
-        comment.id,
-        design.id,
-        toJson(comment.target),
-        comment.body,
-        comment.author,
-        comment.resolved ? 1 : 0,
-        comment.createdAt,
-        comment.updatedAt
-      ]
-    );
-  }
+const layoutRepairVersion = "6";
+const groupGap = 220;
+const collisionPadding = 80;
+const legacySeedNodePositions: Record<string, { x: number; y: number }> = {
+  "n-proposition": { x: 0, y: 0 },
+  "n-decision-points": { x: 460, y: 120 },
+  "n-option-graph": { x: 920, y: 0 },
+  "n-option-freeform": { x: 920, y: 460 },
+  "n-evidence": { x: 1380, y: 120 },
+  "n-tradeoff": { x: 1380, y: 580 },
+  "n-blocker": { x: 1380, y: 1040 },
+  "n-subdecision": { x: 1840, y: 0 },
+  "n-task": { x: 2300, y: 120 },
+  "n-artifact": { x: 2300, y: 580 }
+};
+const wideSeedNodePositions: Record<string, { x: number; y: number }> = {
+  "n-proposition": { x: 0, y: 360 },
+  "n-decision-points": { x: 520, y: 360 },
+  "n-option-graph": { x: 1040, y: 0 },
+  "n-option-freeform": { x: 1040, y: 480 },
+  "n-evidence": { x: 1560, y: 0 },
+  "n-tradeoff": { x: 1560, y: 480 },
+  "n-blocker": { x: 1560, y: 960 },
+  "n-subdecision": { x: 2080, y: 0 },
+  "n-task": { x: 2080, y: 480 },
+  "n-artifact": { x: 2080, y: 960 }
+};
+const compactSeedNodePositions = normalizeSeedPositions(defaultSeedNodePositions);
+
+function repairSceneLayoutIfNeeded(db: SqlDatabase): boolean {
+  if (getMetadata(db, "scene_layout_version") === layoutRepairVersion) return false;
+  let changed = repairLegacySeedNodeLayouts(db);
+  if (repairTopLevelGroupPacking(db, true)) changed = true;
+  setMetadata(db, "scene_layout_version", layoutRepairVersion);
+  return changed;
 }
 
-function syncArtifacts(db: SqlDatabase, design: Design): void {
-  db.run("DELETE FROM artifacts WHERE design_id = ?", [design.id]);
-  for (const artifact of design.artifacts) {
-    db.run("INSERT INTO artifacts (id, design_id, artifact_json, created_at) VALUES (?, ?, ?, ?)", [
-      artifact.id,
-      design.id,
-      toJson(artifact),
-      artifact.createdAt
-    ]);
-  }
-}
-
-function getDesignInDb(db: SqlDatabase, id: string): Design | null {
-  const row = queryOne(db, "SELECT snapshot_json FROM designs WHERE id = ?", [id]);
-  if (!row) return null;
-  return designSchema.parse(parseJson(stringValue(row, "snapshot_json")));
-}
-
-function getDesignOrThrowInDb(db: SqlDatabase, id: string): Design {
-  const design = getDesignInDb(db, id);
-  if (!design) {
-    throw new Error(`Shape not found: ${id}`);
-  }
-  return design;
-}
-
-function getGraphVersionInDb(db: SqlDatabase, designId: string, graphVersion: number): DecisionGraph | null {
-  const row = queryOne(db, "SELECT graph_json FROM graph_versions WHERE design_id = ? AND version = ?", [
-    designId,
-    graphVersion
-  ]);
-  if (!row) return null;
-  return designSchema.shape.graph.parse(parseJson(stringValue(row, "graph_json")));
-}
-
-function insertProposalInDb(db: SqlDatabase, proposal: Proposal): void {
-  db.run(
-    `
-      INSERT INTO proposals (
-        id, design_id, title, description, base_graph_version, status, validation_status,
-        created_by, created_at, updated_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-    [
-      proposal.id,
-      proposal.designId,
-      proposal.title,
-      proposal.description,
-      proposal.baseGraphVersion,
-      proposal.status,
-      proposal.validationStatus,
-      proposal.createdBy,
-      proposal.createdAt,
-      proposal.updatedAt
-    ]
-  );
-}
-
-function getProposalOrThrowInDb(db: SqlDatabase, proposalId: string): Proposal {
-  const row = queryOne(db, "SELECT * FROM proposals WHERE id = ?", [proposalId]);
-  if (!row) {
-    throw new Error(`Proposal not found: ${proposalId}`);
-  }
-  return parseProposalRow(row);
-}
-
-function insertProposalPatchInDb(db: SqlDatabase, patch: ProposalPatch): void {
-  db.run(
-    `
-      INSERT INTO proposal_patches (id, proposal_id, sequence, patch_json, validation_status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `,
-    [patch.id, patch.proposalId, patch.sequence, toJson(patch.patch), patch.validationStatus, patch.createdAt]
-  );
-}
-
-function nextPatchSequence(db: SqlDatabase, proposalId: string): number {
-  const row = queryOne(db, "SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM proposal_patches WHERE proposal_id = ?", [
-    proposalId
-  ]);
-  return numberValue(row ?? { next: 1 }, "next");
-}
-
-function getProposalPatchesInDb(db: SqlDatabase, proposalId: string): ProposalPatch[] {
-  return queryRows(db, "SELECT * FROM proposal_patches WHERE proposal_id = ? ORDER BY sequence ASC", [proposalId]).map(
-    parseProposalPatchRow
-  );
-}
-
-function insertProposalCommentInDb(
-  db: SqlDatabase,
-  input: { proposalId: string; body: string; author: string }
-): ProposalComment {
-  const now = new Date().toISOString();
-  const comment = proposalCommentSchema.parse({
-    id: randomUUID(),
-    proposalId: input.proposalId,
-    body: input.body,
-    author: input.author,
-    resolved: false,
-    createdAt: now,
-    updatedAt: now
-  });
-  db.run(
-    `
-      INSERT INTO proposal_comments (id, proposal_id, body, author, resolved, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `,
-    [comment.id, comment.proposalId, comment.body, comment.author, 0, comment.createdAt, comment.updatedAt]
-  );
-  return comment;
-}
-
-function getProposalCommentsInDb(db: SqlDatabase, proposalId: string): ProposalComment[] {
-  return queryRows(db, "SELECT * FROM proposal_comments WHERE proposal_id = ? ORDER BY created_at ASC", [proposalId]).map(
-    parseProposalCommentRow
-  );
-}
-
-function validateProposalInDb(db: SqlDatabase, proposalId: string): ProposalValidation {
-  const proposal = getProposalOrThrowInDb(db, proposalId);
-  const design = getDesignInDb(db, proposal.designId);
-  if (!design) {
-    return {
-      status: "invalid",
-      messages: [`Shape not found: ${proposal.designId}`],
-      baseGraphVersion: proposal.baseGraphVersion,
-      currentGraphVersion: proposal.baseGraphVersion
-    };
-  }
-
-  const baseGraph = getGraphVersionInDb(db, proposal.designId, proposal.baseGraphVersion);
-  if (!baseGraph) {
-    return {
-      status: "invalid",
-      messages: [`Base graph version not found: ${proposal.designId}@${proposal.baseGraphVersion}`],
-      baseGraphVersion: proposal.baseGraphVersion,
-      currentGraphVersion: design.graphVersion
-    };
-  }
-
-  let previewGraph = baseGraph;
-  for (const patch of getProposalPatchesInDb(db, proposalId)) {
-    const errors = validatePatchReferences(previewGraph, patch.patch);
-    if (errors.length > 0) {
-      return {
-        status: "conflict",
-        messages: errors,
-        baseGraphVersion: proposal.baseGraphVersion,
-        currentGraphVersion: design.graphVersion,
-        baseGraph
-      };
+function repairLegacySeedNodeLayouts(db: SqlDatabase): boolean {
+  let changed = false;
+  const groups = readGroupsInDb(db);
+  for (const group of groups) {
+    const nodes = queryRows(db, "SELECT * FROM nodes WHERE group_id = ?", [group.id]).map(parseNodeRow);
+    if (!isLegacySeedLayout(group, nodes)) continue;
+    const anchor = { x: group.bounds.x + 160, y: group.bounds.y + 160 };
+    const updatedNodes: SceneNode[] = [];
+    const extraNodes: SceneNode[] = [];
+    for (const node of nodes) {
+      const seedKey = seedKeyForNode(group.id, node.id);
+      const position = seedKey ? compactSeedNodePositions[seedKey] : undefined;
+      if (!position) {
+        extraNodes.push(node);
+        continue;
+      }
+      updatedNodes.push(sceneNodeSchema.parse({
+        ...node,
+        position: { x: anchor.x + position.x, y: anchor.y + position.y },
+        updatedAt: new Date().toISOString()
+      }));
     }
-    previewGraph = applyGraphPatch(previewGraph, patch.patch);
+    for (const node of extraNodes.sort((a, b) => a.zIndex - b.zIndex)) {
+      updatedNodes.push(
+        sceneNodeSchema.parse({
+          ...node,
+          position: openNodePosition(updatedNodes, node.position, node.size),
+          updatedAt: new Date().toISOString()
+        })
+      );
+    }
+    for (const node of updatedNodes) upsertNodeInDb(db, node);
+    upsertGroupInDb(db, {
+      ...group,
+      bounds: boundsForNodes(updatedNodes),
+      updatedAt: new Date().toISOString()
+    });
+    changed = true;
   }
+  return changed;
+}
 
-  if (proposal.baseGraphVersion !== design.graphVersion) {
-    return {
-      status: "needs_rebase",
-      messages: [`Base graph version ${proposal.baseGraphVersion} is behind current version ${design.graphVersion}.`],
-      baseGraphVersion: proposal.baseGraphVersion,
-      currentGraphVersion: design.graphVersion,
-      baseGraph,
-      previewGraph
+function isLegacySeedLayout(group: SceneGroup, nodes: SceneNode[]): boolean {
+  return matchesSeedLayout(group, nodes, legacySeedNodePositions) || matchesSeedLayout(group, nodes, wideSeedNodePositions);
+}
+
+function matchesSeedLayout(group: SceneGroup, nodes: SceneNode[], expectedPositions: Record<string, { x: number; y: number }>): boolean {
+  const anchor = { x: group.bounds.x + 160, y: group.bounds.y + 160 };
+  const seedKeys = Object.keys(defaultSeedNodePositions);
+  for (const seedKey of seedKeys) {
+    const node = nodes.find((candidate) => candidate.id === `${group.id}-${seedKey}`);
+    if (!node) return false;
+    const expected = expectedPositions[seedKey];
+    if (!expected) return false;
+    if (Math.abs(node.position.x - (anchor.x + expected.x)) > 6) return false;
+    if (Math.abs(node.position.y - (anchor.y + expected.y)) > 6) return false;
+  }
+  return true;
+}
+
+function normalizeSeedPositions(positions: Record<string, { x: number; y: number }>): Record<string, { x: number; y: number }> {
+  const minX = Math.min(...Object.values(positions).map((position) => position.x));
+  const minY = Math.min(...Object.values(positions).map((position) => position.y));
+  return Object.fromEntries(Object.entries(positions).map(([key, position]) => [key, { x: position.x - minX, y: position.y - minY }]));
+}
+
+function openNodePosition(placedNodes: SceneNode[], preferred: { x: number; y: number }, size: { width: number; height: number }): { x: number; y: number } {
+  const occupied = placedNodes.map(nodeBounds);
+  const candidateFree = (position: { x: number; y: number }) => {
+    const candidate = expandLayoutBounds({ x: position.x, y: position.y, width: size.width, height: size.height }, 54);
+    return occupied.every((bounds) => !boundsIntersect(candidate, bounds));
+  };
+  if (candidateFree(preferred)) return preferred;
+  const stepX = 450;
+  const stepY = 430;
+  for (let radius = 1; radius <= 8; radius += 1) {
+    for (let x = -radius; x <= radius; x += 1) {
+      for (let y = -radius; y <= radius; y += 1) {
+        if (Math.abs(x) !== radius && Math.abs(y) !== radius) continue;
+        const candidate = { x: preferred.x + x * stepX, y: preferred.y + y * stepY };
+        if (candidateFree(candidate)) return candidate;
+      }
+    }
+  }
+  return preferred;
+}
+
+function repairTopLevelGroupPacking(db: SqlDatabase, force: boolean): boolean {
+  const groups = readGroupsInDb(db).filter((group) => group.parentGroupId === null);
+  if (groups.length < 2 || (!force && !hasSignificantGroupOverlap(groups))) return false;
+  packTopLevelGroups(db, groups);
+  return true;
+}
+
+function hasSignificantGroupOverlap(groups: SceneGroup[]): boolean {
+  let overlaps = 0;
+  for (let index = 0; index < groups.length; index += 1) {
+    for (let next = index + 1; next < groups.length; next += 1) {
+      if (boundsOverlapArea(groups[index].bounds, groups[next].bounds) > Math.min(boundsArea(groups[index].bounds), boundsArea(groups[next].bounds)) * 0.18) {
+        overlaps += 1;
+      }
+    }
+  }
+  return overlaps >= Math.max(2, Math.ceil(groups.length * 0.18));
+}
+
+function packTopLevelGroups(db: SqlDatabase, groups: SceneGroup[]): void {
+  const ordered = [...groups].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const columns = Math.max(3, Math.ceil(Math.sqrt(ordered.length)));
+  let cursorY = 0;
+  for (let rowStart = 0; rowStart < ordered.length; rowStart += columns) {
+    let cursorX = 0;
+    let rowHeight = 0;
+    for (const group of ordered.slice(rowStart, rowStart + columns)) {
+      moveGroupBy(db, group, cursorX - group.bounds.x, cursorY - group.bounds.y);
+      cursorX += group.bounds.width + groupGap;
+      rowHeight = Math.max(rowHeight, group.bounds.height);
+    }
+    cursorY += rowHeight + groupGap;
+  }
+}
+
+function nextGroupOffset(db: SqlDatabase, desiredBounds?: Bounds): { x: number; y: number } {
+  const desired = desiredBounds ?? { x: -160, y: -160, width: 2500, height: 1600 };
+  const groups = readGroupsInDb(db).filter((group) => group.parentGroupId === null);
+  const cellWidth = Math.max(2200, desired.width + groupGap);
+  const cellHeight = Math.max(1600, desired.height + groupGap);
+  const columns = Math.max(3, Math.ceil(Math.sqrt(groups.length + 1)));
+  for (let index = 0; index < Math.max(256, (groups.length + 1) * 4); index += 1) {
+    const bounds = {
+      x: (index % columns) * cellWidth,
+      y: Math.floor(index / columns) * cellHeight,
+      width: desired.width,
+      height: desired.height
     };
+    if (groups.every((group) => boundsOverlapArea(expandLayoutBounds(bounds, collisionPadding), expandLayoutBounds(group.bounds, collisionPadding)) === 0)) {
+      return { x: bounds.x - desired.x, y: bounds.y - desired.y };
+    }
   }
-
+  const fallbackIndex = groups.length;
   return {
-    status: "clean",
-    messages: [],
-    baseGraphVersion: proposal.baseGraphVersion,
-    currentGraphVersion: design.graphVersion,
-    baseGraph,
-    previewGraph
+    x: (fallbackIndex % columns) * cellWidth - desired.x,
+    y: Math.floor(fallbackIndex / columns) * cellHeight - desired.y
   };
 }
 
-function validatePatchReferences(graph: DecisionGraph, patch: GraphPatch): string[] {
-  const nodeIds = new Set(graph.nodes.map((node) => node.id));
-  const edgeIds = new Set(graph.edges.map((edge) => edge.id));
-  const errors: string[] = [];
-
-  for (const node of patch.addNodes) {
-    if (nodeIds.has(node.id)) errors.push(`Node already exists: ${node.id}`);
+function moveGroupBy(db: SqlDatabase, group: SceneGroup, dx: number, dy: number): void {
+  if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+  const now = new Date().toISOString();
+  const nodes = queryRows(db, "SELECT * FROM nodes WHERE group_id = ?", [group.id]).map(parseNodeRow);
+  for (const node of nodes) {
+    upsertNodeInDb(db, {
+      ...node,
+      position: { x: node.position.x + dx, y: node.position.y + dy },
+      updatedAt: now
+    });
   }
-  for (const node of patch.updateNodes) {
-    if (!nodeIds.has(node.id)) errors.push(`Node update target not found: ${node.id}`);
-  }
-  for (const nodeId of patch.removeNodeIds) {
-    if (!nodeIds.has(nodeId)) errors.push(`Node remove target not found: ${nodeId}`);
-  }
-  for (const edge of patch.addEdges) {
-    if (edgeIds.has(edge.id)) errors.push(`Edge already exists: ${edge.id}`);
-  }
-  for (const edge of patch.updateEdges) {
-    if (!edgeIds.has(edge.id)) errors.push(`Edge update target not found: ${edge.id}`);
-  }
-  for (const edgeId of patch.removeEdgeIds) {
-    if (!edgeIds.has(edgeId)) errors.push(`Edge remove target not found: ${edgeId}`);
-  }
-
-  const nextNodeIds = new Set(nodeIds);
-  for (const nodeId of patch.removeNodeIds) nextNodeIds.delete(nodeId);
-  for (const node of patch.addNodes) nextNodeIds.add(node.id);
-
-  for (const edge of [...patch.addEdges, ...patch.updateEdges]) {
-    if (!nextNodeIds.has(edge.source)) errors.push(`Edge source node not found: ${edge.id} -> ${edge.source}`);
-    if (!nextNodeIds.has(edge.target)) errors.push(`Edge target node not found: ${edge.id} -> ${edge.target}`);
-  }
-
-  return [...new Set(errors)];
-}
-
-function updateProposalValidationInDb(
-  db: SqlDatabase,
-  proposalId: string,
-  validationStatus: ProposalValidationStatus
-): void {
-  db.run("UPDATE proposals SET validation_status = ?, updated_at = ? WHERE id = ?", [
-    validationStatus,
-    new Date().toISOString(),
-    proposalId
-  ]);
-}
-
-function assertProposalWritable(proposal: Proposal): void {
-  if (proposal.status === "approved" || proposal.status === "rejected") {
-    throw new Error(`Proposal is already ${proposal.status}: ${proposal.id}`);
-  }
-}
-
-function insertEvent(
-  db: SqlDatabase,
-  input: { designId?: string; proposalId?: string; type: string; payload: unknown }
-): void {
-  db.run(
-    "INSERT INTO events (id, design_id, proposal_id, type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    [
-      randomUUID(),
-      input.designId ?? null,
-      input.proposalId ?? null,
-      input.type,
-      toJson(input.payload),
-      new Date().toISOString()
-    ]
-  );
-}
-
-function parseProposalRow(row: SqlRow): Proposal {
-  return proposalSchema.parse({
-    id: stringValue(row, "id"),
-    designId: stringValue(row, "design_id"),
-    title: stringValue(row, "title"),
-    description: stringValue(row, "description"),
-    baseGraphVersion: numberValue(row, "base_graph_version"),
-    status: stringValue(row, "status"),
-    validationStatus: stringValue(row, "validation_status"),
-    createdBy: stringValue(row, "created_by"),
-    createdAt: stringValue(row, "created_at"),
-    updatedAt: stringValue(row, "updated_at")
+  upsertGroupInDb(db, {
+    ...group,
+    bounds: { ...group.bounds, x: group.bounds.x + dx, y: group.bounds.y + dy },
+    updatedAt: now
   });
 }
 
-function parseProposalPatchRow(row: SqlRow): ProposalPatch {
-  return proposalPatchSchema.parse({
-    id: stringValue(row, "id"),
-    proposalId: stringValue(row, "proposal_id"),
-    sequence: numberValue(row, "sequence"),
-    patch: parseJson(stringValue(row, "patch_json")),
-    validationStatus: stringValue(row, "validation_status"),
-    createdAt: stringValue(row, "created_at")
-  });
+function seedKeyForNode(groupId: string, nodeId: string): string | undefined {
+  const prefix = `${groupId}-`;
+  if (!nodeId.startsWith(prefix)) return undefined;
+  const key = nodeId.slice(prefix.length);
+  return key in defaultSeedNodePositions ? key : undefined;
 }
 
-function parseProposalCommentRow(row: SqlRow): ProposalComment {
-  return proposalCommentSchema.parse({
-    id: stringValue(row, "id"),
-    proposalId: stringValue(row, "proposal_id"),
-    body: stringValue(row, "body"),
-    author: stringValue(row, "author"),
-    resolved: numberValue(row, "resolved") === 1,
-    createdAt: stringValue(row, "created_at"),
-    updatedAt: stringValue(row, "updated_at")
-  });
+function boundsArea(bounds: Bounds): number {
+  return Math.max(0, bounds.width) * Math.max(0, bounds.height);
+}
+
+function boundsOverlapArea(a: Bounds, b: Bounds): number {
+  const x = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
+  const y = Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
+  return x * y;
+}
+
+function expandLayoutBounds(bounds: Bounds, padding: number): Bounds {
+  return {
+    x: bounds.x - padding,
+    y: bounds.y - padding,
+    width: bounds.width + padding * 2,
+    height: bounds.height + padding * 2
+  };
+}
+
+function tableExists(db: SqlDatabase, name: string): boolean {
+  return Boolean(queryOne(db, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", [name]));
+}
+
+function columnExists(db: SqlDatabase, table: string, column: string): boolean {
+  return queryRows(db, `PRAGMA table_info(${table})`).some((row) => row.name === column);
 }
 
 function queryRows(db: SqlDatabase, sql: string, params: SqlValue[] = []): SqlRow[] {
-  const result = db.exec(sql, params);
-  const first = result[0];
-  if (!first) return [];
-  return first.values.map((values) =>
-    Object.fromEntries(first.columns.map((column, index) => [column, values[index]]))
-  );
+  const statement = db.prepare(sql, params);
+  const rows: SqlRow[] = [];
+  try {
+    while (statement.step()) rows.push(statement.getAsObject() as SqlRow);
+  } finally {
+    statement.free();
+  }
+  return rows;
 }
 
 function queryOne(db: SqlDatabase, sql: string, params: SqlValue[] = []): SqlRow | null {
@@ -1025,38 +1153,51 @@ function parseJson(value: string): unknown {
   return JSON.parse(value);
 }
 
-function stringValue(row: SqlRow, key: string): string {
-  const value = row[key];
-  if (typeof value !== "string") {
-    throw new Error(`Expected string column: ${key}`);
-  }
+function stringValue(row: SqlRow | null, key: string): string {
+  const value = row?.[key];
+  if (typeof value !== "string") throw new Error(`Expected string column ${key}`);
   return value;
 }
 
-function numberValue(row: SqlRow, key: string): number {
-  const value = row[key];
-  if (typeof value !== "number") {
-    throw new Error(`Expected number column: ${key}`);
-  }
+function numberValue(row: SqlRow | null, key: string): number {
+  const value = row?.[key];
+  if (typeof value !== "number") throw new Error(`Expected number column ${key}`);
   return value;
 }
 
-function extensionFor(type: ExportType, contentType: string): string {
-  if (type === "yadr") return ".yaml";
-  if (type === "image_prompt" || type === "architecture_image") return ".md";
-  if (type === "confluence_html") return ".html";
-  if (type === "mermaid") return ".mmd";
-  if (contentType.includes("html")) return ".html";
-  const known = extname(contentType);
-  return known || ".md";
+function numberValueOr(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function stringOr(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
 }
 
 function slug(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 60) || "artifact"
-  );
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "tag";
+}
+
+function extensionFor(type: ExportType): string {
+  if (type === "yadr") return "yaml";
+  if (type === "confluence_html") return "html";
+  if (type === "mermaid") return "mmd";
+  return "md";
+}
+
+function migrateLegacyTarget(target: unknown, groupId: string, idMap: Map<string, string>): SceneSelection {
+  if (!target || typeof target !== "object") return { kind: "group", id: groupId };
+  const value = target as Record<string, unknown>;
+  const kind = value.kind;
+  const id = typeof value.id === "string" ? value.id : undefined;
+  if (kind === "node" && id) return { kind: "node", id: idMap.get(id) ?? id };
+  if (kind === "edge" && id) return { kind: "edge", id: `${groupId}-${id}` };
+  return { kind: "group", id: groupId };
+}
+
+export async function listLegacyJsonFiles(): Promise<string[]> {
+  try {
+    return (await readdir(DATA_ROOT)).filter((entry) => entry.endsWith(".json"));
+  } catch {
+    return [];
+  }
 }

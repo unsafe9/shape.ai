@@ -1,11 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { generateLocalExport, seedDesignGraph } from "../src/server/local";
-import type { ExportType } from "../src/shared/schema";
+import { sceneGraphForGroup } from "../src/shared/graph";
+import { generateLocalExport, seedGroupScene } from "../src/server/local";
+import type { ExportType, Scene } from "../src/shared/schema";
 
-const graph = seedDesignGraph("Choose an export format for architecture decisions").graph;
+const seed = seedGroupScene("Choose an export format for architecture decisions", {
+  groupId: "group-test",
+  now: "2026-06-05T00:00:00.000Z"
+});
+const scene: Scene = {
+  version: 1,
+  sceneVersion: 0,
+  groups: [seed.group],
+  nodes: seed.nodes,
+  edges: seed.edges,
+  tags: [],
+  comments: [],
+  artifacts: [],
+  selection: { kind: "canvas" },
+  updatedAt: "2026-06-05T00:00:00.000Z"
+};
+const graph = sceneGraphForGroup(scene, seed.group.id);
 
 function exportContent(type: ExportType) {
-  return generateLocalExport(graph, { type, scope: { kind: "whole_graph" } }, "Export Format Decision");
+  return generateLocalExport(graph, { type, scope: { kind: "group", id: seed.group.id } }, "Export Format Decision");
 }
 
 describe("local exports", () => {

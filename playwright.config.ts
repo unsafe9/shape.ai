@@ -4,6 +4,7 @@ export default defineConfig({
   testDir: "./tests",
   testMatch: /.*\.spec\.ts/,
   timeout: 30_000,
+  workers: 1,
   fullyParallel: false,
   use: {
     baseURL: "http://127.0.0.1:5174",
