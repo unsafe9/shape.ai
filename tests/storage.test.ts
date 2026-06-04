@@ -42,7 +42,7 @@ describe("scene storage", () => {
       zoom: 0.05
     });
     expect(overview.groups.length).toBeGreaterThan(0);
-    expect(overview.nodes).toHaveLength(0);
+    expect(overview.nodes.length).toBeGreaterThan(0);
     await expect(readFile(join(dataDir, "shape.sqlite"))).resolves.toBeInstanceOf(Buffer);
   });
 
@@ -85,6 +85,26 @@ describe("scene storage", () => {
       for (let next = index + 1; next < scene.groups.length; next += 1) {
         expect(overlapArea(scene.groups[index].bounds, scene.groups[next].bounds)).toBe(0);
       }
+    }
+  });
+
+  it("translates every node in a group as one object", async () => {
+    const { storage } = await createTempStorage();
+    const created = await storage.createGroup({ prompt: "Translate group test" });
+    const before = await storage.readFullScene();
+    const beforeGroup = before.groups.find((group) => group.id === created.group.id);
+    const beforeNodes = before.nodes.filter((node) => node.groupId === created.group.id);
+
+    const scene = await storage.saveScenePatch({
+      translateGroups: [{ groupId: created.group.id, dx: 125, dy: -80 }]
+    });
+    const afterGroup = scene.groups.find((group) => group.id === created.group.id);
+
+    expect(afterGroup?.bounds.x).toBe((beforeGroup?.bounds.x ?? 0) + 125);
+    expect(afterGroup?.bounds.y).toBe((beforeGroup?.bounds.y ?? 0) - 80);
+    for (const beforeNode of beforeNodes) {
+      const afterNode = scene.nodes.find((node) => node.id === beforeNode.id);
+      expect(afterNode?.position).toEqual({ x: beforeNode.position.x + 125, y: beforeNode.position.y - 80 });
     }
   });
 

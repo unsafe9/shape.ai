@@ -19,14 +19,14 @@ test("creates a group scene, tags it, edits a node, comments, copies, and export
   await expect(page.locator(".sidebar .tag-chip.is-active").filter({ hasText: tagName }).first()).toBeVisible();
 
   await page.getByRole("button", { name: "Create group" }).click();
-  await expect(page.locator(".decision-node").first()).toBeVisible();
+  await expect(page.locator(".scene-node.is-interactive .decision-node").first()).toBeVisible();
   await expect(page.locator(".group-tag-panel")).toHaveCount(0);
   await expect(page.locator(".scene-group-frame").filter({ hasText: tagName }).first()).toBeVisible();
   await page.getByRole("button", { name: "Open groups" }).click();
   await expect(page.locator(".selected-group-tags .tag-chip.is-attached").filter({ hasText: tagName }).first()).toBeVisible();
   await page.getByRole("button", { name: "Close groups" }).click();
 
-  const firstNode = page.locator(".decision-node").first();
+  const firstNode = page.locator(".scene-node.is-interactive .decision-node").first();
   await expect(firstNode.getByLabel("Node title")).toHaveCount(0);
 
   await firstNode.click();
@@ -58,9 +58,9 @@ test("creates a group scene, tags it, edits a node, comments, copies, and export
   await firstNode.click({ position: { x: 20, y: 20 }, modifiers: ["Alt"] });
   await expect(firstNode.getByLabel("Node title")).toBeVisible();
 
-  const nodeCount = await page.locator(".decision-node").count();
+  const nodeCount = await page.locator(".scene-node .decision-node").count();
   await firstNode.getByRole("button", { name: "Evidence" }).click();
-  await expect.poll(async () => page.locator(".decision-node").count()).toBeGreaterThan(nodeCount);
+  await expect.poll(async () => page.locator(".scene-node .decision-node").count()).toBeGreaterThan(nodeCount);
   await firstNode.click({ button: "right" });
   await expect(page.getByRole("menu")).toBeVisible();
   await page.getByRole("menuitem", { name: "Bring to front" }).click();
@@ -69,7 +69,7 @@ test("creates a group scene, tags it, edits a node, comments, copies, and export
   await page.getByRole("menuitem", { name: "Copy as Markdown" }).click();
   await firstNode.click({ button: "right" });
   await page.getByRole("menuitem", { name: "Paste copied node" }).click();
-  await expect.poll(async () => page.locator(".decision-node").count()).toBeGreaterThan(nodeCount + 1);
+  await expect.poll(async () => page.locator(".scene-node .decision-node").count()).toBeGreaterThan(nodeCount + 1);
 
   await page.keyboard.press("Escape");
   await expect(page.locator(".canvas-panel")).not.toHaveClass(/has-card-focus/);

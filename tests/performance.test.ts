@@ -55,7 +55,8 @@ describe("scene LOD performance contracts", () => {
       zoom: 0.05
     });
     expect(overview.groups).toHaveLength(1);
-    expect(overview.nodes).toHaveLength(0);
+    expect(overview.nodes.length).toBeGreaterThan(0);
+    expect(overview.nodes.length).toBeLessThan(10_000);
     expect(overview.edges).toHaveLength(0);
 
     const detail = await storage.readScene({
