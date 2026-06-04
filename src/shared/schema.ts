@@ -34,6 +34,9 @@ export const nodeStatusSchema = z.enum([
 ]);
 
 export const exportTypeSchema = z.enum([
+  "madr",
+  "yadr",
+  "image_prompt",
   "ai_plan_md",
   "design_doc_md",
   "confluence_html",

@@ -212,7 +212,8 @@ async function loadDesignOr404(id: string, reply: FastifyReply) {
 }
 
 function contentTypeFor(type: string): string {
-  if (type === "architecture_image") return "image/svg+xml";
+  if (type === "yadr") return "application/yaml; charset=utf-8";
+  if (type === "image_prompt" || type === "architecture_image") return "text/markdown; charset=utf-8";
   if (type === "confluence_html") return "text/html; charset=utf-8";
   if (type === "mermaid") return "text/plain; charset=utf-8";
   return "text/markdown; charset=utf-8";

@@ -31,11 +31,14 @@ export const edgeTypeLabels: Record<EdgeType, string> = {
 };
 
 export const exportTypeLabels: Record<ExportType, string> = {
+  madr: "MADR Markdown",
+  yadr: "YADR YAML",
+  image_prompt: "Image prompt",
   ai_plan_md: "AI task plan",
-  design_doc_md: "Design document",
+  design_doc_md: "MADR Markdown",
   confluence_html: "Confluence draft",
   mermaid: "Mermaid diagram",
-  architecture_image: "Architecture image"
+  architecture_image: "Image prompt"
 };
 
 export function applyGraphPatch(graph: DecisionGraph, patchInput: GraphPatch): DecisionGraph {
@@ -140,7 +143,7 @@ export function makeMermaid(graph: DecisionGraph): string {
   }
   for (const edge of graph.edges) {
     const label = edge.label || edgeTypeLabels[edge.type];
-    lines.push(`  ${safeMermaidId(edge.source)} -->|"${label.replace(/"/g, "'")}" ${safeMermaidId(edge.target)}`);
+    lines.push(`  ${safeMermaidId(edge.source)} -->|"${label.replace(/"/g, "'")}"| ${safeMermaidId(edge.target)}`);
   }
   return lines.join("\n");
 }

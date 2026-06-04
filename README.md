@@ -10,7 +10,7 @@ shape.ai is a design-decision workspace that agents can read, review, and extend
 - Represents each design as a typed decision graph with nodes for propositions, decision points, options, evidence, tradeoffs, blockers, subdecisions, tasks, and artifacts.
 - Supports graph editing in the Web UI: node dragging, layout persistence, node and edge inspection, inline field edits, connected-node creation, edge creation, and deletion.
 - Stores comments on the whole graph, a selected node, or a selected edge.
-- Exports the whole graph or selected subgraph as deterministic local artifacts: AI task plan Markdown, human design doc Markdown, Confluence HTML, Mermaid, and an architecture image SVG.
+- Exports the whole graph or selected subgraph as deterministic local artifacts: MADR Markdown, YADR YAML, Mermaid, and image-generation prompts.
 - Exposes MCP tools so AI agents can list/read designs, propose graph changes, validate diffs, leave review comments, approve/reject proposals, and export designs.
 
 ## Local Development
@@ -85,11 +85,10 @@ The compatibility tools `create_design`, `save_layout`, `set_selection`, `add_co
 
 Exports are generated locally and deterministically from the stored graph:
 
-- `ai_task_plan`: Markdown task plan for agents.
-- `human_design_doc`: Markdown design document for human review.
-- `confluence_html`: Confluence-ready HTML.
+- `madr`: Markdown Architectural Decision Record, based on the `adr/madr` template.
+- `yadr`: YAML Architectural Decision Record, based on the `adr/yadr` template.
 - `mermaid`: Mermaid flowchart text.
-- `architecture_image`: SVG architecture image.
+- `image_prompt`: Prompt text for an MCP client with its own image-generation capability.
 
 Exports can target the whole graph, a selected node subgraph, or a selected edge subgraph.
 

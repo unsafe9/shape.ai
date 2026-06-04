@@ -47,7 +47,7 @@ test("creates a design graph, comments on a node, and exports markdown", async (
 
   await page.keyboard.press("Escape");
   await expect(page.locator(".canvas-panel")).not.toHaveClass(/has-card-focus/);
-  await page.getByRole("button", { name: "AI task plan" }).click();
+  await page.getByRole("button", { name: "MADR Markdown" }).click();
   await expect(page.getByText(/Export created:/)).toBeVisible();
   await expect(page.locator(".artifact-strip a").first()).toBeVisible();
 });

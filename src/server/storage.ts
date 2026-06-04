@@ -1042,8 +1042,8 @@ function numberValue(row: SqlRow, key: string): number {
 }
 
 function extensionFor(type: ExportType, contentType: string): string {
-  if (type === "architecture_image" && contentType === "image/png") return ".png";
-  if (type === "architecture_image") return ".svg";
+  if (type === "yadr") return ".yaml";
+  if (type === "image_prompt" || type === "architecture_image") return ".md";
   if (type === "confluence_html") return ".html";
   if (type === "mermaid") return ".mmd";
   if (contentType.includes("html")) return ".html";

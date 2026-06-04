@@ -356,7 +356,7 @@ export function createShapeMcpServer(): McpServer {
         path: persisted.path,
         contentType: persisted.contentType
       });
-      return jsonResponse({ design: updated, artifact: updated.artifacts[0] });
+      return jsonResponse({ design: updated, artifact: updated.artifacts[0], imagePrompt: generated.imagePrompt });
     }
   );
 
@@ -372,7 +372,8 @@ async function readDesignOrThrow(designId: string) {
 }
 
 function contentTypeFor(type: string): string {
-  if (type === "architecture_image") return "image/svg+xml";
+  if (type === "yadr") return "application/yaml; charset=utf-8";
+  if (type === "image_prompt" || type === "architecture_image") return "text/markdown; charset=utf-8";
   if (type === "confluence_html") return "text/html; charset=utf-8";
   if (type === "mermaid") return "text/plain; charset=utf-8";
   return "text/markdown; charset=utf-8";

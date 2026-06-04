@@ -64,6 +64,6 @@ describe("graph helpers", () => {
 
   it("exports valid mermaid flowchart syntax", () => {
     expect(makeMermaid(graph)).toContain("flowchart LR");
-    expect(makeMermaid(graph)).toContain('a -->|"supports" b');
+    expect(makeMermaid(graph)).toContain('a -->|"supports"| b');
   });
 });
