@@ -1,0 +1,6 @@
+dist/
+dist-server/
+node_modules/
+.local/
+test-results/
+playwright-report/
