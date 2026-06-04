@@ -4,27 +4,49 @@ test("creates a design graph, comments on a node, and exports markdown", async (
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "shape.ai" })).toBeVisible();
+  await page.getByRole("button", { name: "Toggle designs" }).click();
   await page.getByRole("button", { name: "Create design" }).click();
   await expect(page.locator(".decision-node").first()).toBeVisible();
 
-  await page.locator(".decision-node").first().click();
-  await expect(page.getByRole("heading", { name: "Inspector" })).toBeVisible();
-  await expect(page.getByRole("textbox", { name: "Title" })).toBeVisible();
+  const firstNode = page.locator(".decision-node").first();
+  await expect(firstNode.getByLabel("Node title")).toHaveCount(0);
 
-  await page.getByRole("textbox", { name: "Title" }).fill("Edited decision node");
-  await page.getByRole("textbox", { name: "Summary" }).click();
-  await expect(page.getByRole("textbox", { name: "Title" })).toHaveValue("Edited decision node");
+  await firstNode.click({ position: { x: 12, y: 12 } });
+  await expect(firstNode).toHaveClass(/is-selected/);
+  await expect(firstNode.locator(".node-note-scroll")).toBeVisible();
+  await expect(firstNode.getByRole("button", { name: "Edit" })).toBeVisible();
+  await expect(firstNode.getByLabel("Node title")).toHaveCount(0);
+  await expect
+    .poll(async () => firstNode.locator(".node-note-scroll").evaluate((element) => getComputedStyle(element).overflowY))
+    .toBe("auto");
 
-  await page.getByRole("button", { name: "Evidence" }).click();
-  await expect(page.locator(".canvas-header").getByText("11 nodes")).toBeVisible();
+  await page.keyboard.press("e");
+  await expect(firstNode.getByLabel("Node title")).toBeVisible();
+  await expect(firstNode.getByLabel("Type")).toBeVisible();
+
+  await firstNode.getByLabel("Node title").fill("Edited decision node");
+  await firstNode.getByLabel("Node summary").click();
+  await expect(firstNode.getByLabel("Node title")).toHaveValue("Edited decision node");
 
   await page.getByPlaceholder("Leave a question").fill("Needs a sharper blocker explanation.");
   await page.getByRole("button", { name: "Add comment" }).click();
-  await expect(page.locator(".comment-row").getByText("Needs a sharper blocker explanation.")).toBeVisible();
+  await expect(firstNode.locator(".node-comment-row").getByText("Needs a sharper blocker explanation.")).toBeVisible();
 
-  await page.locator(".comment-row").click();
-  await expect(page.locator(".comment-row.is-resolved")).toBeVisible();
+  await firstNode.locator(".node-comment-row").click();
+  await expect(firstNode.locator(".node-comment-row.is-resolved")).toBeVisible();
 
+  await firstNode.getByRole("button", { name: "Done" }).click();
+  await expect(firstNode.getByLabel("Node title")).toHaveCount(0);
+  await firstNode.click({ position: { x: 20, y: 20 }, modifiers: ["Alt"] });
+  await expect(firstNode.getByLabel("Node title")).toBeVisible();
+
+  await firstNode.getByRole("button", { name: "Evidence" }).click();
+  await expect(page.locator(".decision-node")).toHaveCount(11);
+  await expect(page.locator(".floating-inspector")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Toggle comments and details" })).toHaveCount(0);
+
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".canvas-panel")).not.toHaveClass(/has-card-focus/);
   await page.getByRole("button", { name: "AI task plan" }).click();
   await expect(page.getByText(/Export created:/)).toBeVisible();
   await expect(page.locator(".artifact-strip a").first()).toBeVisible();

@@ -1,11 +1,24 @@
 import { MarkerType, type Edge, type Node } from "@xyflow/react";
 import { edgeTypeLabels } from "../../shared/graph";
 import type { DecisionGraph, GraphComment, GraphEdge, GraphLayout, GraphNode } from "../../shared/schema";
+import type { NodeType } from "../../shared/schema";
 
 export type StudioNodeData = {
   node: GraphNode;
   selected: boolean;
+  editing: boolean;
   commentCount: number;
+  comments: GraphComment[];
+  commentValue: string;
+  busy: boolean;
+  onUpdateNode?: (node: GraphNode) => void;
+  onCommentChange?: (value: string) => void;
+  onAddComment?: () => void;
+  onToggleComment?: (comment: GraphComment) => void;
+  onAddLinkedNode?: (type: NodeType) => void;
+  onDeleteNode?: () => void;
+  onStartEdit?: (nodeId: string) => void;
+  onStopEdit?: () => void;
 };
 
 const columns: Record<GraphNode["type"], number> = {
@@ -34,7 +47,18 @@ export function graphToFlow(
   graph: DecisionGraph,
   layout: GraphLayout | undefined,
   selectedId?: string,
-  comments: GraphComment[] = []
+  editingId?: string | null,
+  comments: GraphComment[] = [],
+  onUpdateNode?: (node: GraphNode) => void,
+  commentValue = "",
+  busy = false,
+  onCommentChange?: (value: string) => void,
+  onAddComment?: () => void,
+  onToggleComment?: (comment: GraphComment) => void,
+  onAddLinkedNode?: (type: NodeType) => void,
+  onDeleteNode?: () => void,
+  onStartEdit?: (nodeId: string) => void,
+  onStopEdit?: () => void
 ): { nodes: Node<StudioNodeData>[]; edges: Edge[] } {
   const groups = new Map<number, GraphNode[]>();
   for (const node of graph.nodes) {
@@ -45,9 +69,11 @@ export function graphToFlow(
   const nodes: Node<StudioNodeData>[] = graph.nodes.map((node) => {
     const column = columns[node.type];
     const index = groups.get(column)?.findIndex((candidate) => candidate.id === node.id) ?? 0;
+    const nodeComments = comments.filter((comment) => comment.target.kind === "node" && comment.target.id === node.id);
     return {
       id: node.id,
       type: "studio",
+      selected: selectedId === node.id,
       position: layout?.nodePositions[node.id] ?? {
         x: 34 + column * 250,
         y: 48 + index * 126 + (column % 2) * 26
@@ -55,7 +81,19 @@ export function graphToFlow(
       data: {
         node,
         selected: selectedId === node.id,
-        commentCount: comments.filter((comment) => !comment.resolved && comment.target.kind === "node" && comment.target.id === node.id).length
+        editing: editingId === node.id,
+        commentCount: nodeComments.filter((comment) => !comment.resolved).length,
+        comments: nodeComments,
+        commentValue,
+        busy,
+        onUpdateNode,
+        onCommentChange,
+        onAddComment,
+        onToggleComment,
+        onAddLinkedNode,
+        onDeleteNode,
+        onStartEdit,
+        onStopEdit
       }
     };
   });

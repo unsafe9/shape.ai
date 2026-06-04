@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { MouseEvent } from "react";
-import { Background, Controls, ReactFlow, type Connection, type Edge, type Node } from "@xyflow/react";
+import { Background, Controls, ReactFlow, type Connection, type Edge, type Node, type ReactFlowInstance } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { BrainCircuit, Loader2, Plug, RefreshCw } from "lucide-react";
+import { BrainCircuit, Loader2, PanelLeft, Plug, RefreshCw } from "lucide-react";
 import {
   createComment,
   createDesign,
@@ -17,7 +17,6 @@ import { graphToFlow, type StudioNodeData } from "./lib/flow";
 import { DecisionNode } from "./components/DecisionNode";
 import { Sidebar } from "./components/Sidebar";
 import { ExportDrawer } from "./components/ExportDrawer";
-import { Inspector } from "./components/Inspector";
 import type {
   DecisionGraph,
   Design,
@@ -33,6 +32,9 @@ import type {
 import "./styles.css";
 
 const nodeTypes = { studio: DecisionNode };
+const cardWidth = 390;
+const cardHeight = 390;
+const viewportEase = (t: number) => 1 - Math.pow(1 - t, 3);
 
 const seedPrompt =
   "Design an AI-assisted architecture decision tool that extracts propositions, decision points, options, evidence, blockers, tradeoffs, subdecisions, tasks, and exports.";
@@ -46,6 +48,9 @@ export default function App() {
   const [commentValue, setCommentValue] = useState("");
   const [status, setStatus] = useState("Ready");
   const [busy, setBusy] = useState(false);
+  const [designPanelOpen, setDesignPanelOpen] = useState(false);
+  const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [flowInstance, setFlowInstance] = useState<ReactFlowInstance<Node<StudioNodeData>, Edge> | null>(null);
 
   const flow = useMemo(() => {
     if (!activeDesign) return { nodes: [] as Node<StudioNodeData>[], edges: [] as Edge[] };
@@ -53,9 +58,20 @@ export default function App() {
       activeDesign.graph,
       activeDesign.layout,
       selection.kind === "graph" ? undefined : selection.id,
-      activeDesign.comments
+      editingNodeId,
+      activeDesign.comments,
+      updateNode,
+      commentValue,
+      busy || !activeDesign,
+      setCommentValue,
+      runAddComment,
+      toggleComment,
+      addLinkedNode,
+      deleteSelection,
+      setEditingNodeId,
+      () => setEditingNodeId(null)
     );
-  }, [activeDesign, selection]);
+  }, [activeDesign, selection, editingNodeId, commentValue, busy]);
 
   const refreshDesigns = useCallback(async () => {
     const [nextDesigns, nextRuntime] = await Promise.all([listDesigns(), getRuntime()]);
@@ -70,10 +86,50 @@ export default function App() {
     refreshDesigns().catch((error) => setStatus(error.message));
   }, []);
 
+  useEffect(() => {
+    if (selection.kind !== "node") {
+      setEditingNodeId(null);
+      return;
+    }
+    if (editingNodeId && editingNodeId !== selection.id) {
+      setEditingNodeId(null);
+    }
+  }, [selection, editingNodeId]);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      if (selection.kind !== "node") return;
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (editingNodeId) {
+          setEditingNodeId(null);
+          return;
+        }
+        resetViewport();
+        void selectGraphItem({ kind: "graph" });
+        return;
+      }
+
+      if (target && ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName)) return;
+
+      if (event.key.toLowerCase() === "e" && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault();
+        setEditingNodeId(selection.id);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selection, editingNodeId, flowInstance]);
+
   async function runCreate() {
     await withBusy("Creating design", async () => {
       const response = await createDesign(prompt);
       updateDesign(response.design);
+      setDesignPanelOpen(false);
+      setEditingNodeId(null);
       setCommentValue("");
       setStatus(response.message);
     });
@@ -143,6 +199,9 @@ export default function App() {
   async function selectGraphItem(nextSelection: GraphSelection) {
     if (!activeDesign) return;
     const valid = validSelection(activeDesign, nextSelection);
+    if (valid.kind !== "node") {
+      setEditingNodeId(null);
+    }
     setSelection(valid);
     setActiveDesign({ ...activeDesign, selection: valid });
     try {
@@ -158,15 +217,6 @@ export default function App() {
     const graph = {
       ...activeDesign.graph,
       nodes: activeDesign.graph.nodes.map((candidate) => (candidate.id === node.id ? node : candidate))
-    };
-    void saveGraph(graph);
-  }
-
-  function updateEdge(edge: GraphEdge) {
-    if (!activeDesign) return;
-    const graph = {
-      ...activeDesign.graph,
-      edges: activeDesign.graph.edges.map((candidate) => (candidate.id === edge.id ? edge : candidate))
     };
     void saveGraph(graph);
   }
@@ -261,6 +311,40 @@ export default function App() {
     });
   }
 
+  function focusNode(node: Node) {
+    void flowInstance?.setCenter(node.position.x + cardWidth / 2, node.position.y + cardHeight / 2, {
+      zoom: 1,
+      duration: 620,
+      ease: viewportEase,
+      interpolate: "smooth"
+    });
+  }
+
+  function focusEdge(edge: Edge) {
+    const source = flow.nodes.find((node) => node.id === edge.source);
+    const target = flow.nodes.find((node) => node.id === edge.target);
+    if (!source || !target) return;
+    void flowInstance?.setCenter(
+      (source.position.x + target.position.x + cardWidth) / 2,
+      (source.position.y + target.position.y + cardHeight) / 2,
+      {
+        zoom: 0.88,
+        duration: 620,
+        ease: viewportEase,
+        interpolate: "smooth"
+      }
+    );
+  }
+
+  function resetViewport() {
+    void flowInstance?.fitView({
+      padding: 0.24,
+      duration: 620,
+      ease: viewportEase,
+      interpolate: "smooth"
+    });
+  }
+
   async function withBusy(label: string, action: () => Promise<void>) {
     setBusy(true);
     setStatus(label);
@@ -276,15 +360,16 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="brand">
-          <BrainCircuit size={24} />
-          <div>
-            <h1>shape.ai</h1>
-            <p>Visual decision design for humans and AI agents.</p>
+      <main className="studio-stage">
+        <header className="floating-commandbar">
+          <div className="brand">
+            <BrainCircuit size={24} />
+            <div>
+              <h1>shape.ai</h1>
+              <p>Visual decision design for humans and AI agents.</p>
+            </div>
           </div>
-        </div>
-        <div className="topbar-actions">
+          <div className="command-separator" />
           <div className="runtime-chip is-configured">
             <Plug size={14} />
             {runtime ? `${runtime.mcp.transport} MCP` : "MCP"}
@@ -297,25 +382,19 @@ export default function App() {
             {busy ? <Loader2 className="spin" size={15} /> : null}
             {status}
           </div>
+        </header>
+
+        <div className="floating-view-controls" aria-label="Workspace panels">
+          <button
+            className={`icon-button ${designPanelOpen ? "is-active" : ""}`}
+            onClick={() => setDesignPanelOpen((open) => !open)}
+            aria-label="Toggle designs"
+          >
+            <PanelLeft size={16} />
+          </button>
         </div>
-      </header>
 
-      <main className="studio-grid">
-        <Sidebar
-          designs={designs}
-          activeDesignId={activeDesign?.id}
-          prompt={prompt}
-          busy={busy}
-          onPromptChange={setPrompt}
-          onCreate={runCreate}
-          onSelect={(design) => {
-            setActiveDesign(design);
-            setSelection(validSelection(design, design.selection));
-          }}
-          onRefresh={() => refreshDesigns().catch((error) => setStatus(error.message))}
-        />
-
-        <section className="canvas-panel">
+        <section className={`canvas-panel ${selection.kind === "node" ? "has-card-focus" : ""}`}>
           <div className="canvas-header">
             <div>
               <h2>{activeDesign?.title ?? "No design selected"}</h2>
@@ -329,15 +408,35 @@ export default function App() {
                 edges={flow.edges}
                 nodeTypes={nodeTypes}
                 fitView
+                fitViewOptions={{ padding: 0.24, duration: 500, ease: viewportEase, interpolate: "smooth" }}
                 minZoom={0.18}
                 maxZoom={1.35}
-                onNodeClick={(_event: MouseEvent, node: Node) => void selectGraphItem({ kind: "node", id: node.id })}
-                onEdgeClick={(_event: MouseEvent, edge: Edge) => void selectGraphItem({ kind: "edge", id: edge.id })}
+                panOnDrag
+                selectionOnDrag={false}
+                onInit={setFlowInstance}
+                onNodeClick={(event: MouseEvent, node: Node) => {
+                  focusNode(node);
+                  if (event.altKey) {
+                    setEditingNodeId(node.id);
+                  } else if (editingNodeId && editingNodeId !== node.id) {
+                    setEditingNodeId(null);
+                  }
+                  void selectGraphItem({ kind: "node", id: node.id });
+                }}
+                onEdgeClick={(_event: MouseEvent, edge: Edge) => {
+                  setEditingNodeId(null);
+                  focusEdge(edge);
+                  void selectGraphItem({ kind: "edge", id: edge.id });
+                }}
                 onNodeDragStop={(_event, node) => moveNode(node)}
                 onConnect={connectNodes}
-                onPaneClick={() => void selectGraphItem({ kind: "graph" })}
+                onPaneClick={() => {
+                  setEditingNodeId(null);
+                  resetViewport();
+                  void selectGraphItem({ kind: "graph" });
+                }}
               >
-                <Background color="#ccd8d2" gap={24} />
+                <Background color="#d6dde2" gap={26} />
                 <Controls position="bottom-left" />
               </ReactFlow>
             ) : (
@@ -347,6 +446,25 @@ export default function App() {
               </div>
             )}
           </div>
+
+          <div className={`floating-designs ${designPanelOpen ? "is-open" : "is-closed"}`}>
+            <Sidebar
+              designs={designs}
+              activeDesignId={activeDesign?.id}
+              prompt={prompt}
+              busy={busy}
+              onPromptChange={setPrompt}
+              onCreate={runCreate}
+              onSelect={(design) => {
+                setActiveDesign(design);
+                setSelection(validSelection(design, design.selection));
+                setEditingNodeId(null);
+                setDesignPanelOpen(false);
+              }}
+              onRefresh={() => refreshDesigns().catch((error) => setStatus(error.message))}
+            />
+          </div>
+
           <ExportDrawer
             artifacts={activeDesign?.artifacts ?? []}
             busy={busy}
@@ -354,21 +472,6 @@ export default function App() {
             onExport={runExport}
           />
         </section>
-
-        <Inspector
-          graph={activeDesign?.graph ?? { version: 1, nodes: [], edges: [] }}
-          selection={selection}
-          comments={activeDesign?.comments ?? []}
-          commentValue={commentValue}
-          busy={busy || !activeDesign}
-          onCommentChange={setCommentValue}
-          onAddComment={runAddComment}
-          onToggleComment={toggleComment}
-          onUpdateNode={updateNode}
-          onUpdateEdge={updateEdge}
-          onDeleteSelection={deleteSelection}
-          onAddLinkedNode={addLinkedNode}
-        />
       </main>
     </div>
   );
