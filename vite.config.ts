@@ -1,8 +1,8 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
-const clientPort = Number(process.env.CHARRETTE_CLIENT_PORT ?? 5173);
-const apiPort = Number(process.env.CHARRETTE_PORT ?? 8787);
+const clientPort = Number(process.env.SHAPE_AI_CLIENT_PORT ?? 5173);
+const apiPort = Number(process.env.SHAPE_AI_PORT ?? 8787);
 
 export default defineConfig({
   plugins: [react()],

@@ -11,13 +11,13 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: "CHARRETTE_PORT=8788 npm run dev:server",
+      command: "SHAPE_AI_PORT=8788 npm run dev:server",
       url: "http://127.0.0.1:8788/api/health",
       reuseExistingServer: false,
       timeout: 30_000
     },
     {
-      command: "CHARRETTE_CLIENT_PORT=5174 CHARRETTE_PORT=8788 npm run dev:client",
+      command: "SHAPE_AI_CLIENT_PORT=5174 SHAPE_AI_PORT=8788 npm run dev:client",
       url: "http://127.0.0.1:5174",
       reuseExistingServer: false,
       timeout: 30_000

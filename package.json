@@ -1,5 +1,5 @@
 {
-  "name": "charrette",
+  "name": "shape.ai",
   "version": "0.1.0",
   "description": "A local design-decision workspace that agents can read, edit, and extend through MCP.",
   "private": true,

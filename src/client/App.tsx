@@ -280,7 +280,7 @@ export default function App() {
         <div className="brand">
           <BrainCircuit size={24} />
           <div>
-            <h1>Charrette</h1>
+            <h1>shape.ai</h1>
             <p>Visual decision design for humans and AI agents.</p>
           </div>
         </div>

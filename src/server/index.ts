@@ -26,8 +26,8 @@ import {
   writeArtifactContent
 } from "./storage";
 
-const port = Number(process.env.CHARRETTE_PORT ?? 8787);
-const host = process.env.CHARRETTE_HOST ?? "127.0.0.1";
+const port = Number(process.env.SHAPE_AI_PORT ?? 8787);
+const host = process.env.SHAPE_AI_HOST ?? "127.0.0.1";
 
 export async function buildServer() {
   const app = Fastify({

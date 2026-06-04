@@ -16,8 +16,8 @@ const __filename = fileURLToPath(import.meta.url);
 const appRoot = resolve(dirname(__filename), "../..");
 const repoRoot = resolve(appRoot, "../..");
 
-export const REPO_ROOT = resolve(process.env.CHARRETTE_REPO_ROOT ?? repoRoot);
-export const DATA_ROOT = resolve(process.env.CHARRETTE_DATA_DIR ?? join(appRoot, ".local"));
+export const REPO_ROOT = resolve(process.env.SHAPE_AI_REPO_ROOT ?? repoRoot);
+export const DATA_ROOT = resolve(process.env.SHAPE_AI_DATA_DIR ?? join(appRoot, ".local"));
 export const DESIGNS_DIR = join(DATA_ROOT, "designs");
 export const EXPORTS_DIR = join(DATA_ROOT, "exports");
 

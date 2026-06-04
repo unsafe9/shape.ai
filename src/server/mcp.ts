@@ -24,14 +24,14 @@ import {
 } from "./storage";
 
 const server = new McpServer({
-  name: "charrette",
+  name: "shape.ai",
   version: "0.1.0"
 });
 
 server.registerTool(
   "list_designs",
   {
-    description: "List local Charrette designs with graph, selection, comment, and export counts.",
+    description: "List local shape.ai designs with graph, selection, comment, and export counts.",
     inputSchema: {}
   },
   async () => {
@@ -255,7 +255,7 @@ async function main() {
   await ensureStorage();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Charrette MCP server running on stdio");
+  console.error("shape.ai MCP server running on stdio");
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
