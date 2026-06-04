@@ -12,10 +12,10 @@ test("creates a shape graph, comments on a node, and exports markdown", async ({
   const firstNode = page.locator(".decision-node").first();
   await expect(firstNode.getByLabel("Node title")).toHaveCount(0);
 
-  await firstNode.click({ position: { x: 12, y: 12 } });
+  await firstNode.click();
   await expect(firstNode).toHaveClass(/is-selected/);
   await expect(firstNode.locator(".node-note-scroll")).toBeVisible();
-  await expect(firstNode.getByRole("button", { name: "Edit" })).toBeVisible();
+  await expect(firstNode.getByRole("button", { name: "Edit node" })).toBeVisible();
   await expect(firstNode.getByLabel("Node title")).toHaveCount(0);
   await expect
     .poll(async () => firstNode.locator(".node-note-scroll").evaluate((element) => getComputedStyle(element).overflowY))

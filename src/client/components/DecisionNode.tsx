@@ -1,5 +1,6 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { useEffect, useRef, type KeyboardEvent, type PointerEvent, type WheelEvent } from "react";
+import { Pencil } from "lucide-react";
 import { nodeTypeLabels } from "../../shared/graph";
 import type { GraphNode } from "../../shared/schema";
 import type { StudioNodeData } from "../lib/flow";
@@ -8,7 +9,7 @@ import { NodeReadNote } from "./node/NodeReadNote";
 
 export function DecisionNode({ data }: NodeProps) {
   const nodeData = data as StudioNodeData;
-  const { node, selected, editing, commentCount } = nodeData;
+  const { node, selected, editing } = nodeData;
   const titleInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -54,13 +55,26 @@ export function DecisionNode({ data }: NodeProps) {
   }
 
   return (
-    <div className={`decision-node decision-node--${node.status} ${selected ? "is-selected" : ""} ${editing ? "is-editing" : ""}`}>
+    <div
+      className={`decision-node decision-node--${node.status} decision-node-type--${node.type} ${selected ? "is-selected" : ""} ${editing ? "is-editing" : ""}`}
+    >
       <Handle type="target" position={Position.Left} />
       <div className="node-head">
         <span className="node-type">{nodeTypeLabels[node.type]}</span>
-        <span className="node-confidence">
-          {commentCount > 0 ? `${commentCount} comments` : `${Math.round(node.confidence * 100)}%`}
-        </span>
+        {!editing ? (
+          <button
+            className="node-edit-icon nodrag nowheel"
+            aria-label="Edit node"
+            title="Edit node"
+            onPointerDown={stopNodeInteraction}
+            onClick={(event) => {
+              event.stopPropagation();
+              nodeData.onStartEdit?.(node.id);
+            }}
+          >
+            <Pencil size={13} />
+          </button>
+        ) : null}
       </div>
 
       {editing ? (
@@ -88,9 +102,7 @@ export function DecisionNode({ data }: NodeProps) {
           node={node}
           selected={selected}
           comments={nodeData.comments}
-          onStartEdit={() => nodeData.onStartEdit?.(node.id)}
           onWheel={stopWheel}
-          onPointerDown={stopNodeInteraction}
         />
       )}
 

@@ -7,7 +7,6 @@ export type StudioNodeData = {
   node: GraphNode;
   selected: boolean;
   editing: boolean;
-  commentCount: number;
   comments: GraphComment[];
   commentValue: string;
   busy: boolean;
@@ -82,7 +81,6 @@ export function graphToFlow(
         node,
         selected: selectedId === node.id,
         editing: editingId === node.id,
-        commentCount: nodeComments.filter((comment) => !comment.resolved).length,
         comments: nodeComments,
         commentValue,
         busy,
