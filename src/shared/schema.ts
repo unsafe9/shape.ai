@@ -79,7 +79,8 @@ export const graphLayoutSchema = z.object({
       x: z.number(),
       y: z.number()
     })
-  ).default({})
+  ).default({}),
+  nodeZOrder: z.record(z.string(), z.number()).default({})
 });
 
 export const graphSelectionSchema = z.discriminatedUnion("kind", [
@@ -117,7 +118,7 @@ export const designSchema = z.object({
   updatedAt: z.string().min(1),
   graphVersion: z.number().int().nonnegative().default(0),
   graph: decisionGraphSchema,
-  layout: graphLayoutSchema.default({ nodePositions: {} }),
+  layout: graphLayoutSchema.default({ nodePositions: {}, nodeZOrder: {} }),
   selection: graphSelectionSchema.default({ kind: "graph" }),
   comments: z.array(graphCommentSchema).default([]),
   artifacts: z.array(artifactSchema).default([])

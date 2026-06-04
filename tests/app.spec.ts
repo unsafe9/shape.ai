@@ -43,6 +43,15 @@ test("creates a shape graph, comments on a node, and exports markdown", async ({
 
   await firstNode.getByRole("button", { name: "Evidence" }).click();
   await expect(page.locator(".decision-node")).toHaveCount(11);
+  await firstNode.click({ button: "right" });
+  await expect(page.getByRole("menu")).toBeVisible();
+  await page.getByRole("menuitem", { name: "Bring to front" }).click();
+
+  await firstNode.click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Copy as Markdown" }).click();
+  await firstNode.click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Paste copied node" }).click();
+  await expect(page.locator(".decision-node")).toHaveCount(12);
   await expect(page.locator(".floating-inspector")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Toggle comments and details" })).toHaveCount(0);
 

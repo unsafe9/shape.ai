@@ -92,7 +92,7 @@ export async function createDesign(input: {
     updatedAt: now,
     graphVersion: 0,
     graph: input.graph,
-    layout: { nodePositions: {} },
+    layout: { nodePositions: {}, nodeZOrder: {} },
     selection: { kind: "graph" },
     comments: [],
     artifacts: []

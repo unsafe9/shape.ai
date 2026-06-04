@@ -69,13 +69,15 @@ export function graphToFlow(
     const column = columns[node.type];
     const index = groups.get(column)?.findIndex((candidate) => candidate.id === node.id) ?? 0;
     const nodeComments = comments.filter((comment) => comment.target.kind === "node" && comment.target.id === node.id);
+    const graphIndex = graph.nodes.findIndex((candidate) => candidate.id === node.id);
     return {
       id: node.id,
       type: "studio",
       selected: selectedId === node.id,
+      zIndex: layout?.nodeZOrder[node.id] ?? graphIndex,
       position: layout?.nodePositions[node.id] ?? {
-        x: 34 + column * 250,
-        y: 48 + index * 126 + (column % 2) * 26
+        x: 80 + column * 420,
+        y: 84 + index * 240 + (column % 2) * 80
       },
       data: {
         node,

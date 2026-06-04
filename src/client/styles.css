@@ -256,14 +256,6 @@ p {
   visibility: visible !important;
 }
 
-.react-flow__node.selected {
-  z-index: 20 !important;
-}
-
-.react-flow__node:has(.decision-node.is-selected) {
-  z-index: 20 !important;
-}
-
 .floating-shapes {
   top: 28px;
   left: 34px;
@@ -313,6 +305,72 @@ p {
   pointer-events: none;
   opacity: 0;
   transform: translateX(-50%) translateY(18px) scale(0.98);
+}
+
+.node-context-menu {
+  position: fixed;
+  z-index: 40;
+  width: 218px;
+  overflow: hidden;
+  padding: 7px;
+  border: 1px solid rgb(255 255 255 / 0.74);
+  border-radius: 15px;
+  background: rgb(255 255 255 / 0.86);
+  box-shadow: var(--shadow-deep);
+  backdrop-filter: var(--glass-blur);
+  transform: translate(4px, 4px);
+}
+
+.node-context-menu-title {
+  padding: 7px 9px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.24;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-context-menu button {
+  width: 100%;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  padding: 7px 9px;
+  font-size: 12px;
+  font-weight: 720;
+  text-align: left;
+}
+
+.node-context-menu button:hover:not(:disabled),
+.node-context-menu button:focus-visible {
+  background: rgb(235 243 251 / 0.92);
+  box-shadow: none;
+}
+
+.node-context-menu button:disabled {
+  opacity: 0.42;
+}
+
+.node-context-menu button svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.node-context-menu .danger-menu-item {
+  color: var(--bad);
+}
+
+.node-context-menu-separator {
+  height: 1px;
+  margin: 5px 7px;
+  background: var(--line);
 }
 
 .sidebar {
