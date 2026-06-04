@@ -2,16 +2,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { MouseEvent } from "react";
 import { Background, Controls, ReactFlow, type Connection, type Edge, type Node, type ReactFlowInstance } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { BrainCircuit, Loader2, PanelLeft, Plug, RefreshCw } from "lucide-react";
+import { BrainCircuit, Loader2, PanelLeft, X } from "lucide-react";
 import {
   createComment,
   createDesign,
   exportDesign,
-  getRuntime,
   listDesigns,
   saveGraphEdit,
   updateComment,
-  type RuntimeStatus
 } from "./lib/api";
 import { graphToFlow, type StudioNodeData } from "./lib/flow";
 import { DecisionNode } from "./components/DecisionNode";
@@ -42,7 +40,6 @@ const seedPrompt =
 export default function App() {
   const [designs, setDesigns] = useState<Design[]>([]);
   const [activeDesign, setActiveDesign] = useState<Design | null>(null);
-  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [prompt, setPrompt] = useState(seedPrompt);
   const [selection, setSelection] = useState<GraphSelection>({ kind: "graph" });
   const [commentValue, setCommentValue] = useState("");
@@ -74,10 +71,9 @@ export default function App() {
   }, [activeDesign, selection, editingNodeId, commentValue, busy]);
 
   const refreshDesigns = useCallback(async () => {
-    const [nextDesigns, nextRuntime] = await Promise.all([listDesigns(), getRuntime()]);
+    const nextDesigns = await listDesigns();
     const nextActive = activeDesign ? nextDesigns.find((design) => design.id === activeDesign.id) ?? activeDesign : nextDesigns[0] ?? null;
     setDesigns(nextDesigns);
-    setRuntime(nextRuntime);
     setActiveDesign(nextActive);
     setSelection(nextActive ? validSelection(nextActive, nextActive.selection) : { kind: "graph" });
   }, [activeDesign]);
@@ -361,47 +357,13 @@ export default function App() {
   return (
     <div className="app-shell">
       <main className="studio-stage">
-        <header className="floating-commandbar">
-          <div className="brand">
-            <BrainCircuit size={24} />
-            <div>
-              <h1>shape.ai</h1>
-              <p>Visual decision design for humans and AI agents.</p>
-            </div>
-          </div>
-          <div className="command-separator" />
-          <div className="runtime-chip is-configured">
-            <Plug size={14} />
-            {runtime ? `${runtime.mcp.remoteTransport ?? runtime.mcp.transport ?? "MCP"} MCP` : "MCP"}
-          </div>
-          <button className="secondary-button" disabled={busy} onClick={() => refreshDesigns().catch((error) => setStatus(error.message))}>
-            <RefreshCw size={15} />
-            Refresh
-          </button>
-          <div className="status-line">
-            {busy ? <Loader2 className="spin" size={15} /> : null}
-            {status}
-          </div>
-        </header>
-
-        <div className="floating-view-controls" aria-label="Workspace panels">
-          <button
-            className={`icon-button ${designPanelOpen ? "is-active" : ""}`}
-            onClick={() => setDesignPanelOpen((open) => !open)}
-            aria-label="Toggle designs"
-          >
-            <PanelLeft size={16} />
-          </button>
-        </div>
-
         <section className={`canvas-panel ${selection.kind === "node" ? "has-card-focus" : ""}`}>
-          <div className="canvas-header">
-            <div>
-              <h2>{activeDesign?.title ?? "No design selected"}</h2>
-              <p>{activeDesign ? `${activeDesign.graph.nodes.length} nodes, ${activeDesign.graph.edges.length} edges` : "Create a design to start."}</p>
-            </div>
-          </div>
           <div className="flow-wrap">
+            <div className="canvas-watermark" aria-hidden="true">
+              <BrainCircuit size={28} />
+              <span>shape.ai</span>
+            </div>
+
             {activeDesign ? (
               <ReactFlow
                 nodes={flow.nodes}
@@ -410,9 +372,13 @@ export default function App() {
                 fitView
                 fitViewOptions={{ padding: 0.24, duration: 500, ease: viewportEase, interpolate: "smooth" }}
                 minZoom={0.18}
-                maxZoom={1.35}
+                maxZoom={2.4}
                 panOnDrag
+                panOnScroll={false}
                 selectionOnDrag={false}
+                zoomOnDoubleClick
+                zoomOnPinch
+                zoomOnScroll
                 onInit={setFlowInstance}
                 onNodeClick={(event: MouseEvent, node: Node) => {
                   focusNode(node);
@@ -437,7 +403,7 @@ export default function App() {
                 }}
               >
                 <Background color="#d6dde2" gap={26} />
-                <Controls position="bottom-left" />
+                <Controls position="bottom-right" />
               </ReactFlow>
             ) : (
               <div className="empty-canvas">
@@ -448,22 +414,38 @@ export default function App() {
           </div>
 
           <div className={`floating-designs ${designPanelOpen ? "is-open" : "is-closed"}`}>
-            <Sidebar
-              designs={designs}
-              activeDesignId={activeDesign?.id}
-              prompt={prompt}
-              busy={busy}
-              onPromptChange={setPrompt}
-              onCreate={runCreate}
-              onSelect={(design) => {
-                setActiveDesign(design);
-                setSelection(validSelection(design, design.selection));
-                setEditingNodeId(null);
-                setDesignPanelOpen(false);
-              }}
-              onRefresh={() => refreshDesigns().catch((error) => setStatus(error.message))}
-            />
+            <button
+              className={`design-panel-toggle icon-button ${designPanelOpen ? "is-active" : ""}`}
+              onClick={() => setDesignPanelOpen((open) => !open)}
+              aria-label={designPanelOpen ? "Close designs" : "Open designs"}
+            >
+              {designPanelOpen ? <X size={16} /> : <PanelLeft size={16} />}
+            </button>
+            <div className="floating-designs-body">
+              <Sidebar
+                designs={designs}
+                activeDesignId={activeDesign?.id}
+                prompt={prompt}
+                busy={busy}
+                onPromptChange={setPrompt}
+                onCreate={runCreate}
+                onSelect={(design) => {
+                  setActiveDesign(design);
+                  setSelection(validSelection(design, design.selection));
+                  setEditingNodeId(null);
+                  setDesignPanelOpen(false);
+                }}
+                onRefresh={() => refreshDesigns().catch((error) => setStatus(error.message))}
+              />
+            </div>
           </div>
+
+          {busy || status !== "Ready" ? (
+            <div className="canvas-status" role="status">
+              {busy ? <Loader2 className="spin" size={15} /> : null}
+              {status}
+            </div>
+          ) : null}
 
           <ExportDrawer
             artifacts={activeDesign?.artifacts ?? []}

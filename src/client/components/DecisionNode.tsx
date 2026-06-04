@@ -22,6 +22,7 @@ export function DecisionNode({ data }: NodeProps) {
   }
 
   function stopWheel(event: WheelEvent<HTMLElement>) {
+    if (event.ctrlKey || event.metaKey) return;
     event.stopPropagation();
   }
 
