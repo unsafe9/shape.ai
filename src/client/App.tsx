@@ -16,6 +16,7 @@ import {
   edgeTypeLabels,
   expandedBounds,
   groupTags,
+  limitSceneNodesForLod,
   nodeBounds,
   nodeTypeLabels,
   shouldShowSceneEdges,
@@ -41,8 +42,10 @@ import type {
 } from "../shared/schema";
 import "./styles.css";
 
-const cardWidth = 390;
-const cardHeight = 390;
+const cardWidth = 270;
+const cardHeight = 178;
+const selectedCardWidth = 390;
+const selectedCardHeight = 390;
 const minZoom = 0.004;
 const maxZoom = 3.4;
 const detailZoom = 0.48;
@@ -64,7 +67,17 @@ type NodeMenuState = {
 
 type DragState =
   | { kind: "pan"; pointerId: number; startX: number; startY: number; camera: Camera }
-  | { kind: "node"; pointerId: number; nodeId: string; startX: number; startY: number; startPosition: { x: number; y: number } };
+  | { kind: "node"; pointerId: number; nodeId: string; startX: number; startY: number; startPosition: { x: number; y: number } }
+  | {
+      kind: "group";
+      pointerId: number;
+      groupId: string;
+      startX: number;
+      startY: number;
+      startBounds: Bounds;
+      startNodes: Array<{ id: string; position: { x: number; y: number } }>;
+      moved: boolean;
+    };
 
 export default function App() {
   const [scene, setScene] = useState<Scene | null>(null);
@@ -86,6 +99,7 @@ export default function App() {
   const [interacting, setInteracting] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
+  const suppressGroupClickRef = useRef(false);
   const interactionTimerRef = useRef<number | null>(null);
   const sceneRequestRef = useRef(0);
 
@@ -106,7 +120,8 @@ export default function App() {
     const nodeGroupIds = focusGroupId ? new Set([focusGroupId]) : groupIds;
     const nodeGroupCount = focusGroupId ? 1 : visibleGroups.length;
     const showNodes = shouldShowSceneNodes(camera.zoom, nodeGroupCount);
-    const nodes = showNodes ? scene.nodes.filter((node) => nodeGroupIds.has(node.groupId) && boundsIntersect(nodeBounds(node), padded)) : [];
+    const candidateNodes = showNodes ? scene.nodes.filter((node) => nodeGroupIds.has(node.groupId) && boundsIntersect(nodeBounds(node), padded)) : [];
+    const nodes = limitSceneNodesForLod(candidateNodes, camera.zoom, nodeGroupCount);
     const nodeIds = new Set(nodes.map((node) => node.id));
     const showEdges = shouldShowSceneEdges(camera.zoom, nodeGroupCount);
     const edges = showEdges ? scene.edges.filter((edge) => nodeGroupIds.has(edge.groupId) && nodeIds.has(edge.source) && nodeIds.has(edge.target)) : [];
@@ -137,6 +152,8 @@ export default function App() {
 
   useEffect(() => {
     const id = window.setTimeout(() => {
+      const drag = dragRef.current;
+      if (drag && (drag.kind === "node" || drag.kind === "group")) return;
       refreshScene().catch((error) => setStatus(error.message));
     }, 120);
     return () => window.clearTimeout(id);
@@ -469,8 +486,8 @@ export default function App() {
     const focusY = rect.width < 700 ? rect.height * 0.34 : rect.height / 2;
     setCamera({
       zoom,
-      x: rect.width / 2 - (node.position.x + node.size.width / 2) * zoom,
-      y: focusY - (node.position.y + node.size.height / 2) * zoom
+      x: rect.width / 2 - (node.position.x + selectedCardWidth / 2) * zoom,
+      y: focusY - (node.position.y + selectedCardHeight / 2) * zoom
     });
     markInteracting();
   }
@@ -543,6 +560,28 @@ export default function App() {
     markInteracting();
   }
 
+  function onGroupPointerDown(event: PointerEvent<HTMLButtonElement>, group: SceneGroup) {
+    if (event.button !== 0 || !scene) return;
+    event.stopPropagation();
+    setNodeMenu(null);
+    setCurrentGroupId(group.id);
+    setSelection({ kind: "group", id: group.id });
+    dragRef.current = {
+      kind: "group",
+      pointerId: event.pointerId,
+      groupId: group.id,
+      startX: event.clientX,
+      startY: event.clientY,
+      startBounds: group.bounds,
+      startNodes: scene.nodes
+        .filter((node) => node.groupId === group.id)
+        .map((node) => ({ id: node.id, position: node.position })),
+      moved: false
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    markInteracting();
+  }
+
   function onPointerMove(event: PointerEvent<HTMLDivElement>) {
     const drag = dragRef.current;
     if (!drag) return;
@@ -552,6 +591,39 @@ export default function App() {
       return;
     }
     if (!scene) return;
+    if (drag.kind === "group") {
+      const dx = (event.clientX - drag.startX) / camera.zoom;
+      const dy = (event.clientY - drag.startY) / camera.zoom;
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 3) {
+        drag.moved = true;
+        suppressGroupClickRef.current = true;
+      }
+      const startNodePositions = new Map(drag.startNodes.map((node) => [node.id, node.position]));
+      const now = new Date().toISOString();
+      setScene({
+        ...scene,
+        groups: scene.groups.map((group) =>
+          group.id === drag.groupId
+            ? {
+                ...group,
+                bounds: { ...drag.startBounds, x: drag.startBounds.x + dx, y: drag.startBounds.y + dy },
+                updatedAt: now
+              }
+            : group
+        ),
+        nodes: scene.nodes.map((node) => {
+          const startPosition = startNodePositions.get(node.id);
+          return startPosition
+            ? {
+                ...node,
+                position: { x: startPosition.x + dx, y: startPosition.y + dy },
+                updatedAt: now
+              }
+            : node;
+        })
+      });
+      return;
+    }
     const node = scene.nodes.find((candidate) => candidate.id === drag.nodeId);
     if (!node) return;
     const nextNode = {
@@ -572,6 +644,20 @@ export default function App() {
     if (drag.kind === "node" && scene) {
       const node = scene.nodes.find((candidate) => candidate.id === drag.nodeId);
       if (node) void saveScenePatch({ nodes: [node] }).then((response) => setScene(response.scene));
+    }
+    if (drag.kind === "group" && drag.moved) {
+      void saveScenePatch({
+        translateGroups: [
+          {
+            groupId: drag.groupId,
+            dx: (event.clientX - drag.startX) / camera.zoom,
+            dy: (event.clientY - drag.startY) / camera.zoom
+          }
+        ]
+      }).then((response) => setScene(response.scene));
+      window.setTimeout(() => {
+        suppressGroupClickRef.current = false;
+      }, 0);
     }
     try {
       event.currentTarget.releasePointerCapture(drag.pointerId);
@@ -666,7 +752,7 @@ export default function App() {
                       edge={edge}
                       nodes={scene.nodes}
                       selected={selection.kind === "edge" && selection.id === edge.id}
-                      fullNodeIds={fullNodeIds}
+                      selectedNodeId={selection.kind === "node" ? selection.id : undefined}
                       zoom={camera.zoom}
                       onClick={() => {
                         setNodeMenu(null);
@@ -683,7 +769,12 @@ export default function App() {
                     tags={groupTags(group, scene.tags)}
                     selected={selection.kind === "group" && selection.id === group.id}
                     zoom={camera.zoom}
+                    onPointerDown={(event) => onGroupPointerDown(event, group)}
                     onClick={() => {
+                      if (suppressGroupClickRef.current) {
+                        suppressGroupClickRef.current = false;
+                        return;
+                      }
                       setNodeMenu(null);
                       setCurrentGroupId(group.id);
                       focusGroup(group, groupFocusZoom(group));
@@ -695,11 +786,11 @@ export default function App() {
 
                 {visible.nodes.map((node) => {
                   const selected = selection.kind === "node" && selection.id === node.id;
-                  const renderFull = fullNodeIds.has(node.id);
+                  const renderInteractive = fullNodeIds.has(node.id) || selected || editingNodeId === node.id;
                   return (
                     <div
                       key={node.id}
-                      className={`scene-node ${renderFull ? "is-full" : "is-compact"} ${selected ? "is-selected" : ""}`}
+                      className={`scene-node ${renderInteractive ? "is-interactive" : "is-preview"} ${selected ? "is-selected" : ""}`}
                       style={{
                         transform: `translate3d(${node.position.x}px, ${node.position.y}px, 0)`,
                         zIndex: node.zIndex
@@ -721,7 +812,7 @@ export default function App() {
                         void selectSceneItem({ kind: "node", id: node.id });
                       }}
                     >
-                      {renderFull ? (
+                      {renderInteractive ? (
                         <DecisionNode
                           data={{
                             node,
@@ -741,7 +832,7 @@ export default function App() {
                           }}
                         />
                       ) : (
-                        <CompactNode node={node} selected={selected} />
+                        <NodePreviewCard node={node} />
                       )}
                     </div>
                   );
@@ -866,22 +957,22 @@ function SceneEdgeLine({
   edge,
   nodes,
   selected,
-  fullNodeIds,
+  selectedNodeId,
   zoom,
   onClick
 }: {
   edge: SceneEdge;
   nodes: SceneNode[];
   selected: boolean;
-  fullNodeIds: Set<string>;
+  selectedNodeId?: string;
   zoom: number;
   onClick: () => void;
 }) {
   const source = nodes.find((node) => node.id === edge.source);
   const target = nodes.find((node) => node.id === edge.target);
   if (!source || !target) return null;
-  const sourceSize = visualNodeSize(source, fullNodeIds, zoom);
-  const targetSize = visualNodeSize(target, fullNodeIds, zoom);
+  const sourceSize = visualNodeSize(source, selectedNodeId);
+  const targetSize = visualNodeSize(target, selectedNodeId);
   const sourceCenter = { x: source.position.x + sourceSize.width / 2, y: source.position.y + sourceSize.height / 2 };
   const targetCenter = { x: target.position.x + targetSize.width / 2, y: target.position.y + targetSize.height / 2 };
   const leftToRight = sourceCenter.x <= targetCenter.x;
@@ -908,9 +999,9 @@ function SceneEdgeLine({
   );
 }
 
-function visualNodeSize(node: SceneNode, fullNodeIds: Set<string>, zoom: number): { width: number; height: number } {
-  if (zoom >= detailZoom && fullNodeIds.has(node.id)) return node.size;
-  return { width: 320, height: 140 };
+function visualNodeSize(node: SceneNode, selectedNodeId?: string): { width: number; height: number } {
+  if (node.id === selectedNodeId) return { width: selectedCardWidth, height: selectedCardHeight };
+  return { width: cardWidth, height: cardHeight };
 }
 
 function GroupFrame({
@@ -918,6 +1009,7 @@ function GroupFrame({
   tags,
   selected,
   zoom,
+  onPointerDown,
   onClick,
   onDoubleClick
 }: {
@@ -925,6 +1017,7 @@ function GroupFrame({
   tags: Tag[];
   selected: boolean;
   zoom: number;
+  onPointerDown: (event: PointerEvent<HTMLButtonElement>) => void;
   onClick: () => void;
   onDoubleClick: () => void;
 }) {
@@ -938,6 +1031,7 @@ function GroupFrame({
         height: group.bounds.height,
         "--group-color": color
       } as CSSProperties}
+      onPointerDown={onPointerDown}
       onClick={(event) => {
         event.stopPropagation();
         onClick();
@@ -953,11 +1047,17 @@ function GroupFrame({
   );
 }
 
-function CompactNode({ node, selected }: { node: SceneNode; selected: boolean }) {
+function NodePreviewCard({ node }: { node: SceneNode }) {
   return (
-    <div className={`compact-node compact-node--${node.type} ${selected ? "is-selected" : ""}`}>
-      <span>{nodeTypeLabels[node.type]}</span>
-      <strong>{node.title}</strong>
+    <div className={`decision-node decision-node--${node.status} decision-node-type--${node.type} is-lod-preview`}>
+      <div className="node-head">
+        <span className="node-type">{nodeTypeLabels[node.type]}</span>
+      </div>
+      <article className="node-note-scroll is-preview">
+        <h3 className="node-note-title">{node.title}</h3>
+        <p className="node-note-summary">{node.summary}</p>
+        {node.detail ? <p className="node-note-detail">{node.detail}</p> : null}
+      </article>
     </div>
   );
 }

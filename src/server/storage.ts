@@ -39,7 +39,7 @@ import {
   type Tag,
   type UpdateTagRequest
 } from "../shared/schema";
-import { boundsIntersect, expandedBounds, nodeBounds, shouldShowSceneEdges, shouldShowSceneNodes } from "../shared/graph";
+import { boundsIntersect, expandedBounds, limitSceneNodesForLod, nodeBounds, shouldShowSceneEdges, shouldShowSceneNodes } from "../shared/graph";
 
 type SqlDatabase = initSqlJs.Database;
 type SqlValue = initSqlJs.SqlValue;
@@ -92,9 +92,10 @@ export async function readScene(query: SceneQuery = {}): Promise<Scene> {
 
     const includeNodes = shouldShowSceneNodes(zoom, nodeGroupCount);
     const includeEdges = shouldShowSceneEdges(zoom, nodeGroupCount);
-    const nodes = includeNodes
+    const candidateNodes = includeNodes
       ? all.nodes.filter((node) => nodeGroupIds.has(node.groupId) && (!viewport || boundsIntersect(nodeBounds(node), viewport)))
       : [];
+    const nodes = limitSceneNodesForLod(candidateNodes, zoom, nodeGroupCount);
     const nodeIds = new Set(nodes.map((node) => node.id));
     const edges = includeEdges
       ? all.edges.filter((edge) => nodeGroupIds.has(edge.groupId) && nodeIds.has(edge.source) && nodeIds.has(edge.target))
@@ -178,6 +179,10 @@ export async function saveScenePatch(input: ScenePatch): Promise<Scene> {
       removeNodeInDb(db, nodeId);
     }
     for (const edgeId of patch.removeEdgeIds ?? []) db.run("DELETE FROM edges WHERE id = ?", [edgeId]);
+    for (const movement of patch.translateGroups ?? []) {
+      const group = getGroupInDb(db, movement.groupId);
+      if (group) moveGroupBy(db, group, movement.dx, movement.dy);
+    }
     for (const group of patch.groups ?? []) upsertGroupInDb(db, group);
     for (const node of patch.nodes ?? []) upsertNodeInDb(db, { ...node, updatedAt: new Date().toISOString() });
     for (const edge of patch.edges ?? []) upsertEdgeInDb(db, { ...edge, updatedAt: new Date().toISOString() });
@@ -505,7 +510,7 @@ function migrateLegacyDesign(db: SqlDatabase, legacy: unknown): void {
       id: nextId,
       groupId,
       position: { x: Number(position.x ?? 0), y: Number(position.y ?? 0) },
-      size: { width: 390, height: 390 },
+      size: layoutNodeSize,
       zIndex: nodeZOrder[parsed.id] ?? index,
       updatedAt: now
     });
@@ -895,9 +900,10 @@ function setMetadata(db: SqlDatabase, key: string, value: string): void {
   );
 }
 
-const layoutRepairVersion = "6";
-const groupGap = 220;
-const collisionPadding = 80;
+const layoutRepairVersion = "11";
+const groupGap = 140;
+const collisionPadding = 60;
+const layoutNodeSize = { width: 270, height: 178 };
 const legacySeedNodePositions: Record<string, { x: number; y: number }> = {
   "n-proposition": { x: 0, y: 0 },
   "n-decision-points": { x: 460, y: 120 },
@@ -921,6 +927,18 @@ const wideSeedNodePositions: Record<string, { x: number; y: number }> = {
   "n-subdecision": { x: 2080, y: 0 },
   "n-task": { x: 2080, y: 480 },
   "n-artifact": { x: 2080, y: 960 }
+};
+const previousSeedNodePositions: Record<string, { x: number; y: number }> = {
+  "n-proposition": { x: 0, y: 510 },
+  "n-decision-points": { x: 450, y: 510 },
+  "n-option-graph": { x: 900, y: 80 },
+  "n-option-freeform": { x: 900, y: 510 },
+  "n-evidence": { x: 1350, y: 80 },
+  "n-tradeoff": { x: 1350, y: 510 },
+  "n-blocker": { x: 1350, y: 940 },
+  "n-subdecision": { x: 1800, y: 80 },
+  "n-task": { x: 1800, y: 510 },
+  "n-artifact": { x: 1800, y: 940 }
 };
 const compactSeedNodePositions = normalizeSeedPositions(defaultSeedNodePositions);
 
@@ -951,14 +969,22 @@ function repairLegacySeedNodeLayouts(db: SqlDatabase): boolean {
       updatedNodes.push(sceneNodeSchema.parse({
         ...node,
         position: { x: anchor.x + position.x, y: anchor.y + position.y },
+        size: layoutNodeSize,
         updatedAt: new Date().toISOString()
       }));
     }
-    for (const node of extraNodes.sort((a, b) => a.zIndex - b.zIndex)) {
+    const seedMaxY = Math.max(...Object.values(compactSeedNodePositions).map((position) => position.y + layoutNodeSize.height));
+    const extraColumns = 4;
+    for (const [index, node] of extraNodes.sort((a, b) => a.zIndex - b.zIndex).entries()) {
+      const preferred = {
+        x: anchor.x + (index % extraColumns) * 360,
+        y: anchor.y + seedMaxY + 120 + Math.floor(index / extraColumns) * 260
+      };
       updatedNodes.push(
         sceneNodeSchema.parse({
           ...node,
-          position: openNodePosition(updatedNodes, node.position, node.size),
+          position: openNodePosition(updatedNodes, preferred, layoutNodeSize),
+          size: layoutNodeSize,
           updatedAt: new Date().toISOString()
         })
       );
@@ -975,7 +1001,11 @@ function repairLegacySeedNodeLayouts(db: SqlDatabase): boolean {
 }
 
 function isLegacySeedLayout(group: SceneGroup, nodes: SceneNode[]): boolean {
-  return matchesSeedLayout(group, nodes, legacySeedNodePositions) || matchesSeedLayout(group, nodes, wideSeedNodePositions);
+  return (
+    matchesSeedLayout(group, nodes, legacySeedNodePositions) ||
+    matchesSeedLayout(group, nodes, wideSeedNodePositions) ||
+    matchesSeedLayout(group, nodes, previousSeedNodePositions)
+  );
 }
 
 function matchesSeedLayout(group: SceneGroup, nodes: SceneNode[], expectedPositions: Record<string, { x: number; y: number }>): boolean {
@@ -1055,10 +1085,10 @@ function packTopLevelGroups(db: SqlDatabase, groups: SceneGroup[]): void {
 }
 
 function nextGroupOffset(db: SqlDatabase, desiredBounds?: Bounds): { x: number; y: number } {
-  const desired = desiredBounds ?? { x: -160, y: -160, width: 2500, height: 1600 };
+  const desired = desiredBounds ?? { x: -120, y: -120, width: 1900, height: 1100 };
   const groups = readGroupsInDb(db).filter((group) => group.parentGroupId === null);
-  const cellWidth = Math.max(2200, desired.width + groupGap);
-  const cellHeight = Math.max(1600, desired.height + groupGap);
+  const cellWidth = Math.max(1900, desired.width + groupGap);
+  const cellHeight = Math.max(1200, desired.height + groupGap);
   const columns = Math.max(3, Math.ceil(Math.sqrt(groups.length + 1)));
   for (let index = 0; index < Math.max(256, (groups.length + 1) * 4); index += 1) {
     const bounds = {

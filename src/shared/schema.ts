@@ -202,6 +202,7 @@ export const scenePatchSchema = z.object({
   groups: z.array(sceneGroupSchema).optional(),
   nodes: z.array(sceneNodeSchema).optional(),
   edges: z.array(sceneEdgeSchema).optional(),
+  translateGroups: z.array(z.object({ groupId: z.string().min(1), dx: z.number(), dy: z.number() })).optional(),
   removeGroupIds: z.array(z.string()).optional(),
   removeNodeIds: z.array(z.string()).optional(),
   removeEdgeIds: z.array(z.string()).optional(),

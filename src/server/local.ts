@@ -11,19 +11,19 @@ import type {
   SceneNode
 } from "../shared/schema";
 
-const nodeWidth = 390;
-const nodeHeight = 390;
+const nodeWidth = 270;
+const nodeHeight = 178;
 export const defaultSeedNodePositions: Record<string, { x: number; y: number }> = {
-  "n-proposition": { x: 0, y: 510 },
-  "n-decision-points": { x: 450, y: 510 },
-  "n-option-graph": { x: 900, y: 80 },
-  "n-option-freeform": { x: 900, y: 510 },
-  "n-evidence": { x: 1350, y: 80 },
-  "n-tradeoff": { x: 1350, y: 510 },
-  "n-blocker": { x: 1350, y: 940 },
-  "n-subdecision": { x: 1800, y: 80 },
-  "n-task": { x: 1800, y: 510 },
-  "n-artifact": { x: 1800, y: 940 }
+  "n-proposition": { x: 0, y: 300 },
+  "n-decision-points": { x: 360, y: 300 },
+  "n-option-graph": { x: 720, y: 120 },
+  "n-option-freeform": { x: 720, y: 480 },
+  "n-evidence": { x: 1080, y: 40 },
+  "n-tradeoff": { x: 1080, y: 300 },
+  "n-blocker": { x: 1080, y: 560 },
+  "n-subdecision": { x: 1440, y: 120 },
+  "n-task": { x: 1440, y: 380 },
+  "n-artifact": { x: 1440, y: 640 }
 };
 
 export function seedGroupScene(prompt: string, input: { groupId: string; now: string; parentGroupId?: string | null; tagIds?: string[] }): GroupSeedOutput {
@@ -204,7 +204,7 @@ export function boundsForNodes(nodes: SceneNode[]) {
   const minY = Math.min(...nodes.map((node) => node.position.y));
   const maxX = Math.max(...nodes.map((node) => node.position.x + node.size.width));
   const maxY = Math.max(...nodes.map((node) => node.position.y + node.size.height));
-  const padding = 160;
+  const padding = 120;
   return {
     x: minX - padding,
     y: minY - padding,
