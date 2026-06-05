@@ -10,6 +10,49 @@ afterEach(() => {
 });
 
 describe("group API exports", () => {
+  it("returns a read-only render snapshot for production scene comparison", async () => {
+    process.env.SHAPE_AI_DATA_DIR = await mkdtemp(join(tmpdir(), "shape-ai-api-"));
+    process.env.LOG_LEVEL = "silent";
+    vi.resetModules();
+    const [{ buildServer }, { ensureStorage }] = await Promise.all([import("../src/server/index"), import("../src/server/storage")]);
+    await ensureStorage();
+    const app = await buildServer();
+
+    try {
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/groups",
+        payload: { prompt: "Render snapshot comparison route" }
+      });
+      expect(created.statusCode).toBe(201);
+      const scene = created.json().scene;
+      const nodeId = scene.nodes[0].id;
+
+      const commented = await app.inject({
+        method: "POST",
+        url: "/api/comments",
+        payload: { target: { kind: "node", id: nodeId }, body: "App-only comment should stay outside the renderer" }
+      });
+      expect(commented.statusCode).toBe(200);
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/scene/render-snapshot?zoom=1"
+      });
+
+      expect(response.statusCode).toBe(200);
+      const snapshot = response.json().snapshot;
+      const serialized = JSON.stringify(snapshot);
+      expect(snapshot.metadata.source).toBe("shape-scene-adapter");
+      expect(snapshot.groups.length).toBeGreaterThan(0);
+      expect(snapshot.cards.length).toBeGreaterThan(0);
+      expect(snapshot.cards[0]).not.toHaveProperty("confidence");
+      expect(serialized).not.toContain("App-only comment should stay outside the renderer");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("returns generated preview content with export metadata", async () => {
     process.env.SHAPE_AI_DATA_DIR = await mkdtemp(join(tmpdir(), "shape-ai-api-"));
     process.env.LOG_LEVEL = "silent";

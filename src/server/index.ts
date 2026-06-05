@@ -17,6 +17,7 @@ import {
   type ExportType
 } from "../shared/schema";
 import { sceneGraphForGroup } from "../shared/graph";
+import { shapeSceneToRenderSnapshot } from "../shared/renderScene";
 import { generateLocalExport } from "./local";
 import {
   addArtifact,
@@ -114,14 +115,13 @@ export async function buildServer() {
 function registerSceneRoutes(app: FastifyInstance) {
   app.get("/api/scene", async (request) => {
     const query = request.query as Record<string, string | undefined>;
-    return {
-      scene: await readScene({
-        viewport: parseViewport(query),
-        zoom: query.zoom && Number.isFinite(Number(query.zoom)) ? Number(query.zoom) : undefined,
-        tagIds: query.tags?.split(",").map((tag) => tag.trim()).filter(Boolean),
-        focusGroupId: query.focusGroupId
-      })
-    };
+    return { scene: await readScene(parseSceneQuery(query)) };
+  });
+
+  app.get("/api/scene/render-snapshot", async (request) => {
+    const query = request.query as Record<string, string | undefined>;
+    const scene = await readScene(parseSceneQuery(query));
+    return { snapshot: shapeSceneToRenderSnapshot(scene) };
   });
 
   app.patch("/api/scene", async (request) => {
@@ -240,6 +240,15 @@ function parseViewport(query: Record<string, string | undefined>): Bounds | unde
   };
   if (Object.values(bounds).some((value) => !Number.isFinite(value))) return undefined;
   return bounds;
+}
+
+function parseSceneQuery(query: Record<string, string | undefined>) {
+  return {
+    viewport: parseViewport(query),
+    zoom: query.zoom && Number.isFinite(Number(query.zoom)) ? Number(query.zoom) : undefined,
+    tagIds: query.tags?.split(",").map((tag) => tag.trim()).filter(Boolean),
+    focusGroupId: query.focusGroupId
+  };
 }
 
 function contentTypeFor(type: ExportType): string {
