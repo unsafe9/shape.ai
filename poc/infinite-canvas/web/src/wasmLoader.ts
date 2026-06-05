@@ -2,27 +2,25 @@ export type RustCoreStatus = {
   available: boolean;
   backend: string;
   detail: string;
-  core: RustCanvasCore | null;
   probeWebGpu: RustWebGpuProbe | null;
   createWebGpuRenderer: RustCreateWebGpuRenderer | null;
-};
-
-export type RustFrameStats = {
-  totalGroups: number;
-  totalCards: number;
-  totalEdges: number;
-  hitTestableCards: number;
-  backend: string;
 };
 
 export type RustWebGpuFrameStats = {
   totalGroups: number;
   totalCards: number;
   totalEdges: number;
+  visibleGroupCount: number;
+  visibleCardCount: number;
+  visibleEdgeCount: number;
   vertexCount: number;
+  drawnVertexCount: number;
+  drawRangeCount: number;
   textGlyphCount: number;
   fallbackTextGlyphCount: number;
   cjkTextGlyphCount: number;
+  textLayoutCacheHits: number;
+  textLayoutCacheMisses: number;
   styleTokenCount: number;
   patchUpdateCount: number;
   dirtyRangeWriteCount: number;
@@ -82,21 +80,13 @@ export type RustCreateWebGpuRenderer = (
   devicePixelRatio: number
 ) => Promise<RustWebGpuRenderer>;
 
-export type RustCanvasCore = {
-  mount(canvas: HTMLCanvasElement): void;
-  resize(width: number, height: number, devicePixelRatio: number): void;
-  loadScene(sceneJson: string): void;
-  setCamera(x: number, y: number, zoom: number): void;
-  renderFrame(): RustFrameStats;
-  hitTest(screenX: number, screenY: number): RustHitResult | null;
-};
-
 export type RustWebGpuRenderer = {
   resize(width: number, height: number, devicePixelRatio: number): void;
   loadScene(sceneJson: string): void;
   applyPatch(patchJson: string): void;
   setCamera(x: number, y: number, zoom: number): void;
   renderFrame(): RustWebGpuFrameStats;
+  renderFrameWithCamera(x: number, y: number, zoom: number): RustWebGpuFrameStats;
   hitTest(screenX: number, screenY: number): RustHitResult | null;
 };
 
@@ -108,7 +98,6 @@ type RustCoreModule = {
   default?: () => Promise<void> | void;
   renderer_backend?: () => string;
   probeWebGpu?: RustWebGpuProbe;
-  ShapeCanvasCore?: new () => RustCanvasCore;
   ShapeWebGpuRenderer?: RustWebGpuRendererClass;
 };
 
@@ -117,7 +106,9 @@ export async function loadRustCore(): Promise<RustCoreStatus> {
   try {
     const wasmModule = (await import(/* @vite-ignore */ modulePath)) as RustCoreModule;
     if (typeof wasmModule.default === "function") await wasmModule.default();
-    if (!wasmModule.ShapeCanvasCore) throw new Error("ShapeCanvasCore export is missing");
+    if (typeof wasmModule.ShapeWebGpuRenderer?.create !== "function") {
+      throw new Error("ShapeWebGpuRenderer.create export is missing");
+    }
     const backend =
       typeof wasmModule.renderer_backend === "function"
         ? String(wasmModule.renderer_backend())
@@ -125,20 +116,15 @@ export async function loadRustCore(): Promise<RustCoreStatus> {
     return {
       available: true,
       backend,
-      detail: "Rust/WASM package loaded and ShapeCanvasCore instantiated.",
-      core: new wasmModule.ShapeCanvasCore(),
+      detail: "Rust/WASM package loaded with WebGPU renderer export.",
       probeWebGpu: typeof wasmModule.probeWebGpu === "function" ? wasmModule.probeWebGpu : null,
-      createWebGpuRenderer:
-        typeof wasmModule.ShapeWebGpuRenderer?.create === "function"
-          ? wasmModule.ShapeWebGpuRenderer.create.bind(wasmModule.ShapeWebGpuRenderer)
-          : null
+      createWebGpuRenderer: wasmModule.ShapeWebGpuRenderer.create.bind(wasmModule.ShapeWebGpuRenderer)
     };
   } catch (error) {
     return {
       available: false,
-      backend: "typescript-canvas2d-poc",
+      backend: "webgpu-wasm-unavailable",
       detail: error instanceof Error ? error.message : "Rust/WASM package has not been built yet.",
-      core: null,
       probeWebGpu: null,
       createWebGpuRenderer: null
     };

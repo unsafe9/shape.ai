@@ -41,7 +41,6 @@ import { loadRustCore, type RustCoreStatus, type RustWebGpuProbeReport, type Rus
 import type { FrameStats, HitResult, RenderCard, RenderGroup, SceneSnapshot } from "./scene";
 import "./styles.css";
 
-type DrawBackend = FrameStats["drawBackend"];
 type AppSceneMode = "fixture" | "api" | null;
 type PocExportPreview = ExportOutput & { type: ExportType; contentType?: string };
 
@@ -63,7 +62,6 @@ function InfiniteCanvasPoc() {
   const [commentDraft, setCommentDraft] = useState("");
   const [exportPreview, setExportPreview] = useState<PocExportPreview | null>(null);
   const [benchmark, setBenchmark] = useState<BenchmarkResult | null>(null);
-  const [drawBackend, setDrawBackend] = useState<DrawBackend>("typescript-canvas2d");
   const [webGpuRenderer, setWebGpuRenderer] = useState<RustWebGpuRenderer | null>(null);
   const [webGpuRendererDetail, setWebGpuRendererDetail] = useState("Visible WebGPU renderer has not been created.");
   const [webGpuProbe, setWebGpuProbe] = useState<RustWebGpuProbeReport | null>(null);
@@ -72,17 +70,9 @@ function InfiniteCanvasPoc() {
     available: false,
     backend: "detecting",
     detail: "Checking generated Rust/WASM package.",
-    core: null,
     probeWebGpu: null,
     createWebGpuRenderer: null
   });
-
-  const activeDrawBackend: DrawBackend =
-    rustStatus.available && drawBackend === "rust-wgpu-visible" && webGpuRenderer
-      ? "rust-wgpu-visible"
-      : rustStatus.available && drawBackend === "rust-wasm-debug"
-        ? "rust-wasm-debug"
-        : "typescript-canvas2d";
 
   const cardsPerEdge = useMemo(() => {
     if (snapshot.edges.length === 0) return "n/a";
@@ -181,9 +171,7 @@ function InfiniteCanvasPoc() {
     const engine = new ShapeCanvasEngine({
       canvas,
       overlayRoot,
-      backend: rustStatus.available ? rustStatus.backend : "typescript-canvas2d-poc",
-      drawBackend: activeDrawBackend,
-      rustCore: rustStatus.core,
+      backend: rustStatus.available ? rustStatus.backend : "webgpu-wasm-unavailable",
       webGpuRenderer,
       onEvent: (event: EngineEvent) => {
         if (event.type === "stats") setStats(event.stats);
@@ -235,7 +223,7 @@ function InfiniteCanvasPoc() {
       engine.stop();
       engineRef.current = null;
     };
-  }, [activeDrawBackend, rustStatus.available, rustStatus.backend, rustStatus.core, webGpuRenderer]);
+  }, [rustStatus.available, rustStatus.backend, webGpuRenderer]);
 
   useEffect(() => {
     engineRef.current?.loadScene(snapshot);
@@ -583,28 +571,18 @@ function InfiniteCanvasPoc() {
     setStatus("Delete skipped: unknown selection");
   }
 
-  function toggleDrawBackend() {
-    setBenchmark(null);
-    setDrawBackend((current) => {
-      const modes: DrawBackend[] = ["typescript-canvas2d"];
-      if (rustStatus.available) modes.push("rust-wasm-debug");
-      if (webGpuRenderer) modes.push("rust-wgpu-visible");
-      return modes[(Math.max(0, modes.indexOf(current)) + 1) % modes.length];
-    });
-  }
-
   return (
     <main className="poc-shell">
       <section className="poc-canvas-region" aria-label="Infinite canvas engine prototype">
         <canvas
           ref={webGpuCanvasRef}
-          className={`poc-canvas poc-webgpu-canvas${activeDrawBackend === "rust-wgpu-visible" ? " is-active" : ""}`}
+          className="poc-canvas poc-webgpu-canvas is-active"
           aria-label="Rust WebGPU retained scene canvas"
         />
         <canvas
           ref={canvasRef}
-          className={`poc-canvas poc-input-canvas${activeDrawBackend === "rust-wgpu-visible" ? " is-input-only" : ""}`}
-          aria-label="Rendered retained scene canvas"
+          className="poc-canvas poc-input-canvas is-input-only"
+          aria-label="WebGPU input surface"
         />
         <div ref={overlayRef} className="poc-overlay-root" />
       </section>
@@ -615,7 +593,7 @@ function InfiniteCanvasPoc() {
             <p className="poc-kicker">POC</p>
             <h1>Infinite Canvas Engine</h1>
           </div>
-          <span className={rustStatus.available ? "poc-status is-ok" : "poc-status"}>{rustStatus.available ? "WASM" : "TS fallback"}</span>
+          <span className={webGpuRenderer ? "poc-status is-ok" : "poc-status"}>{webGpuRenderer ? "WebGPU" : "WASM required"}</span>
         </header>
 
         <div className="poc-toolbar" aria-label="Fixture controls">
@@ -679,10 +657,6 @@ function InfiniteCanvasPoc() {
             <FileJson size={16} />
             Snapshot
           </button>
-          <button type="button" onClick={toggleDrawBackend} disabled={!rustStatus.available}>
-            <ScanLine size={16} />
-            {drawButtonLabel(activeDrawBackend)}
-          </button>
         </div>
 
         <section className="poc-panel">
@@ -696,17 +670,28 @@ function InfiniteCanvasPoc() {
             <Metric label="Total" value={`${snapshot.groups.length}g / ${snapshot.cards.length}c / ${snapshot.edges.length}e`} />
             <Metric label="Cache" value={stats ? `${stats.cacheHits} hit / ${stats.cacheMisses} miss` : "-"} />
             <Metric label="Boundary" value={stats ? `${stats.boundaryCalls} calls` : "-"} />
-            <Metric label="Draw" value={stats?.drawBackend ?? activeDrawBackend} />
+            <Metric label="Draw" value={stats?.drawBackend ?? "rust-wgpu-visible"} />
             <Metric label="Rust boundary" value={stats ? `${stats.rustBoundaryCalls} calls` : "-"} />
             <Metric
               label="Rust frame"
               value={stats?.rustFrameCards === null || stats?.rustFrameCards === undefined ? "-" : `${stats.rustFrameCards}c / ${stats.rustFrameEdges ?? 0}e`}
             />
             <Metric label="GPU vertices" value={stats?.rustGpuVertices === null || stats?.rustGpuVertices === undefined ? "-" : String(stats.rustGpuVertices)} />
+            <Metric label="Drawn vertices" value={stats?.rustDrawnVertices === null || stats?.rustDrawnVertices === undefined ? "-" : String(stats.rustDrawnVertices)} />
+            <Metric label="Draw ranges" value={stats?.rustDrawRanges === null || stats?.rustDrawRanges === undefined ? "-" : String(stats.rustDrawRanges)} />
             <Metric label="GPU glyphs" value={stats?.rustTextGlyphs === null || stats?.rustTextGlyphs === undefined ? "-" : String(stats.rustTextGlyphs)} />
             <Metric label="Fallback glyphs" value={stats?.rustFallbackGlyphs === null || stats?.rustFallbackGlyphs === undefined ? "-" : String(stats.rustFallbackGlyphs)} />
             <Metric label="CJK glyphs" value={stats?.rustCjkGlyphs === null || stats?.rustCjkGlyphs === undefined ? "-" : String(stats.rustCjkGlyphs)} />
+            <Metric
+              label="Text cache"
+              value={
+                stats?.rustTextLayoutCacheHits === null || stats?.rustTextLayoutCacheHits === undefined
+                  ? "-"
+                  : `${stats.rustTextLayoutCacheHits} hit / ${stats.rustTextLayoutCacheMisses ?? 0} miss`
+              }
+            />
             <Metric label="Style tokens" value={stats?.rustStyleTokens === null || stats?.rustStyleTokens === undefined ? "-" : String(stats.rustStyleTokens)} />
+            <Metric label="Camera flushes" value={stats?.rustCameraFlushes === null || stats?.rustCameraFlushes === undefined ? "-" : String(stats.rustCameraFlushes)} />
             <Metric label="GPU patches" value={stats?.rustPatchUpdates === null || stats?.rustPatchUpdates === undefined ? "-" : String(stats.rustPatchUpdates)} />
             <Metric label="GPU dirty" value={stats?.rustDirtyWrites === null || stats?.rustDirtyWrites === undefined ? "-" : String(stats.rustDirtyWrites)} />
             <Metric label="GPU rebuilds" value={stats?.rustFullRebuilds === null || stats?.rustFullRebuilds === undefined ? "-" : String(stats.rustFullRebuilds)} />
@@ -861,10 +846,21 @@ function InfiniteCanvasPoc() {
               <Metric label="Draw" value={benchmark.drawBackend} />
               <Metric label="Rust boundary" value={`${benchmark.rustBoundaryCalls} calls`} />
               <Metric label="GPU vertices" value={benchmark.rustGpuVertices === null ? "-" : String(benchmark.rustGpuVertices)} />
+              <Metric label="Drawn vertices" value={benchmark.rustDrawnVertices === null ? "-" : String(benchmark.rustDrawnVertices)} />
+              <Metric label="Draw ranges" value={benchmark.rustDrawRanges === null ? "-" : String(benchmark.rustDrawRanges)} />
               <Metric label="GPU glyphs" value={benchmark.rustTextGlyphs === null ? "-" : String(benchmark.rustTextGlyphs)} />
               <Metric label="Fallback glyphs" value={benchmark.rustFallbackGlyphs === null ? "-" : String(benchmark.rustFallbackGlyphs)} />
               <Metric label="CJK glyphs" value={benchmark.rustCjkGlyphs === null ? "-" : String(benchmark.rustCjkGlyphs)} />
+              <Metric
+                label="Text cache"
+                value={
+                  benchmark.rustTextLayoutCacheHits === null
+                    ? "-"
+                    : `${benchmark.rustTextLayoutCacheHits} hit / ${benchmark.rustTextLayoutCacheMisses ?? 0} miss`
+                }
+              />
               <Metric label="Style tokens" value={benchmark.rustStyleTokens === null ? "-" : String(benchmark.rustStyleTokens)} />
+              <Metric label="Camera flushes" value={benchmark.rustCameraFlushes === null ? "-" : String(benchmark.rustCameraFlushes)} />
               <Metric label="GPU patches" value={benchmark.rustPatchUpdates === null ? "-" : String(benchmark.rustPatchUpdates)} />
               <Metric label="GPU dirty" value={benchmark.rustDirtyWrites === null ? "-" : String(benchmark.rustDirtyWrites)} />
               <Metric label="GPU rebuilds" value={benchmark.rustFullRebuilds === null ? "-" : String(benchmark.rustFullRebuilds)} />
@@ -916,7 +912,7 @@ function InfiniteCanvasPoc() {
             <Metric label="App source" value={appSceneMode ?? "-"} />
             <Metric label="Cards / edge" value={cardsPerEdge} />
             <Metric label="Backend" value={stats?.backend ?? rustStatus.backend} />
-            <Metric label="Rust core" value={stats?.rustCoreAvailable || rustStatus.available ? "available" : "missing"} />
+            <Metric label="WebGPU renderer" value={stats?.webGpuRendererAvailable || webGpuRenderer ? "available" : "missing"} />
             <Metric label="WebGPU" value={webGpuProbeLabel(webGpuProbe, webGpuProbeError, rustStatus.available)} />
             <Metric label="Visible GPU" value={webGpuRenderer ? "available" : "missing"} />
             <Metric label="Surface" value={webGpuProbeSurface(webGpuProbe)} />
@@ -1053,12 +1049,6 @@ function Metric({ label, value }: { label: string; value: string }) {
       <dd>{value}</dd>
     </>
   );
-}
-
-function drawButtonLabel(activeDrawBackend: DrawBackend): string {
-  if (activeDrawBackend === "rust-wgpu-visible") return "TS draw";
-  if (activeDrawBackend === "rust-wasm-debug") return "WebGPU";
-  return "Rust draw";
 }
 
 function webGpuProbeLabel(report: RustWebGpuProbeReport | null, error: string | null, rustAvailable: boolean): string {

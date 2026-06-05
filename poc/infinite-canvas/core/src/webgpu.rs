@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
+
 use std::collections::HashMap;
 
 use crate::model::{
@@ -11,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(js_name = probeWebGpu)]
 pub async fn probe_web_gpu(
     canvas: HtmlCanvasElement,
@@ -124,6 +127,31 @@ pub async fn probe_web_gpu(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[wasm_bindgen(js_name = probeWebGpu)]
+pub async fn probe_web_gpu(
+    _canvas: HtmlCanvasElement,
+    width: f64,
+    height: f64,
+    device_pixel_ratio: f64,
+) -> Result<JsValue, JsValue> {
+    serde_wasm(WebGpuProbeReport {
+        supported: false,
+        adapter_found: false,
+        device_created: false,
+        surface_configured: false,
+        render_pass_submitted: false,
+        presented: false,
+        backend: "wgpu-webgpu-wasm32-only".to_string(),
+        enabled_backends: "native-test".to_string(),
+        format: None,
+        present_mode: None,
+        width: ((width.max(1.0) * device_pixel_ratio.max(1.0)).round() as u32).max(1),
+        height: ((height.max(1.0) * device_pixel_ratio.max(1.0)).round() as u32).max(1),
+        detail: "Browser WebGPU canvas surfaces are only available in wasm32 builds.".to_string(),
+    })
+}
+
 #[cfg(feature = "wgpu-probe")]
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -170,6 +198,72 @@ impl Default for TextBuildStats {
 }
 
 #[cfg(feature = "wgpu-probe")]
+#[derive(Clone)]
+struct CachedTextGlyph {
+    offset_x: f32,
+    uv: [[f32; 2]; 4],
+}
+
+#[cfg(feature = "wgpu-probe")]
+#[derive(Clone)]
+struct CachedTextLine {
+    glyphs: Vec<CachedTextGlyph>,
+    stats: TextBuildStats,
+}
+
+#[cfg(feature = "wgpu-probe")]
+#[derive(Default)]
+struct TextLayoutCache {
+    lines: HashMap<String, CachedTextLine>,
+    wrapped_lines: HashMap<String, Vec<String>>,
+    hits: usize,
+    misses: usize,
+}
+
+#[cfg(feature = "wgpu-probe")]
+impl TextLayoutCache {
+    fn text_line(&mut self, value: &str, max_width: f32, font_size: f32) -> CachedTextLine {
+        let key = text_line_cache_key(value, max_width, font_size);
+        if let Some(cached) = self.lines.get(&key) {
+            self.hits += 1;
+            return cached.clone();
+        }
+        self.misses += 1;
+        let line = layout_text_line(value, max_width, font_size);
+        self.trim_if_needed();
+        self.lines.insert(key, line.clone());
+        line
+    }
+
+    fn wrap_lines(
+        &mut self,
+        value: &str,
+        max_width: f32,
+        font_size: f32,
+        max_lines: usize,
+    ) -> Vec<String> {
+        let key = wrapped_lines_cache_key(value, max_width, font_size, max_lines);
+        if let Some(cached) = self.wrapped_lines.get(&key) {
+            self.hits += 1;
+            return cached.clone();
+        }
+        self.misses += 1;
+        let lines = wrap_text_lines(value, max_width, font_size, max_lines);
+        self.trim_if_needed();
+        self.wrapped_lines.insert(key, lines.clone());
+        lines
+    }
+
+    fn trim_if_needed(&mut self) {
+        if self.lines.len() + self.wrapped_lines.len() <= TEXT_LAYOUT_CACHE_LIMIT {
+            return;
+        }
+        self.lines.clear();
+        self.wrapped_lines.clear();
+    }
+}
+
+#[cfg(feature = "wgpu-probe")]
 #[derive(Clone, Copy)]
 struct VertexSlot {
     offset: usize,
@@ -186,6 +280,39 @@ struct VertexRanges {
     edge_free_offsets: Vec<usize>,
     cards: HashMap<String, VertexSlot>,
     card_free_offsets: Vec<usize>,
+}
+
+#[cfg(feature = "wgpu-probe")]
+struct DrawRange {
+    start: u32,
+    end: u32,
+}
+
+#[cfg(feature = "wgpu-probe")]
+#[derive(Default)]
+struct FrameDrawList {
+    ranges: Vec<DrawRange>,
+    visible_group_count: usize,
+    visible_card_count: usize,
+    visible_edge_count: usize,
+    drawn_vertex_count: usize,
+}
+
+#[cfg(feature = "wgpu-probe")]
+impl FrameDrawList {
+    fn push_slot(&mut self, slot: VertexSlot) {
+        let start = slot.offset as u32;
+        let end = (slot.offset + slot.capacity) as u32;
+        if let Some(last) = self.ranges.last_mut() {
+            if last.end == start {
+                last.end = end;
+                self.drawn_vertex_count += slot.capacity;
+                return;
+            }
+        }
+        self.ranges.push(DrawRange { start, end });
+        self.drawn_vertex_count += slot.capacity;
+    }
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -209,6 +336,7 @@ pub struct ShapeWebGpuRenderer {
     _text_sampler: wgpu::Sampler,
     vertex_buffer: wgpu::Buffer,
     vertex_ranges: VertexRanges,
+    text_layout_cache: TextLayoutCache,
     vertex_count: usize,
     text_glyph_count: usize,
     fallback_text_glyph_count: usize,
@@ -225,6 +353,7 @@ pub struct ShapeWebGpuRenderer {
 }
 
 #[cfg(feature = "wgpu-probe")]
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl ShapeWebGpuRenderer {
     #[wasm_bindgen(js_name = create)]
@@ -414,6 +543,7 @@ impl ShapeWebGpuRenderer {
             _text_sampler: text_sampler,
             vertex_buffer,
             vertex_ranges: VertexRanges::default(),
+            text_layout_cache: TextLayoutCache::default(),
             vertex_count: 0,
             text_glyph_count: 0,
             fallback_text_glyph_count: 0,
@@ -814,9 +944,21 @@ impl ShapeWebGpuRenderer {
         self.write_uniform();
     }
 
+    #[wasm_bindgen(js_name = renderFrameWithCamera)]
+    pub fn render_frame_with_camera(
+        &mut self,
+        x: f64,
+        y: f64,
+        zoom: f64,
+    ) -> Result<JsValue, JsValue> {
+        self.camera = CameraState { x, y, zoom };
+        self.render_frame()
+    }
+
     #[wasm_bindgen(js_name = renderFrame)]
     pub fn render_frame(&mut self) -> Result<JsValue, JsValue> {
         self.write_uniform();
+        let draw_list = self.build_draw_list();
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
@@ -857,11 +999,13 @@ impl ShapeWebGpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if self.vertex_count > 0 {
+            if !draw_list.ranges.is_empty() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.draw(0..self.vertex_count as u32, 0..1);
+                for range in &draw_list.ranges {
+                    pass.draw(range.start..range.end, 0..1);
+                }
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -883,10 +1027,17 @@ impl ShapeWebGpuRenderer {
             total_groups,
             total_cards,
             total_edges,
+            visible_group_count: draw_list.visible_group_count,
+            visible_card_count: draw_list.visible_card_count,
+            visible_edge_count: draw_list.visible_edge_count,
             vertex_count: self.vertex_count,
+            drawn_vertex_count: draw_list.drawn_vertex_count,
+            draw_range_count: draw_list.ranges.len(),
             text_glyph_count: self.text_glyph_count,
             fallback_text_glyph_count: self.fallback_text_glyph_count,
             cjk_text_glyph_count: self.cjk_text_glyph_count,
+            text_layout_cache_hits: self.text_layout_cache.hits,
+            text_layout_cache_misses: self.text_layout_cache.misses,
             style_token_count,
             patch_update_count: self.patch_update_count,
             dirty_range_write_count: self.dirty_range_write_count,
@@ -994,7 +1145,104 @@ impl ShapeWebGpuRenderer {
 }
 
 #[cfg(feature = "wgpu-probe")]
+#[cfg(target_arch = "wasm32")]
 impl ShapeWebGpuRenderer {
+    fn build_draw_list(&self) -> FrameDrawList {
+        let Some(scene) = &self.scene else {
+            return FrameDrawList::default();
+        };
+        let viewport = self.padded_world_viewport();
+        let mut draw_list = FrameDrawList::default();
+
+        let mut groups: Vec<(&RenderGroup, VertexSlot)> = scene
+            .groups
+            .iter()
+            .filter_map(|group| {
+                self.vertex_ranges
+                    .groups
+                    .get(&group.id)
+                    .copied()
+                    .map(|slot| (group, slot))
+            })
+            .collect();
+        groups.sort_by_key(|(_, slot)| slot.offset);
+        for (group, slot) in groups {
+            if rects_intersect(&group.bounds, &viewport) {
+                draw_list.visible_group_count += 1;
+                draw_list.push_slot(slot);
+            }
+        }
+
+        let cards_by_id: HashMap<&str, &RenderCard> = scene
+            .cards
+            .iter()
+            .map(|card| (card.id.as_str(), card))
+            .collect();
+        let mut edges: Vec<(&RenderEdge, VertexSlot)> = scene
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                self.vertex_ranges
+                    .edges
+                    .get(&edge.id)
+                    .copied()
+                    .map(|slot| (edge, slot))
+            })
+            .collect();
+        edges.sort_by_key(|(_, slot)| slot.offset);
+        for (edge, slot) in edges {
+            let Some(source) = cards_by_id.get(edge.source.as_str()).copied() else {
+                continue;
+            };
+            let Some(target) = cards_by_id.get(edge.target.as_str()).copied() else {
+                continue;
+            };
+            if rects_intersect(&edge_visible_bounds(source, target), &viewport) {
+                draw_list.visible_edge_count += 1;
+                draw_list.push_slot(slot);
+            }
+        }
+
+        let mut cards: Vec<(&RenderCard, VertexSlot)> = scene
+            .cards
+            .iter()
+            .filter_map(|card| {
+                self.vertex_ranges
+                    .cards
+                    .get(&card.id)
+                    .copied()
+                    .map(|slot| (card, slot))
+            })
+            .collect();
+        cards.sort_by_key(|(_, slot)| slot.offset);
+        for (card, slot) in cards {
+            if rects_intersect(&card.bounds, &viewport) {
+                draw_list.visible_card_count += 1;
+                draw_list.push_slot(slot);
+            }
+        }
+
+        draw_list
+    }
+
+    fn padded_world_viewport(&self) -> WorldRect {
+        let zoom = self.camera.zoom.max(0.025);
+        let left = (0.0 - self.camera.x) / zoom;
+        let top = (0.0 - self.camera.y) / zoom;
+        let right = (self.width - self.camera.x) / zoom;
+        let bottom = (self.height - self.camera.y) / zoom;
+        let min_x = left.min(right) - VIEWPORT_CULL_PADDING;
+        let min_y = top.min(bottom) - VIEWPORT_CULL_PADDING;
+        let max_x = left.max(right) + VIEWPORT_CULL_PADDING;
+        let max_y = top.max(bottom) + VIEWPORT_CULL_PADDING;
+        WorldRect {
+            x: min_x,
+            y: min_y,
+            width: (max_x - min_x).max(1.0),
+            height: (max_y - min_y).max(1.0),
+        }
+    }
+
     fn write_uniform(&self) {
         let uniform = ViewUniform {
             camera: [
@@ -1018,7 +1266,8 @@ impl ShapeWebGpuRenderer {
             groups.sort_by(|a, b| a.z_index.total_cmp(&b.z_index));
             for group in groups {
                 let offset = vertices.len();
-                let (group_vertices, group_text_stats) = build_group_vertices(scene, group);
+                let (group_vertices, group_text_stats) =
+                    build_group_vertices(scene, group, &mut self.text_layout_cache);
                 text_stats.add(group_text_stats);
                 vertices.extend(fit_vertices_to_slot(group_vertices, GROUP_VERTEX_SLOT));
                 vertex_ranges.groups.insert(
@@ -1039,7 +1288,8 @@ impl ShapeWebGpuRenderer {
 
             for edge in &scene.edges {
                 let offset = vertices.len();
-                let (edge_vertices, edge_text_stats) = build_edge_vertices(scene, edge);
+                let (edge_vertices, edge_text_stats) =
+                    build_edge_vertices(scene, edge, &mut self.text_layout_cache);
                 text_stats.add(edge_text_stats);
                 vertices.extend(fit_vertices_to_slot(edge_vertices, EDGE_VERTEX_SLOT));
                 vertex_ranges.edges.insert(
@@ -1062,7 +1312,8 @@ impl ShapeWebGpuRenderer {
             cards.sort_by(|a, b| a.z_index.total_cmp(&b.z_index));
             for card in cards {
                 let offset = vertices.len();
-                let (card_vertices, card_text_stats) = build_card_vertices(scene, card);
+                let (card_vertices, card_text_stats) =
+                    build_card_vertices(scene, card, &mut self.text_layout_cache);
                 text_stats.add(card_text_stats);
                 vertices.extend(fit_vertices_to_slot(card_vertices, CARD_VERTEX_SLOT));
                 vertex_ranges.cards.insert(
@@ -1101,16 +1352,18 @@ impl ShapeWebGpuRenderer {
     }
 
     fn write_dirty_card(&mut self, id: &str) -> bool {
-        let Some(scene) = &self.scene else {
-            return false;
-        };
         let Some(slot) = self.vertex_ranges.cards.get(id).copied() else {
             return false;
         };
-        let Some(card) = scene.cards.iter().find(|card| card.id == id) else {
-            return false;
+        let (vertices, text_stats) = {
+            let Some(scene) = &self.scene else {
+                return false;
+            };
+            let Some(card) = scene.cards.iter().find(|card| card.id == id) else {
+                return false;
+            };
+            build_card_vertices(scene, card, &mut self.text_layout_cache)
         };
-        let (vertices, text_stats) = build_card_vertices(scene, card);
         self.write_slot_vertices(slot, vertices);
         if let Some(slot) = self.vertex_ranges.cards.get_mut(id) {
             self.text_glyph_count = self
@@ -1132,16 +1385,18 @@ impl ShapeWebGpuRenderer {
     }
 
     fn write_dirty_group(&mut self, id: &str) -> bool {
-        let Some(scene) = &self.scene else {
-            return false;
-        };
         let Some(slot) = self.vertex_ranges.groups.get(id).copied() else {
             return false;
         };
-        let Some(group) = scene.groups.iter().find(|group| group.id == id) else {
-            return false;
+        let (vertices, text_stats) = {
+            let Some(scene) = &self.scene else {
+                return false;
+            };
+            let Some(group) = scene.groups.iter().find(|group| group.id == id) else {
+                return false;
+            };
+            build_group_vertices(scene, group, &mut self.text_layout_cache)
         };
-        let (vertices, text_stats) = build_group_vertices(scene, group);
         self.write_slot_vertices(slot, vertices);
         if let Some(slot) = self.vertex_ranges.groups.get_mut(id) {
             self.text_glyph_count = self
@@ -1163,16 +1418,18 @@ impl ShapeWebGpuRenderer {
     }
 
     fn write_dirty_edge(&mut self, id: &str) -> bool {
-        let Some(scene) = &self.scene else {
-            return false;
-        };
         let Some(slot) = self.vertex_ranges.edges.get(id).copied() else {
             return false;
         };
-        let Some(edge) = scene.edges.iter().find(|edge| edge.id == id) else {
-            return false;
+        let (vertices, text_stats) = {
+            let Some(scene) = &self.scene else {
+                return false;
+            };
+            let Some(edge) = scene.edges.iter().find(|edge| edge.id == id) else {
+                return false;
+            };
+            build_edge_vertices(scene, edge, &mut self.text_layout_cache)
         };
-        let (vertices, text_stats) = build_edge_vertices(scene, edge);
         self.write_slot_vertices(slot, vertices);
         if let Some(slot) = self.vertex_ranges.edges.get_mut(id) {
             self.text_glyph_count = self
@@ -1913,6 +2170,7 @@ impl ShapeWebGpuRenderer {
 fn build_group_vertices(
     scene: &SceneSnapshot,
     group: &RenderGroup,
+    text_layout_cache: &mut TextLayoutCache,
 ) -> (Vec<GpuVertex>, TextBuildStats) {
     let mut vertices = Vec::new();
     let fill = style_color(&scene.styles, &group.style_key, StyleColor::Fill, 0.62);
@@ -1932,6 +2190,7 @@ fn build_group_vertices(
         group.bounds.width as f32 - 56.0,
         18.0,
         text,
+        text_layout_cache,
     );
     (vertices, text_stats)
 }
@@ -1940,6 +2199,7 @@ fn build_group_vertices(
 fn build_edge_vertices(
     scene: &SceneSnapshot,
     edge: &RenderEdge,
+    text_layout_cache: &mut TextLayoutCache,
 ) -> (Vec<GpuVertex>, TextBuildStats) {
     let mut vertices = Vec::new();
     let Some(source) = scene.cards.iter().find(|card| card.id == edge.source) else {
@@ -2010,6 +2270,7 @@ fn build_edge_vertices(
             label_width,
             label_font_size,
             label_text,
+            text_layout_cache,
         ));
     }
     (vertices, text_stats)
@@ -2019,6 +2280,7 @@ fn build_edge_vertices(
 fn build_card_vertices(
     scene: &SceneSnapshot,
     card: &RenderCard,
+    text_layout_cache: &mut TextLayoutCache,
 ) -> (Vec<GpuVertex>, TextBuildStats) {
     let mut vertices = Vec::new();
     let mut text_stats = TextBuildStats::default();
@@ -2041,6 +2303,7 @@ fn build_card_vertices(
         card.bounds.width as f32 - 36.0,
         17.0,
         title,
+        text_layout_cache,
     ));
     text_stats.add(add_wrapped_text(
         &mut vertices,
@@ -2052,6 +2315,7 @@ fn build_card_vertices(
         15.0,
         3,
         muted,
+        text_layout_cache,
     ));
     (vertices, text_stats)
 }
@@ -2152,12 +2416,65 @@ fn add_text_line(
     max_width: f32,
     font_size: f32,
     color: [f32; 4],
+    text_layout_cache: &mut TextLayoutCache,
 ) -> TextBuildStats {
+    let line = text_layout_cache.text_line(value, max_width, font_size);
     let scale = font_size / GLYPH_HEIGHT as f32;
     let glyph_width = GLYPH_WIDTH as f32 * scale;
     let glyph_height = GLYPH_HEIGHT as f32 * scale;
-    let mut cursor_x = x;
-    let right_limit = x + max_width.max(0.0);
+    for glyph in &line.glyphs {
+        let left = x + glyph.offset_x;
+        let top = y;
+        let right = left + glyph_width;
+        let bottom = top + glyph_height;
+        add_quad_uv(
+            vertices,
+            [left, top],
+            [right, top],
+            [right, bottom],
+            [left, bottom],
+            glyph.uv,
+            color,
+        );
+    }
+    line.stats
+}
+
+#[cfg(feature = "wgpu-probe")]
+fn add_wrapped_text(
+    vertices: &mut Vec<GpuVertex>,
+    value: &str,
+    x: f32,
+    y: f32,
+    max_width: f32,
+    font_size: f32,
+    line_height: f32,
+    max_lines: usize,
+    color: [f32; 4],
+    text_layout_cache: &mut TextLayoutCache,
+) -> TextBuildStats {
+    let lines = text_layout_cache.wrap_lines(value, max_width, font_size, max_lines);
+    let mut text_stats = TextBuildStats::default();
+    for (line_index, line) in lines.iter().enumerate() {
+        text_stats.add(add_text_line(
+            vertices,
+            line,
+            x,
+            y + line_index as f32 * line_height,
+            max_width,
+            font_size,
+            color,
+            text_layout_cache,
+        ));
+    }
+    text_stats
+}
+
+#[cfg(feature = "wgpu-probe")]
+fn layout_text_line(value: &str, max_width: f32, font_size: f32) -> CachedTextLine {
+    let mut glyphs = Vec::new();
+    let mut cursor_x = 0.0;
+    let right_limit = max_width.max(0.0);
     let mut text_stats = TextBuildStats::default();
 
     for grapheme in value.graphemes(true) {
@@ -2178,57 +2495,57 @@ fn add_text_line(
             cursor_x += advance;
             continue;
         };
-        let left = cursor_x;
-        let top = y;
-        let right = left + glyph_width;
-        let bottom = top + glyph_height;
-        add_quad_uv(
-            vertices,
-            [left, top],
-            [right, top],
-            [right, bottom],
-            [left, bottom],
+        let fallback = grapheme_uses_fallback_glyph(grapheme);
+        let cjk = is_cjk_grapheme(grapheme);
+        glyphs.push(CachedTextGlyph {
+            offset_x: cursor_x,
             uv,
-            color,
-        );
+        });
         text_stats.glyph_count += 1;
-        if grapheme_uses_fallback_glyph(grapheme) {
+        if fallback {
             text_stats.fallback_glyph_count += 1;
         }
-        if is_cjk_grapheme(grapheme) {
+        if cjk {
             text_stats.cjk_glyph_count += 1;
         }
         cursor_x += advance;
     }
-    text_stats
+
+    CachedTextLine {
+        glyphs,
+        stats: text_stats,
+    }
 }
 
 #[cfg(feature = "wgpu-probe")]
-fn add_wrapped_text(
-    vertices: &mut Vec<GpuVertex>,
+fn text_line_cache_key(value: &str, max_width: f32, font_size: f32) -> String {
+    format!(
+        "line:{}:{}:{}",
+        quantize_text_metric(max_width),
+        quantize_text_metric(font_size),
+        value
+    )
+}
+
+#[cfg(feature = "wgpu-probe")]
+fn wrapped_lines_cache_key(
     value: &str,
-    x: f32,
-    y: f32,
     max_width: f32,
     font_size: f32,
-    line_height: f32,
     max_lines: usize,
-    color: [f32; 4],
-) -> TextBuildStats {
-    let lines = wrap_text_lines(value, max_width, font_size, max_lines);
-    let mut text_stats = TextBuildStats::default();
-    for (line_index, line) in lines.iter().enumerate() {
-        text_stats.add(add_text_line(
-            vertices,
-            line,
-            x,
-            y + line_index as f32 * line_height,
-            max_width,
-            font_size,
-            color,
-        ));
-    }
-    text_stats
+) -> String {
+    format!(
+        "wrap:{}:{}:{}:{}",
+        quantize_text_metric(max_width),
+        quantize_text_metric(font_size),
+        max_lines,
+        value
+    )
+}
+
+#[cfg(feature = "wgpu-probe")]
+fn quantize_text_metric(value: f32) -> i32 {
+    (value * 100.0).round() as i32
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -2502,6 +2819,7 @@ mod tests {
     #[test]
     fn add_text_line_tracks_fallback_and_cjk_glyphs() {
         let mut vertices = Vec::new();
+        let mut text_layout_cache = TextLayoutCache::default();
 
         let stats = add_text_line(
             &mut vertices,
@@ -2511,12 +2829,14 @@ mod tests {
             200.0,
             14.0,
             [1.0, 1.0, 1.0, 1.0],
+            &mut text_layout_cache,
         );
 
         assert_eq!(stats.glyph_count, 3);
         assert_eq!(stats.fallback_glyph_count, 1);
         assert_eq!(stats.cjk_glyph_count, 1);
         assert_eq!(vertices.len(), 18);
+        assert_eq!(text_layout_cache.misses, 1);
     }
 }
 
@@ -2780,6 +3100,11 @@ fn point_in_rect(point: &WorldPoint, rect: &WorldRect) -> bool {
 }
 
 #[cfg(feature = "wgpu-probe")]
+fn rects_intersect(a: &WorldRect, b: &WorldRect) -> bool {
+    a.x <= b.x + b.width && a.x + a.width >= b.x && a.y <= b.y + b.height && a.y + a.height >= b.y
+}
+
+#[cfg(feature = "wgpu-probe")]
 fn text_field_at_point(card: &RenderCard, point: &WorldPoint) -> Option<String> {
     if point_in_rect(point, &text_field_rect(&card.bounds, "title")) {
         return Some("title".to_string());
@@ -2849,6 +3174,42 @@ fn edge_route(source: &RenderCard, target: &RenderCard) -> CubicRoute {
         },
         start,
         end,
+    }
+}
+
+#[cfg(feature = "wgpu-probe")]
+fn edge_visible_bounds(source: &RenderCard, target: &RenderCard) -> WorldRect {
+    let route = edge_route(source, target);
+    let min_x = route
+        .start
+        .x
+        .min(route.cp1.x)
+        .min(route.cp2.x)
+        .min(route.end.x);
+    let min_y = route
+        .start
+        .y
+        .min(route.cp1.y)
+        .min(route.cp2.y)
+        .min(route.end.y);
+    let max_x = route
+        .start
+        .x
+        .max(route.cp1.x)
+        .max(route.cp2.x)
+        .max(route.end.x);
+    let max_y = route
+        .start
+        .y
+        .max(route.cp1.y)
+        .max(route.cp2.y)
+        .max(route.end.y);
+    let padding = 96.0;
+    WorldRect {
+        x: min_x - padding,
+        y: min_y - padding,
+        width: (max_x - min_x) + padding * 2.0,
+        height: (max_y - min_y) + padding * 2.0,
     }
 }
 
@@ -3179,6 +3540,10 @@ const GROUP_VERTEX_SLOT: usize = 768;
 const EDGE_VERTEX_SLOT: usize = 384;
 #[cfg(feature = "wgpu-probe")]
 const CARD_VERTEX_SLOT: usize = 768;
+#[cfg(feature = "wgpu-probe")]
+const VIEWPORT_CULL_PADDING: f64 = 400.0;
+#[cfg(feature = "wgpu-probe")]
+const TEXT_LAYOUT_CACHE_LIMIT: usize = 4096;
 
 #[cfg(feature = "wgpu-probe")]
 fn webgpu_vertex_buffer_usage() -> wgpu::BufferUsages {

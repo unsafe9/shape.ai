@@ -34,7 +34,7 @@ Machine-measured:
 - Boundary call count.
 - Active draw backend.
 - Rust/WASM boundary call count and Rust frame totals when generated WASM exists.
-- GPU primitive vertex count, bitmap glyph count, fallback glyph count, CJK glyph count, consumed style token count, compact patch update count, dirty slot write count, full buffer rebuild count, edge slot grow/compact count, and edge slot used/free count when the visible Rust/wgpu renderer is active.
+- GPU primitive vertex count, drawn vertex count, draw range count, bitmap glyph count, fallback glyph count, CJK glyph count, text cache hit/miss count, consumed style token count, compact patch update count, dirty slot write count, full buffer rebuild count, edge slot grow/compact count, and edge slot used/free count when the visible Rust/wgpu renderer is active.
 - Input batch size.
 - Text/edge cache hit and miss count.
 
@@ -53,7 +53,7 @@ Human-reviewed:
 - Scripted pan/zoom produces a benchmark result rather than relying on subjective smoothness.
 - The renderer reports visible objects separately from total objects.
 - Pan/zoom should not recompute text layout for every object every frame; cache hit/miss stats must expose this.
-- JS/WASM boundary is represented as coarse lifecycle calls: scene load, resize, camera update, patch, and frame render.
+- JS/WASM boundary is represented as coarse lifecycle calls: scene load, resize, queued camera update, patch, hit test, and frame render. Camera changes during render are coalesced through `renderFrameWithCamera`.
 
 ## Current Command
 

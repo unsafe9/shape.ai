@@ -10,14 +10,19 @@ export type BenchmarkResult = {
   memoryBytes: number | null;
   backend: string;
   drawBackend: FrameStats["drawBackend"];
-  rustCoreAvailable: boolean;
+  webGpuRendererAvailable: boolean;
   rustBoundaryCalls: number;
   rustFrameCards: number | null;
   rustGpuVertices: number | null;
+  rustDrawnVertices: number | null;
+  rustDrawRanges: number | null;
   rustTextGlyphs: number | null;
   rustFallbackGlyphs: number | null;
   rustCjkGlyphs: number | null;
+  rustTextLayoutCacheHits: number | null;
+  rustTextLayoutCacheMisses: number | null;
   rustStyleTokens: number | null;
+  rustCameraFlushes: number | null;
   rustPatchUpdates: number | null;
   rustDirtyWrites: number | null;
   rustFullRebuilds: number | null;
@@ -63,15 +68,20 @@ export async function runScriptedPanZoom(engine: ShapeCanvasEngine, frames = 180
     averageVisibleCards: average(samples.map((sample) => sample.visibleCards)),
     memoryBytes: samples.at(-1)?.memoryBytes ?? null,
     backend: samples.at(-1)?.backend ?? "unknown",
-    drawBackend: samples.at(-1)?.drawBackend ?? "typescript-canvas2d",
-    rustCoreAvailable: samples.at(-1)?.rustCoreAvailable ?? false,
+    drawBackend: samples.at(-1)?.drawBackend ?? "rust-wgpu-visible",
+    webGpuRendererAvailable: samples.at(-1)?.webGpuRendererAvailable ?? false,
     rustBoundaryCalls: samples.at(-1)?.rustBoundaryCalls ?? 0,
     rustFrameCards: samples.at(-1)?.rustFrameCards ?? null,
     rustGpuVertices: samples.at(-1)?.rustGpuVertices ?? null,
+    rustDrawnVertices: samples.at(-1)?.rustDrawnVertices ?? null,
+    rustDrawRanges: samples.at(-1)?.rustDrawRanges ?? null,
     rustTextGlyphs: samples.at(-1)?.rustTextGlyphs ?? null,
     rustFallbackGlyphs: samples.at(-1)?.rustFallbackGlyphs ?? null,
     rustCjkGlyphs: samples.at(-1)?.rustCjkGlyphs ?? null,
+    rustTextLayoutCacheHits: samples.at(-1)?.rustTextLayoutCacheHits ?? null,
+    rustTextLayoutCacheMisses: samples.at(-1)?.rustTextLayoutCacheMisses ?? null,
     rustStyleTokens: samples.at(-1)?.rustStyleTokens ?? null,
+    rustCameraFlushes: samples.at(-1)?.rustCameraFlushes ?? null,
     rustPatchUpdates: samples.at(-1)?.rustPatchUpdates ?? null,
     rustDirtyWrites: samples.at(-1)?.rustDirtyWrites ?? null,
     rustFullRebuilds: samples.at(-1)?.rustFullRebuilds ?? null,

@@ -1,4 +1,3 @@
-mod debug_canvas;
 mod model;
 mod stats;
 
@@ -10,12 +9,11 @@ use wasm_bindgen::prelude::*;
 #[cfg(not(feature = "wgpu-probe"))]
 use web_sys::HtmlCanvasElement;
 
-pub use debug_canvas::ShapeCanvasCore;
 pub use model::{
     CameraState, RenderCard, RenderEdge, RenderGroup, SceneSelection, SceneSnapshot,
     SceneStyleToken, WorldRect,
 };
-pub use stats::{CoreFrameStats, CoreHitResult, WebGpuFrameStats, WebGpuProbeReport};
+pub use stats::{CoreHitResult, WebGpuFrameStats, WebGpuProbeReport};
 #[cfg(feature = "wgpu-probe")]
 pub use webgpu::ShapeWebGpuRenderer;
 

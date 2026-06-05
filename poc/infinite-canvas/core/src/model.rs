@@ -125,6 +125,7 @@ pub enum SceneSelection {
 }
 
 #[cfg(feature = "wgpu-probe")]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub(crate) enum RenderScenePatch {

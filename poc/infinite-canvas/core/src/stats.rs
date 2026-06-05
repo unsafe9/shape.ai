@@ -2,24 +2,21 @@ use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CoreFrameStats {
-    pub total_groups: usize,
-    pub total_cards: usize,
-    pub total_edges: usize,
-    pub hit_testable_cards: usize,
-    pub backend: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct WebGpuFrameStats {
     pub total_groups: usize,
     pub total_cards: usize,
     pub total_edges: usize,
+    pub visible_group_count: usize,
+    pub visible_card_count: usize,
+    pub visible_edge_count: usize,
     pub vertex_count: usize,
+    pub drawn_vertex_count: usize,
+    pub draw_range_count: usize,
     pub text_glyph_count: usize,
     pub fallback_text_glyph_count: usize,
     pub cjk_text_glyph_count: usize,
+    pub text_layout_cache_hits: usize,
+    pub text_layout_cache_misses: usize,
     pub style_token_count: usize,
     pub patch_update_count: usize,
     pub dirty_range_write_count: usize,
