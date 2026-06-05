@@ -14,7 +14,13 @@
     "build": "vite build && tsc -p tsconfig.server.json",
     "test": "vitest run && playwright test",
     "test:unit": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "poc:dev": "vite --config poc/infinite-canvas/web/vite.config.ts --host 127.0.0.1",
+    "poc:typecheck": "tsc -p poc/infinite-canvas/web/tsconfig.json --noEmit",
+    "poc:test": "vitest run tests/infinite-canvas-poc.test.ts",
+    "poc:build": "vite build --config poc/infinite-canvas/web/vite.config.ts",
+    "poc:verify": "npm run poc:typecheck && npm run poc:test && npm run poc:build",
+    "poc:wasm:build": "wasm-pack build poc/infinite-canvas/core --target web --out-dir ../web/src/wasm --out-name shape_canvas_core"
   },
   "dependencies": {
     "@fastify/static": "^9.1.3",
