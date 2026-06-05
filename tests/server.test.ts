@@ -37,7 +37,7 @@ describe("group API exports", () => {
 
       const response = await app.inject({
         method: "GET",
-        url: "/api/scene/render-snapshot?zoom=1"
+        url: "/api/scene/render-snapshot"
       });
 
       expect(response.statusCode).toBe(200);

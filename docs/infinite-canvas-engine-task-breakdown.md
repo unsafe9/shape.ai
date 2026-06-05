@@ -2,31 +2,54 @@
 
 > Source: [Infinite Canvas Engine Strategy](./infinite-canvas-engine-strategy.md)
 
-이 문서는 무한 캔버스 전략을 실행 가능한 phase/task graph로 분해한 것이다. 구현 지시를 포함하며, 사람 또는 에이전트가 순차 실행하고 검증할 수 있는 작업 단위와 review gate를 정의한다.
+이 문서는 무한 캔버스 전략을 실행 가능한 phase/task graph로 분해했던 historical task graph다. 현재 구현 지시는 `docs/rust-canvas-replacement-task.md`를 우선한다.
+
+## Current Contract Refresh
+
+2026-06-05 update: `docs/rust-canvas-replacement-task.md` is now the stronger replacement contract. The earlier POC task graph remains useful as historical evidence, but its "production replacement not ready" conclusion is a historical gate result from the POC cycle, not the current objective.
+
+The current objective is full production replacement: Rust/WASM/WebGPU owns the canvas, and the web layer keeps only product shell, floating UI, API/MCP/business state, a hidden diagnostics drawer, and the native active text input overlay. No follow-up task should shrink the target to "POC mount", "better bitmap text", or a long-lived DOM/SVG fallback.
+
+P9 update: the isolated `poc/` directory has been removed. Stable renderer code now lives under `src/client/renderer` and `src/renderer/core`; historical POC evidence has moved to `docs/renderer/evidence/`.
 
 ## Objective
 
-shape.ai의 현재 DOM/SVG 기반 scene canvas 구현을 최종적으로 custom Rust/WASM/WebGPU 기반 performance-aware infinite canvas engine으로 전부 대체한다. 모든 POC 구현은 `poc/` 아래에 격리해서 진행하고, 오픈소스는 구현 템플릿이 아니라 reference, benchmark, failure-mode source로만 사용한다.
+shape.ai의 현재 DOM/SVG 기반 scene canvas 구현을 최종적으로 custom Rust/WASM/WebGPU 기반 performance-aware infinite canvas engine으로 전부 대체한다. Earlier evidence cycles used an isolated POC workspace; current promoted implementation lives in `src/client/renderer` and `src/renderer/core`, with preserved evidence under `docs/renderer/evidence`.
 
-## Done Criteria
+## Historical POC Evidence Done Criteria
 
-이 task graph가 완료됐다고 볼 수 있는 상태:
+이 task graph의 POC/evidence cycle이 완료됐다고 볼 수 있는 상태:
 
-- `poc/` 안의 Rust/WASM canvas core가 browser canvas에 mount된다.
+- isolated Rust/WASM canvas core가 browser canvas에 mount된다.
 - 하나의 world scene 안에서 group frame, node card, text snippet, edge를 연속적으로 pan/zoom 렌더링한다.
 - 1,000개 이상 card/edge fixture에서 frame time, memory, interaction latency를 측정한다.
 - DOM overlay 기반 inline text editing이 실제 카드 내부 편집처럼 동작한다.
 - TypeScript app layer와 Rust render scene의 책임 경계가 명확하다.
-- 현재 shape graph 하나를 새 canvas scene으로 변환해 `poc/` harness에서 사용할 수 있다.
+- 현재 shape graph 하나를 새 canvas scene으로 변환해 renderer harness에서 사용할 수 있다.
 - 현재 DOM/SVG scene canvas baseline과 새 canvas path의 성능/UX/복잡도 비교가 문서화되어 있다.
 - 현재 구현된 graph editor 기능인 group/tag filtering, node create/edit/delete/duplicate/copy, linked node/edge creation, edge select/delete, pan/zoom/fit, selection persistence, comments, z-order, export compatibility를 새 engine 위에 올릴 수 있음이 증명된다.
 - HTML-in-Canvas 없이도 실행 가능한 경로가 있다.
+
+## Current Replacement Acceptance Criteria
+
+기존 DOM/SVG scene canvas path를 삭제하기 전에 다음 조건이 모두 참이어야 한다.
+
+- Production canvas가 기본적으로 Rust/WASM/WebGPU engine을 통해 렌더링되고, 기존 DOM/SVG canvas는 장기 fallback이나 alternate rendering mode로 남지 않는다.
+- Rust owns retained scene rendering, camera, hit testing, layout-relevant selection geometry, culling, GPU buffers/caches, style/effect rendering, text layout/shaping, and frame/debug stats.
+- Web owns only product panels, commands, API/MCP/business state, floating UI, hidden diagnostics drawer, and active native input overlay.
+- Text uses HarfBuzz-grade shaping/font fallback/glyph atlas logic. Korean, mixed Latin/CJK, punctuation, multiline, and no-space long text pass tests and browser visual QA. Bitmap text is not the production path.
+- Group frames, node cards, text snippets/detail, edge curves/labels, selected/focus states, ports/handles, shadows, gradients, rounded corners, strokes, badges, and polish-level card/edge effects are Rust graphics primitives/style tokens, not CSS-only DOM rendering.
+- Active text input uses native DOM input/textarea only while editing, but the overlay receives Rust-computed geometry, typography, padding, line metrics, and state style tokens so it visually sits inside the Rust-rendered card across pan/zoom.
+- Korean IME, selection, copy/paste, commit, cancel, blur, and persisted text behavior pass for the overlay.
+- Diagnostics are hidden behind a development button/drawer and still expose renderer health, frame time, visible counts, glyph/cache stats, dirty writes, buffer growth/compaction, hit result, selected object, and backend availability.
+- Existing workflows still pass on the Rust path: group create, tag attach/filter, node create/edit/delete/duplicate/copy/paste, z-order, edge create/select/delete, pan/zoom/fit/fullscreen, comments, export, selection persistence, and MCP/API compatibility.
+- Automated checks, browser interaction checks, desktop/mobile visual captures, and production DOM/SVG path deletion verification pass in the same replacement cycle.
 
 ## Execution Snapshot
 
 2026-06-05 진행 상태:
 
-- `poc/infinite-canvas/` 아래에 isolated Rust/WASM scene core scaffold와 Vite web harness를 추가했다.
+- Historical isolated Rust/WASM scene core scaffold와 Vite web harness를 추가했다.
 - POC harness는 group frame, node card, text snippet, edge를 하나의 retained scene fixture로 렌더링하고 pan/zoom/fit, selection, group tag attach/filtering, comments, product export preview, group drag, card drag, group create/delete, node create/delete/duplicate/copy/paste, z-order, edge creation/deletion, DOM text edit overlay, scripted benchmark를 제공한다.
 - `createBenchmarkFixture()`는 1,000개 이상 card/edge fixture를 deterministic하게 생성한다.
 - `src/shared/renderScene.ts`의 `shapeSceneToRenderSnapshot()`은 current `Scene`에서 renderer scene으로 변환하는 production-side adapter module을 제공하고 comments/artifacts/export/MCP/business fields를 제외한다.
@@ -35,14 +58,14 @@ shape.ai의 현재 DOM/SVG 기반 scene canvas 구현을 최종적으로 custom 
 - POC harness의 `Real scene` loader는 backend가 실행 중일 때 `/api/scene`을 proxy로 읽고 group tag filtering을 적용하며 selected-group tag attach를 `/api/groups/:id/tags`, comments를 `/api/comments`, exports를 `/api/groups/:id/export`로 보내고 group translate/card drag/edit/group create/delete/node create/delete/duplicate/copy/paste/z-order/edge app patches를 real `PATCH /api/scene` route로 보낼 수 있다.
 - Temporary backend verification으로 POC proxy를 통한 group 생성, scene load, node position patch, text patch, group create/delete patch, edge create/delete patch persistence round trip을 확인했다.
 - POC test는 `sceneGraphForGroup()`, `selectedSubgraph()`, `generateLocalExport()`가 renderer snapshot이 아니라 app `Scene`에서 deterministic export/subgraph semantics를 유지함을 검증한다.
-- P0~P7 evidence는 `poc/infinite-canvas/docs/` 아래에 baseline, benchmark criteria, source deep dive, renderer/editing confirmations, scene contract/parity, scale hardening/replacement plan, replacement decision summary로 기록했다.
-- repo-local `.poc-toolchains/` 아래에 Rust stable toolchain과 `wasm-pack`을 설치해 `npm run poc:wasm:build`를 검증했다. Generated WASM glue는 gitignore된 `poc/infinite-canvas/web/src/wasm/`에 생성된다.
+- P0~P7 evidence는 `docs/renderer/evidence/` 아래에 baseline, benchmark criteria, source deep dive, renderer/editing confirmations, scene contract/parity, scale hardening/replacement plan, replacement decision summary로 보존했다.
+- repo-local `.renderer-toolchains/` 아래에 Rust stable toolchain과 `wasm-pack`을 설치해 `npm run renderer:wasm:build`를 검증했다. Generated WASM glue는 gitignore된 `src/client/renderer/wasm/`에 생성된다.
 - Web harness는 POC scene rendering을 Rust/WASM WebGPU 단일 경로로 좁혔다. Generated WASM 또는 visible WebGPU renderer가 없으면 TS Canvas2D fallback으로 그리지 않고 renderer unavailable 상태를 표시한다.
 - Rust core는 `wgpu` 29 기반 WebGPU readiness probe를 제공해 detached canvas에서 browser WebGPU support, canvas surface, adapter/device request, default surface config, clear render pass submit/present를 검증한다.
-- Rust core는 visible WebGPU canvas를 소유하는 `ShapeWebGpuRenderer`를 제공해 group/card primitive와 cubic edge/arrow/label vertex upload, selected group/card/edge outline styling, shared style token color ingestion, Rust-owned padded viewport culling과 merged draw-range rendering, `unicode-segmentation`/`unicode-width` 기반 grapheme-aware bitmap title/summary/edge-label wrapping, text line/wrap layout cache, CJK/fallback glyph metric reporting, compact render patch ingestion, fixed-slot dirty group/card/edge buffer writes for group translate/card move/edit/select patches, z-order patch의 order-preserving buffer rebuild, spare group slot dirty writes for group create/delete patches, group spare slot 고갈 시 edge/card segment 앞에 추가 group slots를 삽입하는 GPU buffer growth, group deletion 후 과도한 free slots를 줄이는 GPU segment-copy compaction, spare card slot dirty writes for card create/delete patches, card spare slot 고갈 시 buffer suffix에 추가 card slots를 append하는 GPU buffer growth, card deletion 후 과도한 free slots를 줄이는 GPU segment-copy compaction, spare edge slot dirty writes for edge create/delete patches, edge spare slot 고갈 시 card draw segment 앞에 추가 edge slots를 삽입하는 GPU buffer growth, edge deletion 후 과도한 free slots를 줄이는 GPU segment-copy compaction, Rust-owned card/text/port/cubic-edge/group hit testing, render pass submit/present, visible object/drawn vertex/draw range/GPU vertex/glyph/fallback-glyph/CJK-glyph/text-cache/style-token/patch/dirty-write/rebuild/group-slot/group-grow/group-compact/card-slot/card-grow/card-compact/edge-slot/edge-grow/edge-compact count reporting을 수행한다.
-- TS harness는 WebGPU mode에서도 per-frame spatial visible 계산을 하지 않고 Rust frame stats를 HUD/benchmark에 사용한다. Camera input은 dirty flag로 coalesce되고 render tick에서는 `renderFrameWithCamera()`로 camera update와 render call을 하나의 WASM boundary call로 합친다.
-- P7 decision summary는 이 branch에서 production DOM/SVG scene canvas를 제거하지 말고, 다음 cycle에서 rendered browser interaction verification과 product-quality Rust/wgpu hardening을 먼저 진행하라고 권고한다.
-- 실제 product-quality Rust/wgpu renderer로 보기에는 Swash/Cosmic Text 수준의 real shaping, real font fallback/Korean glyph raster quality, richer card/edge styling fidelity, broader dirty-range updates, DOM overlay alignment/IME verification, real backend browser interaction verification이 다음 hardening task로 남는다. Current Browser smoke는 local POC가 WebGPU renderer로 열리고 benchmark를 실행할 수 있음을 확인했지만, real backend scene interaction과 visual QA capture는 아직 완료되지 않았다.
+- Rust core는 visible WebGPU canvas를 소유하는 `ShapeWebGpuRenderer`를 제공해 group/card primitive와 cubic edge/arrow/label vertex upload, selected group/card/edge outline styling, shared style token color ingestion, Rust-owned padded viewport culling과 merged draw-range rendering, rustybuzz/fontdue 기반 shaped title/summary/edge-label rendering, explicit bundled Latin/Korean Noto Sans KR renderer font subsets, font fallback, glyph atlas upload, text line/wrap layout cache, CJK/fallback/missing glyph/raster-cache metric reporting, compact render patch ingestion, fixed-slot dirty group/card/edge buffer writes for group translate/card move/edit/select patches, z-order patch의 order-preserving buffer rebuild, spare group slot dirty writes for group create/delete patches, group spare slot 고갈 시 edge/card segment 앞에 추가 group slots를 삽입하는 GPU buffer growth, group deletion 후 과도한 free slots를 줄이는 GPU segment-copy compaction, spare card slot dirty writes for card create/delete patches, card spare slot 고갈 시 buffer suffix에 추가 card slots를 append하는 GPU buffer growth, card deletion 후 과도한 free slots를 줄이는 GPU segment-copy compaction, spare edge slot dirty writes for edge create/delete patches, edge spare slot 고갈 시 card draw segment 앞에 추가 edge slots를 삽입하는 GPU buffer growth, edge deletion 후 과도한 free slots를 줄이는 GPU segment-copy compaction, Rust-owned card/text/port/cubic-edge/group hit testing, render pass submit/present, visible object/drawn vertex/draw range/GPU vertex/shaped-glyph/fallback-run/missing-glyph/CJK-glyph/glyph-atlas/raster-cache/text-cache/style-token/patch/dirty-write/rebuild/group-slot/group-grow/group-compact/card-slot/card-grow/card-compact/edge-slot/edge-grow/edge-compact count reporting을 수행한다.
+- TS harness는 WebGPU mode에서도 per-frame spatial visible 계산을 하지 않고 Rust frame stats를 HUD/benchmark에 사용한다. Camera/input interpretation, hit/selection classification, overlay geometry request, patch batching, and debug snapshots now flow through Rust-facing batch/debug APIs instead of single-purpose JS/WASM calls.
+- P7 decision summary는 이전 POC cycle의 gate result로서, 그 branch에서 production DOM/SVG scene canvas를 제거하지 말고 rendered browser interaction verification과 product-quality Rust/wgpu hardening을 먼저 진행하라고 권고했다.
+- 이 historical "not ready" 판단은 현재 objective를 축소하지 않는다. 현재 replacement gate는 HarfBuzz-grade shaping/font fallback/Korean glyph quality, Rust-owned graphics effects, polished DOM input overlay, hidden diagnostics drawer, real backend browser interaction verification, visual QA, and legacy DOM/SVG removal까지 요구한다. Current replacement cycle treats that gate as passed before P9 legacy removal; future e2e/browser verification should use the Browser agentic workflow, not a committed Playwright harness.
 
 ## Locked Inputs
 
@@ -51,9 +74,11 @@ shape.ai의 현재 DOM/SVG 기반 scene canvas 구현을 최종적으로 custom 
 - Rust는 business logic 이전용이 아니라 canvas/graphics core 구현 언어로 사용한다.
 - TypeScript app layer는 shape business model, persistence, AI/MCP workflow, comments/export/proposals를 계속 책임진다.
 - DOM은 app chrome, floating UI, active editing overlay에 사용한다.
+- Debug panel은 개발용 button/drawer 뒤에 숨기되 renderer health/debug stats를 잃지 않는다.
+- HarfBuzz-grade shaping/font fallback/glyph atlas와 product-quality Korean/mixed text rendering은 production replacement gate다. P4에서 bitmap text는 정상 rendering path에서 제거되고 rustybuzz/fontdue 기반 renderer text path가 들어왔다. Browser/visual approval belongs to P8 and is not represented by committed Playwright tests in this branch.
 - 평상시 canvas object는 live DOM element가 아니라 renderer scene object다.
 - renderer path는 custom Rust + wgpu/WebGPU로 잠근다. Vello, CanvasKit/Skia, Graphite, ThorVG, Pathfinder, Lyon, Kurbo, Peniko, Swash, Cosmic Text는 직접 구현 범위를 줄이고 위험을 검증하기 위한 참고 자료다.
-- production source replacement 전까지 POC 구현, fixture, benchmark, adapter draft는 `poc/` 아래에 둔다.
+- historical POC evidence is preserved under `docs/renderer/evidence`; current fixture, benchmark, adapter, and renderer implementation live in production paths.
 - 최종 migration 목표는 현재 DOM/SVG scene canvas path를 유지보수용 fallback으로 남기는 것이 아니라 새 engine으로 대체하고 기존 path를 제거하는 것이다.
 
 ## Must-Haves
@@ -62,9 +87,12 @@ shape.ai의 현재 DOM/SVG 기반 scene canvas 구현을 최종적으로 custom 
 - Retained scene: 모든 객체는 하나의 world scene과 stable object id를 가진다.
 - Batched boundary: JS/WASM 호출은 scene patch, input batch, frame render 중심으로 묶는다.
 - Active edit bridge: 텍스트 편집은 DOM overlay로 처리하되 scene과 좌표 동기화가 정확해야 한다.
+- Product-quality text: Rust renderer가 HarfBuzz-grade shaping/font fallback/glyph atlas, Korean/mixed text quality, line wrap, clipping, ellipsis, and cache invalidation을 소유한다.
+- Rust graphics effects: card/group/edge visual polish, shadows, gradients, strokes, rounded corners, badges, ports, focus/selected states, and edge labels are renderer-owned primitives/style tokens.
+- Hidden diagnostics: visible-by-default debug panels become a development drawer without losing renderer health/frame/cache/buffer/hit/backend stats.
 - Performance-aware renderer: spatial index, culling, geometry/text/edge cache, batched GPU updates, JS/WASM boundary budget을 foundation 요구사항으로 둔다.
 - Current editor parity: 현재 Scene/Group/Node/Edge/Tag/Comment/Artifact workflow를 새 canvas 위에 다시 올릴 수 있어야 한다.
-- Migration safety: 현재 DOM/SVG scene canvas path를 즉시 삭제하지 않고 `poc/`에서 비교/대체 가능한 migration path를 만든 뒤 제거한다.
+- Migration safety: earlier isolated evidence was used to compare the replacement path before removing the DOM/SVG scene canvas path.
 
 ## Current Implementation Features To Preserve
 
@@ -595,7 +623,7 @@ Source refs:
 
 Deliverables:
 
-- `hitTest` API.
+- Hit result through the Rust input/debug boundary.
 - group/card/edge/text/port hit region.
 - selected object highlight.
 - selection event output.
@@ -1356,7 +1384,7 @@ Serial work:
 3. Capture visual QA for desktop/mobile viewports and representative zoom/edit states on the WebGPU-only POC path.
 4. Browser-verify the render snapshot comparison route and POC `Real scene` mode against the same real backend scene.
 
-These tasks are the remaining gate before production source replacement can start. The current branch should not delete the DOM/SVG scene canvas path.
+These tasks are the remaining evidence gate before production source replacement can start. They do not redefine the final target: the replacement cycle must still delete the DOM/SVG scene canvas path after the current replacement acceptance criteria pass.
 
 ## Resolved Decisions
 
@@ -1387,7 +1415,6 @@ Use existing project commands where they apply:
 npm run typecheck
 npm run test:unit
 npm run build
-npm run test:e2e
+npm run renderer:test
+npm run renderer:rust:test
 ```
-
-Prototype-specific commands under `poc/` should be added by T1.1. Until then, renderer work must report the exact build/run commands it introduces.

@@ -39,17 +39,14 @@ import {
   type Tag,
   type UpdateTagRequest
 } from "../shared/schema";
-import { boundsIntersect, expandedBounds, limitSceneNodesForLod, nodeBounds, shouldShowSceneEdges, shouldShowSceneNodes } from "../shared/graph";
+import { boundsIntersect, expandedBounds, nodeBounds } from "../shared/graph";
 
 type SqlDatabase = initSqlJs.Database;
 type SqlValue = initSqlJs.SqlValue;
 type SqlRow = Record<string, SqlValue | undefined>;
 
 export type SceneQuery = {
-  viewport?: Bounds;
-  zoom?: number;
   tagIds?: string[];
-  focusGroupId?: string;
 };
 
 export type GroupDetail = {
@@ -79,27 +76,12 @@ export async function ensureStorage(): Promise<void> {
 export async function readScene(query: SceneQuery = {}): Promise<Scene> {
   return withDb((db) => {
     const all = readFullSceneInDb(db);
-    const zoom = query.zoom ?? 1;
-    const viewport = query.viewport ? expandedBounds(query.viewport, Math.max(800, 1600 / Math.max(zoom, 0.02))) : undefined;
     const tagIds = query.tagIds?.filter(Boolean) ?? [];
-    const groups = all.groups
-      .filter((group) => tagIds.length === 0 || tagIds.every((tagId) => group.tagIds.includes(tagId)))
-      .filter((group) => !viewport || boundsIntersect(group.bounds, viewport));
+    const groups = all.groups.filter((group) => tagIds.length === 0 || tagIds.every((tagId) => group.tagIds.includes(tagId)));
     const groupIds = new Set(groups.map((group) => group.id));
-    const focusGroupId = query.focusGroupId && groupIds.has(query.focusGroupId) && zoom >= 0.36 ? query.focusGroupId : undefined;
-    const nodeGroupIds = focusGroupId ? new Set([focusGroupId]) : groupIds;
-    const nodeGroupCount = focusGroupId ? 1 : groups.length;
-
-    const includeNodes = shouldShowSceneNodes(zoom, nodeGroupCount);
-    const includeEdges = shouldShowSceneEdges(zoom, nodeGroupCount);
-    const candidateNodes = includeNodes
-      ? all.nodes.filter((node) => nodeGroupIds.has(node.groupId) && (!viewport || boundsIntersect(nodeBounds(node), viewport)))
-      : [];
-    const nodes = limitSceneNodesForLod(candidateNodes, zoom, nodeGroupCount);
+    const nodes = all.nodes.filter((node) => groupIds.has(node.groupId));
     const nodeIds = new Set(nodes.map((node) => node.id));
-    const edges = includeEdges
-      ? all.edges.filter((edge) => nodeGroupIds.has(edge.groupId) && nodeIds.has(edge.source) && nodeIds.has(edge.target))
-      : [];
+    const edges = all.edges.filter((edge) => groupIds.has(edge.groupId) && nodeIds.has(edge.source) && nodeIds.has(edge.target));
 
     return sceneSchema.parse({
       ...all,

@@ -1,5 +1,4 @@
 import type {
-  Bounds,
   CreateCommentRequest,
   ExportOutput,
   ExportRequest,
@@ -12,23 +11,12 @@ import type {
 } from "../../shared/schema";
 
 type SceneQuery = {
-  viewport?: Bounds;
-  zoom?: number;
   tagIds?: string[];
-  focusGroupId?: string;
 };
 
 export async function fetchScene(query: SceneQuery = {}): Promise<Scene> {
   const params = new URLSearchParams();
-  if (query.viewport) {
-    params.set("x", String(query.viewport.x));
-    params.set("y", String(query.viewport.y));
-    params.set("width", String(query.viewport.width));
-    params.set("height", String(query.viewport.height));
-  }
-  if (query.zoom) params.set("zoom", String(query.zoom));
   if (query.tagIds?.length) params.set("tags", query.tagIds.join(","));
-  if (query.focusGroupId) params.set("focusGroupId", query.focusGroupId);
   const suffix = params.toString() ? `?${params}` : "";
   const data = await request<{ scene: Scene }>(`/api/scene${suffix}`);
   return data.scene;

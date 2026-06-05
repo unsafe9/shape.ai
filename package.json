@@ -11,16 +11,12 @@
     "mcp": "tsx src/server/mcp.ts",
     "start": "npm run build && tsx src/server/index.ts --open",
     "typecheck": "tsc --noEmit",
-    "build": "vite build && tsc -p tsconfig.server.json",
-    "test": "vitest run && playwright test",
+    "build": "npm run renderer:wasm:build && vite build && tsc -p tsconfig.server.json",
+    "test": "vitest run",
     "test:unit": "vitest run",
-    "test:e2e": "playwright test",
-    "poc:dev": "vite --config poc/infinite-canvas/web/vite.config.ts --host 127.0.0.1",
-    "poc:typecheck": "tsc -p poc/infinite-canvas/web/tsconfig.json --noEmit",
-    "poc:test": "vitest run tests/infinite-canvas-poc.test.ts",
-    "poc:build": "vite build --config poc/infinite-canvas/web/vite.config.ts",
-    "poc:verify": "npm run poc:typecheck && npm run poc:test && npm run poc:build",
-    "poc:wasm:build": "wasm-pack build poc/infinite-canvas/core --target web --out-dir ../web/src/wasm --out-name shape_canvas_core"
+    "renderer:test": "vitest run tests/infinite-canvas-renderer.test.ts",
+    "renderer:rust:test": "scripts/renderer-toolchain.sh cargo test --manifest-path src/renderer/core/Cargo.toml --features wgpu-probe",
+    "renderer:wasm:build": "scripts/renderer-toolchain.sh wasm-pack build src/renderer/core --target web --out-dir ../../client/renderer/wasm --out-name shape_canvas_core"
   },
   "dependencies": {
     "@fastify/static": "^9.1.3",
@@ -34,7 +30,6 @@
     "zod": "^4.1.13"
   },
   "devDependencies": {
-    "@playwright/test": "^1.57.0",
     "@types/node": "^24.10.2",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",

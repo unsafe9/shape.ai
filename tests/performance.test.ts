@@ -9,8 +9,8 @@ afterEach(() => {
   vi.resetModules();
 });
 
-describe("scene LOD performance contracts", () => {
-  it("keeps 10k-object reads bounded by zoom and viewport", async () => {
+describe("scene read performance contracts", () => {
+  it("returns the canonical 10k-object scene for renderer-side culling", async () => {
     process.env.SHAPE_AI_DATA_DIR = await mkdtemp(join(tmpdir(), "shape-ai-perf-"));
     vi.resetModules();
     const storage = await import("../src/server/storage");
@@ -50,20 +50,9 @@ describe("scene LOD performance contracts", () => {
 
     await storage.saveScenePatch({ groups: [group], nodes });
 
-    const overview = await storage.readScene({
-      viewport: { x: 0, y: 0, width: 1200, height: 900 },
-      zoom: 0.05
-    });
-    expect(overview.groups).toHaveLength(1);
-    expect(overview.nodes.length).toBeGreaterThan(0);
-    expect(overview.nodes.length).toBeLessThan(10_000);
-    expect(overview.edges).toHaveLength(0);
-
-    const detail = await storage.readScene({
-      viewport: { x: 0, y: 0, width: 1200, height: 900 },
-      zoom: 1
-    });
-    expect(detail.nodes.length).toBeGreaterThan(0);
-    expect(detail.nodes.length).toBeLessThan(10_000);
+    const scene = await storage.readScene();
+    expect(scene.groups).toHaveLength(1);
+    expect(scene.nodes).toHaveLength(10_000);
+    expect(scene.edges).toHaveLength(0);
   });
 });

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, PointerEvent, WheelEvent } from "react";
-import { BrainCircuit, Clipboard, Copy, Layers, Loader2, Maximize2, Minus, PanelLeft, Pencil, Plus, Trash2, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { MouseEvent } from "react";
+import { Activity, BrainCircuit, Clipboard, Copy, Layers, Loader2, Maximize2, Minus, MoreHorizontal, PanelLeft, Pencil, Plus, Trash2, X } from "lucide-react";
 import {
   createComment,
   createGroup,
@@ -13,21 +13,18 @@ import {
 } from "./lib/api";
 import {
   boundsIntersect,
-  edgeTypeLabels,
   expandedBounds,
-  groupTags,
-  limitSceneNodesForLod,
-  nodeBounds,
-  nodeTypeLabels,
-  shouldShowSceneEdges,
-  shouldShowSceneNodes
+  nodeBounds
 } from "../shared/graph";
 import { cloneNodeForPaste, formatNodeMarkdown } from "./lib/nodeClipboard";
-import { DecisionNode } from "./components/DecisionNode";
+import { SelectedNodeInspector } from "./components/SelectedNodeInspector";
+import { RendererCanvasHost, type RendererCanvasHostHandle, type RendererHealth, type RendererStats } from "./components/RendererCanvasHost";
+import { RendererDiagnosticsDrawer } from "./components/RendererDiagnosticsDrawer";
 import { Sidebar } from "./components/Sidebar";
 import { ExportDrawer, type ExportPreview } from "./components/ExportDrawer";
+import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../shared/renderPatch";
+import type { CameraState } from "../shared/renderScene";
 import type {
-  Bounds,
   EdgeType,
   ExportType,
   GraphComment,
@@ -46,38 +43,17 @@ const cardWidth = 270;
 const cardHeight = 178;
 const selectedCardWidth = 390;
 const selectedCardHeight = 390;
-const minZoom = 0.004;
-const maxZoom = 3.4;
-const detailZoom = 0.48;
 const tagColors = ["#6b8df2", "#12a594", "#d17b31", "#b65fcf", "#d84d66", "#6f7a86"];
 const seedPrompt =
   "Draft an AI-assisted architecture decision tool that extracts propositions, decision points, options, evidence, blockers, tradeoffs, subdecisions, tasks, and exports.";
 
-type Camera = {
-  x: number;
-  y: number;
-  zoom: number;
-};
+type Camera = CameraState;
 
 type NodeMenuState = {
   nodeId: string;
   x: number;
   y: number;
 };
-
-type DragState =
-  | { kind: "pan"; pointerId: number; startX: number; startY: number; camera: Camera }
-  | { kind: "node"; pointerId: number; nodeId: string; startX: number; startY: number; startPosition: { x: number; y: number } }
-  | {
-      kind: "group";
-      pointerId: number;
-      groupId: string;
-      startX: number;
-      startY: number;
-      startBounds: Bounds;
-      startNodes: Array<{ id: string; position: { x: number; y: number } }>;
-      moved: boolean;
-    };
 
 export default function App() {
   const [scene, setScene] = useState<Scene | null>(null);
@@ -96,55 +72,57 @@ export default function App() {
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [exportPreviewCopied, setExportPreviewCopied] = useState(false);
   const [camera, setCamera] = useState<Camera>({ x: 140, y: 120, zoom: 0.28 });
-  const [interacting, setInteracting] = useState(false);
+  const [rendererStats, setRendererStats] = useState<RendererStats | null>(null);
+  const [rendererHealth, setRendererHealth] = useState<RendererHealth | null>(null);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [rendererStatus, setRendererStatus] = useState("No renderer status yet");
   const canvasRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<DragState | null>(null);
-  const suppressGroupClickRef = useRef(false);
-  const interactionTimerRef = useRef<number | null>(null);
+  const rendererRef = useRef<RendererCanvasHostHandle | null>(null);
   const sceneRequestRef = useRef(0);
+  const sceneRef = useRef<Scene | null>(null);
+  const selectionRef = useRef<SceneSelection>({ kind: "canvas" });
+  const rendererPatchSaveRef = useRef(0);
 
-  const viewport = useMemo(() => viewportBounds(camera, canvasRef.current), [camera]);
   const selectedGroupId = activeGroupIdForSelection(scene, selection);
   const activeGroupId = selectedGroupId ?? currentGroupId ?? scene?.groups[0]?.id;
   const activeGroup = scene?.groups.find((group) => group.id === activeGroupId) ?? null;
   const selectedNode = selection.kind === "node" ? scene?.nodes.find((node) => node.id === selection.id) ?? null : null;
   const artifacts = scene?.artifacts.filter((artifact) => artifact.target.kind === "group" && artifact.target.id === activeGroupId) ?? [];
+  const selectedTargetLabel = selectedNode
+    ? `node:${selectedNode.id} - ${selectedNode.title}`
+    : selection.kind === "canvas"
+      ? "canvas"
+      : `${selection.kind}:${selection.id}`;
 
-  const visible = useMemo(() => {
-    if (!scene) return { groups: [] as SceneGroup[], nodes: [] as SceneNode[], edges: [] as SceneEdge[] };
-    const padded = expandedBounds(viewport, Math.max(800, 1600 / Math.max(camera.zoom, 0.02)));
-    const groups = scene.groups.filter((group) => activeTagIds.length === 0 || activeTagIds.every((tagId) => group.tagIds.includes(tagId)));
-    const visibleGroups = groups.filter((group) => boundsIntersect(group.bounds, padded));
-    const groupIds = new Set(visibleGroups.map((group) => group.id));
-    const focusGroupId = activeGroupId && groupIds.has(activeGroupId) && camera.zoom >= 0.36 ? activeGroupId : undefined;
-    const nodeGroupIds = focusGroupId ? new Set([focusGroupId]) : groupIds;
-    const nodeGroupCount = focusGroupId ? 1 : visibleGroups.length;
-    const showNodes = shouldShowSceneNodes(camera.zoom, nodeGroupCount);
-    const candidateNodes = showNodes ? scene.nodes.filter((node) => nodeGroupIds.has(node.groupId) && boundsIntersect(nodeBounds(node), padded)) : [];
-    const nodes = limitSceneNodesForLod(candidateNodes, camera.zoom, nodeGroupCount);
-    const nodeIds = new Set(nodes.map((node) => node.id));
-    const showEdges = shouldShowSceneEdges(camera.zoom, nodeGroupCount);
-    const edges = showEdges ? scene.edges.filter((edge) => nodeGroupIds.has(edge.groupId) && nodeIds.has(edge.source) && nodeIds.has(edge.target)) : [];
-    return { groups: visibleGroups, nodes, edges };
-  }, [scene, viewport, camera.zoom, activeTagIds, activeGroupId]);
+  useEffect(() => {
+    sceneRef.current = scene;
+  }, [scene]);
 
-  const fullNodeIds = useMemo(() => {
-    if (camera.zoom < detailZoom) return new Set<string>();
-    if (!interacting) return new Set(visible.nodes.map((node) => node.id));
-    return new Set([selection.kind === "node" ? selection.id : ""].filter(Boolean));
-  }, [camera.zoom, interacting, visible.nodes, selection]);
+  useEffect(() => {
+    selectionRef.current = selection;
+  }, [selection]);
+
+  const handleRendererHealth = useCallback((health: RendererHealth) => {
+    setRendererHealth(health);
+    if (health.state === "ready") {
+      setStatus((current) => (isDiagnosticsOnlyRendererStatus(current) ? "Ready" : current));
+    }
+  }, []);
 
   const refreshScene = useCallback(async () => {
     const requestId = ++sceneRequestRef.current;
-    const nextScene = await fetchScene({ viewport, zoom: camera.zoom, tagIds: activeTagIds, focusGroupId: activeGroupId });
+    const nextScene = await fetchScene({ tagIds: activeTagIds });
     if (requestId !== sceneRequestRef.current) return;
+    sceneRef.current = nextScene;
     setScene(nextScene);
     setSelection((current) => {
       const serverSelection = validSelection(nextScene, nextScene.selection);
       const localSelection = validSelection(nextScene, current);
-      return serverSelection.kind === "canvas" && localSelection.kind !== "canvas" ? localSelection : serverSelection;
+      const nextSelection = serverSelection.kind === "canvas" && localSelection.kind !== "canvas" ? localSelection : serverSelection;
+      selectionRef.current = nextSelection;
+      return nextSelection;
     });
-  }, [viewport, camera.zoom, activeTagIds, activeGroupId]);
+  }, [activeTagIds]);
 
   useEffect(() => {
     refreshScene().catch((error) => setStatus(error.message));
@@ -152,8 +130,6 @@ export default function App() {
 
   useEffect(() => {
     const id = window.setTimeout(() => {
-      const drag = dragRef.current;
-      if (drag && (drag.kind === "node" || drag.kind === "group")) return;
       refreshScene().catch((error) => setStatus(error.message));
     }, 120);
     return () => window.clearTimeout(id);
@@ -164,6 +140,10 @@ export default function App() {
       const target = event.target as HTMLElement | null;
       if (event.key === "Escape") {
         event.preventDefault();
+        if (diagnosticsOpen) {
+          setDiagnosticsOpen(false);
+          return;
+        }
         if (nodeMenu) {
           setNodeMenu(null);
           return;
@@ -194,7 +174,7 @@ export default function App() {
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selection, editingNodeId, nodeMenu, copiedNode, scene]);
+  }, [selection, editingNodeId, nodeMenu, copiedNode, scene, diagnosticsOpen]);
 
   async function runCreateGroup() {
     await withBusy("Creating group", async () => {
@@ -208,7 +188,7 @@ export default function App() {
       setCurrentGroupId(response.group.id);
       const firstNode = response.scene.nodes.find((node) => node.groupId === response.group.id);
       if (firstNode) focusNode(firstNode, 0.92);
-      else focusGroup(response.group, 0.72);
+      else focusGroup(response.group, { zoom: 0.72 });
       await selectSceneItem({ kind: "group", id: response.group.id }, response.scene);
     });
   }
@@ -297,6 +277,86 @@ export default function App() {
     }
   }
 
+  function handleRendererSelection(nextSelection: SceneSelection) {
+    const currentScene = sceneRef.current;
+    if (!currentScene) return;
+    const valid = validSelection(currentScene, nextSelection);
+    selectionRef.current = valid;
+    const nextGroupId = activeGroupIdForSelection(currentScene, valid);
+    if (nextGroupId) setCurrentGroupId(nextGroupId);
+    if (valid.kind !== "node") setEditingNodeId(null);
+    setSelection(valid);
+    void saveScenePatch({ selection: valid }).catch((error) => {
+      setStatus(error instanceof Error ? error.message : "Selection save failed");
+    });
+  }
+
+  function handleRendererPatch(patch: RenderScenePatch) {
+    const currentScene = sceneRef.current;
+    if (!currentScene) return;
+    const previousSelection = selectionRef.current;
+    const applied = applyRenderPatchToShapeScene(currentScene, patch, new Date().toISOString());
+    if (applied.errors.length > 0) {
+      setStatus(applied.errors.join("; "));
+      return;
+    }
+
+    const optimisticSelection = validSelection(applied.scene, applied.scene.selection);
+    sceneRequestRef.current += 1;
+    sceneRef.current = applied.scene;
+    selectionRef.current = optimisticSelection;
+    setScene(applied.scene);
+    setSelection(optimisticSelection);
+    const nextGroupId = activeGroupIdForSelection(applied.scene, optimisticSelection);
+    if (nextGroupId) setCurrentGroupId(nextGroupId);
+    if (optimisticSelection.kind !== "node") setEditingNodeId(null);
+    const saveId = ++rendererPatchSaveRef.current;
+    void saveScenePatch(applied.appPatch)
+      .then((response) => {
+        if (saveId !== rendererPatchSaveRef.current) return;
+        const savedSelection = validSelection(response.scene, response.scene.selection);
+        sceneRef.current = response.scene;
+        selectionRef.current = savedSelection;
+        setScene(response.scene);
+        setSelection(savedSelection);
+        const savedGroupId = activeGroupIdForSelection(response.scene, savedSelection);
+        if (savedGroupId) setCurrentGroupId(savedGroupId);
+      })
+      .catch((error) => {
+        if (saveId !== rendererPatchSaveRef.current) return;
+        const restoredSelection = validSelection(currentScene, previousSelection);
+        sceneRef.current = currentScene;
+        selectionRef.current = restoredSelection;
+        setScene(currentScene);
+        setSelection(restoredSelection);
+        const restoredGroupId = activeGroupIdForSelection(currentScene, restoredSelection);
+        if (restoredGroupId) setCurrentGroupId(restoredGroupId);
+        if (restoredSelection.kind !== "node") setEditingNodeId(null);
+        setStatus(error instanceof Error ? error.message : `Renderer patch save failed: ${patch.kind}`);
+        refreshScene().catch((refreshError) => setStatus(refreshError instanceof Error ? refreshError.message : "Scene refresh failed"));
+      });
+  }
+
+  function handleRendererContextMenu(point: { x: number; y: number }) {
+    const currentSelection = selectionRef.current;
+    if (currentSelection.kind !== "node") return;
+    setEditingNodeId(null);
+    setNodeMenu({ nodeId: currentSelection.id, x: point.x, y: point.y });
+  }
+
+  function handleRendererStatus(message: string) {
+    setRendererStatus(message);
+    if (isDiagnosticsOnlyRendererStatus(message)) return;
+    setStatus(message);
+  }
+
+  function openSelectedNodeMenu(event: MouseEvent<HTMLButtonElement>) {
+    if (!selectedNode) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setEditingNodeId(null);
+    setNodeMenu({ nodeId: selectedNode.id, x: rect.right - 220, y: rect.bottom + 8 });
+  }
+
   function updateNode(node: GraphNode) {
     if (!scene) return;
     const current = scene.nodes.find((candidate) => candidate.id === node.id);
@@ -372,9 +432,10 @@ export default function App() {
           updatedAt: new Date().toISOString()
         }
       : null;
-    setScene({ ...scene, nodes: [...scene.nodes, node], edges: edge ? [...scene.edges, edge] : scene.edges });
+    const nextScene = { ...scene, nodes: [...scene.nodes, node], edges: edge ? [...scene.edges, edge] : scene.edges };
+    setScene(nextScene);
     void saveScenePatch({ nodes: [node], edges: edge ? [edge] : [], selection: { kind: "node", id } }).then((response) => setScene(response.scene));
-    void selectSceneItem({ kind: "node", id });
+    void selectSceneItem({ kind: "node", id }, nextScene);
   }
 
   async function copyNode(nodeId: string) {
@@ -459,24 +520,16 @@ export default function App() {
     return preferred;
   }
 
-  function focusGroup(group: SceneGroup, zoom = Math.min(0.65, Math.max(0.18, camera.zoom))) {
+  function focusGroup(group: SceneGroup, options: { zoom?: number; fit?: boolean } = {}) {
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
-    setCamera({
-      zoom,
-      x: rect.width / 2 - (group.bounds.x + group.bounds.width / 2) * zoom,
-      y: rect.height / 2 - (group.bounds.y + group.bounds.height / 2) * zoom
+    rendererRef.current?.focusBounds(group.bounds, {
+      screen: { x: rect.width / 2, y: rect.height / 2 },
+      zoom: options.fit ? undefined : options.zoom ?? Math.min(0.65, Math.max(0.18, camera.zoom)),
+      padding: options.fit ? { x: 110, y: 140 } : undefined,
+      minZoom: options.fit ? 0.36 : undefined,
+      maxZoom: options.fit ? 0.58 : undefined
     });
-    markInteracting();
-  }
-
-  function groupFocusZoom(group: SceneGroup): number {
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return Math.min(0.58, Math.max(0.38, camera.zoom));
-    const usableWidth = Math.max(360, rect.width - 220);
-    const usableHeight = Math.max(320, rect.height - 280);
-    const fitZoom = Math.min(usableWidth / group.bounds.width, usableHeight / group.bounds.height);
-    return clamp(Math.max(0.38, fitZoom), 0.36, 0.58);
   }
 
   function focusNode(node: SceneNode, targetZoom?: number) {
@@ -484,52 +537,30 @@ export default function App() {
     if (!rect) return;
     const zoom = targetZoom ?? Math.max(0.78, camera.zoom);
     const focusY = rect.width < 700 ? rect.height * 0.34 : rect.height / 2;
-    setCamera({
-      zoom,
-      x: rect.width / 2 - (node.position.x + selectedCardWidth / 2) * zoom,
-      y: focusY - (node.position.y + selectedCardHeight / 2) * zoom
-    });
-    markInteracting();
+    rendererRef.current?.focusBounds(
+      {
+        x: node.position.x,
+        y: node.position.y,
+        width: selectedCardWidth,
+        height: selectedCardHeight
+      },
+      {
+        screen: { x: rect.width / 2, y: focusY },
+        zoom,
+        minZoom: 0.04,
+        maxZoom: 2.8
+      }
+    );
   }
 
-  function zoomAtCanvasCenter(multiplier: number) {
+  function zoomAtCanvasCenter(deltaY: number) {
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const screenX = rect.width / 2;
-    const screenY = rect.height / 2;
-    const world = screenToWorld(screenX, screenY, camera);
-    const zoom = clamp(camera.zoom * multiplier, minZoom, maxZoom);
-    setCamera({
-      zoom,
-      x: screenX - world.x * zoom,
-      y: screenY - world.y * zoom
-    });
-    markInteracting();
+    rendererRef.current?.wheelAtScreen({ x: rect.width / 2, y: rect.height / 2 }, deltaY);
   }
 
-  async function fitScene() {
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    let groups = scene?.groups ?? [];
-    try {
-      const overviewScene = await fetchScene({ zoom: 0.05, tagIds: activeTagIds });
-      sceneRequestRef.current += 1;
-      setScene(overviewScene);
-      groups = overviewScene.groups;
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Fit scene failed");
-    }
-    if (groups.length === 0) return;
-    const bounds = unionBounds(groups.map((group) => group.bounds));
-    const usableWidth = Math.max(320, rect.width - 160);
-    const usableHeight = Math.max(260, rect.height - 160);
-    const zoom = clamp(Math.min(usableWidth / bounds.width, usableHeight / bounds.height), minZoom, 1.1);
-    setCamera({
-      zoom,
-      x: rect.width / 2 - (bounds.x + bounds.width / 2) * zoom,
-      y: rect.height / 2 - (bounds.y + bounds.height / 2) * zoom
-    });
-    markInteracting();
+  function fitScene() {
+    rendererRef.current?.fitScene();
   }
 
   async function toggleFullscreen() {
@@ -541,151 +572,6 @@ export default function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Fullscreen failed");
     }
-  }
-
-  function onCanvasPointerDown(event: PointerEvent<HTMLDivElement>) {
-    if (event.button !== 0 || event.target !== event.currentTarget) return;
-    dragRef.current = { kind: "pan", pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, camera };
-    event.currentTarget.setPointerCapture(event.pointerId);
-    markInteracting();
-  }
-
-  function onNodePointerDown(event: PointerEvent<HTMLDivElement>, node: SceneNode) {
-    if (event.button !== 0) return;
-    const target = event.target as HTMLElement;
-    if (target.closest("button,input,textarea,select,.node-note-scroll")) return;
-    event.stopPropagation();
-    dragRef.current = { kind: "node", pointerId: event.pointerId, nodeId: node.id, startX: event.clientX, startY: event.clientY, startPosition: node.position };
-    event.currentTarget.setPointerCapture(event.pointerId);
-    markInteracting();
-  }
-
-  function onGroupPointerDown(event: PointerEvent<HTMLButtonElement>, group: SceneGroup) {
-    if (event.button !== 0 || !scene) return;
-    event.stopPropagation();
-    setNodeMenu(null);
-    setCurrentGroupId(group.id);
-    setSelection({ kind: "group", id: group.id });
-    dragRef.current = {
-      kind: "group",
-      pointerId: event.pointerId,
-      groupId: group.id,
-      startX: event.clientX,
-      startY: event.clientY,
-      startBounds: group.bounds,
-      startNodes: scene.nodes
-        .filter((node) => node.groupId === group.id)
-        .map((node) => ({ id: node.id, position: node.position })),
-      moved: false
-    };
-    event.currentTarget.setPointerCapture(event.pointerId);
-    markInteracting();
-  }
-
-  function onPointerMove(event: PointerEvent<HTMLDivElement>) {
-    const drag = dragRef.current;
-    if (!drag) return;
-    markInteracting();
-    if (drag.kind === "pan") {
-      setCamera({ ...drag.camera, x: drag.camera.x + event.clientX - drag.startX, y: drag.camera.y + event.clientY - drag.startY });
-      return;
-    }
-    if (!scene) return;
-    if (drag.kind === "group") {
-      const dx = (event.clientX - drag.startX) / camera.zoom;
-      const dy = (event.clientY - drag.startY) / camera.zoom;
-      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 3) {
-        drag.moved = true;
-        suppressGroupClickRef.current = true;
-      }
-      const startNodePositions = new Map(drag.startNodes.map((node) => [node.id, node.position]));
-      const now = new Date().toISOString();
-      setScene({
-        ...scene,
-        groups: scene.groups.map((group) =>
-          group.id === drag.groupId
-            ? {
-                ...group,
-                bounds: { ...drag.startBounds, x: drag.startBounds.x + dx, y: drag.startBounds.y + dy },
-                updatedAt: now
-              }
-            : group
-        ),
-        nodes: scene.nodes.map((node) => {
-          const startPosition = startNodePositions.get(node.id);
-          return startPosition
-            ? {
-                ...node,
-                position: { x: startPosition.x + dx, y: startPosition.y + dy },
-                updatedAt: now
-              }
-            : node;
-        })
-      });
-      return;
-    }
-    const node = scene.nodes.find((candidate) => candidate.id === drag.nodeId);
-    if (!node) return;
-    const nextNode = {
-      ...node,
-      position: {
-        x: drag.startPosition.x + (event.clientX - drag.startX) / camera.zoom,
-        y: drag.startPosition.y + (event.clientY - drag.startY) / camera.zoom
-      },
-      updatedAt: new Date().toISOString()
-    };
-    setScene({ ...scene, nodes: scene.nodes.map((candidate) => (candidate.id === node.id ? nextNode : candidate)) });
-  }
-
-  function onPointerUp(event: PointerEvent<HTMLDivElement>) {
-    const drag = dragRef.current;
-    if (!drag) return;
-    dragRef.current = null;
-    if (drag.kind === "node" && scene) {
-      const node = scene.nodes.find((candidate) => candidate.id === drag.nodeId);
-      if (node) void saveScenePatch({ nodes: [node] }).then((response) => setScene(response.scene));
-    }
-    if (drag.kind === "group" && drag.moved) {
-      void saveScenePatch({
-        translateGroups: [
-          {
-            groupId: drag.groupId,
-            dx: (event.clientX - drag.startX) / camera.zoom,
-            dy: (event.clientY - drag.startY) / camera.zoom
-          }
-        ]
-      }).then((response) => setScene(response.scene));
-      window.setTimeout(() => {
-        suppressGroupClickRef.current = false;
-      }, 0);
-    }
-    try {
-      event.currentTarget.releasePointerCapture(drag.pointerId);
-    } catch {
-      // Pointer capture may already be released by the browser.
-    }
-  }
-
-  function onWheel(event: WheelEvent<HTMLDivElement>) {
-    event.preventDefault();
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const screenX = event.clientX - rect.left;
-    const screenY = event.clientY - rect.top;
-    const world = screenToWorld(screenX, screenY, camera);
-    const nextZoom = clamp(camera.zoom * Math.exp(-event.deltaY * 0.0012), minZoom, maxZoom);
-    setCamera({
-      zoom: nextZoom,
-      x: screenX - world.x * nextZoom,
-      y: screenY - world.y * nextZoom
-    });
-    markInteracting();
-  }
-
-  function markInteracting() {
-    setInteracting(true);
-    if (interactionTimerRef.current) window.clearTimeout(interactionTimerRef.current);
-    interactionTimerRef.current = window.setTimeout(() => setInteracting(false), 180);
   }
 
   async function withBusy(label: string, action: () => Promise<void>) {
@@ -702,149 +588,94 @@ export default function App() {
   }
 
   const nodeMenuNode = nodeMenu ? scene?.nodes.find((node) => node.id === nodeMenu.nodeId) : null;
-  const lodLabel = visible.nodes.length === 0 ? "overview" : camera.zoom < detailZoom ? "compact" : interacting ? "active-cull" : "detail";
 
   return (
     <div className="app-shell">
       <main className="studio-stage">
         <section className={`canvas-panel ${selection.kind === "node" ? "has-card-focus" : ""}`}>
-          <div
-            className="flow-wrap scene-canvas"
-            ref={canvasRef}
-            onPointerDown={onCanvasPointerDown}
-            onPointerMove={onPointerMove}
-            onPointerUp={onPointerUp}
-            onWheel={onWheel}
-          >
+          <div className="flow-wrap renderer-scene-surface" ref={canvasRef}>
             <div className="canvas-watermark" aria-hidden="true">
               <BrainCircuit size={28} />
               <span>shape.ai</span>
             </div>
-            <div className="scene-perf-hud" aria-label="Scene performance mode">
-              {lodLabel} · {visible.groups.length}g/{visible.nodes.length}n · {Math.round(camera.zoom * 100)}%
-            </div>
             <div className="scene-controls" aria-label="Canvas controls">
-              <button className="icon-button" onClick={() => zoomAtCanvasCenter(0.82)} aria-label="Zoom out" title="Zoom out">
+              <button
+                className={`icon-button ${diagnosticsOpen ? "is-active" : ""}`}
+                type="button"
+                onClick={() => setDiagnosticsOpen((open) => !open)}
+                aria-label={diagnosticsOpen ? "Close diagnostics" : "Open diagnostics"}
+                aria-expanded={diagnosticsOpen}
+                aria-controls="renderer-diagnostics"
+                title={diagnosticsOpen ? "Close diagnostics" : "Open diagnostics"}
+              >
+                <Activity size={15} />
+              </button>
+              <button className="icon-button" onClick={() => zoomAtCanvasCenter(160)} aria-label="Zoom out" title="Zoom out">
                 <Minus size={15} />
               </button>
-              <button className="icon-button" onClick={() => zoomAtCanvasCenter(1.22)} aria-label="Zoom in" title="Zoom in">
+              <button className="icon-button" onClick={() => zoomAtCanvasCenter(-160)} aria-label="Zoom in" title="Zoom in">
                 <Plus size={15} />
               </button>
-              <button className="icon-button" onClick={() => void fitScene()} aria-label="Fit scene" title="Fit scene">
+              <button className="icon-button" onClick={fitScene} aria-label="Fit scene" title="Fit scene">
                 <Layers size={15} />
               </button>
               <button className="icon-button" onClick={() => void toggleFullscreen()} aria-label="Fullscreen" title="Fullscreen">
                 <Maximize2 size={15} />
               </button>
             </div>
+            <RendererDiagnosticsDrawer
+              open={diagnosticsOpen}
+              stats={rendererStats}
+              health={rendererHealth}
+              camera={camera}
+              selection={selection}
+              selectedTargetLabel={selectedTargetLabel}
+              status={status}
+              rendererStatus={rendererStatus}
+              onClose={() => setDiagnosticsOpen(false)}
+            />
 
-            {scene && scene.groups.length > 0 ? (
-              <div
-                className="scene-viewport"
-                style={{
-                  transform: `matrix(${camera.zoom}, 0, 0, ${camera.zoom}, ${camera.x}, ${camera.y})`
-                }}
-              >
-                <svg className="scene-edge-layer" width="120000" height="120000" viewBox="-20000 -20000 120000 120000">
-                  {visible.edges.map((edge) => (
-                    <SceneEdgeLine
-                      key={edge.id}
-                      edge={edge}
-                      nodes={scene.nodes}
-                      selected={selection.kind === "edge" && selection.id === edge.id}
-                      selectedNodeId={selection.kind === "node" ? selection.id : undefined}
-                      zoom={camera.zoom}
-                      onClick={() => {
-                        setNodeMenu(null);
-                        void selectSceneItem({ kind: "edge", id: edge.id });
-                      }}
-                    />
-                  ))}
-                </svg>
-
-                {visible.groups.map((group) => (
-                  <GroupFrame
-                    key={group.id}
-                    group={group}
-                    tags={groupTags(group, scene.tags)}
-                    selected={selection.kind === "group" && selection.id === group.id}
-                    zoom={camera.zoom}
-                    onPointerDown={(event) => onGroupPointerDown(event, group)}
-                    onClick={() => {
-                      if (suppressGroupClickRef.current) {
-                        suppressGroupClickRef.current = false;
-                        return;
-                      }
-                      setNodeMenu(null);
-                      setCurrentGroupId(group.id);
-                      focusGroup(group, groupFocusZoom(group));
-                      void selectSceneItem({ kind: "group", id: group.id });
-                    }}
-                    onDoubleClick={() => focusGroup(group, 0.72)}
-                  />
-                ))}
-
-                {visible.nodes.map((node) => {
-                  const selected = selection.kind === "node" && selection.id === node.id;
-                  const renderInteractive = fullNodeIds.has(node.id) || selected || editingNodeId === node.id;
-                  return (
-                    <div
-                      key={node.id}
-                      className={`scene-node ${renderInteractive ? "is-interactive" : "is-preview"} ${selected ? "is-selected" : ""}`}
-                      style={{
-                        transform: `translate3d(${node.position.x}px, ${node.position.y}px, 0)`,
-                        zIndex: node.zIndex
-                      }}
-                      onPointerDown={(event) => onNodePointerDown(event, node)}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setNodeMenu(null);
-                        focusNode(node);
-                        if (event.altKey) setEditingNodeId(node.id);
-                        else if (editingNodeId && editingNodeId !== node.id) setEditingNodeId(null);
-                        void selectSceneItem({ kind: "node", id: node.id });
-                      }}
-                      onContextMenu={(event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        setEditingNodeId(null);
-                        setNodeMenu({ nodeId: node.id, x: event.clientX, y: event.clientY });
-                        void selectSceneItem({ kind: "node", id: node.id });
-                      }}
-                    >
-                      {renderInteractive ? (
-                        <DecisionNode
-                          data={{
-                            node,
-                            selected,
-                            editing: editingNodeId === node.id,
-                            comments: scene.comments.filter((comment) => comment.target.kind === "node" && comment.target.id === node.id),
-                            commentValue,
-                            busy,
-                            onUpdateNode: updateNode,
-                            onCommentChange: setCommentValue,
-                            onAddComment: runAddComment,
-                            onToggleComment: toggleComment,
-                            onAddLinkedNode: addLinkedNode,
-                            onDeleteNode: () => deleteNode(node.id),
-                            onStartEdit: startEditingNode,
-                            onStopEdit: () => setEditingNodeId(null)
-                          }}
-                        />
-                      ) : (
-                        <NodePreviewCard node={node} />
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="empty-canvas">
-                <h2>Create a group</h2>
-                <p>Start with a proposition, architecture concern, or implementation plan. It will become a group on the infinite canvas.</p>
-              </div>
-            )}
+            <RendererCanvasHost
+              ref={rendererRef}
+              scene={scene}
+              activeTagIds={activeTagIds}
+              camera={camera}
+              selection={selection}
+              onCameraChange={setCamera}
+              onSelectionChange={handleRendererSelection}
+              onPatch={handleRendererPatch}
+              onStats={setRendererStats}
+              onStatus={handleRendererStatus}
+              onHealthChange={handleRendererHealth}
+              onContextMenuRequest={handleRendererContextMenu}
+            />
           </div>
+
+          {selectedNode && scene ? (
+            <div className="selected-node-panel" aria-label="Selected node">
+              <button className="selected-node-menu-button icon-button" aria-label="Node commands" title="Node commands" onClick={openSelectedNodeMenu}>
+                <MoreHorizontal size={15} />
+              </button>
+              <SelectedNodeInspector
+                data={{
+                  node: selectedNode,
+                  selected: true,
+                  editing: editingNodeId === selectedNode.id,
+                  comments: scene.comments.filter((comment) => comment.target.kind === "node" && comment.target.id === selectedNode.id),
+                  commentValue,
+                  busy,
+                  onUpdateNode: updateNode,
+                  onCommentChange: setCommentValue,
+                  onAddComment: runAddComment,
+                  onToggleComment: toggleComment,
+                  onAddLinkedNode: addLinkedNode,
+                  onDeleteNode: () => deleteNode(selectedNode.id),
+                  onStartEdit: startEditingNode,
+                  onStopEdit: () => setEditingNodeId(null)
+                }}
+              />
+            </div>
+          ) : null}
 
           <div className={`floating-groups ${groupPanelOpen ? "is-open" : "is-closed"}`}>
             <button
@@ -874,7 +705,7 @@ export default function App() {
                   setExportPreview(null);
                   setExportPreviewCopied(false);
                   setGroupPanelOpen(false);
-                  focusGroup(group, groupFocusZoom(group));
+                  focusGroup(group, { fit: true });
                   void selectSceneItem({ kind: "group", id: group.id });
                 }}
                 onToggleGroupTag={toggleGroupTag}
@@ -953,133 +784,6 @@ export default function App() {
   );
 }
 
-function SceneEdgeLine({
-  edge,
-  nodes,
-  selected,
-  selectedNodeId,
-  zoom,
-  onClick
-}: {
-  edge: SceneEdge;
-  nodes: SceneNode[];
-  selected: boolean;
-  selectedNodeId?: string;
-  zoom: number;
-  onClick: () => void;
-}) {
-  const source = nodes.find((node) => node.id === edge.source);
-  const target = nodes.find((node) => node.id === edge.target);
-  if (!source || !target) return null;
-  const sourceSize = visualNodeSize(source, selectedNodeId);
-  const targetSize = visualNodeSize(target, selectedNodeId);
-  const sourceCenter = { x: source.position.x + sourceSize.width / 2, y: source.position.y + sourceSize.height / 2 };
-  const targetCenter = { x: target.position.x + targetSize.width / 2, y: target.position.y + targetSize.height / 2 };
-  const leftToRight = sourceCenter.x <= targetCenter.x;
-  const x1 = leftToRight ? source.position.x + sourceSize.width : source.position.x;
-  const y1 = sourceCenter.y;
-  const x2 = leftToRight ? target.position.x : target.position.x + targetSize.width;
-  const y2 = targetCenter.y;
-  const bend = Math.min(280, Math.max(120, Math.abs(x2 - x1) * 0.45));
-  const c1x = leftToRight ? x1 + bend : x1 - bend;
-  const c2x = leftToRight ? x2 - bend : x2 + bend;
-  const midX = (x1 + x2) / 2;
-  const path = `M ${x1} ${y1} C ${c1x} ${y1}, ${c2x} ${y2}, ${x2} ${y2}`;
-  return (
-    <g
-      className={`scene-edge ${selected ? "is-selected" : ""} ${zoom < detailZoom ? "is-compact" : ""}`}
-      onClick={(event) => {
-        event.stopPropagation();
-        onClick();
-      }}
-    >
-      <path d={path} />
-      {zoom >= detailZoom || selected ? <text x={midX} y={(y1 + y2) / 2 - 8}>{edge.label || edgeTypeLabels[edge.type]}</text> : null}
-    </g>
-  );
-}
-
-function visualNodeSize(node: SceneNode, selectedNodeId?: string): { width: number; height: number } {
-  if (node.id === selectedNodeId) return { width: selectedCardWidth, height: selectedCardHeight };
-  return { width: cardWidth, height: cardHeight };
-}
-
-function GroupFrame({
-  group,
-  tags,
-  selected,
-  zoom,
-  onPointerDown,
-  onClick,
-  onDoubleClick
-}: {
-  group: SceneGroup;
-  tags: Tag[];
-  selected: boolean;
-  zoom: number;
-  onPointerDown: (event: PointerEvent<HTMLButtonElement>) => void;
-  onClick: () => void;
-  onDoubleClick: () => void;
-}) {
-  const color = tags[0]?.color ?? "#7b8794";
-  return (
-    <button
-      className={`scene-group-frame ${selected ? "is-selected" : ""} ${zoom < 0.12 ? "is-overview" : ""}`}
-      style={{
-        transform: `translate3d(${group.bounds.x}px, ${group.bounds.y}px, 0)`,
-        width: group.bounds.width,
-        height: group.bounds.height,
-        "--group-color": color
-      } as CSSProperties}
-      onPointerDown={onPointerDown}
-      onClick={(event) => {
-        event.stopPropagation();
-        onClick();
-      }}
-      onDoubleClick={(event) => {
-        event.stopPropagation();
-        onDoubleClick();
-      }}
-    >
-      <strong>{group.title}</strong>
-      <span>{tags.map((tag) => tag.name).join(" / ") || "untagged"}</span>
-    </button>
-  );
-}
-
-function NodePreviewCard({ node }: { node: SceneNode }) {
-  return (
-    <div className={`decision-node decision-node--${node.status} decision-node-type--${node.type} is-lod-preview`}>
-      <div className="node-head">
-        <span className="node-type">{nodeTypeLabels[node.type]}</span>
-      </div>
-      <article className="node-note-scroll is-preview">
-        <h3 className="node-note-title">{node.title}</h3>
-        <p className="node-note-summary">{node.summary}</p>
-        {node.detail ? <p className="node-note-detail">{node.detail}</p> : null}
-      </article>
-    </div>
-  );
-}
-
-function viewportBounds(camera: Camera, element: HTMLDivElement | null): Bounds {
-  const width = element?.clientWidth ?? window.innerWidth;
-  const height = element?.clientHeight ?? window.innerHeight;
-  return {
-    x: -camera.x / camera.zoom,
-    y: -camera.y / camera.zoom,
-    width: width / camera.zoom,
-    height: height / camera.zoom
-  };
-}
-
-function screenToWorld(x: number, y: number, camera: Camera): { x: number; y: number } {
-  return {
-    x: (x - camera.x) / camera.zoom,
-    y: (y - camera.y) / camera.zoom
-  };
-}
-
 function activeGroupIdForSelection(scene: Scene | null, selection: SceneSelection): string | undefined {
   if (!scene) return undefined;
   if (selection.kind === "group") return selection.id;
@@ -1094,14 +798,6 @@ function validSelection(scene: Scene, selection: SceneSelection): SceneSelection
   if (selection.kind === "node" && scene.nodes.some((node) => node.id === selection.id)) return selection;
   if (selection.kind === "edge" && scene.edges.some((edge) => edge.id === selection.id)) return selection;
   return { kind: "canvas" };
-}
-
-function unionBounds(boundsList: Bounds[]): Bounds {
-  const minX = Math.min(...boundsList.map((bounds) => bounds.x));
-  const minY = Math.min(...boundsList.map((bounds) => bounds.y));
-  const maxX = Math.max(...boundsList.map((bounds) => bounds.x + bounds.width));
-  const maxY = Math.max(...boundsList.map((bounds) => bounds.y + bounds.height));
-  return { x: minX, y: minY, width: Math.max(1, maxX - minX), height: Math.max(1, maxY - minY) };
 }
 
 function newNodeTitle(type: NodeType): string {
@@ -1186,4 +882,8 @@ function selectExportPreviewText(): boolean {
   selection.removeAllRanges();
   selection.addRange(range);
   return true;
+}
+
+function isDiagnosticsOnlyRendererStatus(message: string): boolean {
+  return message.startsWith("WebGPU renderer unavailable:") || message.startsWith("WebGPU render failed");
 }

@@ -154,37 +154,6 @@ export function expandedBounds(bounds: Bounds, padding: number): Bounds {
   };
 }
 
-export function shouldShowSceneNodes(zoom: number, visibleGroupCount: number): boolean {
-  return visibleGroupCount > 0 && Number.isFinite(zoom);
-}
-
-export function shouldShowSceneEdges(zoom: number, visibleGroupCount: number): boolean {
-  if (visibleGroupCount <= 1) return zoom >= 0.28;
-  return zoom >= 0.48;
-}
-
-export function sceneNodeBudget(zoom: number, visibleGroupCount: number): number {
-  if (zoom < 0.08) return Math.max(24, Math.min(600, visibleGroupCount * 6));
-  if (zoom < 0.18) return Math.max(60, Math.min(1200, visibleGroupCount * 12));
-  if (zoom < 0.36) return Math.max(120, Math.min(1800, visibleGroupCount * 24));
-  return Number.POSITIVE_INFINITY;
-}
-
-export function limitSceneNodesForLod<T extends Pick<SceneNode, "groupId" | "zIndex">>(nodes: T[], zoom: number, visibleGroupCount: number): T[] {
-  const budget = sceneNodeBudget(zoom, visibleGroupCount);
-  if (!Number.isFinite(budget) || nodes.length <= budget) return nodes;
-  const byGroup = new Map<string, T[]>();
-  for (const node of nodes) {
-    const groupNodes = byGroup.get(node.groupId) ?? [];
-    groupNodes.push(node);
-    byGroup.set(node.groupId, groupNodes);
-  }
-  const perGroup = Math.max(1, Math.floor(budget / Math.max(1, byGroup.size)));
-  return Array.from(byGroup.values()).flatMap((groupNodes) =>
-    [...groupNodes].sort((a, b) => a.zIndex - b.zIndex).slice(0, perGroup)
-  );
-}
-
 export function groupTags(group: SceneGroup, tags: Tag[]): Tag[] {
   const byId = new Map(tags.map((tag) => [tag.id, tag]));
   return group.tagIds.map((tagId) => byId.get(tagId)).filter((tag): tag is Tag => Boolean(tag));

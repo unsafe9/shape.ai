@@ -2,9 +2,6 @@ dist/
 dist-server/
 node_modules/
 .local/
-test-results/
-playwright-report/
-poc/infinite-canvas/web/src/wasm/
-poc/infinite-canvas/dist/
-poc/infinite-canvas/core/target/
-.poc-toolchains/
+src/client/renderer/wasm/
+src/renderer/core/target/
+.renderer-toolchains/

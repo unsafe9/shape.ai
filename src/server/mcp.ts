@@ -40,15 +40,6 @@ const mcpExportTypeSchema = z.enum([
   "architecture_image"
 ]);
 
-const viewportInputSchema = z
-  .object({
-    x: z.number(),
-    y: z.number(),
-    width: z.number().positive(),
-    height: z.number().positive()
-  })
-  .optional();
-
 const exportScopeInputSchema = z
   .object({
     kind: z.enum(["group", "node", "edge", "selection"]),
@@ -67,14 +58,12 @@ export function createSceneMcpServer(): McpServer {
   server.registerTool(
     "query_scene",
     {
-      description: "Query the infinite scene canvas by viewport, zoom, and optional group tag filters. Low zoom returns overview data only.",
+      description: "Query canonical scene data with optional group tag filters. Renderer-side culling owns viewport and zoom behavior.",
       inputSchema: {
-        viewport: viewportInputSchema,
-        zoom: z.number().positive().optional(),
         tagIds: z.array(z.string()).optional()
       }
     },
-    async ({ viewport, zoom, tagIds }) => jsonResponse({ scene: await readScene({ viewport, zoom, tagIds }) })
+    async ({ tagIds }) => jsonResponse({ scene: await readScene({ tagIds }) })
   );
 
   server.registerTool(

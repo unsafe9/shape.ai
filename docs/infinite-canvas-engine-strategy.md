@@ -565,7 +565,7 @@ Rust는 renderable scene, interaction geometry, hit testing, renderer state를 �
 목표:
 
 - 작은 Rust/WASM package를 만든다.
-- `loadScene`, `applyPatch`, `setCamera`, `hitTest`, `renderFrame`만 노출한다.
+- `loadScene`, `resize`, `applyPatchBatch`, `inputBatch`, `renderFrame`, `overlayRequest`, `debugSnapshot`처럼 lifecycle, batch, frame, overlay, diagnostics 중심의 좁은 API만 노출한다.
 - Vite 앱에서 import해 canvas에 붙인다.
 
 판단 기준:

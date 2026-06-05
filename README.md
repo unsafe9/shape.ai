@@ -8,7 +8,7 @@ shape.ai stores one infinite `Scene` in SQLite. The only organization unit is a 
 
 - Creates a group from a proposition, architecture concern, or implementation plan.
 - Stores scene objects as `Group`, `Node`, and `Edge` records with scene-space bounds and z-index ordering.
-- Supports a large canvas UI with smooth pan/zoom, pinch zoom, viewport culling, zoom-level LOD, compact overview rendering, inline note editing, copy/paste, comments, and z-order actions.
+- Supports a Rust/WASM/WebGPU canvas UI with smooth pan/zoom, pinch zoom, renderer-owned culling, inline note editing, copy/paste, comments, and z-order actions.
 - Keeps group tags in a global registry with create, rename, recolor, delete-unused, attach, detach, and filter flows.
 - Exports group, node, edge, or selection scope as MADR Markdown, YADR YAML, Mermaid, and image-generation prompts.
 - Exposes MCP tools so AI agents can query the scene, inspect groups, update group tags, patch scene objects, add comments, and export group content.
@@ -43,7 +43,7 @@ Useful environment variables:
 
 Primary HTTP routes:
 
-- `GET /api/scene?x&y&width&height&zoom&tags`: query visible scene objects for a viewport and optional tag filter.
+- `GET /api/scene?tags`: query canonical scene objects with an optional tag filter. Viewport and zoom culling are renderer-owned.
 - `PATCH /api/scene`: patch groups, nodes, edges, or the current selection.
 - `POST /api/groups`: create a group with seeded nodes and optional tags.
 - `GET /api/groups/:id`: read a group subgraph.
@@ -104,12 +104,10 @@ Exports can target `group`, `node`, `edge`, or `selection` scope.
 
 ## Performance Model
 
-- The server answers viewport queries using stored bounds, zoom, and tag filters.
-- The client keeps pan/zoom interaction cheap by moving one transformed scene layer and deferring detailed DOM cards until the camera settles.
-- Low zoom renders top-level group overview only.
-- Mid zoom renders group frames and compact node summaries.
-- High zoom mounts editable note cards only for visible nodes near the viewport.
-- Edges are hidden at far zoom levels and only rendered when both endpoints are visible.
+- The server returns canonical scene data with business filters; viewport and zoom culling happen in the Rust/WASM/WebGPU renderer.
+- The client mounts a renderer host and delegates retained scene rendering, camera updates, culling, hit testing, text layout, and GPU buffer/cache work to the Rust/WASM/WebGPU renderer.
+- DOM remains for product panels, floating controls, diagnostics, and the active native input overlay while editing.
+- Generated WASM glue is built into `src/client/renderer/wasm/` before production builds and copied into the client bundle.
 
 ## Constraints
 
@@ -124,6 +122,7 @@ Exports can target `group`, `node`, `edge`, or `selection` scope.
 ```bash
 npm run typecheck
 npm run test:unit
+npm run renderer:test
+npm run renderer:rust:test
 npm run build
-npm run test:e2e
 ```

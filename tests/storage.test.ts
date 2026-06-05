@@ -17,7 +17,7 @@ describe("scene storage", () => {
     return { dataDir, storage };
   }
 
-  it("creates groups, registered tags, and viewport-filtered scene reads", async () => {
+  it("creates groups, registered tags, and tag-filtered scene reads", async () => {
     const { dataDir, storage } = await createTempStorage();
 
     const tag = await storage.createTag({ name: "Architecture", color: "#2f7ee6" });
@@ -29,18 +29,11 @@ describe("scene storage", () => {
     expect(created.group.tagIds).toEqual([tag.tag.id]);
     expect(created.scene.nodes.length).toBeGreaterThan(0);
 
-    const visible = await storage.readScene({
-      viewport: created.group.bounds,
-      zoom: 0.8,
-      tagIds: [tag.tag.id]
-    });
+    const visible = await storage.readScene({ tagIds: [tag.tag.id] });
     expect(visible.groups.map((group) => group.id)).toContain(created.group.id);
     expect(visible.nodes.length).toBeGreaterThan(0);
 
-    const overview = await storage.readScene({
-      viewport: created.group.bounds,
-      zoom: 0.05
-    });
+    const overview = await storage.readScene();
     expect(overview.groups.length).toBeGreaterThan(0);
     expect(overview.nodes.length).toBeGreaterThan(0);
     await expect(readFile(join(dataDir, "shape.sqlite"))).resolves.toBeInstanceOf(Buffer);
@@ -123,21 +116,16 @@ describe("scene storage", () => {
     expect(updated?.bounds.width).toBeLessThan(originalWidth);
   });
 
-  it("limits detailed scene objects to the focused group", async () => {
+  it("returns canonical scene objects for renderer-side culling", async () => {
     const { storage } = await createTempStorage();
     const first = await storage.createGroup({ prompt: "Focused scene group A" });
     const second = await storage.createGroup({ prompt: "Focused scene group B" });
-    const viewport = unionBounds([first.group.bounds, second.group.bounds]);
 
-    const scene = await storage.readScene({
-      viewport,
-      zoom: 0.58,
-      focusGroupId: second.group.id
-    });
+    const scene = await storage.readScene();
 
     expect(scene.groups.length).toBeGreaterThan(1);
     expect(scene.nodes.length).toBeGreaterThan(0);
-    expect(new Set(scene.nodes.map((node) => node.groupId))).toEqual(new Set([second.group.id]));
+    expect(new Set(scene.nodes.map((node) => node.groupId))).toEqual(new Set([first.group.id, second.group.id]));
   });
 });
 
@@ -148,12 +136,4 @@ function overlapArea(
   const x = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
   const y = Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
   return x * y;
-}
-
-function unionBounds(boundsList: Array<{ x: number; y: number; width: number; height: number }>) {
-  const minX = Math.min(...boundsList.map((bounds) => bounds.x));
-  const minY = Math.min(...boundsList.map((bounds) => bounds.y));
-  const maxX = Math.max(...boundsList.map((bounds) => bounds.x + bounds.width));
-  const maxY = Math.max(...boundsList.map((bounds) => bounds.y + bounds.height));
-  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }

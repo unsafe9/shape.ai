@@ -13,7 +13,6 @@ import {
   updateCommentRequestSchema,
   updateGroupTagsRequestSchema,
   updateTagRequestSchema,
-  type Bounds,
   type ExportType
 } from "../shared/schema";
 import { sceneGraphForGroup } from "../shared/graph";
@@ -230,24 +229,9 @@ function registerSceneRoutes(app: FastifyInstance) {
   });
 }
 
-function parseViewport(query: Record<string, string | undefined>): Bounds | undefined {
-  if (!query.x || !query.y || !query.width || !query.height) return undefined;
-  const bounds = {
-    x: Number(query.x),
-    y: Number(query.y),
-    width: Number(query.width),
-    height: Number(query.height)
-  };
-  if (Object.values(bounds).some((value) => !Number.isFinite(value))) return undefined;
-  return bounds;
-}
-
 function parseSceneQuery(query: Record<string, string | undefined>) {
   return {
-    viewport: parseViewport(query),
-    zoom: query.zoom && Number.isFinite(Number(query.zoom)) ? Number(query.zoom) : undefined,
-    tagIds: query.tags?.split(",").map((tag) => tag.trim()).filter(Boolean),
-    focusGroupId: query.focusGroupId
+    tagIds: query.tags?.split(",").map((tag) => tag.trim()).filter(Boolean)
   };
 }
 
