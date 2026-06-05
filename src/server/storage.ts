@@ -334,6 +334,33 @@ export function artifactReadStream(path: string) {
   return createReadStream(path);
 }
 
+/**
+ * T5.4: Read recent events for a specific clientId from the events table.
+ *
+ * Returns up to `limit` rows, most-recent first, matching the given clientId
+ * via a json_extract on payload_json.$.clientId.
+ */
+export async function readClientEvents(
+  clientId: string,
+  limit = 50
+): Promise<Array<{ id: string; type: string; payloadJson: string; createdAt: string }>> {
+  return withDb((db) => {
+    const rows = queryRows(
+      db,
+      `SELECT id, type, payload_json, created_at FROM events
+       WHERE json_extract(payload_json, '$.clientId') = ?
+       ORDER BY created_at DESC LIMIT ?`,
+      [clientId, limit]
+    );
+    return rows.map((row) => ({
+      id: stringValue(row, "id"),
+      type: stringValue(row, "type"),
+      payloadJson: stringValue(row, "payload_json"),
+      createdAt: stringValue(row, "created_at")
+    }));
+  });
+}
+
 async function getDb(): Promise<SqlDatabase> {
   if (databasePromise) return databasePromise;
   databasePromise = (async () => {

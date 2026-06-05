@@ -496,6 +496,7 @@ export default function App() {
       confidence: 0.5,
       evidenceRefs: [],
       childDecisionIds: [],
+      tagIds: [],
       position: openNodePosition(groupId, { x: basePosition.x + 450, y: basePosition.y + 430 }, { width: cardWidth, height: cardHeight }),
       size: { width: cardWidth, height: cardHeight },
       zIndex: nextTopZ(scene.nodes.filter((node) => node.groupId === groupId)),
@@ -511,6 +512,7 @@ export default function App() {
           label: defaultEdgeLabel(type),
           rationale: "",
           confidence: 0.5,
+          tagIds: [],
           updatedAt: new Date().toISOString()
         }
       : null;

@@ -125,6 +125,7 @@ export function seedGroupScene(prompt: string, input: { groupId: string; now: st
       position,
       size: { width: nodeWidth, height: nodeHeight },
       zIndex: index,
+      tagIds: [],
       updatedAt: input.now
     };
   });
@@ -136,6 +137,7 @@ export function seedGroupScene(prompt: string, input: { groupId: string; now: st
     source: nodeId(graphEdge.source),
     target: nodeId(graphEdge.target),
     groupId: input.groupId,
+    tagIds: [],
     updatedAt: input.now
   }));
 
@@ -464,4 +466,65 @@ function yamlBlock(value: string, indent: number): string[] {
 function yamlString(value: string): string {
   if (/^[a-zA-Z0-9 _.-]+$/.test(value)) return value;
   return JSON.stringify(value);
+}
+
+// ---------------------------------------------------------------------------
+// T4.4 — ADR export preset (reads primitive content)
+//
+// Reads text/labels/comments/edges/artifacts from a DecisionGraph whose nodes
+// may carry semantics in meta.semanticType / meta.status (post-demotion) OR
+// in node.type / node.status (pre-demotion / legacy).  The shim
+// `semanticType(n)` / `semanticStatus(n)` abstracts the difference so every
+// preset reader works with both old and new object shapes.
+//
+// Per T4.4 §7: no structured-ADR core component is required; sceneGraphForGroup
+// already reads primitive SceneNode/SceneEdge rows and the export reads from
+// the resulting DecisionGraph.  This function surfaces that contract as a named
+// export so tests and callers can use it directly.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the semantic type of a graph node, preferring meta.semanticType over
+ * the legacy node.type field (T4.4 §7 read-source shim).
+ */
+export function semanticType(node: GraphNode): string {
+  const metaSemanticType = (node as GraphNode & { meta?: Record<string, unknown> }).meta?.semanticType;
+  if (typeof metaSemanticType === "string" && metaSemanticType.length > 0) return metaSemanticType;
+  return node.type;
+}
+
+/**
+ * Read the status of a graph node, preferring meta.status over the legacy
+ * node.status field (T4.4 §7 read-source shim).
+ */
+export function semanticStatus(node: GraphNode): string {
+  const metaStatus = (node as GraphNode & { meta?: Record<string, unknown> }).meta?.status;
+  if (typeof metaStatus === "string" && metaStatus.length > 0) return metaStatus;
+  return node.status;
+}
+
+/**
+ * Generate an export from a DecisionGraph whose nodes may use the post-T2.1
+ * meta.semanticType / meta.status demotion OR the legacy node.type /
+ * node.status fields.  The read shim ensures both old and new objects produce
+ * identical ADR output.
+ *
+ * This is the ADR export preset described in T4.4 §7.  It delegates to the
+ * existing generateLocalExport after normalising the graph node partitions
+ * through the shim — so the preset reads primitive text/labels/comments/edges
+ * /artifacts without requiring structured ADR core components.
+ */
+export function adrExportPreset(graph: DecisionGraph, request: ExportRequest, groupTitle: string): ExportOutput {
+  // Re-map nodes so that type/status reflect the shim values, giving existing
+  // preset readers (madrSections, yadrSections, taskPlanSections, makeMermaid)
+  // the correct partition without any change to those readers.
+  const normalised: DecisionGraph = {
+    ...graph,
+    nodes: graph.nodes.map((n) => ({
+      ...n,
+      type: semanticType(n) as GraphNode["type"],
+      status: semanticStatus(n) as GraphNode["status"]
+    }))
+  };
+  return generateLocalExport(normalised, request, groupTitle);
 }

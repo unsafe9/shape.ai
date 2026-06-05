@@ -87,6 +87,10 @@ export const decisionGraphSchema = z.object({
   edges: z.array(graphEdgeSchema).default([])
 });
 
+// Universal free-form metadata bag for all scene primitives.
+// Defaults to {} so old payloads parse unchanged (additive, backward-compatible).
+export const objectMetaSchema = z.record(z.string(), z.unknown()).optional();
+
 export const tagSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -106,7 +110,8 @@ export const sceneGroupSchema = z.object({
   zIndex: z.number().default(0),
   collapsed: z.boolean().default(false),
   createdAt: z.string().min(1),
-  updatedAt: z.string().min(1)
+  updatedAt: z.string().min(1),
+  meta: objectMetaSchema
 });
 
 export const sceneNodeSchema = graphNodeSchema.extend({
@@ -114,12 +119,18 @@ export const sceneNodeSchema = graphNodeSchema.extend({
   position: pointSchema,
   size: sizeSchema.default({ width: 390, height: 390 }),
   zIndex: z.number().default(0),
-  updatedAt: z.string().min(1).optional()
+  // T2.4: generalise tagIds onto nodes (mirrors sceneGroupSchema.tagIds)
+  tagIds: z.array(z.string()).default([]),
+  updatedAt: z.string().min(1).optional(),
+  meta: objectMetaSchema
 });
 
 export const sceneEdgeSchema = graphEdgeSchema.extend({
   groupId: z.string().min(1),
-  updatedAt: z.string().min(1).optional()
+  // T2.4: generalise tagIds onto edges (mirrors sceneGroupSchema.tagIds)
+  tagIds: z.array(z.string()).default([]),
+  updatedAt: z.string().min(1).optional(),
+  meta: objectMetaSchema
 });
 
 export const sceneSelectionSchema = z.discriminatedUnion("kind", [
@@ -235,6 +246,7 @@ export const graphPatchSchema = z.object({
   removeEdgeIds: z.array(z.string()).default([])
 });
 
+export type ObjectMeta = z.infer<typeof objectMetaSchema>;
 export type NodeType = z.infer<typeof nodeTypeSchema>;
 export type EdgeType = z.infer<typeof edgeTypeSchema>;
 export type NodeStatus = z.infer<typeof nodeStatusSchema>;
@@ -272,3 +284,42 @@ export type GroupSeedOutput = {
   nodes: SceneNode[];
   edges: SceneEdge[];
 };
+
+/**
+ * The six persisted primitive kinds that compose a Scene document.
+ * `actor_marker` is ephemeral (P5/T5.x) and is never persisted to Scene.
+ */
+export type PrimitiveKind =
+  | "shape"
+  | "text"
+  | "edge"
+  | "frame"
+  | "image_artifact"
+  | "comment_marker";
+
+/**
+ * Derive the PrimitiveKind for a persisted scene object.
+ * - SceneGroup  → "frame"
+ * - SceneNode   → "shape" (a node whose styleKey is "text-plain" is still a shape;
+ *                          `text` is the degenerate box-less shape, represented by the same type)
+ * - SceneEdge   → "edge"
+ * - SceneComment → "comment_marker"
+ * - SceneArtifact → "image_artifact"
+ *
+ * actor_marker is ephemeral and has no persisted schema entry; it is not handled here.
+ */
+export function primitiveKind(obj: SceneGroup): "frame";
+export function primitiveKind(obj: SceneNode): "shape";
+export function primitiveKind(obj: SceneEdge): "edge";
+export function primitiveKind(obj: SceneComment): "comment_marker";
+export function primitiveKind(obj: SceneArtifact): "image_artifact";
+export function primitiveKind(
+  obj: SceneGroup | SceneNode | SceneEdge | SceneComment | SceneArtifact
+): PrimitiveKind {
+  if ("bounds" in obj && "collapsed" in obj) return "frame";
+  if ("position" in obj && "size" in obj) return "shape";
+  if ("source" in obj && "target" in obj && "groupId" in obj) return "edge";
+  if ("body" in obj && "resolved" in obj) return "comment_marker";
+  // SceneArtifact: has type (exportType), path, contentType, sceneVersion
+  return "image_artifact";
+}

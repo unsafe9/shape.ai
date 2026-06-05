@@ -240,7 +240,12 @@ export function applyScenePatch(snapshot: SceneSnapshot, patch: ScenePatch): Sce
   if (patch.kind === "delete-edge") {
     return { ...snapshot, edges: snapshot.edges.filter((edge) => edge.id !== patch.id) };
   }
-  return { ...snapshot, selection: patch.selection };
+  if (patch.kind === "select") {
+    return { ...snapshot, selection: patch.selection };
+  }
+  // T2.2 ops are applied server-side via applyRenderPatchToShapeScene;
+  // the client snapshot is refreshed from the authoritative scene response.
+  return snapshot;
 }
 
 export function validateScenePatch(snapshot: SceneSnapshot, patch: ScenePatch): string[] {

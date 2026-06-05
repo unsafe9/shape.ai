@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -15,11 +16,18 @@ import {
 } from "../shared/schema";
 import { generateLocalExport } from "./local";
 import {
+  projectEventRow,
+  projectReadRing,
+  registerClient,
+  setClientDockState
+} from "./mcpClients";
+import {
   addArtifact,
   addComment,
   createGroup,
   createTag,
   ensureStorage,
+  readClientEvents,
   readFullScene,
   readGroup,
   readScene,
@@ -197,6 +205,26 @@ export function createSceneMcpServer(): McpServer {
     }
   );
 
+  server.registerTool(
+    "get_client_trace",
+    {
+      description: "Return the recent operation trace for a registered MCP client: read events (ephemeral ring) merged with committed write/comment/export/proposal events from the operation log.",
+      inputSchema: {
+        clientId: z.string().min(1),
+        limit: z.number().int().min(1).max(200).optional()
+      }
+    },
+    async ({ clientId, limit = 50 }) => {
+      const readEvents = projectReadRing(clientId);
+      const eventRows = await readClientEvents(clientId, limit);
+      const writeEvents = eventRows.map((row) => projectEventRow(clientId, row));
+      // Merge: write events (already sorted newest-first) + read events (newest last in ring)
+      // Produce unified list sorted newest-first.
+      const all = [...writeEvents, ...readEvents].sort((a, b) => b.at - a.at).slice(0, limit);
+      return jsonResponse({ clientId, trace: all, total: all.length });
+    }
+  );
+
   return server;
 }
 
@@ -277,8 +305,18 @@ function jsonResponse(value: unknown) {
 
 async function main() {
   await ensureStorage();
+  const clientId = "stdio:" + randomUUID();
   const server = createSceneMcpServer();
+
+  server.server.oninitialized = () => {
+    const impl = server.server.getClientVersion();
+    if (impl) {
+      registerClient(impl, "stdio", clientId);
+    }
+  };
+
   const transport = new StdioServerTransport();
+  transport.onclose = () => setClientDockState(clientId, "disconnected");
   await server.connect(transport);
   console.error("shape.ai MCP server running on stdio");
 }

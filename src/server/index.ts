@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { stat } from "node:fs/promises";
 import fastifyStatic from "@fastify/static";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import { listClients, registerClient, setClientDockState, removeClient } from "./mcpClients";
 import {
   createCommentRequestSchema,
   createGroupRequestSchema,
@@ -70,16 +72,37 @@ export async function buildServer() {
     }
   }));
 
+  // Stateful MCP transport: session IDs give each connected client a stable identity.
+  // Each session gets its own McpServer instance; the registry (mcpClients.ts) maps
+  // sessionId → McpClientIdentity so the dock can track who is doing what.
+  const mcpTransports = new Map<string, StreamableHTTPServerTransport>();
+
   app.all("/mcp", async (request, reply) => {
     const server = createSceneMcpServer();
+    const sessionId = randomUUID();
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined
+      sessionIdGenerator: () => sessionId
     });
+
+    // Wire identity: after initialize we know the client's Implementation.
+    server.server.oninitialized = () => {
+      const impl = server.server.getClientVersion();
+      if (impl) {
+        registerClient(impl, "http", sessionId);
+      }
+    };
+
     reply.hijack();
     reply.raw.on("close", () => {
+      mcpTransports.delete(sessionId);
+      setClientDockState(sessionId, "disconnected");
+      // Grace: after a brief delay remove the entry so reconnects within the window can reattach.
+      setTimeout(() => removeClient(sessionId), 5_000);
       void transport.close();
       void server.close();
     });
+
+    mcpTransports.set(sessionId, transport);
 
     try {
       await server.connect(transport);
@@ -101,10 +124,14 @@ export async function buildServer() {
           })
         );
       }
+      mcpTransports.delete(sessionId);
       await transport.close();
       await server.close();
     }
   });
+
+  // Read path: shell/dock reads the live companion identity list.
+  app.get("/api/mcp/clients", async () => ({ clients: listClients() }));
 
   registerSceneRoutes(app);
   await registerClientIfBuilt(app);

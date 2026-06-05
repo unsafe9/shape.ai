@@ -64,6 +64,7 @@ describe("infinite canvas renderer contract", () => {
           confidence: 0.91,
           evidenceRefs: ["secret-source"],
           childDecisionIds: ["child-a"],
+          tagIds: [],
           position: { x: 120, y: 160 },
           size: { width: 270, height: 178 },
           zIndex: 4,

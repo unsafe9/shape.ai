@@ -1,7 +1,9 @@
 dist/
 dist-server/
-node_modules/
+node_modules
 .local/
-src/client/renderer/wasm/
+.claude/
+bun.lock
+src/client/renderer/wasm
 src/renderer/core/target/
 .renderer-toolchains/

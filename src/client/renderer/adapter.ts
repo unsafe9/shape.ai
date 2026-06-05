@@ -122,6 +122,7 @@ function sceneNode(
     position: { x, y },
     size: { width: 320, height: 172 },
     zIndex,
+    tagIds: [],
     updatedAt: generatedAt
   };
 }
@@ -136,6 +137,7 @@ function sceneEdge(id: string, groupId: string, source: string, target: string, 
     label,
     rationale: `Business rationale for ${id} remains outside renderer scene.`,
     confidence: 0.66,
+    tagIds: [],
     updatedAt: generatedAt
   };
 }

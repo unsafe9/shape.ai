@@ -41,6 +41,7 @@ describe("scene read performance contracts", () => {
         confidence: 0.5,
         evidenceRefs: [],
         childDecisionIds: [],
+        tagIds: [],
         position: { x, y },
         size: { width: 80, height: 80 },
         zIndex: index,
