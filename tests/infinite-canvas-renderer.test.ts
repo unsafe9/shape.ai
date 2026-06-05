@@ -754,6 +754,93 @@ describe("infinite canvas renderer contract", () => {
     });
   });
 
+  it("syncs external selection without reloading the Rust scene or emitting app patches", () => {
+    const fixture = createBenchmarkFixture({ seed: 18, cards: 4, edges: 2 });
+    const card = fixture.cards[0];
+    const events: EngineEvent[] = [];
+    const renderer = createOverlayTestRenderer(fixture);
+    const loadScene = renderer.loadScene.bind(renderer);
+    const applyPatchBatch = renderer.applyPatchBatch.bind(renderer);
+    let loadSceneCalls = 0;
+    const patchBatches: ScenePatch[][] = [];
+    renderer.loadScene = (sceneJson) => {
+      loadSceneCalls += 1;
+      loadScene(sceneJson);
+    };
+    renderer.applyPatchBatch = (patchesJson) => {
+      patchBatches.push(JSON.parse(patchesJson) as ScenePatch[]);
+      applyPatchBatch(patchesJson);
+    };
+    const engine = new ShapeCanvasEngine({
+      canvas: testCanvas(),
+      overlayRoot: testOverlayRoot(),
+      backend: "test",
+      webGpuRenderer: renderer,
+      onEvent: (event) => events.push(event)
+    });
+
+    engine.loadScene(fixture);
+    const loadSceneCallsAfterInitialLoad = loadSceneCalls;
+    const errors = engine.syncSelection({ kind: "node", id: card.id });
+
+    expect(errors).toEqual([]);
+    expect(loadSceneCalls).toBe(loadSceneCallsAfterInitialLoad);
+    expect(patchBatches).toEqual([[{ kind: "select", selection: { kind: "node", id: card.id } }]]);
+    expect(engine.getSnapshot()?.selection).toEqual({ kind: "node", id: card.id });
+    expect(events.filter((event) => event.type === "patch")).toHaveLength(0);
+
+    patchBatches.length = 0;
+    engine.syncSelection({ kind: "node", id: card.id });
+
+    expect(patchBatches).toHaveLength(0);
+  });
+
+  it("defers full Rust scene reloads while a mouse drag is active", () => {
+    const fixture = createBenchmarkFixture({ seed: 19, cards: 4, edges: 2 });
+    const canvas = testCanvasWithListeners();
+    const renderer = createOverlayTestRenderer(fixture);
+    const loadScene = renderer.loadScene.bind(renderer);
+    let loadSceneCalls = 0;
+    renderer.loadScene = (sceneJson) => {
+      loadSceneCalls += 1;
+      loadScene(sceneJson);
+    };
+    const raf = installFakeAnimationFrame();
+    try {
+      const engine = new ShapeCanvasEngine({
+        canvas: canvas.element,
+        overlayRoot: testOverlayRoot(),
+        backend: "test",
+        webGpuRenderer: renderer,
+        onEvent() {}
+      });
+      const nextScene: SceneSnapshot = {
+        ...fixture,
+        sceneId: "drag-updated-scene",
+        camera: { ...fixture.camera, x: fixture.camera.x + 40 }
+      };
+
+      engine.loadScene(fixture);
+      canvas.dispatch("mousedown", { button: 0, clientX: 120, clientY: 160 });
+      engine.loadScene(nextScene);
+
+      expect(loadSceneCalls).toBe(1);
+
+      canvas.dispatch("mouseup", { clientX: 150, clientY: 180 });
+
+      expect(loadSceneCalls).toBe(1);
+      expect(raf.pending()).toBe(1);
+
+      raf.flush();
+
+      expect(loadSceneCalls).toBe(2);
+
+      engine.stop();
+    } finally {
+      raf.restore();
+    }
+  });
+
   it("keeps the engine mirror unchanged when Rust rejects a patch batch", () => {
     const fixture = createBenchmarkFixture({ seed: 7, cards: 20, edges: 10 });
     const card = fixture.cards[0];
@@ -881,15 +968,82 @@ describe("infinite canvas renderer contract", () => {
     });
 
     expect(canvas.listenerCount("pointerdown")).toBe(1);
+    expect(canvas.listenerCount("mousedown")).toBe(1);
     expect(canvas.listenerCount("wheel")).toBe(1);
 
     engine.stop();
 
     expect(canvas.listenerCount("pointerdown")).toBe(0);
+    expect(canvas.listenerCount("mousedown")).toBe(0);
     expect(canvas.listenerCount("wheel")).toBe(0);
     canvas.dispatch("pointerdown", { pointerId: 1, clientX: 120, clientY: 160 });
+    canvas.dispatch("mousedown", { button: 0, clientX: 120, clientY: 160 });
     canvas.dispatch("wheel", { deltaY: 80, clientX: 120, clientY: 160 });
     expect(inputCalls).toBe(0);
+  });
+
+  it("routes mouse drag fallback through the Rust input boundary", () => {
+    const fixture = createBenchmarkFixture({ seed: 15, cards: 4, edges: 2 });
+    const canvas = testCanvasWithListeners();
+    const renderer = createOverlayTestRenderer(fixture);
+    const inputEvents: Array<{ kind: string; pointerId: number; screen?: { x: number; y: number } }> = [];
+    const inputBatch = renderer.inputBatch.bind(renderer);
+    renderer.inputBatch = (eventsJson) => {
+      inputEvents.push(...JSON.parse(eventsJson));
+      return inputBatch(eventsJson);
+    };
+    const engine = new ShapeCanvasEngine({
+      canvas: canvas.element,
+      overlayRoot: testOverlayRoot(),
+      backend: "test",
+      webGpuRenderer: renderer,
+      onEvent() {}
+    });
+
+    canvas.dispatch("mousedown", { button: 0, clientX: 120, clientY: 160 });
+    expect(canvas.listenerCount("mousemove")).toBe(1);
+    expect(canvas.listenerCount("mouseup")).toBe(1);
+    canvas.dispatch("mousemove", { clientX: 165, clientY: 190 });
+    canvas.dispatch("mouseup", { clientX: 180, clientY: 210 });
+
+    expect(inputEvents.map((event) => event.kind)).toEqual(["pointer-down", "pointer-move", "pointer-up"]);
+    expect(inputEvents.map((event) => event.pointerId)).toEqual([-1, -1, -1]);
+    expect(inputEvents[0].screen).toEqual({ x: 120, y: 160 });
+    expect(inputEvents[1].screen).toEqual({ x: 165, y: 190 });
+    expect(inputEvents[2].screen).toEqual({ x: 180, y: 210 });
+    expect(canvas.listenerCount("mousemove")).toBe(0);
+    expect(canvas.listenerCount("mouseup")).toBe(0);
+
+    engine.stop();
+  });
+
+  it("lets mouse fallback own mouse pointer drags", () => {
+    const fixture = createBenchmarkFixture({ seed: 16, cards: 4, edges: 2 });
+    const canvas = testCanvasWithListeners();
+    const renderer = createOverlayTestRenderer(fixture);
+    const inputEvents: Array<{ kind: string; pointerId: number }> = [];
+    const inputBatch = renderer.inputBatch.bind(renderer);
+    renderer.inputBatch = (eventsJson) => {
+      inputEvents.push(...JSON.parse(eventsJson));
+      return inputBatch(eventsJson);
+    };
+    const engine = new ShapeCanvasEngine({
+      canvas: canvas.element,
+      overlayRoot: testOverlayRoot(),
+      backend: "test",
+      webGpuRenderer: renderer,
+      onEvent() {}
+    });
+
+    canvas.dispatch("pointerdown", { pointerType: "mouse", pointerId: 7, clientX: 120, clientY: 160 });
+    canvas.dispatch("pointermove", { pointerType: "mouse", pointerId: 7, clientX: 140, clientY: 180 });
+    canvas.dispatch("mousedown", { button: 0, clientX: 120, clientY: 160 });
+    canvas.dispatch("mousemove", { clientX: 140, clientY: 180 });
+    canvas.dispatch("mouseup", { clientX: 160, clientY: 200 });
+
+    expect(inputEvents.map((event) => `${event.kind}:${event.pointerId}`)).toEqual(["pointer-down:-1", "pointer-move:-1", "pointer-up:-1"]);
+
+    engine.stop();
   });
 });
 
@@ -946,6 +1100,44 @@ function testOverlayRoot(appended: HTMLElement[] = []): HTMLElement {
       appended.push(element);
     }
   } as unknown as HTMLElement;
+}
+
+function installFakeAnimationFrame(): { flush: () => void; pending: () => number; restore: () => void } {
+  const callbacks: FrameRequestCallback[] = [];
+  const previousRequest = Object.getOwnPropertyDescriptor(globalThis, "requestAnimationFrame");
+  const previousCancel = Object.getOwnPropertyDescriptor(globalThis, "cancelAnimationFrame");
+  Object.defineProperty(globalThis, "requestAnimationFrame", {
+    configurable: true,
+    value: (callback: FrameRequestCallback) => {
+      callbacks.push(callback);
+      return callbacks.length;
+    }
+  });
+  Object.defineProperty(globalThis, "cancelAnimationFrame", {
+    configurable: true,
+    value: () => {}
+  });
+  return {
+    flush() {
+      const pending = callbacks.splice(0);
+      for (const callback of pending) callback(performance.now());
+    },
+    pending() {
+      return callbacks.length;
+    },
+    restore() {
+      if (previousRequest) {
+        Object.defineProperty(globalThis, "requestAnimationFrame", previousRequest);
+      } else {
+        Reflect.deleteProperty(globalThis, "requestAnimationFrame");
+      }
+      if (previousCancel) {
+        Object.defineProperty(globalThis, "cancelAnimationFrame", previousCancel);
+      } else {
+        Reflect.deleteProperty(globalThis, "cancelAnimationFrame");
+      }
+    }
+  };
 }
 
 function installFakeTextAreaDocument(): { created: FakeTextArea[]; restore: () => void } {

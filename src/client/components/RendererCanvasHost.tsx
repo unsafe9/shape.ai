@@ -33,6 +33,7 @@ type RendererCanvasHostProps = {
   onCameraChange: (camera: CameraState) => void;
   onSelectionChange: (selection: SceneSelection) => void;
   onPatch: (patch: RenderScenePatch) => void;
+  onGestureChange: (active: boolean) => void;
   onStats: (stats: RendererStats) => void;
   onStatus: (message: string) => void;
   onHealthChange: (health: RendererHealth) => void;
@@ -56,6 +57,7 @@ export const RendererCanvasHost = forwardRef<RendererCanvasHostHandle, RendererC
     onCameraChange,
     onSelectionChange,
     onPatch,
+    onGestureChange,
     onStats,
     onStatus,
     onHealthChange,
@@ -68,7 +70,8 @@ export const RendererCanvasHost = forwardRef<RendererCanvasHostHandle, RendererC
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<ShapeCanvasEngine | null>(null);
   const cameraRef = useRef<CameraState>(camera);
-  const callbacksRef = useRef({ onCameraChange, onSelectionChange, onPatch, onStats, onStatus });
+  const selectionRef = useRef<SceneSelection>(selection);
+  const callbacksRef = useRef({ onCameraChange, onSelectionChange, onPatch, onGestureChange, onStats, onStatus });
   const [rustStatus, setRustStatus] = useState<RustCoreStatus>(initialRustStatus);
   const [webGpuRenderer, setWebGpuRenderer] = useState<RustWebGpuRenderer | null>(null);
   const [engineWebGpuAvailable, setEngineWebGpuAvailable] = useState<boolean | null>(null);
@@ -76,7 +79,8 @@ export const RendererCanvasHost = forwardRef<RendererCanvasHostHandle, RendererC
   const [webGpuDetail, setWebGpuDetail] = useState("Visible Rust/wgpu renderer has not been created.");
   const [engineReadyKey, setEngineReadyKey] = useState(0);
 
-  callbacksRef.current = { onCameraChange, onSelectionChange, onPatch, onStats, onStatus };
+  callbacksRef.current = { onCameraChange, onSelectionChange, onPatch, onGestureChange, onStats, onStatus };
+  selectionRef.current = selection;
 
   useImperativeHandle(
     ref,
@@ -178,14 +182,20 @@ export const RendererCanvasHost = forwardRef<RendererCanvasHostHandle, RendererC
 
   useEffect(() => {
     if (!scene || !engineRef.current) return;
-    const sceneForRenderer: Scene = { ...scene, selection };
+    const sceneForRenderer: Scene = { ...scene, selection: selectionRef.current };
     engineRef.current.loadScene(
       shapeSceneToFilteredRenderSnapshot(sceneForRenderer, activeTagIds, {
         camera: cameraRef.current,
         sceneId: `shape-scene-v${scene.sceneVersion}-production-renderer`
       })
     );
-  }, [scene, activeTagIds, selection, engineReadyKey]);
+  }, [scene, activeTagIds, engineReadyKey]);
+
+  useEffect(() => {
+    selectionRef.current = selection;
+    const errors = engineRef.current?.syncSelection(selection) ?? [];
+    if (errors.length > 0) callbacksRef.current.onStatus(errors.join("; "));
+  }, [selection, engineReadyKey]);
 
   function handleEngineEvent(event: EngineEvent) {
     if (event.type === "stats") {
@@ -210,6 +220,11 @@ export const RendererCanvasHost = forwardRef<RendererCanvasHostHandle, RendererC
         return;
       }
       callbacksRef.current.onPatch(event.patch);
+      return;
+    }
+
+    if (event.type === "gesture") {
+      callbacksRef.current.onGestureChange(event.active);
       return;
     }
 

@@ -34,6 +34,7 @@ import type {
   SceneEdge,
   SceneGroup,
   SceneNode,
+  ScenePatch,
   SceneSelection,
   Tag
 } from "../shared/schema";
@@ -43,6 +44,7 @@ const cardWidth = 270;
 const cardHeight = 178;
 const selectedCardWidth = 390;
 const selectedCardHeight = 390;
+const rendererPatchSaveDebounceMs = 80;
 const tagColors = ["#6b8df2", "#12a594", "#d17b31", "#b65fcf", "#d84d66", "#6f7a86"];
 const seedPrompt =
   "Draft an AI-assisted architecture decision tool that extracts propositions, decision points, options, evidence, blockers, tradeoffs, subdecisions, tasks, and exports.";
@@ -53,6 +55,13 @@ type NodeMenuState = {
   nodeId: string;
   x: number;
   y: number;
+};
+
+type PendingRendererPatchSave = {
+  patch: ScenePatch;
+  rollbackScene: Scene;
+  rollbackSelection: SceneSelection;
+  patchKind: RenderScenePatch["kind"];
 };
 
 export default function App() {
@@ -82,6 +91,9 @@ export default function App() {
   const sceneRef = useRef<Scene | null>(null);
   const selectionRef = useRef<SceneSelection>({ kind: "canvas" });
   const rendererPatchSaveRef = useRef(0);
+  const pendingRendererPatchSaveRef = useRef<PendingRendererPatchSave | null>(null);
+  const rendererPatchSaveTimerRef = useRef<number | null>(null);
+  const rendererGestureActiveRef = useRef(false);
 
   const selectedGroupId = activeGroupIdForSelection(scene, selection);
   const activeGroupId = selectedGroupId ?? currentGroupId ?? scene?.groups[0]?.id;
@@ -101,6 +113,12 @@ export default function App() {
   useEffect(() => {
     selectionRef.current = selection;
   }, [selection]);
+
+  useEffect(() => {
+    return () => {
+      if (rendererPatchSaveTimerRef.current !== null) window.clearTimeout(rendererPatchSaveTimerRef.current);
+    };
+  }, []);
 
   const handleRendererHealth = useCallback((health: RendererHealth) => {
     setRendererHealth(health);
@@ -305,15 +323,79 @@ export default function App() {
     sceneRequestRef.current += 1;
     sceneRef.current = applied.scene;
     selectionRef.current = optimisticSelection;
-    setScene(applied.scene);
-    setSelection(optimisticSelection);
-    const nextGroupId = activeGroupIdForSelection(applied.scene, optimisticSelection);
+    if (isContinuousRendererPatch(patch)) {
+      if (!rendererGestureActiveRef.current) commitRendererScene(applied.scene, optimisticSelection);
+      queueRendererPatchSave(applied.appPatch, currentScene, previousSelection, patch.kind, rendererGestureActiveRef.current);
+      return;
+    }
+    commitRendererScene(applied.scene, optimisticSelection);
+    flushRendererPatchSave();
+    saveRendererPatchNow(applied.appPatch, currentScene, previousSelection, patch.kind);
+  }
+
+  function handleRendererGesture(active: boolean) {
+    rendererGestureActiveRef.current = active;
+    if (active) return;
+    commitRendererScene();
+    flushRendererPatchSave();
+  }
+
+  function commitRendererScene(nextScene = sceneRef.current, nextSelection = selectionRef.current) {
+    if (!nextScene) return;
+    const valid = validSelection(nextScene, nextSelection);
+    setScene(nextScene);
+    setSelection(valid);
+    const nextGroupId = activeGroupIdForSelection(nextScene, valid);
     if (nextGroupId) setCurrentGroupId(nextGroupId);
-    if (optimisticSelection.kind !== "node") setEditingNodeId(null);
+    if (valid.kind !== "node") setEditingNodeId(null);
+  }
+
+  function queueRendererPatchSave(
+    patch: ScenePatch,
+    rollbackScene: Scene,
+    rollbackSelection: SceneSelection,
+    patchKind: RenderScenePatch["kind"],
+    waitForGestureEnd = false
+  ) {
+    const pending = pendingRendererPatchSaveRef.current;
+    pendingRendererPatchSaveRef.current = {
+      patch: pending ? mergeScenePatches(pending.patch, patch) : patch,
+      rollbackScene: pending?.rollbackScene ?? rollbackScene,
+      rollbackSelection: pending?.rollbackSelection ?? rollbackSelection,
+      patchKind
+    };
+    if (rendererPatchSaveTimerRef.current !== null) window.clearTimeout(rendererPatchSaveTimerRef.current);
+    if (waitForGestureEnd) {
+      rendererPatchSaveTimerRef.current = null;
+      return;
+    }
+    rendererPatchSaveTimerRef.current = window.setTimeout(flushRendererPatchSave, rendererPatchSaveDebounceMs);
+  }
+
+  function flushRendererPatchSave() {
+    const pending = pendingRendererPatchSaveRef.current;
+    if (!pending) return;
+    pendingRendererPatchSaveRef.current = null;
+    if (rendererPatchSaveTimerRef.current !== null) {
+      window.clearTimeout(rendererPatchSaveTimerRef.current);
+      rendererPatchSaveTimerRef.current = null;
+    }
+    saveRendererPatchNow(pending.patch, pending.rollbackScene, pending.rollbackSelection, pending.patchKind, false);
+  }
+
+  function saveRendererPatchNow(
+    patch: ScenePatch,
+    rollbackScene: Scene,
+    rollbackSelection: SceneSelection,
+    patchKind: RenderScenePatch["kind"],
+    applyResponseScene = true
+  ) {
     const saveId = ++rendererPatchSaveRef.current;
-    void saveScenePatch(applied.appPatch)
+    void saveScenePatch(patch)
       .then((response) => {
         if (saveId !== rendererPatchSaveRef.current) return;
+        if (!applyResponseScene) return;
+        if (rendererGestureActiveRef.current) return;
         const savedSelection = validSelection(response.scene, response.scene.selection);
         sceneRef.current = response.scene;
         selectionRef.current = savedSelection;
@@ -324,15 +406,15 @@ export default function App() {
       })
       .catch((error) => {
         if (saveId !== rendererPatchSaveRef.current) return;
-        const restoredSelection = validSelection(currentScene, previousSelection);
-        sceneRef.current = currentScene;
+        const restoredSelection = validSelection(rollbackScene, rollbackSelection);
+        sceneRef.current = rollbackScene;
         selectionRef.current = restoredSelection;
-        setScene(currentScene);
+        setScene(rollbackScene);
         setSelection(restoredSelection);
-        const restoredGroupId = activeGroupIdForSelection(currentScene, restoredSelection);
+        const restoredGroupId = activeGroupIdForSelection(rollbackScene, restoredSelection);
         if (restoredGroupId) setCurrentGroupId(restoredGroupId);
         if (restoredSelection.kind !== "node") setEditingNodeId(null);
-        setStatus(error instanceof Error ? error.message : `Renderer patch save failed: ${patch.kind}`);
+        setStatus(error instanceof Error ? error.message : `Renderer patch save failed: ${patchKind}`);
         refreshScene().catch((refreshError) => setStatus(refreshError instanceof Error ? refreshError.message : "Scene refresh failed"));
       });
   }
@@ -644,6 +726,7 @@ export default function App() {
               onCameraChange={setCamera}
               onSelectionChange={handleRendererSelection}
               onPatch={handleRendererPatch}
+              onGestureChange={handleRendererGesture}
               onStats={setRendererStats}
               onStatus={handleRendererStatus}
               onHealthChange={handleRendererHealth}
@@ -790,6 +873,57 @@ function activeGroupIdForSelection(scene: Scene | null, selection: SceneSelectio
   if (selection.kind === "node") return scene.nodes.find((node) => node.id === selection.id)?.groupId;
   if (selection.kind === "edge") return scene.edges.find((edge) => edge.id === selection.id)?.groupId;
   return undefined;
+}
+
+function isContinuousRendererPatch(patch: RenderScenePatch): boolean {
+  return patch.kind === "move-group" || patch.kind === "move-card";
+}
+
+function mergeScenePatches(left: ScenePatch, right: ScenePatch): ScenePatch {
+  const groups = mergeById(left.groups, right.groups);
+  const nodes = mergeById(left.nodes, right.nodes);
+  const edges = mergeById(left.edges, right.edges);
+  const translateGroups = mergeTranslateGroups(left.translateGroups, right.translateGroups);
+  const removeGroupIds = mergeUnique(left.removeGroupIds, right.removeGroupIds);
+  const removeNodeIds = mergeUnique(left.removeNodeIds, right.removeNodeIds);
+  const removeEdgeIds = mergeUnique(left.removeEdgeIds, right.removeEdgeIds);
+  return {
+    ...(groups.length > 0 ? { groups } : {}),
+    ...(nodes.length > 0 ? { nodes } : {}),
+    ...(edges.length > 0 ? { edges } : {}),
+    ...(translateGroups.length > 0 ? { translateGroups } : {}),
+    ...(removeGroupIds.length > 0 ? { removeGroupIds } : {}),
+    ...(removeNodeIds.length > 0 ? { removeNodeIds } : {}),
+    ...(removeEdgeIds.length > 0 ? { removeEdgeIds } : {}),
+    ...(right.selection ? { selection: right.selection } : left.selection ? { selection: left.selection } : {})
+  };
+}
+
+function mergeById<T extends { id: string }>(left: T[] | undefined, right: T[] | undefined): T[] {
+  const items = new Map<string, T>();
+  for (const item of left ?? []) items.set(item.id, item);
+  for (const item of right ?? []) items.set(item.id, item);
+  return Array.from(items.values());
+}
+
+function mergeTranslateGroups(
+  left: ScenePatch["translateGroups"] | undefined,
+  right: ScenePatch["translateGroups"] | undefined
+): NonNullable<ScenePatch["translateGroups"]> {
+  const movements = new Map<string, { groupId: string; dx: number; dy: number }>();
+  for (const movement of [...(left ?? []), ...(right ?? [])]) {
+    const current = movements.get(movement.groupId);
+    movements.set(movement.groupId, {
+      groupId: movement.groupId,
+      dx: (current?.dx ?? 0) + movement.dx,
+      dy: (current?.dy ?? 0) + movement.dy
+    });
+  }
+  return Array.from(movements.values());
+}
+
+function mergeUnique(left: string[] | undefined, right: string[] | undefined): string[] {
+  return Array.from(new Set([...(left ?? []), ...(right ?? [])]));
 }
 
 function validSelection(scene: Scene, selection: SceneSelection): SceneSelection {

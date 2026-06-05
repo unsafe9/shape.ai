@@ -26,34 +26,34 @@ Canvas engine은 web 전용 구현이 아니라 `core`, `web`, `metal` 같은 po
 - 좋은 LOD는 visual degradation이다. 같은 객체가 같은 위치와 stable id를 유지하되, 멀어질수록 text, shadow, detail, badge, handle, edge label 같은 표현만 점진적으로 줄인다.
 - 무한한 데이터는 화면에 항상 full detail로 올라오는 것이 아니라 viewport, zoom, 관심도, cache level에 따라 stream/render된다.
 - MCP companion tracker는 장식이 아니라 agent operation observability다. 어떤 client가 무엇을 읽고, 어디를 수정하고, 어떤 artifact를 만들었는지 canvas 위에 trace로 보여야 한다.
+- Web product shell의 장기 목표는 Svelte다. 현재 React shell은 migration input이며, production 방향에서는 React/React DOM 의존성을 제거한다.
+- Svelte는 app shell, panels, controls, inspector, template picker, export drawer, MCP companion dock 같은 UI orchestration을 맡는다. Canvas와 깊게 연결된 성능 민감 책임은 Svelte component state로 끌어올리지 않는다.
+- Canvas-related performance work belongs in Rust/core by default: scene mutation application, camera math, hit testing, selection geometry, grouping hull geometry, LOD decisions, culling, text layout/shaping, render primitive generation, cache/debug stats, and input batching.
 - Realtime remote collaboration은 현재 scope가 아니다. 이 계획은 local-first single-user workspace를 기준으로 한다.
 - Realtime collaboration을 지금 구현하지 않더라도, scene mutation은 나중에 remote collaboration으로 확장 가능한 형태여야 한다. Canonical write path는 stable object id, granular operation, actor metadata, targetIds, timestamp, base revision을 남기고, raw scene blob overwrite를 기본 편집 모델로 삼지 않는다.
 - Document state와 ephemeral activity state를 분리한다. Object geometry/text/style/comment/export/proposal은 document state이고, viewport, hover, active tool, follow mode, companion animation, transient read cursor는 ephemeral state다.
-- 현재 production code를 바로 `apps/`나 `canvas/`로 이동하지 않는다. 우선 구조 placeholder와 task graph만 만든다.
+- 현재 production code를 바로 새 top-level layout으로 이동하지 않는다. 기존 `src/client`, `src/client/renderer`, `src/renderer/core`, `src/server`, `src/shared` 구조를 먼저 조사하고, 그 증거에 맞춰 target layout을 결정한다.
 
-## Initial Repo Scaffold
+## Repo Layout Planning
 
-이번 planning pass에서 다음 placeholder 구조만 둔다.
+이 문서는 `apps/`와 `canvas/` 같은 top-level 구조를 확정하지 않는다. 현재 repo는 이미 다음 구조를 갖고 있으므로, migration task는 먼저 이 구조를 기준으로 책임 경계를 읽어야 한다.
 
 ```text
-apps/
-  web/.gitkeep
-  macos/.gitkeep
-canvas/
-  core/.gitkeep
-  web/.gitkeep
-  metal/.gitkeep
+src/client/             current web shell and UI
+src/client/renderer/    web canvas adapter and WASM loader candidates
+src/renderer/core/      Rust canvas core candidate
+src/server/             API, local storage, MCP server
+src/shared/             schema, graph, render scene/patch contracts
 ```
 
-의미:
+Target layout은 별도 task에서 결정한다. 가능한 결론은 예를 들어 다음 중 하나일 수 있다.
 
-- `apps/web`: 현재 web product shell의 미래 위치.
-- `apps/macos`: macOS native shell의 미래 위치.
-- `canvas/core`: platform-neutral scene model, editing operation, layout/render contract의 미래 위치.
-- `canvas/web`: WASM/WebGPU web adapter의 미래 위치.
-- `canvas/metal`: macOS/iOS native Metal adapter의 미래 위치.
+- existing `src/` structure를 유지하고 내부 ownership만 정리한다.
+- `src/renderer/core`와 `src/client/renderer`를 canonical engine/adapter boundary로 승격한다.
+- top-level packages를 도입한다.
+- Svelte migration 시점에 web shell만 별도 위치로 이동한다.
 
-이 구조는 implementation placeholder다. 현재 `src/`와 `poc/` 코드는 이 문서만으로 이동하지 않는다.
+어떤 결론이든 build/test/import path churn이 migration risk를 정당화해야 한다. 빈 directory scaffold 자체는 성공 기준이 아니다.
 
 ## Done Criteria
 
@@ -66,6 +66,8 @@ canvas/
 - 기존 Shape/project와 ADR 전용 컴포넌트는 primitive layer에서 제거되거나 migration/template/export layer로 내려간다.
 - Todo, wiki note, ADR/design, server architecture diagram, presentation outline 템플릿이 primitive 조합으로 생성된다.
 - Good LOD policy가 구현되어 대량 객체에서도 객체 정체성을 유지하면서 안정적인 pan/zoom 성능을 낸다.
+- Web product shell은 Svelte로 migration되어 있고, production path에서 React/React DOM runtime dependency가 제거된다.
+- Canvas와 깊게 연결된 성능 민감 로직은 Svelte shell이 아니라 Rust/core boundary에 있다.
 - MCP client별 companion icon, dock, active animation, click-to-follow, spectator mode, operation trace가 작동한다.
 - Human edit와 AI/MCP write는 actor, target, operation, diff/proposal, timestamp, base revision을 남긴다.
 - Canonical document mutation과 viewport/follow/hover 같은 ephemeral UI state가 분리되어 있다.
@@ -78,6 +80,8 @@ canvas/
 - Shape/project 또는 structured ADR을 기본 object model로 유지하지 않는다.
 - 모든 데이터를 항상 메모리에 올리거나 full detail로 렌더링하지 않는다.
 - Todo, wiki, slides, architecture diagram을 각각 별도 앱으로 만든다는 뜻이 아니다.
+- Svelte migration은 canvas behavior를 Svelte component tree로 재작성한다는 뜻이 아니다.
+- React compatibility layer, dual React/Svelte production shell, or long-lived React fallback은 목표가 아니다.
 - Realtime remote collaboration, remote teammate cursor, simultaneous co-editing은 현재 계획에 포함하지 않는다.
 - CRDT/Yjs, realtime transport, remote user auth, conflict resolution UI, remote cursor rendering은 현재 계획에 포함하지 않는다.
 - macOS/iOS app을 지금 구현하지 않는다.
@@ -110,12 +114,13 @@ Tasks: T0.1, T0.2, T0.3
 Verify or evaluate:
 
 - A reviewer can explain what belongs in app shell, canvas core, platform adapter, semantic template, and MCP activity tracker.
-- Placeholder directories exist but contain no implementation.
+- Current `src` responsibilities are inventoried before any directory scaffold is treated as architecture.
 - Existing `src/` and `poc/` code remains unmoved.
+- Target layout is chosen from the current repo shape and documented before files move.
 
 Review gate:
 
-- `human-decision`: approve the package boundary names before code moves into them.
+- `human-decision`: approve the target layout and package boundary names before code moves into them.
 
 ### T0.1 Define Product Object Vocabulary
 
@@ -146,16 +151,19 @@ Stop or ask if:
 
 ### T0.2 Confirm Package And App Boundaries
 
-Outcome: Confirm the future repo boundary before moving code.
+Outcome: Confirm the future repo boundary from the current `src` structure before moving code.
 
 Deliverable:
 
-- Boundary note for `canvas/core`, `canvas/web`, `canvas/metal`, `apps/web`, and `apps/macos`.
-- Explicit migration rule: current `src/` and `poc/` stay where they are until a later migration phase.
+- Current structure inventory for `src/client`, `src/client/renderer`, `src/renderer/core`, `src/server`, and `src/shared`.
+- Boundary note for the platform-neutral canvas core, web canvas adapter, native/Metal adapter, web product shell, future macOS shell, server/API/MCP layer, and shared contracts.
+- Target layout options with tradeoffs: keep `src`, reorganize within `src`, or introduce top-level packages.
+- Explicit migration rule: current `src/` stays where it is until a target layout is approved.
 
 Verify:
 
 - The boundary supports a future iOS native app without putting product business logic inside the renderer adapter.
+- The chosen layout explains why it is better than the current `src` structure, or explicitly keeps the current structure.
 
 Depends on: none
 
@@ -165,18 +173,22 @@ Stop or ask if:
 
 - The desired native target changes from shared core plus native adapter to separate native reimplementation.
 
-### T0.3 Add Placeholder Structure
+### T0.3 Plan Target Layout Placement
 
-Outcome: Reserve the future package/app directories without starting implementation.
+Outcome: Turn the boundary decision into a concrete placement plan without moving files yet.
 
 Deliverable:
 
-- `.gitkeep` files under `apps/web`, `apps/macos`, `canvas/core`, `canvas/web`, and `canvas/metal`.
+- Proposed final directory layout for web shell, renderer core, web adapter, native adapter, shared contracts, server/API/MCP, tests, scripts, and docs.
+- Migration map from current paths to target paths, including paths that should stay where they are.
+- Import/build/test impact note for the selected layout.
+- Rule for when empty placeholder directories are useful and when they should be avoided.
 
 Verify:
 
-- `git status --short` shows only placeholder files for the new directories.
-- No build config imports these directories yet.
+- A reviewer can see exactly which existing path moves, which path stays, and why.
+- No placeholder directory is treated as a committed architecture decision before the layout is approved.
+- No build config imports a future path before the migration task that owns it.
 
 Depends on: none
 
@@ -184,7 +196,7 @@ Parallel wave: A
 
 Stop or ask if:
 
-- Existing repo tooling treats empty package directories as packages automatically.
+- The selected layout requires package manager, bundler, or TypeScript project-reference changes beyond the approved scope.
 
 ## Phase P1: Portable Canvas Core Boundary
 
@@ -206,7 +218,7 @@ Review gate:
 
 ### T1.1 Define Platform-Neutral Core Contract
 
-Outcome: Specify what `canvas/core` owns.
+Outcome: Specify what the platform-neutral canvas core owns, independent of its final directory.
 
 Deliverable:
 
@@ -226,7 +238,7 @@ Stop or ask if:
 
 ### T1.2 Define Web Adapter Contract
 
-Outcome: Specify what `canvas/web` owns.
+Outcome: Specify what the web canvas adapter owns, independent of its final directory.
 
 Deliverable:
 
@@ -246,7 +258,7 @@ Stop or ask if:
 
 ### T1.3 Define Metal Adapter Contract
 
-Outcome: Specify what `canvas/metal` owns for macOS/iOS.
+Outcome: Specify what the native Metal adapter owns for macOS/iOS, independent of its final directory.
 
 Deliverable:
 
@@ -270,11 +282,13 @@ Outcome: Separate product shell responsibility from canvas engine responsibility
 
 Deliverable:
 
-- App shell contract for `apps/web` and `apps/macos`: account/session if needed, MCP connection state, persistence/API, panels, inspector, template picker, export drawer, companion dock, and spectator controls.
+- App shell contract for the web shell and future macOS shell: account/session if needed, MCP connection state, persistence/API, panels, inspector, template picker, export drawer, companion dock, and spectator controls.
+- Web shell target contract: the chosen web shell location is a Svelte shell, not a React shell. It owns UI composition and event routing, while Rust/core owns canvas behavior and performance-sensitive scene work.
 
 Verify:
 
 - The app shell can be replaced per platform while canvas/core remains stable.
+- A reviewer can tell which responsibilities leave React, which belong to Svelte, and which must stay in Rust/core.
 
 Depends on: P0 review gate
 
@@ -283,6 +297,7 @@ Parallel wave: B
 Stop or ask if:
 
 - Product business logic needs to move into renderer adapters to make a feature work.
+- Canvas performance-sensitive behavior starts moving into Svelte component state instead of Rust/core.
 
 ## Phase P2: Universal Primitive Editing Slice
 
@@ -756,17 +771,19 @@ Stop or ask if:
 
 - Trace events become permanent visual clutter instead of inspectable history.
 
-## Phase P6: Product Integration And Migration Plan
+## Phase P6: Product Integration, Svelte Migration, And Rust Boundary Plan
 
-Goal: Decide how the universal canvas, templates, and companion activity tracker become production without disrupting the current replacement work.
+Goal: Decide how the universal canvas, templates, companion activity tracker, Svelte web shell, and Rust-owned canvas boundary become production without disrupting the current replacement work.
 
-Why now: Existing work already has a Rust canvas replacement track. This phase prevents duplicate or conflicting migrations.
+Why now: Existing work already has a Rust canvas replacement track and a React shell. This phase prevents duplicate or conflicting migrations by separating product shell migration from canvas/performance migration.
 
-Tasks: T6.1, T6.2, T6.3
+Tasks: T6.1, T6.2, T6.3, T6.4, T6.5
 
 Verify or evaluate:
 
-- The plan explains how current `src/`, `poc/`, future `apps/`, and future `canvas/` fit together.
+- The plan explains how current `src/`, existing renderer paths, any retained `poc/` evidence, and the chosen target layout fit together.
+- The plan explains how React is removed and Svelte becomes the web shell.
+- The plan explains which canvas-adjacent responsibilities move to Rust/core rather than Svelte.
 - No current production behavior is lost without an acceptance gate.
 
 ### T6.1 Current Model Compatibility Review
@@ -793,17 +810,22 @@ Stop or ask if:
 
 - Migration would break existing local SQLite data without a recovery path.
 
-### T6.2 Production Migration Sequence
+### T6.2 React To Svelte Web Shell Migration
 
-Outcome: Define the order for moving from current app layout to future package layout.
+Outcome: Replace the current React product shell with a Svelte web shell without moving canvas behavior into the frontend framework.
 
 Deliverable:
 
-- Migration sequence for promoting validated POC/engine code into `canvas/` and moving app shell toward `apps/web` only after contracts are stable.
+- Migration plan for the chosen web shell location as the Svelte shell: app chrome, panels, inspector, template picker, export drawer, MCP companion dock, spectator controls, active text overlay host, diagnostics drawer host, and API/MCP orchestration.
+- React removal plan covering `react`, `react-dom`, React-specific client entrypoints/components, JSX build assumptions, and any tests tied to React rendering.
+- Bridge contract between Svelte shell and the chosen web canvas adapter: load scene, apply operation batch, input batch, overlay requests, diagnostics snapshots, and event callbacks.
+- Test migration plan for shell-level interactions without requiring React test utilities.
 
 Verify:
 
-- Build/test commands remain available throughout the migration.
+- A reviewer can identify the final Svelte-owned UI surface and the removed React-owned surface.
+- No task asks Svelte to own retained scene rendering, hit testing, LOD, culling, text shaping, or canvas cache behavior.
+- Build/test commands remain available during migration.
 
 Depends on: T6.1
 
@@ -811,23 +833,71 @@ Parallel wave: J
 
 Stop or ask if:
 
+- A React compatibility layer or dual production shell becomes necessary to ship the migration.
+- Svelte migration starts rewriting the canvas engine instead of wrapping the canvas adapter.
+
+### T6.3 Rust-Owned Canvas Performance Boundary
+
+Outcome: Move performance-sensitive canvas-adjacent behavior to Rust/core before the Svelte shell becomes responsible for it by accident.
+
+Deliverable:
+
+- Responsibility audit for current frontend-owned canvas behavior: camera math, viewport transforms, hit testing, selection geometry, group hull geometry, group membership visuals, LOD thresholding, culling, text layout, input batching, patch batching, and diagnostics.
+- Migration plan for moving those responsibilities into Rust/core or the platform canvas adapter, with TypeScript/Svelte retaining only product semantics, API calls, DOM overlay mounting, and shell event routing.
+- Boundary tests or contract tests that prove Svelte calls narrow canvas APIs instead of deriving canvas state through component reactivity.
+
+Verify:
+
+- Pan/zoom/select/drag/group/label/follow/trace flows can be explained as shell events routed into Rust/core and adapter APIs.
+- Performance-critical canvas code has a Rust/core owner or an explicit adapter owner.
+- Svelte state does not become the source of truth for object geometry, visible object sets, hit regions, LOD decisions, text layout, or render caches.
+
+Depends on: T6.1
+
+Parallel wave: J
+
+Stop or ask if:
+
+- A canvas-related feature cannot be implemented without making Svelte component state the performance-critical source of truth.
+- Moving a responsibility to Rust would pull product business rules into the renderer.
+
+### T6.4 Production Migration Sequence
+
+Outcome: Define the order for moving from current app layout to future package layout.
+
+Deliverable:
+
+- Migration sequence for promoting validated POC/engine code into the chosen renderer/core layout, moving app shell toward the chosen Svelte shell location, and deleting the React shell after acceptance gates pass.
+- Coordination plan for package dependencies, build scripts, entrypoints, CSS/assets, tests, and local development commands.
+
+Verify:
+
+- Build/test commands remain available throughout the migration.
+- The migration has an explicit React-removal gate and a Rust-performance-boundary gate.
+
+Depends on: T6.2, T6.3
+
+Parallel wave: K
+
+Stop or ask if:
+
 - The migration needs a repo/package manager change beyond the approved scope.
 
-### T6.3 Final Direction Review
+### T6.5 Final Direction Review
 
 Outcome: Reconfirm the AI companion canvas product direction before broad implementation.
 
 Deliverable:
 
-- Review brief summarizing product scope, core architecture, primitive sufficiency, LOD evidence, template coverage, MCP activity tracker behavior, and remaining deferrals.
+- Review brief summarizing product scope, core architecture, primitive sufficiency, LOD evidence, template coverage, MCP activity tracker behavior, Svelte shell migration, Rust canvas boundary, and remaining deferrals.
 
 Verify:
 
 - A reviewer can choose to approve implementation, split scope, or redirect product positioning.
 
-Depends on: T6.2
+Depends on: T6.4
 
-Parallel wave: K
+Parallel wave: L
 
 Stop or ask if:
 
@@ -839,16 +909,18 @@ Question: Is the next implementation wave still the universal AI companion canva
 
 Approve if:
 
-- Package boundaries still support web, macOS, and future iOS.
+- Approved package/module boundaries still support web, macOS, and future iOS.
 - Primitive/template separation still covers the first templates without special-case renderers.
 - Good LOD keeps object identity stable while making large scenes performant.
 - MCP companion tracker still provides useful agent observability instead of only decorative animation.
+- Svelte owns the web shell and Rust/core owns canvas performance-sensitive behavior.
 
 Redirect if:
 
 - The product should narrow back to engineering architecture work only.
 - The product should prioritize full Figma-like vector editing over AI-agent work memory.
-- The package split creates migration cost without improving portability.
+- The selected layout creates migration cost without improving portability.
+- React migration or Rust boundary work should be split into a separate migration program before implementation.
 
 ## Waves
 
@@ -861,17 +933,18 @@ Redirect if:
 - Wave G: T4.1, T5.2
 - Wave H: T4.2, T4.3, T4.4, T4.5, T5.3, T5.4
 - Wave I: T6.1
-- Wave J: T6.2
-- Wave K: T6.3
+- Wave J: T6.2, T6.3
+- Wave K: T6.4
+- Wave L: T6.5
 
 ## Next Unblocked
 
 - T0.1 Define Product Object Vocabulary
 - T0.2 Confirm Package And App Boundaries
-- T0.3 Add Placeholder Structure
+- T0.3 Plan Target Layout Placement
 
 ## Deferred
 
-- iOS app scaffold: defer until `canvas/metal` contract is approved and the macOS shell direction is clearer.
+- iOS app scaffold: defer until the native Metal adapter contract is approved and the macOS shell direction is clearer.
 - Remote collaboration: out of current scope. Keep the operation model collaboration-ready, but revisit realtime transport, remote users, conflict handling, and remote cursors only after the local-first canvas, operation trace, and MCP companion tracker are stable.
 - Full document editor, full presentation editor, full vector design editor: defer unless a primitive/template gap proves one of these is actually required.

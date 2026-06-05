@@ -24,6 +24,7 @@ export type EngineEvent =
   | { type: "selection"; hit: HitResult | null }
   | { type: "patch"; patch: ScenePatch; errors: string[] }
   | { type: "overlay"; request: DomOverlayRequest | null }
+  | { type: "gesture"; active: boolean }
   | { type: "status"; message: string };
 
 export type ShapeCanvasEngineOptions = {
@@ -41,6 +42,8 @@ export type FocusBoundsOptions = {
   minZoom?: number;
   maxZoom?: number;
 };
+
+const MOUSE_POINTER_ID = -1;
 
 export class ShapeCanvasEngine {
   private canvas: HTMLCanvasElement;
@@ -63,6 +66,11 @@ export class ShapeCanvasEngine {
   private backend: string;
   private webGpuRenderer: RustWebGpuRenderer | null;
   private webGpuUnavailableNotified = false;
+  private mouseDragActive = false;
+  private mouseFallbackTarget: EventTarget | null = null;
+  private inputGestureActive = false;
+  private deferredScene: SceneSnapshot | null = null;
+  private deferredSceneRaf = 0;
 
   constructor(options: ShapeCanvasEngineOptions) {
     this.canvas = options.canvas;
@@ -78,6 +86,15 @@ export class ShapeCanvasEngine {
   }
 
   loadScene(snapshot: SceneSnapshot) {
+    if (this.inputGestureActive) {
+      this.deferredScene = snapshot;
+      return;
+    }
+    this.loadSceneNow(snapshot);
+  }
+
+  private loadSceneNow(snapshot: SceneSnapshot) {
+    this.deferredScene = null;
     this.snapshot = snapshot;
     this.camera = snapshot.camera;
     this.syncWebGpuScene(snapshot);
@@ -100,7 +117,11 @@ export class ShapeCanvasEngine {
   stop() {
     this.running = false;
     if (this.raf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.raf);
+    if (this.deferredSceneRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.deferredSceneRaf);
     this.raf = 0;
+    this.deferredSceneRaf = 0;
+    this.inputGestureActive = false;
+    this.deferredScene = null;
     this.unbindInput();
     this.removeOverlay(false);
   }
@@ -165,6 +186,17 @@ export class ShapeCanvasEngine {
     this.mirrorAcceptedPatches(patches, false);
     this.boundaryCalls += 1;
     for (const patch of patches) this.onEvent({ type: "patch", patch, errors: [] });
+    this.onEvent({ type: "stats", stats: this.renderFrame(performance.now()) });
+    return [];
+  }
+
+  syncSelection(selection: SceneSelection): string[] {
+    if (!this.snapshot || selectionEqual(this.snapshot.selection, selection)) return [];
+    const patch: ScenePatch = { kind: "select", selection };
+    const errors = this.applyPatchBatchInRust([patch]);
+    if (errors.length > 0) return errors;
+    this.mirrorAcceptedPatches([patch], false);
+    this.boundaryCalls += 1;
     this.onEvent({ type: "stats", stats: this.renderFrame(performance.now()) });
     return [];
   }
@@ -282,6 +314,7 @@ export class ShapeCanvasEngine {
     this.canvas.addEventListener("pointermove", this.onPointerMove);
     this.canvas.addEventListener("pointerup", this.onPointerUp);
     this.canvas.addEventListener("pointercancel", this.onPointerCancel);
+    this.canvas.addEventListener("mousedown", this.onMouseDown);
     this.canvas.addEventListener("dblclick", this.onDoubleClick);
     this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
   }
@@ -291,21 +324,27 @@ export class ShapeCanvasEngine {
     this.canvas.removeEventListener("pointermove", this.onPointerMove);
     this.canvas.removeEventListener("pointerup", this.onPointerUp);
     this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
+    this.canvas.removeEventListener("mousedown", this.onMouseDown);
+    this.unbindMouseFallbackMove();
     this.canvas.removeEventListener("dblclick", this.onDoubleClick);
     this.canvas.removeEventListener("wheel", this.onWheel);
   }
 
   private onPointerDown = (event: PointerEvent) => {
+    if (isMousePointerEvent(event)) return;
+    this.beginInputGesture();
     const screen = this.eventPoint(event);
     this.sendInputBatch([{ kind: "pointer-down", pointerId: event.pointerId, screen }]);
     this.canvas.setPointerCapture(event.pointerId);
   };
 
   private onPointerMove = (event: PointerEvent) => {
+    if (isMousePointerEvent(event)) return;
     this.sendInputBatch([{ kind: "pointer-move", pointerId: event.pointerId, screen: this.eventPoint(event) }]);
   };
 
   private onPointerUp = (event: PointerEvent) => {
+    if (isMousePointerEvent(event)) return;
     this.sendInputBatch([
       {
         kind: "pointer-up",
@@ -319,10 +358,44 @@ export class ShapeCanvasEngine {
     } catch {
       // Pointer capture may already be released after cancellation.
     }
+    this.finishInputGesture();
   };
 
   private onPointerCancel = (event: PointerEvent) => {
+    if (isMousePointerEvent(event)) return;
     this.sendInputBatch([{ kind: "pointer-cancel", pointerId: event.pointerId }]);
+    this.finishInputGesture();
+  };
+
+  private onMouseDown = (event: MouseEvent) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    this.beginInputGesture();
+    this.mouseDragActive = true;
+    this.bindMouseFallbackMove();
+    this.sendInputBatch([{ kind: "pointer-down", pointerId: MOUSE_POINTER_ID, screen: this.eventPoint(event) }]);
+  };
+
+  private onMouseMove = (event: MouseEvent) => {
+    if (!this.mouseDragActive) return;
+    event.preventDefault();
+    this.sendInputBatch([{ kind: "pointer-move", pointerId: MOUSE_POINTER_ID, screen: this.eventPoint(event) }]);
+  };
+
+  private onMouseUp = (event: MouseEvent) => {
+    if (!this.mouseDragActive) return;
+    event.preventDefault();
+    this.mouseDragActive = false;
+    this.unbindMouseFallbackMove();
+    this.sendInputBatch([
+      {
+        kind: "pointer-up",
+        pointerId: MOUSE_POINTER_ID,
+        screen: this.eventPoint(event),
+        edgeId: `renderer-edge-${crypto.randomUUID().slice(0, 8)}`
+      }
+    ]);
+    this.finishInputGesture();
   };
 
   private onDoubleClick = (event: MouseEvent) => {
@@ -407,6 +480,48 @@ export class ShapeCanvasEngine {
   private eventPoint(event: MouseEvent | PointerEvent | WheelEvent): WorldPoint {
     const rect = this.canvas.getBoundingClientRect();
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
+
+  private bindMouseFallbackMove() {
+    if (this.mouseFallbackTarget) return;
+    this.mouseFallbackTarget = mouseFallbackTarget(this.canvas);
+    this.mouseFallbackTarget.addEventListener("mousemove", this.onMouseMove as EventListener);
+    this.mouseFallbackTarget.addEventListener("mouseup", this.onMouseUp as EventListener);
+  }
+
+  private unbindMouseFallbackMove() {
+    if (!this.mouseFallbackTarget) return;
+    this.mouseFallbackTarget.removeEventListener("mousemove", this.onMouseMove as EventListener);
+    this.mouseFallbackTarget.removeEventListener("mouseup", this.onMouseUp as EventListener);
+    this.mouseFallbackTarget = null;
+    this.mouseDragActive = false;
+  }
+
+  private beginInputGesture() {
+    if (!this.inputGestureActive) this.onEvent({ type: "gesture", active: true });
+    this.inputGestureActive = true;
+    if (this.deferredSceneRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.deferredSceneRaf);
+    this.deferredSceneRaf = 0;
+  }
+
+  private finishInputGesture() {
+    if (this.inputGestureActive) this.onEvent({ type: "gesture", active: false });
+    this.inputGestureActive = false;
+    this.flushDeferredSceneSoon();
+  }
+
+  private flushDeferredSceneSoon() {
+    if (!this.deferredScene || this.deferredSceneRaf) return;
+    const flush = () => {
+      this.deferredSceneRaf = 0;
+      if (this.inputGestureActive || !this.deferredScene) return;
+      this.loadSceneNow(this.deferredScene);
+    };
+    if (typeof requestAnimationFrame === "function") {
+      this.deferredSceneRaf = requestAnimationFrame(flush);
+    } else {
+      flush();
+    }
   }
 
   private emptyStats(start: number): FrameStats {
@@ -599,7 +714,29 @@ function debugSelectionId(selection: SceneSelection | null): string | null {
   return selection.id;
 }
 
+function selectionEqual(left: SceneSelection, right: SceneSelection): boolean {
+  if (left.kind !== right.kind) return false;
+  switch (left.kind) {
+    case "canvas":
+      return true;
+    case "group":
+      return right.kind === "group" && left.id === right.id;
+    case "node":
+      return right.kind === "node" && left.id === right.id;
+    case "edge":
+      return right.kind === "edge" && left.id === right.id;
+  }
+}
+
 function readMemoryBytes(): number | null {
   const performanceWithMemory = performance as Performance & { memory?: { usedJSHeapSize: number } };
   return performanceWithMemory.memory?.usedJSHeapSize ?? null;
+}
+
+function mouseFallbackTarget(canvas: HTMLCanvasElement): EventTarget {
+  return typeof window === "undefined" ? canvas : window;
+}
+
+function isMousePointerEvent(event: PointerEvent): boolean {
+  return event.pointerType === "mouse";
 }

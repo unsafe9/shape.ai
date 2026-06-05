@@ -751,7 +751,6 @@ impl ShapeWebGpuRenderer {
         };
         self.vertex_count = 0;
         self.scene = Some(scene);
-        self.input_drag = None;
         self.last_hit = None;
         self.rebuild_vertex_buffer();
         self.write_uniform();
