@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, f32::consts::PI};
 
+use crate::lod::{apparent_px, lod_tier, LodTier};
 use crate::model::{
     CameraState, CanvasInputEvent, CubicRoute, RenderCard, RenderEdge, RenderGroup,
     RenderScenePatch, SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken,
@@ -373,6 +374,14 @@ struct FrameDrawList {
     visible_card_count: usize,
     visible_edge_count: usize,
     drawn_vertex_count: usize,
+    full_tier_count: usize,
+    compact_tier_count: usize,
+    shape_only_tier_count: usize,
+    density_tier_count: usize,
+    minimap_tier_count: usize,
+    /// Per-object LOD tier resolved this frame, keyed by object id. Carries the
+    /// hysteresis state forward to the next frame's `lod_tier` resolution.
+    lod_tiers: HashMap<String, LodTier>,
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -389,6 +398,27 @@ impl FrameDrawList {
         }
         self.ranges.push(DrawRange { start, end });
         self.drawn_vertex_count += slot.capacity;
+    }
+
+    /// Resolve and record a visible object's LOD tier. The tier is a derived
+    /// diagnostic value: it never alters slot identity, vertex ranges, or
+    /// culling — only which token groups the draw build consumes (T3.1 §2/§4).
+    fn record_tier(
+        &mut self,
+        id: &str,
+        bounds: &WorldRect,
+        camera: &CameraState,
+        previous: &HashMap<String, LodTier>,
+    ) {
+        let tier = lod_tier(apparent_px(bounds, camera), previous.get(id).copied());
+        match tier {
+            LodTier::Full => self.full_tier_count += 1,
+            LodTier::Compact => self.compact_tier_count += 1,
+            LodTier::ShapeOnly => self.shape_only_tier_count += 1,
+            LodTier::Density => self.density_tier_count += 1,
+            LodTier::Minimap => self.minimap_tier_count += 1,
+        }
+        self.lod_tiers.insert(id.to_string(), tier);
     }
 }
 
@@ -502,6 +532,7 @@ pub struct ShapeWebGpuRenderer {
     group_compaction_count: usize,
     input_drag: Option<InputDragState>,
     last_hit: Option<CoreHitResult>,
+    last_lod_tiers: HashMap<String, LodTier>,
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -723,6 +754,7 @@ impl ShapeWebGpuRenderer {
             group_compaction_count: 0,
             input_drag: None,
             last_hit: None,
+            last_lod_tiers: HashMap::new(),
         };
         renderer.write_uniform();
         Ok(renderer)
@@ -1173,7 +1205,11 @@ impl ShapeWebGpuRenderer {
     pub fn render_frame(&mut self) -> Result<JsValue, JsValue> {
         self.write_uniform();
         self.flush_text_atlas();
-        let draw_list = self.build_draw_list();
+        let mut draw_list = self.build_draw_list();
+        // Carry this frame's per-object tiers forward so the next frame's
+        // hysteresis resolves against them (T3.1 §3). Tiers are diagnostics; they
+        // do not touch slot identity or vertex ranges.
+        self.last_lod_tiers = std::mem::take(&mut draw_list.lod_tiers);
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
@@ -1245,6 +1281,11 @@ impl ShapeWebGpuRenderer {
             visible_group_count: draw_list.visible_group_count,
             visible_card_count: draw_list.visible_card_count,
             visible_edge_count: draw_list.visible_edge_count,
+            full_tier_count: draw_list.full_tier_count,
+            compact_tier_count: draw_list.compact_tier_count,
+            shape_only_tier_count: draw_list.shape_only_tier_count,
+            density_tier_count: draw_list.density_tier_count,
+            minimap_tier_count: draw_list.minimap_tier_count,
             vertex_count: self.vertex_count,
             drawn_vertex_count: draw_list.drawn_vertex_count,
             draw_range_count: draw_list.ranges.len(),
@@ -1632,6 +1673,12 @@ impl ShapeWebGpuRenderer {
         for (group, slot) in groups {
             if rects_intersect(&group.bounds, &viewport) {
                 draw_list.visible_group_count += 1;
+                draw_list.record_tier(
+                    &group.id,
+                    &group.bounds,
+                    &self.camera,
+                    &self.last_lod_tiers,
+                );
                 draw_list.push_slot(slot);
             }
         }
@@ -1660,8 +1707,10 @@ impl ShapeWebGpuRenderer {
             let Some(target) = cards_by_id.get(edge.target.as_str()).copied() else {
                 continue;
             };
-            if rects_intersect(&edge_visible_bounds(source, target), &viewport) {
+            let edge_bounds = edge_visible_bounds(source, target);
+            if rects_intersect(&edge_bounds, &viewport) {
                 draw_list.visible_edge_count += 1;
+                draw_list.record_tier(&edge.id, &edge_bounds, &self.camera, &self.last_lod_tiers);
                 draw_list.push_slot(slot);
             }
         }
@@ -1681,6 +1730,7 @@ impl ShapeWebGpuRenderer {
         for (card, slot) in cards {
             if rects_intersect(&card.bounds, &viewport) {
                 draw_list.visible_card_count += 1;
+                draw_list.record_tier(&card.id, &card.bounds, &self.camera, &self.last_lod_tiers);
                 draw_list.push_slot(slot);
             }
         }
@@ -4206,6 +4256,75 @@ mod tests {
             style_key: "default".to_string(),
             accessibility_label: String::new(),
         }
+    }
+
+    fn lod_camera(zoom: f64) -> CameraState {
+        CameraState {
+            x: 0.0,
+            y: 0.0,
+            zoom,
+        }
+    }
+
+    fn lod_bounds(width: f64, height: f64) -> WorldRect {
+        WorldRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn record_tier_buckets_objects_by_apparent_size() {
+        let mut draw_list = FrameDrawList::default();
+        let previous = HashMap::new();
+        let camera = lod_camera(1.0);
+
+        // 390px card -> Full (>= 220px apparent).
+        draw_list.record_tier("card-full", &lod_bounds(390.0, 390.0), &camera, &previous);
+        // 150px card -> Compact (120..220).
+        draw_list.record_tier("card-compact", &lod_bounds(150.0, 80.0), &camera, &previous);
+        // 60px card -> ShapeOnly (40..120).
+        draw_list.record_tier("card-shape", &lod_bounds(60.0, 30.0), &camera, &previous);
+        // 20px card -> Density (8..40).
+        draw_list.record_tier("card-density", &lod_bounds(20.0, 10.0), &camera, &previous);
+        // 4px card -> Minimap (< 8).
+        draw_list.record_tier("card-minimap", &lod_bounds(4.0, 2.0), &camera, &previous);
+
+        assert_eq!(draw_list.full_tier_count, 1);
+        assert_eq!(draw_list.compact_tier_count, 1);
+        assert_eq!(draw_list.shape_only_tier_count, 1);
+        assert_eq!(draw_list.density_tier_count, 1);
+        assert_eq!(draw_list.minimap_tier_count, 1);
+        assert_eq!(draw_list.lod_tiers.len(), 5);
+        assert_eq!(draw_list.lod_tiers.get("card-full"), Some(&LodTier::Full));
+        assert_eq!(
+            draw_list.lod_tiers.get("card-minimap"),
+            Some(&LodTier::Minimap)
+        );
+    }
+
+    #[test]
+    fn record_tier_honors_previous_frame_for_hysteresis() {
+        // A 222px card sits just past the 220px Full edge. With no history it is
+        // Full; if the previous frame had it Compact, hysteresis holds Compact
+        // until it clears the dead-band.
+        let camera = lod_camera(1.0);
+        let bounds = lod_bounds(222.0, 100.0);
+
+        let mut fresh = FrameDrawList::default();
+        fresh.record_tier("card", &bounds, &camera, &HashMap::new());
+        assert_eq!(fresh.full_tier_count, 1);
+        assert_eq!(fresh.compact_tier_count, 0);
+
+        let mut previous = HashMap::new();
+        previous.insert("card".to_string(), LodTier::Compact);
+        let mut held = FrameDrawList::default();
+        held.record_tier("card", &bounds, &camera, &previous);
+        assert_eq!(held.full_tier_count, 0);
+        assert_eq!(held.compact_tier_count, 1);
+        assert_eq!(held.lod_tiers.get("card"), Some(&LodTier::Compact));
     }
 }
 
