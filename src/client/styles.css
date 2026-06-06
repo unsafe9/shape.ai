@@ -1855,3 +1855,40 @@ p {
     width: calc(100vw - 16px);
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * CanvasEditingToolbar — T2.2 selection-context editing actions
+ * --------------------------------------------------------------------------- */
+
+.canvas-editing-toolbar {
+  position: absolute;
+  top: 22px;
+  left: 50%;
+  z-index: 12;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid rgb(255 255 255 / 0.72);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+  backdrop-filter: var(--glass-blur);
+}
+
+.canvas-editing-toolbar-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--line);
+  margin: 0 2px;
+}
+
+.canvas-editing-toolbar-delete {
+  color: var(--bad);
+}
+
+.canvas-editing-toolbar-delete:hover {
+  border-color: rgb(214 75 69 / 0.28);
+  background: rgb(255 240 240 / 0.92);
+}

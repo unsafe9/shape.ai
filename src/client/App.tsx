@@ -41,6 +41,7 @@ import {
   type FollowState
 } from "./lib/followController";
 import { TemplatePicker } from "./components/TemplatePicker";
+import { CanvasEditingToolbar } from "./components/CanvasEditingToolbar";
 import { buildTemplateInsertion, templateCatalog } from "./lib/templates";
 import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../shared/renderPatch";
 import type { CameraState } from "../shared/renderScene";
@@ -90,6 +91,7 @@ export default function App() {
   const [tagName, setTagName] = useState("");
   const [activeTagIds, setActiveTagIds] = useState<string[]>([]);
   const [selection, setSelection] = useState<SceneSelection>({ kind: "canvas" });
+  const [multiSelectIds, setMultiSelectIds] = useState<string[]>([]);
   const [currentGroupId, setCurrentGroupId] = useState<string | undefined>();
   const [commentValue, setCommentValue] = useState("");
   const [status, setStatus] = useState("Ready");
@@ -375,6 +377,7 @@ export default function App() {
     const nextGroupId = activeGroupIdForSelection(sourceScene, valid);
     if (nextGroupId) setCurrentGroupId(nextGroupId);
     if (valid.kind !== "node") setEditingNodeId(null);
+    if (valid.kind === "canvas") setMultiSelectIds([]);
     setSelection(valid);
     try {
       await saveScenePatch({ selection: valid });
@@ -985,6 +988,15 @@ export default function App() {
               onContextMenuRequest={handleRendererContextMenu}
             />
           </div>
+
+          {scene && selection.kind !== "canvas" ? (
+            <CanvasEditingToolbar
+              scene={scene}
+              selection={selection}
+              multiSelectIds={multiSelectIds}
+              onPatch={handleRendererPatch}
+            />
+          ) : null}
 
           {selectedNode && scene ? (
             <div className="selected-node-panel" aria-label="Selected node">
