@@ -1602,6 +1602,58 @@ p {
   }
 }
 
+/* T5.3 follow mode: followed-chip ring + hover-revealed follow controls. */
+.companion-chip-followed .companion-chip-icon {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.companion-chip-follow {
+  position: absolute;
+  left: calc(100% + 6px);
+  top: 50%;
+  transform: translateY(-50%);
+  display: none;
+  align-items: center;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid rgb(255 255 255 / 0.72);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+  backdrop-filter: var(--glass-blur);
+}
+
+.companion-chip:hover .companion-chip-follow,
+.companion-chip:focus-within .companion-chip-follow,
+.companion-chip-followed .companion-chip-follow {
+  display: flex;
+}
+
+.companion-follow-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.companion-follow-button:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+
+.companion-follow-button.is-following {
+  color: var(--accent);
+}
+
 /* ---------------------------------------------------------------------------
  * T5.4 Companion Trace Drawer
  * Mirrors the renderer-diagnostics-drawer pattern; positioned to the left

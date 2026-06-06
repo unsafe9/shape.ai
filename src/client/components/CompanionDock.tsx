@@ -1,8 +1,19 @@
+import { Pause, Play, Crosshair } from "lucide-react";
 import type { McpClientInfo } from "../lib/api";
+import type { FollowMode } from "../lib/followController";
+
+type FollowControls = {
+  followeeClientId: string | null;
+  mode: FollowMode;
+  onToggleFollow: (client: McpClientInfo) => void;
+  onPauseResume: () => void;
+  onJumpToCurrent: () => void;
+};
 
 type Props = {
   clients: McpClientInfo[];
   onFocusTarget?: (target: unknown) => void;
+  follow?: FollowControls;
 };
 
 const STATE_COLORS: Record<McpClientInfo["dockState"], string> = {
@@ -12,6 +23,10 @@ const STATE_COLORS: Record<McpClientInfo["dockState"], string> = {
   disconnected: "var(--muted)",
   muted: "var(--muted)"
 };
+
+function isFollowable(client: McpClientInfo): boolean {
+  return client.dockState === "idle" || client.dockState === "active" || client.dockState === "error";
+}
 
 function chipTitle(client: McpClientInfo): string {
   const state = client.dockState;
@@ -27,7 +42,7 @@ function chipTitle(client: McpClientInfo): string {
     .join("\n");
 }
 
-export function CompanionDock({ clients, onFocusTarget }: Props) {
+export function CompanionDock({ clients, onFocusTarget, follow }: Props) {
   if (clients.length === 0) {
     return (
       <div className="companion-dock companion-dock-empty" aria-label="MCP companions">
@@ -59,10 +74,12 @@ export function CompanionDock({ clients, onFocusTarget }: Props) {
         const target = client.lastTarget as { kind?: string } | null;
         const hasSpatialTarget = target !== null && target?.kind !== undefined && target.kind !== "canvas";
         const clickable = hasSpatialTarget && onFocusTarget !== undefined;
+        const isFollowed = follow !== undefined && follow.followeeClientId === client.clientId && follow.mode !== "off";
+        const canFollow = follow !== undefined && isFollowable(client);
         return (
           <div
             key={client.clientId}
-            className={`companion-chip ${isActive ? "companion-chip-active" : ""} ${isDisconnected ? "companion-chip-disconnected" : ""} ${clickable ? "companion-chip-focusable" : ""}`}
+            className={`companion-chip ${isActive ? "companion-chip-active" : ""} ${isDisconnected ? "companion-chip-disconnected" : ""} ${clickable ? "companion-chip-focusable" : ""} ${isFollowed ? "companion-chip-followed" : ""}`}
             title={chipTitle(client)}
             role={clickable ? "button" : "listitem"}
             aria-label={`${client.label}: ${client.dockState}`}
@@ -88,6 +105,42 @@ export function CompanionDock({ clients, onFocusTarget }: Props) {
               style={{ background: dotColor }}
               aria-hidden="true"
             />
+            {canFollow ? (
+              <span className="companion-chip-follow" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  className={`companion-follow-button ${isFollowed ? "is-following" : ""}`}
+                  aria-pressed={isFollowed}
+                  aria-label={isFollowed ? `Stop following ${client.label}` : `Follow ${client.label}`}
+                  title={isFollowed ? "Stop following" : "Follow agent"}
+                  onClick={() => follow!.onToggleFollow(client)}
+                >
+                  <Crosshair size={12} />
+                </button>
+                {isFollowed ? (
+                  <>
+                    <button
+                      type="button"
+                      className="companion-follow-button"
+                      aria-label={follow!.mode === "paused" ? "Resume following" : "Pause following"}
+                      title={follow!.mode === "paused" ? "Resume following" : "Pause following"}
+                      onClick={() => follow!.onPauseResume()}
+                    >
+                      {follow!.mode === "paused" ? <Play size={12} /> : <Pause size={12} />}
+                    </button>
+                    <button
+                      type="button"
+                      className="companion-follow-button"
+                      aria-label="Jump to current target"
+                      title="Jump to current target"
+                      onClick={() => follow!.onJumpToCurrent()}
+                    >
+                      <Crosshair size={12} strokeWidth={2.5} />
+                    </button>
+                  </>
+                ) : null}
+              </span>
+            ) : null}
           </div>
         );
       })}

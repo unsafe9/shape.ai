@@ -26,6 +26,20 @@ import { Sidebar } from "./components/Sidebar";
 import { ExportDrawer, type ExportPreview } from "./components/ExportDrawer";
 import { CompanionDock } from "./components/CompanionDock";
 import { CompanionTrace } from "./components/CompanionTrace";
+import {
+  decideFollowCommand,
+  initialFollowState,
+  jumpToCurrentTarget,
+  onUserGrab,
+  pauseFollow,
+  reconcileFollowee,
+  resolveFollowee,
+  resumeFollow,
+  stopFollow,
+  targetKey,
+  toggleFollow,
+  type FollowState
+} from "./lib/followController";
 import { TemplatePicker } from "./components/TemplatePicker";
 import { buildTemplateInsertion, templateCatalog } from "./lib/templates";
 import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../shared/renderPatch";
@@ -94,6 +108,7 @@ export default function App() {
   const [traceOpen, setTraceOpen] = useState(false);
   const [rendererStatus, setRendererStatus] = useState("No renderer status yet");
   const [mcpClients, setMcpClients] = useState<McpClientInfo[]>([]);
+  const [followState, setFollowState] = useState<FollowState>(initialFollowState);
   const canvasRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<RendererCanvasHostHandle | null>(null);
   const sceneRequestRef = useRef(0);
@@ -103,6 +118,7 @@ export default function App() {
   const pendingRendererPatchSaveRef = useRef<PendingRendererPatchSave | null>(null);
   const rendererPatchSaveTimerRef = useRef<number | null>(null);
   const rendererGestureActiveRef = useRef(false);
+  const followStateRef = useRef<FollowState>(initialFollowState);
 
   const selectedGroupId = activeGroupIdForSelection(scene, selection);
   const activeGroupId = selectedGroupId ?? currentGroupId ?? scene?.groups[0]?.id;
@@ -122,6 +138,29 @@ export default function App() {
   useEffect(() => {
     selectionRef.current = selection;
   }, [selection]);
+
+  useEffect(() => {
+    followStateRef.current = followState;
+  }, [followState]);
+
+  // T5.3 pinned follow (§3) + followee reconcile (§1/§8). When the MCP poll reports
+  // a new lastTarget for the pinned followee — and no user gesture is active (§8) —
+  // re-frame the camera through the existing focus path. Drops follow with no camera
+  // move when the followee disconnects or is muted.
+  useEffect(() => {
+    const reconciled = reconcileFollowee(followStateRef.current, mcpClients);
+    if (reconciled !== followStateRef.current) {
+      setFollowState(reconciled);
+      return;
+    }
+    if (reconciled.mode !== "pinned") return;
+    const followee = resolveFollowee(reconciled, mcpClients);
+    const command = decideFollowCommand(reconciled, followee, rendererGestureActiveRef.current);
+    if (command.state !== reconciled) setFollowState(command.state);
+    if (command.target !== null) followTarget(command.target);
+    // followTarget is a stable closure over refs; intentionally excluded from deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mcpClients]);
 
   useEffect(() => {
     return () => {
@@ -179,6 +218,11 @@ export default function App() {
       const target = event.target as HTMLElement | null;
       if (event.key === "Escape") {
         event.preventDefault();
+        // T5.3 §7 hard handoff: Esc stops following first; camera stays put.
+        if (followStateRef.current.mode !== "off") {
+          setFollowState(stopFollow(followStateRef.current));
+          return;
+        }
         if (traceOpen) {
           setTraceOpen(false);
           return;
@@ -379,7 +423,13 @@ export default function App() {
 
   function handleRendererGesture(active: boolean) {
     rendererGestureActiveRef.current = active;
-    if (active) return;
+    // T5.3 §8 rule 2: a user grab during pinned follow demotes to paused (soft
+    // handoff). The followee is remembered; one tap of Resume re-engages.
+    if (active) {
+      const grabbed = onUserGrab(followStateRef.current);
+      if (grabbed !== followStateRef.current) setFollowState(grabbed);
+      return;
+    }
     commitRendererScene();
     flushRendererPatchSave();
   }
@@ -687,6 +737,76 @@ export default function App() {
     }
   }
 
+  // T5.3 follow framing: the camera-only subset of handleFocusTarget. Follow is
+  // observe-only (§0/§8) — it frames the followee's target through the existing
+  // focusBounds/fitScene surface but never writes selection/document state.
+  function followTarget(target: unknown) {
+    const currentScene = sceneRef.current;
+    if (!currentScene || !target || typeof target !== "object") return;
+    const t = target as { kind?: string; id?: string; groupId?: string; ids?: { kind: string; id: string }[] };
+    if (t.kind === "group" && t.id) {
+      const group = currentScene.groups.find((g) => g.id === t.id);
+      if (group) focusGroup(group, { fit: true });
+    } else if (t.kind === "node" && t.id) {
+      const node = currentScene.nodes.find((n) => n.id === t.id);
+      if (node) focusNode(node);
+    } else if (t.kind === "artifact" && t.groupId) {
+      const group = currentScene.groups.find((g) => g.id === t.groupId);
+      if (group) focusGroup(group, { fit: true });
+    } else if (t.kind === "selection" && Array.isArray(t.ids) && t.ids.length > 0) {
+      const first = t.ids[0] as { kind: string; id: string };
+      if (first.kind === "group") {
+        const group = currentScene.groups.find((g) => g.id === first.id);
+        if (group) focusGroup(group, { fit: true });
+      } else if (first.kind === "node") {
+        const node = currentScene.nodes.find((n) => n.id === first.id);
+        if (node) focusNode(node);
+      }
+    }
+  }
+
+  // T5.3 follow controls (dock affordances).
+  function handleToggleFollow(client: McpClientInfo) {
+    const next = toggleFollow(followStateRef.current, client);
+    if (next === followStateRef.current) return;
+    // §2 click-to-follow: one framing jump to the followee's current target on entry.
+    // Seed lastFramedKey so the next poll's pinned-follow effect does not re-frame
+    // the same target (it only re-frames when the live target *changes*, §3).
+    if (next.mode === "pinned") {
+      setFollowState({ ...next, lastFramedKey: targetKey(client.lastTarget) });
+      followTarget(client.lastTarget);
+    } else {
+      setFollowState(next);
+    }
+  }
+
+  function handlePauseResumeFollow() {
+    const current = followStateRef.current;
+    if (current.mode === "pinned") {
+      setFollowState(pauseFollow(current));
+      return;
+    }
+    if (current.mode === "paused") {
+      const resumed = resumeFollow(current);
+      // §4 resume: snap to the followee's *current* live target; seed lastFramedKey
+      // so the next poll does not immediately re-frame the same target (§3).
+      const followee = resolveFollowee(resumed, mcpClients);
+      if (followee && targetKey(followee.lastTarget) !== null) {
+        setFollowState({ ...resumed, lastFramedKey: targetKey(followee.lastTarget) });
+        followTarget(followee.lastTarget);
+      } else {
+        setFollowState(resumed);
+      }
+    }
+  }
+
+  function handleJumpToCurrent() {
+    // §5: one-shot frame of the followee's live target without changing mode.
+    const followee = resolveFollowee(followStateRef.current, mcpClients);
+    const target = jumpToCurrentTarget(followee);
+    if (target !== null) followTarget(target);
+  }
+
   function focusGroup(group: SceneGroup, options: { zoom?: number; fit?: boolean } = {}) {
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -760,7 +880,17 @@ export default function App() {
     <div className="app-shell">
       <main className="studio-stage">
         <section className={`canvas-panel ${selection.kind === "node" ? "has-card-focus" : ""}`}>
-          <CompanionDock clients={mcpClients} onFocusTarget={handleFocusTarget} />
+          <CompanionDock
+            clients={mcpClients}
+            onFocusTarget={handleFocusTarget}
+            follow={{
+              followeeClientId: followState.followeeClientId,
+              mode: followState.mode,
+              onToggleFollow: handleToggleFollow,
+              onPauseResume: handlePauseResumeFollow,
+              onJumpToCurrent: handleJumpToCurrent
+            }}
+          />
           <div className="flow-wrap renderer-scene-surface" ref={canvasRef}>
             <div className="canvas-watermark" aria-hidden="true">
               <BrainCircuit size={28} />
