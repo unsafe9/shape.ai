@@ -44,20 +44,31 @@
  * classification of every state field currently in `App.tsx`.
  */
 
-// Re-export the real handle type from its canonical location so downstream
-// tasks and the Svelte migration (T6.2) can import from a single, stable path.
-export type { RendererCanvasHostHandle } from "./components/RendererCanvasHost";
-
 // Re-export the real event union from its canonical location.
 export type { EngineEvent, FocusBoundsOptions } from "./renderer/engine";
 
-import type { RendererCanvasHostHandle } from "./components/RendererCanvasHost";
 import type { EngineEvent } from "./renderer/engine";
 import type { SceneSnapshot } from "./renderer/scene";
 import type { CameraState, WorldRect } from "../shared/renderScene";
 import type { RenderScenePatch } from "../shared/renderPatch";
 import type { FocusBoundsOptions } from "./renderer/engine";
 import type { WorldPoint } from "./renderer/scene";
+
+/**
+ * The shell→canvas imperative command surface. Originally exported by the React
+ * `RendererCanvasHost.tsx`; after the Svelte cutover the canonical command
+ * surface lives on the framework-neutral `ShapeCanvasHost` class
+ * (`lib/canvasHost.ts`). This structural type is kept here as the stable
+ * boundary-contract name downstream tasks reference.
+ */
+export type RendererCanvasHostHandle = {
+  fitScene: () => void;
+  focusBounds: (bounds: WorldRect, options?: FocusBoundsOptions) => void;
+  wheelAtScreen: (screen: { x: number; y: number }, deltaY: number) => void;
+  setCamera: (camera: CameraState) => void;
+  applyPatch: (patch: RenderScenePatch) => string[];
+  getSnapshot: () => SceneSnapshot | null;
+};
 
 // ---------------------------------------------------------------------------
 // Framework-neutral host interface
