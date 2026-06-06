@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MouseEvent } from "react";
-import { Activity, BrainCircuit, Clipboard, Copy, Layers, LayoutTemplate, Loader2, Maximize2, Minus, MoreHorizontal, PanelLeft, Pencil, Plus, Trash2, X } from "lucide-react";
+import { Activity, BrainCircuit, Clipboard, Copy, History, Layers, LayoutTemplate, Loader2, Maximize2, Minus, MoreHorizontal, PanelLeft, Pencil, Plus, Trash2, X } from "lucide-react";
 import {
   createComment,
   createGroup,
@@ -25,6 +25,7 @@ import { RendererDiagnosticsDrawer } from "./components/RendererDiagnosticsDrawe
 import { Sidebar } from "./components/Sidebar";
 import { ExportDrawer, type ExportPreview } from "./components/ExportDrawer";
 import { CompanionDock } from "./components/CompanionDock";
+import { CompanionTrace } from "./components/CompanionTrace";
 import { TemplatePicker } from "./components/TemplatePicker";
 import { buildTemplateInsertion, templateCatalog } from "./lib/templates";
 import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../shared/renderPatch";
@@ -90,6 +91,7 @@ export default function App() {
   const [rendererStats, setRendererStats] = useState<RendererStats | null>(null);
   const [rendererHealth, setRendererHealth] = useState<RendererHealth | null>(null);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [traceOpen, setTraceOpen] = useState(false);
   const [rendererStatus, setRendererStatus] = useState("No renderer status yet");
   const [mcpClients, setMcpClients] = useState<McpClientInfo[]>([]);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -177,6 +179,10 @@ export default function App() {
       const target = event.target as HTMLElement | null;
       if (event.key === "Escape") {
         event.preventDefault();
+        if (traceOpen) {
+          setTraceOpen(false);
+          return;
+        }
         if (diagnosticsOpen) {
           setDiagnosticsOpen(false);
           return;
@@ -211,7 +217,7 @@ export default function App() {
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selection, editingNodeId, nodeMenu, copiedNode, scene, diagnosticsOpen]);
+  }, [selection, editingNodeId, nodeMenu, copiedNode, scene, diagnosticsOpen, traceOpen]);
 
   async function runCreateGroup() {
     await withBusy("Creating group", async () => {
@@ -744,6 +750,17 @@ export default function App() {
               >
                 <Activity size={15} />
               </button>
+              <button
+                className={`icon-button ${traceOpen ? "is-active" : ""}`}
+                type="button"
+                onClick={() => setTraceOpen((open) => !open)}
+                aria-label={traceOpen ? "Close agent trace" : "Open agent trace"}
+                aria-expanded={traceOpen}
+                aria-controls="companion-trace"
+                title={traceOpen ? "Close agent trace" : "Open agent trace"}
+              >
+                <History size={15} />
+              </button>
               <button className="icon-button" onClick={() => zoomAtCanvasCenter(160)} aria-label="Zoom out" title="Zoom out">
                 <Minus size={15} />
               </button>
@@ -775,6 +792,11 @@ export default function App() {
               status={status}
               rendererStatus={rendererStatus}
               onClose={() => setDiagnosticsOpen(false)}
+            />
+            <CompanionTrace
+              open={traceOpen}
+              clients={mcpClients}
+              onClose={() => setTraceOpen(false)}
             />
 
             <RendererCanvasHost
