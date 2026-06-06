@@ -12,6 +12,7 @@
     "start": "npm run build && tsx src/server/index.ts --open",
     "typecheck": "tsc --noEmit",
     "build": "npm run renderer:wasm:build && vite build && tsc -p tsconfig.server.json",
+    "build:svelte": "vite build --config vite.svelte.config.ts",
     "test": "vitest run",
     "test:unit": "vitest run",
     "renderer:test": "vitest run tests/infinite-canvas-renderer.test.ts",
@@ -30,11 +31,14 @@
     "zod": "^4.1.13"
   },
   "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/node": "^24.10.2",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@types/sql.js": "^1.4.11",
     "concurrently": "^9.2.1",
+    "lucide-svelte": "^0.556.0",
+    "svelte": "^5.56.2",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vite": "^7.2.4",
