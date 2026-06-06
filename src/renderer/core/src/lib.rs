@@ -1,5 +1,6 @@
 mod adapter_contract;
 mod model;
+mod render_cache;
 mod stats;
 mod text;
 
