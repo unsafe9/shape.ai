@@ -1,7 +1,7 @@
 //! The `StorageAdapter` trait every backend implements.
 
 use crate::error::Result;
-use crate::format::{export_bundle, import_bundle, Manifest, DEFAULT_SHARD_COUNT};
+use crate::format::{export_stream, import_stream, Manifest, DEFAULT_SHARD_COUNT};
 use crate::record::{Record, StoreSnapshot};
 use std::path::Path;
 
@@ -38,17 +38,25 @@ impl AdapterKind {
     }
 }
 
+/// A lazy, deterministic record cursor: yields a store's records in id-sorted
+/// order, one at a time, without materializing them all. Returned by
+/// [`StorageAdapter::records`] and consumed by the streaming export.
+pub type RecordCursor<'a> = Box<dyn Iterator<Item = Result<Record>> + 'a>;
+
 /// A data store the rest of the system can read and write through, regardless
 /// of where the bytes actually live.
 ///
-/// Two concerns live here:
+/// Three concerns live here:
 ///
 /// 1. **In-store I/O** — `save` / `load` / `delete` / `list`, the per-record
 ///    operations every backend must support against its native format.
-/// 2. **Portability** — `snapshot` / `restore`, the bridge to the single
-///    portable bundle format. `export` and `import` are provided on top of
-///    these and are the same for every adapter, so any store can round-trip
-///    through the on-disk bundle into any other store.
+/// 2. **Streaming** — `records` (a lazy, id-sorted cursor) and `ingest` (a
+///    one-at-a-time sink). These are what make `export`/`import` memory-safe
+///    for large stores: neither ever holds the whole store in RAM.
+/// 3. **Portability** — `snapshot` / `restore`, the bridge to the single
+///    portable bundle format for small/in-memory use. `export` and `import`
+///    are provided on top of the streaming pair, so any store can round-trip
+///    through the on-disk bundle into any other store in **bounded memory**.
 pub trait StorageAdapter {
     /// Which backend this is.
     fn kind(&self) -> AdapterKind;
@@ -65,10 +73,29 @@ pub trait StorageAdapter {
     /// List all record ids currently held, in deterministic order.
     fn list(&self) -> Result<Vec<String>>;
 
-    /// Produce the full logical contents as a portable snapshot.
+    /// A lazy cursor over all records in **deterministic id-sorted order**.
+    ///
+    /// This is the memory-safe read path for export: implementations must yield
+    /// records one at a time (e.g. shard-by-shard from disk) rather than
+    /// building the whole store in memory. Ordering must be id-sorted so the
+    /// exported bundle stays byte-stable.
+    fn records(&self) -> Result<RecordCursor<'_>>;
+
+    /// Streaming write sink for import: ingest a single record, inserting or
+    /// overwriting by id, without requiring the whole store in memory.
+    ///
+    /// Defaults to [`save`](StorageAdapter::save); override when ingestion can
+    /// be made cheaper than a full per-record persist.
+    fn ingest(&mut self, record: Record) -> Result<()> {
+        self.save(record)
+    }
+
+    /// Produce the full logical contents as a portable snapshot. For
+    /// small/in-memory use; **not** used by streaming export.
     fn snapshot(&self) -> Result<StoreSnapshot>;
 
-    /// Replace the store's contents with `snapshot`.
+    /// Replace the store's contents with `snapshot`. For small/in-memory use;
+    /// **not** used by streaming import.
     fn restore(&mut self, snapshot: StoreSnapshot) -> Result<()>;
 
     /// Export the entire store to the one portable bundle format at `root`,
@@ -78,15 +105,20 @@ pub trait StorageAdapter {
     }
 
     /// Export with an explicit shard count (parallel-write fan-out width).
+    ///
+    /// Streams the [`records`](StorageAdapter::records) cursor straight to the
+    /// bundle in bounded memory — it never builds a full snapshot.
     fn export_with_shards(&self, root: &Path, shard_count: u32) -> Result<Manifest> {
-        let snapshot = self.snapshot()?;
-        export_bundle(&snapshot, root, shard_count)
+        export_stream(self.records()?, root, shard_count)
     }
 
-    /// Import a portable bundle at `root`, replacing this store's contents.
-    /// Implemented once for all adapters.
+    /// Import a portable bundle at `root`, merging its records into this store.
+    ///
+    /// Streams the bundle shard-by-shard into [`ingest`](StorageAdapter::ingest)
+    /// in bounded memory — it never builds a full snapshot. Implementors that
+    /// need replace-not-merge semantics should clear first.
     fn import(&mut self, root: &Path) -> Result<()> {
-        let snapshot = import_bundle(root)?;
-        self.restore(snapshot)
+        import_stream(root, |record| self.ingest(record))?;
+        Ok(())
     }
 }

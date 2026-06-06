@@ -1,10 +1,15 @@
 //! Fully-working in-memory adapter.
 //!
 //! Backs tests and serves as the default in-process store. Implements all of
-//! the per-record I/O directly against an in-memory [`StoreSnapshot`], and
-//! inherits `export`/`import` from the trait's portable-format machinery.
+//! the per-record I/O directly against an in-memory [`StoreSnapshot`].
+//!
+//! This is the in-RAM backend, so the store itself is necessarily resident.
+//! Its export/import are still **streaming**: [`records`](StorageAdapter::records)
+//! hands the streaming export a lazy id-sorted cursor, and `import` ingests one
+//! record at a time. That keeps export/import from duplicating the whole
+//! serialized bundle in memory on top of the store.
 
-use crate::adapter::{AdapterKind, StorageAdapter};
+use crate::adapter::{AdapterKind, RecordCursor, StorageAdapter};
 use crate::error::{Result, StorageError};
 use crate::record::{Record, StoreSnapshot};
 
@@ -61,6 +66,11 @@ impl StorageAdapter for MemoryAdapter {
         Ok(self.snapshot.ids().cloned().collect())
     }
 
+    fn records(&self) -> Result<RecordCursor<'_>> {
+        // Lazy: clones one record at a time, in BTreeMap (id-sorted) order.
+        Ok(Box::new(self.snapshot.records().cloned().map(Ok)))
+    }
+
     fn snapshot(&self) -> Result<StoreSnapshot> {
         Ok(self.snapshot.clone())
     }
@@ -100,5 +110,19 @@ mod tests {
             Err(StorageError::NotFound { .. })
         ));
         assert_eq!(store.list().unwrap(), vec!["b"]);
+    }
+
+    #[test]
+    fn records_cursor_is_id_sorted_and_complete() {
+        let mut store = MemoryAdapter::new();
+        for id in ["c", "a", "b"] {
+            store.save(Record::new(id, "k", id.as_bytes().to_vec())).unwrap();
+        }
+        let ids: Vec<String> = store
+            .records()
+            .unwrap()
+            .map(|r| r.unwrap().id)
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
     }
 }
