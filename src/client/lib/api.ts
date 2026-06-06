@@ -78,6 +78,57 @@ export async function updateComment(
   });
 }
 
+// ---------------------------------------------------------------------------
+// MCP companion state — mirrors src/server/mcpClients.ts (ephemeral, HTTP only)
+// ---------------------------------------------------------------------------
+
+export type McpClientDockState = "idle" | "active" | "error" | "disconnected" | "muted";
+
+export type McpClientInfo = {
+  clientId: string;
+  actorType: "mcp";
+  label: string;
+  name: string;
+  version: string;
+  color: string;
+  iconRef: string | null;
+  transport: "stdio" | "http";
+  dockState: McpClientDockState;
+  lastTarget: unknown;
+  connectedAt: number;
+  lastActivityAt: number;
+  muted: boolean;
+};
+
+export type McpTraceKind =
+  | "read" | "write" | "comment" | "export"
+  | "proposal-created" | "proposal-accepted" | "proposal-rejected" | "error";
+
+export type McpTraceEvent = {
+  clientId: string;
+  kind: McpTraceKind;
+  target: unknown;
+  verb: string;
+  operationId: string | null;
+  callId: string | null;
+  at: number;
+  summary: string;
+  errorMessage: string | null;
+};
+
+export async function fetchMcpClients(): Promise<{ clients: McpClientInfo[] }> {
+  return request("/api/mcp/clients");
+}
+
+export async function fetchMcpTrace(
+  clientId: string,
+  limit?: number
+): Promise<{ clientId: string; trace: McpTraceEvent[]; total: number }> {
+  const params = new URLSearchParams({ clientId });
+  if (limit !== undefined) params.set("limit", String(limit));
+  return request(`/api/mcp/trace?${params}`);
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     headers: {

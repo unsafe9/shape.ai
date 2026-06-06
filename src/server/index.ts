@@ -5,7 +5,7 @@ import { stat } from "node:fs/promises";
 import fastifyStatic from "@fastify/static";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
-import { listClients, registerClient, setClientDockState, removeClient } from "./mcpClients";
+import { listClients, projectEventRow, projectReadRing, registerClient, setClientDockState, removeClient } from "./mcpClients";
 import {
   createCommentRequestSchema,
   createGroupRequestSchema,
@@ -30,6 +30,7 @@ import {
   deleteUnusedTag,
   ensureStorage,
   isExportPath,
+  readClientEvents,
   readFullScene,
   readGroup,
   readScene,
@@ -132,6 +133,18 @@ export async function buildServer() {
 
   // Read path: shell/dock reads the live companion identity list.
   app.get("/api/mcp/clients", async () => ({ clients: listClients() }));
+
+  // Read path: recent operation trace for one MCP client (read ring + events log).
+  app.get("/api/mcp/trace", async (request) => {
+    const query = request.query as Record<string, string | undefined>;
+    const clientId = query.clientId ?? "";
+    const limit = Math.min(200, Math.max(1, Number(query.limit ?? 50) || 50));
+    const readEvents = projectReadRing(clientId);
+    const eventRows = await readClientEvents(clientId, limit);
+    const writeEvents = eventRows.map((row) => projectEventRow(clientId, row));
+    const trace = [...writeEvents, ...readEvents].sort((a, b) => b.at - a.at).slice(0, limit);
+    return { clientId, trace, total: trace.length };
+  });
 
   registerSceneRoutes(app);
   await registerClientIfBuilt(app);
