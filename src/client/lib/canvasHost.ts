@@ -27,7 +27,9 @@ export type RendererHealth = {
 
 export type ShapeCanvasHostCallbacks = {
   onCameraChange: (camera: CameraState) => void;
-  onSelectionChange: (selection: SceneSelection) => void;
+  // T2.2: `additive` carries the shift/meta modifier held at pick time so the
+  // shell can fold the hit into a transient `multi` selection.
+  onSelectionChange: (selection: SceneSelection, additive: boolean) => void;
   onPatch: (patch: RenderScenePatch) => void;
   onGestureChange: (active: boolean) => void;
   onStats: (stats: RendererStats) => void;
@@ -249,7 +251,7 @@ export class ShapeCanvasHost {
     }
 
     if (event.type === "selection") {
-      this.callbacks.onSelectionChange(hitToSceneSelection(event.hit));
+      this.callbacks.onSelectionChange(hitToSceneSelection(event.hit), event.additive);
       return;
     }
 
