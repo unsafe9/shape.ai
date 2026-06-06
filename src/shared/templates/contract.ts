@@ -139,7 +139,10 @@ export type TemplateContract = {
 // ---------------------------------------------------------------------------
 
 export type AppliedTemplate = {
+  /** First frame group (kept for back-compat). */
   group: SceneGroup;
+  /** All frame groups, in creation order (parents before children). */
+  groups: SceneGroup[];
   nodes: SceneNode[];
   edges: SceneEdge[];
   /** Tags that were newly created by the template (not pre-existing). */
@@ -332,6 +335,7 @@ export function applyTemplate(
 
   return {
     group: scene.groups[0] ?? (null as unknown as SceneGroup),
+    groups: scene.groups,
     nodes: scene.nodes,
     edges: scene.edges,
     newTags,

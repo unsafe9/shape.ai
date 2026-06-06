@@ -374,7 +374,7 @@ p {
   bottom: 34px;
   z-index: 10;
   display: grid;
-  grid-template-columns: repeat(5, 36px);
+  grid-template-columns: repeat(6, 36px);
   gap: 7px;
   padding: 8px;
   border: 1px solid rgb(255 255 255 / 0.72);
@@ -473,6 +473,77 @@ p {
   box-shadow: var(--shadow-deep);
   backdrop-filter: var(--glass-blur);
   transform: translate(4px, 4px);
+}
+
+.template-picker {
+  position: absolute;
+  right: 34px;
+  bottom: 92px;
+  z-index: 13;
+  width: 286px;
+  overflow: hidden;
+  padding: 8px;
+  border: 1px solid rgb(255 255 255 / 0.74);
+  border-radius: 16px;
+  background: rgb(255 255 255 / 0.88);
+  box-shadow: var(--shadow-deep);
+  backdrop-filter: var(--glass-blur);
+}
+
+.template-picker-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 8px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.template-picker-header svg {
+  flex: 0 0 auto;
+}
+
+.template-picker-list {
+  display: grid;
+  gap: 4px;
+}
+
+.template-picker-item {
+  display: grid;
+  gap: 2px;
+  border: 0;
+  border-radius: 11px;
+  background: transparent;
+  padding: 9px 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.template-picker-item:hover:not(:disabled),
+.template-picker-item:focus-visible {
+  background: rgb(235 243 251 / 0.92);
+  box-shadow: none;
+}
+
+.template-picker-item:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.template-picker-title {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 760;
+}
+
+.template-picker-desc {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 560;
+  line-height: 1.3;
 }
 
 .node-context-menu-title {

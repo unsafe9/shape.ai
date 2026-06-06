@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MouseEvent } from "react";
-import { Activity, BrainCircuit, Clipboard, Copy, Layers, Loader2, Maximize2, Minus, MoreHorizontal, PanelLeft, Pencil, Plus, Trash2, X } from "lucide-react";
+import { Activity, BrainCircuit, Clipboard, Copy, Layers, LayoutTemplate, Loader2, Maximize2, Minus, MoreHorizontal, PanelLeft, Pencil, Plus, Trash2, X } from "lucide-react";
 import {
   createComment,
   createGroup,
@@ -22,6 +22,8 @@ import { RendererCanvasHost, type RendererCanvasHostHandle, type RendererHealth,
 import { RendererDiagnosticsDrawer } from "./components/RendererDiagnosticsDrawer";
 import { Sidebar } from "./components/Sidebar";
 import { ExportDrawer, type ExportPreview } from "./components/ExportDrawer";
+import { TemplatePicker } from "./components/TemplatePicker";
+import { buildTemplateInsertion, templateCatalog } from "./lib/templates";
 import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../shared/renderPatch";
 import type { CameraState } from "../shared/renderScene";
 import type {
@@ -75,6 +77,7 @@ export default function App() {
   const [status, setStatus] = useState("Ready");
   const [busy, setBusy] = useState(false);
   const [groupPanelOpen, setGroupPanelOpen] = useState(false);
+  const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [nodeMenu, setNodeMenu] = useState<NodeMenuState | null>(null);
   const [copiedNode, setCopiedNode] = useState<SceneNode | null>(null);
@@ -208,6 +211,25 @@ export default function App() {
       if (firstNode) focusNode(firstNode, 0.92);
       else focusGroup(response.group, { zoom: 0.72 });
       await selectSceneItem({ kind: "group", id: response.group.id }, response.scene);
+    });
+  }
+
+  async function applyTemplateById(templateId: string) {
+    await withBusy("Inserting template", async () => {
+      const built = buildTemplateInsertion(sceneRef.current, templateId);
+      if (!built) return;
+      sceneRequestRef.current += 1;
+      const response = await saveScenePatch(built.patch);
+      setScene(response.scene);
+      setExportPreview(null);
+      setExportPreviewCopied(false);
+      if (built.group) {
+        const created = response.scene.groups.find((group) => group.id === built.group!.id) ?? built.group;
+        setCurrentGroupId(created.id);
+        focusGroup(created, { fit: true });
+        await selectSceneItem({ kind: "group", id: created.id }, response.scene);
+      }
+      setStatus(`Inserted ${built.title}`);
     });
   }
 
@@ -684,6 +706,17 @@ export default function App() {
             </div>
             <div className="scene-controls" aria-label="Canvas controls">
               <button
+                className={`icon-button ${templatePickerOpen ? "is-active" : ""}`}
+                type="button"
+                onClick={() => setTemplatePickerOpen((open) => !open)}
+                aria-label="Insert template"
+                aria-expanded={templatePickerOpen}
+                aria-controls="template-picker"
+                title="Insert template"
+              >
+                <LayoutTemplate size={15} />
+              </button>
+              <button
                 className={`icon-button ${diagnosticsOpen ? "is-active" : ""}`}
                 type="button"
                 onClick={() => setDiagnosticsOpen((open) => !open)}
@@ -707,6 +740,14 @@ export default function App() {
                 <Maximize2 size={15} />
               </button>
             </div>
+            {templatePickerOpen ? (
+              <TemplatePicker
+                templates={templateCatalog.map(({ id, title, description }) => ({ id, title, description }))}
+                busy={busy}
+                onApply={(templateId) => void applyTemplateById(templateId)}
+                onClose={() => setTemplatePickerOpen(false)}
+              />
+            ) : null}
             <RendererDiagnosticsDrawer
               open={diagnosticsOpen}
               stats={rendererStats}
