@@ -67,7 +67,7 @@
     </button>
   </div>
 
-  {#key `${node.id}-title-${node.title}`}
+  {#key node.id}
     <input
       use:autoFocus
       class="node-title-input"

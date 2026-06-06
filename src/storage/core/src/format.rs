@@ -216,6 +216,9 @@ where
 {
     let shard_count = shard_count.max(1);
     fs::create_dir_all(root)?;
+    // NOTE: export is not atomic — stale shards are cleared and new ones written
+    // in place, so a failure partway (disk full/crash) can leave `root` partial.
+    // Export to a fresh path when the existing bundle must survive failure.
     clear_stale_shards(root)?;
 
     // One open, buffered body writer per shard. Records arrive id-sorted, so
@@ -236,7 +239,11 @@ where
         frame.clear();
         encode_record_frame(&mut frame, &record);
         bodies[idx].write_all(&frame)?;
-        counts[idx] += 1;
+        // The shard header stores the count as u32; turn a >u32::MAX overflow into
+        // a clean error instead of a silently truncated, CRC-sealed corrupt shard.
+        counts[idx] = counts[idx]
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Format(format!("shard {idx} record count exceeds u32::MAX")))?;
         total += 1;
     }
     for w in &mut bodies {

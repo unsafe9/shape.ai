@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { Activity, BrainCircuit, History, Layers, Loader2, Maximize2, Minus, Ellipsis, PanelLeft, Plus, X } from "lucide-svelte";
   import {
     createComment,
@@ -147,8 +147,13 @@
     onSaved: (savedScene, savedSelection) => {
       const validated = validSelection(savedScene, savedSelection);
       sceneRequest += 1;
+      // Update selectionRef BEFORE scene so the scene-push $effect (which reads
+      // selectionRef non-reactively) loads the new scene with the correct anchor
+      // in the same frame instead of one frame behind.
+      selectionRef = validated;
       scene = savedScene;
       selection = validated;
+      multiSelectIds = validated.kind === "multi" ? validated.ids : [];
       const savedGroupId = activeGroupIdForSelection(savedScene, validated);
       if (savedGroupId) currentGroupId = savedGroupId;
     },
@@ -380,6 +385,9 @@
     const valid = validSelection(nextScene, nextSelection);
     scene = nextScene;
     selection = valid;
+    // Keep the transient multi-set in lockstep with the committed selection so the
+    // editing toolbar doesn't stay in multi-mode after a renderer-driven commit.
+    multiSelectIds = valid.kind === "multi" ? valid.ids : [];
     const nextGroupId = activeGroupIdForSelection(nextScene, valid);
     if (nextGroupId) currentGroupId = nextGroupId;
     if (valid.kind !== "node") editingNodeId = null;
@@ -430,6 +438,11 @@
       edges: scene.edges.filter((edge) => edge.source !== nodeId && edge.target !== nodeId),
       selection: { kind: "canvas" }
     };
+    // Reset the reactive shell selection too — otherwise it keeps pointing at the
+    // deleted node (stale renderer anchor, extra Esc press, stale auto-save).
+    selection = { kind: "canvas" };
+    editingNodeId = null;
+    multiSelectIds = [];
     void saveScenePatch({ removeNodeIds: [nodeId], selection: { kind: "canvas" } });
   }
 
@@ -662,7 +675,10 @@
   // T5.3 follow framing: the camera-only subset of handleFocusTarget. Follow is
   // observe-only (§0/§8) — frames the followee's target but never writes state.
   function followTarget(target: unknown): void {
-    const currentScene = scene;
+    // Read scene untracked: followTarget is called synchronously from the follow
+    // $effect, and a tracked read here would make every scene mutation (e.g. each
+    // edit keystroke) re-trigger the effect and snap the camera back.
+    const currentScene = untrack(() => scene);
     if (!currentScene || !target || typeof target !== "object") return;
     const t = target as { kind?: string; id?: string; groupId?: string; ids?: { kind: string; id: string }[] };
     if (t.kind === "group" && t.id) {
@@ -744,6 +760,8 @@
       const response = await createGroup(prompt, undefined, activeTagIds);
       scene = response.scene;
       groupPanelOpen = false;
+      exportPreview = null;
+      exportPreviewCopied = false;
       status = response.message;
       currentGroupId = response.group.id;
       const firstNode = response.scene.nodes.find((node) => node.groupId === response.group.id);
@@ -763,6 +781,8 @@
       sceneRequest += 1;
       const response = await saveScenePatch(built.patch);
       scene = response.scene;
+      exportPreview = null;
+      exportPreviewCopied = false;
       if (built.group) {
         const created = response.scene.groups.find((group) => group.id === built.group!.id) ?? built.group;
         currentGroupId = created.id;

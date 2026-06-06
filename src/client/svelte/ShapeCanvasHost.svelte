@@ -30,9 +30,18 @@
   onMount(() => {
     // T6.2 §4: the Svelte node only owns the three DOM nodes; the
     // framework-neutral ShapeCanvasHost owns the engine lifecycle.
+    let disposed = false;
     const host = new ShapeCanvasHost(callbacks);
-    void host.mount(inputCanvas, webGpuCanvas, overlayRoot, initialCamera).then(() => onHost(host));
-    return () => host.destroy();
+    void host.mount(inputCanvas, webGpuCanvas, overlayRoot, initialCamera).then(() => {
+      // If the component unmounted while mount() was in flight, host.destroy()
+      // already ran — don't hand a dead host back to the shell.
+      if (disposed) return;
+      onHost(host);
+    });
+    return () => {
+      disposed = true;
+      host.destroy();
+    };
   });
 
   function handleContextMenu(event: MouseEvent) {

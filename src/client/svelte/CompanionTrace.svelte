@@ -48,12 +48,18 @@
   const targetClientId = $derived(activeClientId ?? clients[0]?.clientId ?? null);
   const activeClient = $derived(clients.find((c) => c.clientId === targetClientId) ?? clients[0] ?? null);
 
-  async function fetchTrace(clientId: string): Promise<void> {
+  // Monotonic generation: every effect re-run (client switch or open toggle)
+  // bumps it, so a stale in-flight response can't overwrite the current view.
+  let traceGen = 0;
+
+  async function fetchTrace(clientId: string, gen: number): Promise<void> {
     try {
       const result = await fetchMcpTrace(clientId, DEFAULT_LIMIT);
+      if (gen !== traceGen) return;
       events = result.trace;
       fetchError = null;
     } catch (err) {
+      if (gen !== traceGen) return;
       fetchError = err instanceof Error ? err.message : "Trace fetch failed";
     }
   }
@@ -61,13 +67,14 @@
   // Poll the active client's trace while open, mirroring CompanionTrace.tsx.
   $effect(() => {
     const clientId = targetClientId;
+    const gen = ++traceGen;
     if (!open || !clientId) {
       events = [];
       return;
     }
-    void fetchTrace(clientId);
+    void fetchTrace(clientId, gen);
     const id = window.setInterval(() => {
-      void fetchTrace(clientId);
+      void fetchTrace(clientId, gen);
     }, POLL_INTERVAL_MS);
     return () => window.clearInterval(id);
   });
