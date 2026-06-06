@@ -161,6 +161,22 @@ export const artifactSchema = z.object({
   sceneVersion: z.number().int().nonnegative()
 });
 
+/**
+ * T2.5: Minimal proposal slot for staged MCP writes that require human review.
+ * Full diff/ghost-write UI is P5/T5.4; this only defines the document-state record
+ * so accept-proposal / reject-proposal ops have a target.
+ *
+ * Additive optional array with default [] — back-compat like T2.1 `meta`.
+ */
+export const sceneProposalSchema = z.object({
+  id: z.string().min(1),
+  actorId: z.string().min(1),
+  status: z.enum(["pending", "accepted", "rejected"]).default("pending"),
+  /** The staged operation envelope (not yet committed). Stored as-is; validated on accept. */
+  operation: z.unknown(),
+  createdAt: z.string().min(1)
+});
+
 export const sceneSchema = z.object({
   version: z.literal(1).default(1),
   sceneVersion: z.number().int().nonnegative().default(0),
@@ -170,6 +186,8 @@ export const sceneSchema = z.object({
   tags: z.array(tagSchema).default([]),
   comments: z.array(sceneCommentSchema).default([]),
   artifacts: z.array(artifactSchema).default([]),
+  /** T2.5: Staged MCP proposals pending human review. Full UI is P5/T5.4. Additive optional field, mirrors T2.1 meta pattern. */
+  proposals: z.array(sceneProposalSchema).optional(),
   selection: sceneSelectionSchema.default({ kind: "canvas" }),
   updatedAt: z.string().min(1)
 });
@@ -264,6 +282,7 @@ export type SceneEdge = z.infer<typeof sceneEdgeSchema>;
 export type SceneSelection = z.infer<typeof sceneSelectionSchema>;
 export type SceneComment = z.infer<typeof sceneCommentSchema>;
 export type SceneArtifact = z.infer<typeof artifactSchema>;
+export type SceneProposal = z.infer<typeof sceneProposalSchema>;
 export type Scene = z.infer<typeof sceneSchema>;
 export type GraphComment = SceneComment;
 export type CreateGroupRequest = z.infer<typeof createGroupRequestSchema>;

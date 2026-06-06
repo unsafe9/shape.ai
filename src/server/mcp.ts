@@ -33,7 +33,8 @@ import {
   readScene,
   saveScenePatch,
   updateGroupTags,
-  writeArtifactContent
+  writeArtifactContent,
+  type SaveScenePatchMeta
 } from "./storage";
 
 const mcpExportTypeSchema = z.enum([
@@ -134,7 +135,10 @@ export function createSceneMcpServer(): McpServer {
       description: "Patch groups, nodes, edges, removals, or selection on the scene canvas.",
       inputSchema: scenePatchSchema.shape
     },
-    async (input) => jsonResponse({ scene: await saveScenePatch(input) })
+    async (input) => {
+      const mcpMeta: SaveScenePatchMeta = { actorType: "mcp", actorId: "mcp", clientId: "mcp-unknown", sourceToolCall: { tool: "patch_scene" } };
+      return jsonResponse({ scene: await saveScenePatch(input, mcpMeta) });
+    }
   );
 
   server.registerTool(

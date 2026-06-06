@@ -40,6 +40,7 @@ import {
   type UpdateTagRequest
 } from "../shared/schema";
 import { boundsIntersect, expandedBounds, nodeBounds } from "../shared/graph";
+import type { OperationEnvelope } from "../shared/operation";
 
 type SqlDatabase = initSqlJs.Database;
 type SqlValue = initSqlJs.SqlValue;
@@ -150,9 +151,28 @@ export async function createGroup(input: CreateGroupRequest): Promise<{ group: S
   });
 }
 
-export async function saveScenePatch(input: ScenePatch): Promise<Scene> {
+/** Optional actor context that MCP callers supply to tag their writes. */
+export type SaveScenePatchMeta = {
+  actorType: "human" | "mcp" | "system";
+  actorId: string;
+  clientId: string;
+  sourceToolCall?: { tool: string; callId?: string };
+};
+
+export async function saveScenePatch(input: ScenePatch, meta?: SaveScenePatchMeta): Promise<Scene> {
   const patch = scenePatchSchema.parse(input);
   return withWritableDb((db) => {
+    // Detect selection-only patches: no document mutation, just an ephemeral selection write.
+    const isSelectionOnly =
+      !patch.groups?.length &&
+      !patch.nodes?.length &&
+      !patch.edges?.length &&
+      !patch.translateGroups?.length &&
+      !patch.removeGroupIds?.length &&
+      !patch.removeNodeIds?.length &&
+      !patch.removeEdgeIds?.length &&
+      Boolean(patch.selection);
+
     for (const groupId of patch.removeGroupIds ?? []) removeGroupInDb(db, groupId);
     const removedNodeGroupIds = new Set<string>();
     for (const nodeId of patch.removeNodeIds ?? []) {
@@ -170,7 +190,28 @@ export async function saveScenePatch(input: ScenePatch): Promise<Scene> {
     for (const edge of patch.edges ?? []) upsertEdgeInDb(db, { ...edge, updatedAt: new Date().toISOString() });
     if (patch.selection) setMetadata(db, "selection_json", toJson(patch.selection));
     recomputeTouchedGroupBounds(db, patch, removedNodeGroupIds);
-    bumpSceneVersion(db);
+
+    if (!isSelectionOnly) {
+      // Document write: capture baseRevision before bumping, then bump.
+      const baseRevision = getSceneVersion(db);
+      bumpSceneVersion(db);
+      const now = new Date().toISOString();
+      const targetIds = scenePatchtargetIds(patch);
+      const actor = meta ?? { actorType: "human" as const, actorId: "human", clientId: "local-shell" };
+      const envelope: OperationEnvelope = {
+        operationId: `op-${now}-${Math.random().toString(36).slice(2, 9)}`,
+        actorId: actor.actorId,
+        actorType: actor.actorType,
+        clientId: actor.clientId,
+        targetIds,
+        timestamp: now,
+        baseRevision,
+        sourceToolCall: actor.sourceToolCall,
+        patch: { kind: "select", selection: patch.selection ?? { kind: "canvas" } }
+      };
+      appendEventInDb(db, envelope, patch);
+    }
+
     return readFullSceneInDb(db);
   });
 }
@@ -907,6 +948,56 @@ function setMetadata(db: SqlDatabase, key: string, value: string): void {
     "INSERT INTO metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     [key, value]
   );
+}
+
+/**
+ * Append one operation envelope row to the events table.
+ * Called inside the same withWritableDb block as the document write so the
+ * log row is atomic with the patch application and sceneVersion bump.
+ *
+ * id          = envelope.operationId
+ * type        = patch.kind (the verb)
+ * payload_json= full envelope JSON (metadata + targetIds + inner patch)
+ * created_at  = envelope.timestamp
+ */
+function appendEventInDb(db: SqlDatabase, envelope: OperationEnvelope, patch: ScenePatch): void {
+  // Derive the event type from the patch fields — first document-mutation verb wins.
+  const type = scenePatchtargetVerb(patch);
+  db.run(
+    "INSERT INTO events (id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+    [envelope.operationId, type, toJson(envelope), envelope.timestamp]
+  );
+}
+
+/**
+ * Derive a human-readable verb for the events.type column from a ScenePatch.
+ * Mirrors the RenderScenePatch kind taxonomy so the events table stays consistent.
+ */
+function scenePatchtargetVerb(patch: ScenePatch): string {
+  if (patch.removeGroupIds?.length) return "delete-group";
+  if (patch.removeNodeIds?.length) return "delete-card";
+  if (patch.removeEdgeIds?.length) return "delete-edge";
+  if (patch.translateGroups?.length) return "move-group";
+  if (patch.groups?.length) return "upsert-group";
+  if (patch.nodes?.length) return "upsert-card";
+  if (patch.edges?.length) return "upsert-edge";
+  return "patch-scene";
+}
+
+/**
+ * Derive the set of targetIds that a ScenePatch touches.
+ * Used as the fallback when no envelope was supplied by the caller.
+ */
+function scenePatchtargetIds(patch: ScenePatch): string[] {
+  const ids: string[] = [];
+  for (const gid of patch.removeGroupIds ?? []) ids.push(gid);
+  for (const nid of patch.removeNodeIds ?? []) ids.push(nid);
+  for (const eid of patch.removeEdgeIds ?? []) ids.push(eid);
+  for (const t of patch.translateGroups ?? []) ids.push(t.groupId);
+  for (const g of patch.groups ?? []) ids.push(g.id);
+  for (const n of patch.nodes ?? []) ids.push(n.id);
+  for (const e of patch.edges ?? []) ids.push(e.id);
+  return ids;
 }
 
 const layoutRepairVersion = "11";
