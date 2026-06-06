@@ -6,4 +6,5 @@ node_modules
 bun.lock
 src/client/renderer/wasm
 src/renderer/core/target/
+src/storage/core/target/
 .renderer-toolchains/
