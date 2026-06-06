@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { Activity, BrainCircuit, History, LayoutTemplate, Layers, Loader2, Maximize2, Minus, Ellipsis, PanelLeft, Plus, X } from "lucide-svelte";
+  import { Activity, BrainCircuit, History, Layers, Loader2, Maximize2, Minus, Ellipsis, PanelLeft, Plus, X } from "lucide-svelte";
   import {
     createComment,
     createGroup,
@@ -15,7 +15,8 @@
   } from "../lib/api";
   import { boundsIntersect, expandedBounds, nodeBounds } from "../../shared/graph";
   import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../../shared/renderPatch";
-  import type { CameraState } from "../../shared/renderScene";
+  import type { CameraState, RenderCard, RenderGroup, WorldRect } from "../../shared/renderScene";
+  import { screenToWorld } from "../renderer/scene";
   import { primarySelection } from "../../shared/schema";
   import type {
     EdgeType,
@@ -49,7 +50,7 @@
   import { createPatchSaver, isContinuousRendererPatch } from "../lib/patchSaver";
   import { buildTemplateInsertion, templateCatalog } from "../lib/templates";
   import Sidebar from "./Sidebar.svelte";
-  import TemplatePicker from "./TemplatePicker.svelte";
+  import ShapePalette, { type PrimitiveKindId } from "./ShapePalette.svelte";
   import CanvasHost from "./ShapeCanvasHost.svelte";
   import CanvasEditingToolbar from "./CanvasEditingToolbar.svelte";
   import SelectedNodeInspector from "./node/SelectedNodeInspector.svelte";
@@ -89,7 +90,6 @@
   let status = $state("Ready");
   let busy = $state(false);
   let groupPanelOpen = $state(false);
-  let templatePickerOpen = $state(false);
   let diagnosticsOpen = $state(false);
   let traceOpen = $state(false);
 
@@ -773,6 +773,153 @@
     });
   }
 
+  // ----- primitive palette --------------------------------------------------
+
+  // World-space point at the centre of the current viewport, used to drop new
+  // primitives into the open area the user is looking at. Reuses the shared
+  // screenToWorld transform so no camera math is duplicated here.
+  function viewportCenterWorld(): { x: number; y: number } {
+    const rect = canvasWrap?.getBoundingClientRect();
+    if (!rect) return { x: 120, y: 120 };
+    return screenToWorld({ x: rect.width / 2, y: rect.height / 2 }, camera);
+  }
+
+  // Insert a basic primitive (rectangle/ellipse/connector/sticky/frame) onto the
+  // canvas near the viewport. Everything flows through the existing renderPatch
+  // create-card/create-group/create-edge ops + handleRendererPatch, which
+  // persists discrete patches through saveScenePatch (patchSaver.saveNow).
+  function insertPrimitive(kind: PrimitiveKindId): void {
+    if (!scene) return;
+    const center = viewportCenterWorld();
+
+    if (kind === "frame") {
+      const frame: RenderGroup = {
+        id: `palette-frame-${crypto.randomUUID().slice(0, 8)}`,
+        title: "Frame",
+        summary: "",
+        bounds: { x: center.x - 320, y: center.y - 220, width: 640, height: 440 },
+        tagIds: [],
+        zIndex: 0,
+        styleKey: "default"
+      };
+      handleRendererPatch({ kind: "create-group", group: frame });
+      status = "Inserted frame";
+      return;
+    }
+
+    const groupId = activeGroupId ?? scene.groups[0]?.id;
+    if (!groupId) {
+      // No frame to host the primitive yet — drop one into a fresh frame in a
+      // single batch so the create-card validates against a live group id.
+      const frameId = `palette-frame-${crypto.randomUUID().slice(0, 8)}`;
+      const frame: RenderGroup = {
+        id: frameId,
+        title: "Canvas",
+        summary: "",
+        bounds: { x: center.x - 360, y: center.y - 260, width: 720, height: 520 },
+        tagIds: [],
+        zIndex: 0,
+        styleKey: "default"
+      };
+      const ops: RenderScenePatch[] = [{ kind: "create-group", group: frame }, ...buildPrimitiveOps(kind, frameId, center)];
+      handleRendererPatch({ kind: "batch", ops });
+      status = primitiveStatus(kind);
+      return;
+    }
+
+    const ops = buildPrimitiveOps(kind, groupId, center);
+    handleRendererPatch(ops.length === 1 ? ops[0] : { kind: "batch", ops });
+    status = primitiveStatus(kind);
+  }
+
+  // Build the renderPatch op(s) for a primitive within an existing group, placed
+  // in an open slot near the requested world anchor. "frame" is handled by the
+  // caller (it is a group, not a card) and never reaches here.
+  function buildPrimitiveOps(kind: Exclude<PrimitiveKindId, "frame">, groupId: string, anchor: { x: number; y: number }): RenderScenePatch[] {
+    const z = nextTopZ(scene?.nodes.filter((node) => node.groupId === groupId) ?? []);
+
+    if (kind === "connector") {
+      // A standalone connector is an edge — represented by two small anchor nodes
+      // joined by a create-edge op. Endpoint nodes are created first so the edge
+      // validates against live node ids inside the batch.
+      const sourceId = `palette-line-${crypto.randomUUID().slice(0, 8)}`;
+      const targetId = `palette-line-${crypto.randomUUID().slice(0, 8)}`;
+      const handle = { width: 28, height: 28 };
+      const start = openNodePosition(groupId, { x: anchor.x - 150, y: anchor.y }, handle);
+      const end = openNodePosition(groupId, { x: start.x + 320, y: start.y }, handle);
+      return [
+        { kind: "create-card", card: primitiveCard(sourceId, groupId, "task", { x: start.x, y: start.y, ...handle }, z, "Line start", "") },
+        { kind: "create-card", card: primitiveCard(targetId, groupId, "task", { x: end.x, y: end.y, ...handle }, z + 1, "Line end", "") },
+        {
+          kind: "create-edge",
+          groupId,
+          source: sourceId,
+          target: targetId,
+          edgeId: `palette-edge-${crypto.randomUUID().slice(0, 8)}`,
+          label: "connects"
+        }
+      ];
+    }
+
+    const spec = primitiveCardSpec(kind);
+    const position = openNodePosition(groupId, { x: anchor.x - spec.size.width / 2, y: anchor.y - spec.size.height / 2 }, spec.size);
+    const id = `palette-${kind}-${crypto.randomUUID().slice(0, 8)}`;
+    return [
+      {
+        kind: "create-card",
+        card: primitiveCard(id, groupId, spec.type, { x: position.x, y: position.y, ...spec.size }, z, spec.title, spec.summary)
+      }
+    ];
+  }
+
+  // Map a primitive to a card type (drives styleKey in the renderer) + size/copy.
+  function primitiveCardSpec(kind: Exclude<PrimitiveKindId, "frame" | "connector">): {
+    type: string;
+    size: { width: number; height: number };
+    title: string;
+    summary: string;
+  } {
+    if (kind === "rectangle") return { type: "task", size: { width: 220, height: 140 }, title: "Rectangle", summary: "" };
+    if (kind === "ellipse") return { type: "option", size: { width: 200, height: 200 }, title: "Ellipse", summary: "" };
+    // sticky / text box: a card whose body is editable text.
+    return { type: "proposition", size: { width: 220, height: 180 }, title: "Note", summary: "Type your note here." };
+  }
+
+  function primitiveCard(
+    id: string,
+    groupId: string,
+    type: string,
+    bounds: WorldRect,
+    zIndex: number,
+    title: string,
+    summary: string
+  ): RenderCard {
+    return {
+      id,
+      groupId,
+      title,
+      summary,
+      detail: "",
+      status: "draft",
+      type,
+      bounds,
+      zIndex,
+      styleKey: type,
+      accessibilityLabel: `${type} ${title}`
+    };
+  }
+
+  function primitiveStatus(kind: PrimitiveKindId): string {
+    const labels: Record<PrimitiveKindId, string> = {
+      rectangle: "Inserted rectangle",
+      ellipse: "Inserted ellipse",
+      connector: "Inserted connector",
+      sticky: "Inserted note",
+      frame: "Inserted frame"
+    };
+    return labels[kind];
+  }
+
   async function runCreateTag(): Promise<void> {
     if (!tagName.trim()) return;
     await withBusy("Creating tag", async () => {
@@ -999,16 +1146,6 @@
         </div>
         <div class="scene-controls" aria-label="Canvas controls">
           <button
-            class="icon-button {templatePickerOpen ? 'is-active' : ''}"
-            type="button"
-            onclick={() => (templatePickerOpen = !templatePickerOpen)}
-            aria-label="Insert template"
-            aria-expanded={templatePickerOpen}
-            title="Insert template"
-          >
-            <LayoutTemplate size={15} />
-          </button>
-          <button
             class="icon-button {diagnosticsOpen ? 'is-active' : ''}"
             type="button"
             onclick={() => (diagnosticsOpen = !diagnosticsOpen)}
@@ -1041,14 +1178,12 @@
             <Maximize2 size={15} />
           </button>
         </div>
-        {#if templatePickerOpen}
-          <TemplatePicker
-            templates={templateCatalog.map(({ id, title, description }) => ({ id, title, description }))}
-            {busy}
-            onApply={(templateId) => void applyTemplateById(templateId)}
-            onClose={() => (templatePickerOpen = false)}
-          />
-        {/if}
+        <ShapePalette
+          templates={templateCatalog.map(({ id, title, description }) => ({ id, title, description }))}
+          {busy}
+          onInsertPrimitive={insertPrimitive}
+          onApplyTemplate={(templateId) => void applyTemplateById(templateId)}
+        />
         <RendererDiagnosticsDrawer
           open={diagnosticsOpen}
           stats={rendererStats}
