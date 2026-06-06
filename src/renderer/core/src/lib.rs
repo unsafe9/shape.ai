@@ -1,11 +1,11 @@
 mod adapter_contract;
+mod frame_budget;
+mod lod;
 mod model;
 mod render_cache;
 mod stats;
 mod text;
 
-#[cfg(feature = "wgpu-probe")]
-mod lod;
 #[cfg(feature = "wgpu-probe")]
 mod webgpu;
 
