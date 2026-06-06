@@ -1,7 +1,7 @@
 import { cpSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import react from "@vitejs/plugin-react";
+import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { defineConfig, type Plugin } from "vite";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -9,7 +9,7 @@ const clientPort = Number(process.env.SHAPE_AI_CLIENT_PORT ?? 5173);
 const apiPort = Number(process.env.SHAPE_AI_PORT ?? 8787);
 
 export default defineConfig({
-  plugins: [react(), copyRendererWasm()],
+  plugins: [svelte(), copyRendererWasm()],
   server: {
     host: "127.0.0.1",
     port: clientPort,
