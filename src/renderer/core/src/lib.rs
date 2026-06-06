@@ -1,3 +1,4 @@
+mod adapter_contract;
 mod model;
 mod stats;
 mod text;
