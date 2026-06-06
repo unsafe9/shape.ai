@@ -4,6 +4,8 @@ mod stats;
 mod text;
 
 #[cfg(feature = "wgpu-probe")]
+mod lod;
+#[cfg(feature = "wgpu-probe")]
 mod webgpu;
 
 use serde::Serialize;
