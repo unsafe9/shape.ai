@@ -21,7 +21,9 @@ import type {
 
 export type EngineEvent =
   | { type: "stats"; stats: FrameStats }
-  | { type: "selection"; hit: HitResult | null }
+  // T2.2: `additive` carries the shift/meta modifier held at pick time so the shell
+  // can toggle the hit into a transient multi-select set instead of replacing it.
+  | { type: "selection"; hit: HitResult | null; additive: boolean }
   | { type: "patch"; patch: ScenePatch; errors: string[] }
   | { type: "overlay"; request: DomOverlayRequest | null }
   | { type: "gesture"; active: boolean }
@@ -69,6 +71,9 @@ export class ShapeCanvasEngine {
   private mouseDragActive = false;
   private mouseFallbackTarget: EventTarget | null = null;
   private inputGestureActive = false;
+  // T2.2: shift/meta held at the most recent pointer/mouse-down; consumed by the
+  // selection event so the shell can build a transient multi-select set.
+  private lastPointerAdditive = false;
   private deferredScene: SceneSnapshot | null = null;
   private deferredSceneRaf = 0;
 
@@ -332,6 +337,7 @@ export class ShapeCanvasEngine {
 
   private onPointerDown = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
     const screen = this.eventPoint(event);
     this.sendInputBatch([{ kind: "pointer-down", pointerId: event.pointerId, screen }]);
@@ -370,6 +376,7 @@ export class ShapeCanvasEngine {
   private onMouseDown = (event: MouseEvent) => {
     if (event.button !== 0) return;
     event.preventDefault();
+    this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
     this.mouseDragActive = true;
     this.bindMouseFallbackMove();
@@ -644,7 +651,7 @@ export class ShapeCanvasEngine {
   private processInputResult(result: RustInputBatchResult) {
     const hit = rustHitToEngineHit(result.hit);
     if (result.patches.some((patch) => patch.kind === "select")) {
-      this.onEvent({ type: "selection", hit });
+      this.onEvent({ type: "selection", hit, additive: this.lastPointerAdditive });
     }
     this.mirrorAcceptedPatches(result.patches, true);
     if (result.overlay) {
@@ -711,6 +718,10 @@ function rustHitToEngineHit(hit: RustHitResult | null): HitResult | null {
 
 function debugSelectionId(selection: SceneSelection | null): string | null {
   if (!selection || selection.kind === "canvas") return null;
+  // The renderer/core only ever receives the single-anchor form; a `multi`
+  // selection is down-projected before it reaches the engine, but handle it
+  // defensively by reporting its primary id.
+  if (selection.kind === "multi") return selection.ids[0] ?? null;
   return selection.id;
 }
 
@@ -725,6 +736,12 @@ function selectionEqual(left: SceneSelection, right: SceneSelection): boolean {
       return right.kind === "node" && left.id === right.id;
     case "edge":
       return right.kind === "edge" && left.id === right.id;
+    case "multi":
+      return (
+        right.kind === "multi" &&
+        left.ids.length === right.ids.length &&
+        left.ids.every((id, index) => id === right.ids[index])
+      );
   }
 }
 

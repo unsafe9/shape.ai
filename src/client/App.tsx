@@ -45,6 +45,7 @@ import { CanvasEditingToolbar } from "./components/CanvasEditingToolbar";
 import { buildTemplateInsertion, templateCatalog } from "./lib/templates";
 import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../shared/renderPatch";
 import type { CameraState } from "../shared/renderScene";
+import { primarySelection } from "../shared/schema";
 import type {
   EdgeType,
   ExportType,
@@ -131,7 +132,9 @@ export default function App() {
     ? `node:${selectedNode.id} - ${selectedNode.title}`
     : selection.kind === "canvas"
       ? "canvas"
-      : `${selection.kind}:${selection.id}`;
+      : selection.kind === "multi"
+        ? `multi:${selection.ids.length} objects`
+        : `${selection.kind}:${selection.id}`;
 
   useEffect(() => {
     sceneRef.current = scene;
@@ -386,16 +389,25 @@ export default function App() {
     }
   }
 
-  function handleRendererSelection(nextSelection: SceneSelection) {
+  function handleRendererSelection(nextSelection: SceneSelection, additive = false) {
     const currentScene = sceneRef.current;
     if (!currentScene) return;
-    const valid = validSelection(currentScene, nextSelection);
+    // T2.2 transient multi-select: shift/meta-click on a card toggles it in/out of
+    // the ephemeral set instead of replacing the selection. The set never becomes a
+    // SceneGroup; it evaporates on a plain (non-additive) click or click-away.
+    const resolved = additive && nextSelection.kind === "node"
+      ? toggleMultiSelect(selectionRef.current, nextSelection.id)
+      : nextSelection;
+    const valid = validSelection(currentScene, resolved);
     selectionRef.current = valid;
+    setMultiSelectIds(valid.kind === "multi" ? valid.ids : []);
     const nextGroupId = activeGroupIdForSelection(currentScene, valid);
     if (nextGroupId) setCurrentGroupId(nextGroupId);
     if (valid.kind !== "node") setEditingNodeId(null);
     setSelection(valid);
-    void saveScenePatch({ selection: valid }).catch((error) => {
+    // The canonical persisted selection stays single-anchor so the renderer/Rust
+    // core can restore it; the multi-set itself is shell-only ephemeral state.
+    void saveScenePatch({ selection: primarySelection(valid) }).catch((error) => {
       setStatus(error instanceof Error ? error.message : "Selection save failed");
     });
   }
@@ -1190,11 +1202,35 @@ function mergeUnique(left: string[] | undefined, right: string[] | undefined): s
   return Array.from(new Set([...(left ?? []), ...(right ?? [])]));
 }
 
+// T2.2: fold a shift/meta-clicked node id into the current selection, producing a
+// transient `multi` set. Re-clicking a member removes it; collapsing to one node
+// returns a plain `node` selection, and to zero returns `canvas`.
+function toggleMultiSelect(current: SceneSelection, nodeId: string): SceneSelection {
+  const baseIds =
+    current.kind === "multi"
+      ? current.ids
+      : current.kind === "node"
+        ? [current.id]
+        : [];
+  const nextIds = baseIds.includes(nodeId) ? baseIds.filter((id) => id !== nodeId) : [...baseIds, nodeId];
+  if (nextIds.length === 0) return { kind: "canvas" };
+  if (nextIds.length === 1) return { kind: "node", id: nextIds[0] };
+  return { kind: "multi", ids: nextIds };
+}
+
 function validSelection(scene: Scene, selection: SceneSelection): SceneSelection {
   if (selection.kind === "canvas") return selection;
   if (selection.kind === "group" && scene.groups.some((group) => group.id === selection.id)) return selection;
   if (selection.kind === "node" && scene.nodes.some((node) => node.id === selection.id)) return selection;
   if (selection.kind === "edge" && scene.edges.some((edge) => edge.id === selection.id)) return selection;
+  if (selection.kind === "multi") {
+    // T2.2: keep only live node ids. Collapse to a single node when one remains,
+    // to canvas when none do — the multi form is reserved for ≥2 objects.
+    const liveIds = selection.ids.filter((id) => scene.nodes.some((node) => node.id === id));
+    if (liveIds.length >= 2) return { kind: "multi", ids: liveIds };
+    if (liveIds.length === 1) return { kind: "node", id: liveIds[0] };
+    return { kind: "canvas" };
+  }
   return { kind: "canvas" };
 }
 

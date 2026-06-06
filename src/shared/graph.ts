@@ -161,6 +161,7 @@ export function groupTags(group: SceneGroup, tags: Tag[]): Tag[] {
 
 export function selectionTarget(selection: SceneSelection): string {
   if (selection.kind === "canvas") return "canvas";
+  if (selection.kind === "multi") return `multi:${selection.ids.join(",")}`;
   return `${selection.kind}:${selection.id}`;
 }
 

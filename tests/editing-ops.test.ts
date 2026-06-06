@@ -591,3 +591,52 @@ describe("deriveTargetIds for T2.2 ops", () => {
     expect(deriveTargetIds(patch)).toEqual(["n1", "n2"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// T2.2 transient multi-select (additive SceneSelection `multi` form)
+// ---------------------------------------------------------------------------
+
+import { primarySelection, sceneSelectionSchema } from "../src/shared/schema";
+
+describe("multi-select SceneSelection form", () => {
+  it("parses an additive `multi` selection of node ids", () => {
+    const parsed = sceneSelectionSchema.parse({ kind: "multi", ids: ["n1", "n2", "n3"] });
+    expect(parsed).toEqual({ kind: "multi", ids: ["n1", "n2", "n3"] });
+  });
+
+  it("rejects an empty `multi` selection", () => {
+    expect(() => sceneSelectionSchema.parse({ kind: "multi", ids: [] })).toThrow();
+  });
+
+  it("leaves the existing single-anchor members unchanged", () => {
+    expect(sceneSelectionSchema.parse({ kind: "canvas" })).toEqual({ kind: "canvas" });
+    expect(sceneSelectionSchema.parse({ kind: "node", id: "n1" })).toEqual({ kind: "node", id: "n1" });
+    expect(sceneSelectionSchema.parse({ kind: "group", id: "g1" })).toEqual({ kind: "group", id: "g1" });
+    expect(sceneSelectionSchema.parse({ kind: "edge", id: "e1" })).toEqual({ kind: "edge", id: "e1" });
+  });
+
+  it("down-projects `multi` to its primary node, passing single forms through", () => {
+    expect(primarySelection({ kind: "multi", ids: ["n2", "n3"] })).toEqual({ kind: "node", id: "n2" });
+    expect(primarySelection({ kind: "node", id: "n1" })).toEqual({ kind: "node", id: "n1" });
+    expect(primarySelection({ kind: "canvas" })).toEqual({ kind: "canvas" });
+  });
+
+  it("`select` op validates and applies a `multi` selection without creating a group", () => {
+    const patch: RenderScenePatch = { kind: "select", selection: { kind: "multi", ids: ["n1", "n2"] } };
+    const result = applyRenderPatchToShapeScene(baseScene, patch, NOW);
+    expect(result.errors).toEqual([]);
+    expect(result.scene.selection).toEqual({ kind: "multi", ids: ["n1", "n2"] });
+    // The transient set never adds a SceneGroup.
+    expect(result.scene.groups.length).toBe(baseScene.groups.length);
+  });
+
+  it("`select` op rejects a `multi` selection with an unknown node id", () => {
+    const patch: RenderScenePatch = { kind: "select", selection: { kind: "multi", ids: ["n1", "ghost"] } };
+    const result = applyRenderPatchToShapeScene(baseScene, patch, NOW);
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+
+  it("deriveTargetIds returns the full set for a `multi` selection", () => {
+    expect(deriveTargetIds({ kind: "select", selection: { kind: "multi", ids: ["n1", "n2", "n3"] } })).toEqual(["n1", "n2", "n3"]);
+  });
+});

@@ -31,17 +31,20 @@ type CanvasEditingToolbarProps = {
 export function CanvasEditingToolbar({ scene, selection, multiSelectIds, onPatch }: CanvasEditingToolbarProps) {
   if (selection.kind === "canvas") return null;
 
-  // Resolve effective ids: multi-select set if present, else single-target from selection.
+  // Resolve effective ids: a `multi` selection (or the ephemeral multiSelectIds set)
+  // drives batch actions, else the single-target id from the selection.
   const effectiveIds: string[] =
-    multiSelectIds.length >= 2
-      ? multiSelectIds
-      : selection.kind === "node"
-        ? [selection.id]
-        : selection.kind === "group"
+    selection.kind === "multi"
+      ? selection.ids
+      : multiSelectIds.length >= 2
+        ? multiSelectIds
+        : selection.kind === "node"
           ? [selection.id]
-          : selection.kind === "edge"
+          : selection.kind === "group"
             ? [selection.id]
-            : [];
+            : selection.kind === "edge"
+              ? [selection.id]
+              : [];
 
   const nodeIds = effectiveIds.filter((id) => scene.nodes.some((n) => n.id === id));
   const groupIds = effectiveIds.filter((id) => scene.groups.some((g) => g.id === id));

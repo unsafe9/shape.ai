@@ -184,5 +184,6 @@ function rustLastHitValue(stats: RendererStats | null): string | null {
 
 function selectionValue(selection: SceneSelection): string {
   if (selection.kind === "canvas") return "canvas";
+  if (selection.kind === "multi") return `multi:${selection.ids.length} objects`;
   return `${selection.kind}:${selection.id}`;
 }

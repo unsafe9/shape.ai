@@ -871,6 +871,12 @@ function assertTagsExist(db: SqlDatabase, tagIds: string[]): void {
 
 function assertTargetExists(db: SqlDatabase, target: SceneSelection): void {
   if (target.kind === "canvas") return;
+  if (target.kind === "multi") {
+    for (const id of target.ids) {
+      if (!queryOne(db, "SELECT id FROM nodes WHERE id = ?", [id])) throw new Error(`Target not found: ${id}`);
+    }
+    return;
+  }
   if (target.kind === "group" && getGroupInDb(db, target.id)) return;
   if (target.kind === "node" && queryOne(db, "SELECT id FROM nodes WHERE id = ?", [target.id])) return;
   if (target.kind === "edge" && queryOne(db, "SELECT id FROM edges WHERE id = ?", [target.id])) return;

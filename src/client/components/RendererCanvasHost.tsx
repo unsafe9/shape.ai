@@ -1,5 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type MouseEvent } from "react";
-import type { Scene, SceneSelection } from "../../shared/schema";
+import { primarySelection, type Scene, type SceneSelection } from "../../shared/schema";
 import type { CameraState } from "../../shared/renderScene";
 import { shapeSceneToFilteredRenderSnapshot, type RenderScenePatch } from "../../shared/renderPatch";
 import { ShapeCanvasEngine, type EngineEvent, type FocusBoundsOptions } from "../renderer/engine";
@@ -31,7 +31,9 @@ type RendererCanvasHostProps = {
   camera: CameraState;
   selection: SceneSelection;
   onCameraChange: (camera: CameraState) => void;
-  onSelectionChange: (selection: SceneSelection) => void;
+  // T2.2: `additive` is true when shift/meta was held at pick time, asking the
+  // shell to toggle the hit into a transient multi-select set.
+  onSelectionChange: (selection: SceneSelection, additive: boolean) => void;
   onPatch: (patch: RenderScenePatch) => void;
   onGestureChange: (active: boolean) => void;
   onStats: (stats: RendererStats) => void;
@@ -80,7 +82,10 @@ export const RendererCanvasHost = forwardRef<RendererCanvasHostHandle, RendererC
   const [engineReadyKey, setEngineReadyKey] = useState(0);
 
   callbacksRef.current = { onCameraChange, onSelectionChange, onPatch, onGestureChange, onStats, onStatus };
-  selectionRef.current = selection;
+  // T2.2: the Rust core understands only the single-anchor selection forms, so a
+  // transient `multi` selection is down-projected to its primary node before it
+  // is fed into loadScene/syncSelection. The full set stays in the React shell.
+  selectionRef.current = primarySelection(selection);
 
   useImperativeHandle(
     ref,
@@ -192,8 +197,9 @@ export const RendererCanvasHost = forwardRef<RendererCanvasHostHandle, RendererC
   }, [scene, activeTagIds, engineReadyKey]);
 
   useEffect(() => {
-    selectionRef.current = selection;
-    const errors = engineRef.current?.syncSelection(selection) ?? [];
+    const primary = primarySelection(selection);
+    selectionRef.current = primary;
+    const errors = engineRef.current?.syncSelection(primary) ?? [];
     if (errors.length > 0) callbacksRef.current.onStatus(errors.join("; "));
   }, [selection, engineReadyKey]);
 
@@ -210,7 +216,7 @@ export const RendererCanvasHost = forwardRef<RendererCanvasHostHandle, RendererC
     }
 
     if (event.type === "selection") {
-      callbacksRef.current.onSelectionChange(hitToSceneSelection(event.hit));
+      callbacksRef.current.onSelectionChange(hitToSceneSelection(event.hit), event.additive);
       return;
     }
 
