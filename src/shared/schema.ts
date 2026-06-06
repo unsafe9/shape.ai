@@ -137,7 +137,12 @@ export const sceneSelectionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("canvas") }),
   z.object({ kind: z.literal("group"), id: z.string().min(1) }),
   z.object({ kind: z.literal("node"), id: z.string().min(1) }),
-  z.object({ kind: z.literal("edge"), id: z.string().min(1) })
+  z.object({ kind: z.literal("edge"), id: z.string().min(1) }),
+  // T2.2 transient multi-select: an ephemeral set of node ids. Additive; the
+  // existing canvas/group/node/edge members are unchanged. This never becomes a
+  // SceneGroup. The canonical Rust-facing selection stays single-anchor — the
+  // shell down-projects `multi` to its primary node when syncing to the core.
+  z.object({ kind: z.literal("multi"), ids: z.array(z.string().min(1)).min(1) })
 ]);
 
 export const sceneCommentSchema = z.object({
@@ -280,6 +285,18 @@ export type SceneGroup = z.infer<typeof sceneGroupSchema>;
 export type SceneNode = z.infer<typeof sceneNodeSchema>;
 export type SceneEdge = z.infer<typeof sceneEdgeSchema>;
 export type SceneSelection = z.infer<typeof sceneSelectionSchema>;
+
+/**
+ * T2.2: Down-project a (possibly `multi`) selection to its single-anchor primary,
+ * which is the only shape the Rust core and the canonical persisted `selection`
+ * understand. A `multi` selection collapses to a `node` on its first id; all other
+ * forms pass through unchanged. The multi-set itself stays ephemeral in the shell.
+ */
+export function primarySelection(selection: SceneSelection): SceneSelection {
+  if (selection.kind === "multi") return { kind: "node", id: selection.ids[0] };
+  return selection;
+}
+
 export type SceneComment = z.infer<typeof sceneCommentSchema>;
 export type SceneArtifact = z.infer<typeof artifactSchema>;
 export type SceneProposal = z.infer<typeof sceneProposalSchema>;

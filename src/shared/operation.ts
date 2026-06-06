@@ -99,7 +99,11 @@ export function deriveTargetIds(patch: ExtendedRenderPatch): string[] {
       return [patch.id];
     case "select":
       // Selection is ephemeral; targetIds are the selected ids (no document target).
-      return patch.selection.kind === "canvas" ? [] : [patch.selection.id];
+      return patch.selection.kind === "canvas"
+        ? []
+        : patch.selection.kind === "multi"
+          ? patch.selection.ids
+          : [patch.selection.id];
     // T2.2 ops
     case "resize-card":
       return [patch.id];
@@ -113,7 +117,11 @@ export function deriveTargetIds(patch: ExtendedRenderPatch): string[] {
     case "batch":
       return patch.ops.flatMap(deriveTargetIds);
     case "add-comment":
-      return patch.target.kind === "canvas" ? [] : [patch.target.id];
+      return patch.target.kind === "canvas"
+        ? []
+        : patch.target.kind === "multi"
+          ? patch.target.ids
+          : [patch.target.id];
     case "export":
       return patch.scopeIds;
     case "accept-proposal":

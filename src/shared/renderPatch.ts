@@ -402,6 +402,8 @@ function selectionVisible(selection: SceneSelection, groupIds: Set<string>, node
   if (selection.kind === "canvas") return true;
   if (selection.kind === "group") return groupIds.has(selection.id);
   if (selection.kind === "node") return nodeIds.has(selection.id);
+  // T2.2 multi-select stays visible while any member node survives the filter.
+  if (selection.kind === "multi") return selection.ids.some((id) => nodeIds.has(id));
   return edgeIds.has(selection.id);
 }
 
@@ -410,6 +412,11 @@ function validateSceneSelection(scene: Scene, selection: SceneSelection): string
   if (selection.kind === "group" && scene.groups.some((group) => group.id === selection.id)) return [];
   if (selection.kind === "node" && scene.nodes.some((node) => node.id === selection.id)) return [];
   if (selection.kind === "edge" && scene.edges.some((edge) => edge.id === selection.id)) return [];
+  // T2.2 multi-select is valid when every member node id exists.
+  if (selection.kind === "multi") {
+    const unknown = selection.ids.find((id) => !scene.nodes.some((node) => node.id === id));
+    return unknown ? [`Unknown node selection id: ${unknown}`] : [];
+  }
   return [`Unknown ${selection.kind} selection id: ${selection.id}`];
 }
 

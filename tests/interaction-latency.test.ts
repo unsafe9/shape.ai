@@ -115,6 +115,7 @@ function createLoadedEngine(
 function selectionId(snapshot: SceneSnapshot | null): string {
   const selection = snapshot?.selection;
   if (!selection || selection.kind === "canvas") return "";
+  if (selection.kind === "multi") return selection.ids[0] ?? "";
   return selection.id;
 }
 
