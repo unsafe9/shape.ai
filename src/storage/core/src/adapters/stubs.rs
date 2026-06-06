@@ -6,11 +6,11 @@
 //! name and route to it, but the per-record I/O returns
 //! [`StorageError::Unsupported`] until a backend is wired in.
 //!
-//! Crucially, the portability surface is *not* faked: `export`/`import` still
-//! flow through `snapshot`/`restore`, so once a real backend lands the bundle
-//! format works unchanged.
+//! Crucially, the portability surface is *not* faked: a real backend just needs
+//! to implement the streaming pair (`records`/`ingest`) plus `snapshot`/
+//! `restore`, and `export`/`import` then work unchanged via the streaming core.
 
-use crate::adapter::{AdapterKind, StorageAdapter};
+use crate::adapter::{AdapterKind, RecordCursor, StorageAdapter};
 use crate::error::{Result, StorageError};
 use crate::record::{Record, StoreSnapshot};
 
@@ -57,6 +57,13 @@ macro_rules! unsupported_adapter {
                 Err(StorageError::Unsupported {
                     kind: $label,
                     op: "list",
+                })
+            }
+
+            fn records(&self) -> Result<RecordCursor<'_>> {
+                Err(StorageError::Unsupported {
+                    kind: $label,
+                    op: "records",
                 })
             }
 
