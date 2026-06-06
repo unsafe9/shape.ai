@@ -127,6 +127,64 @@ describe("scene storage", () => {
     expect(scene.nodes.length).toBeGreaterThan(0);
     expect(new Set(scene.nodes.map((node) => node.groupId))).toEqual(new Set([first.group.id, second.group.id]));
   });
+
+  // T2.5: operation log write path
+  it("saveScenePatch appends one events row per document write", async () => {
+    const { storage } = await createTempStorage();
+    const created = await storage.createGroup({ prompt: "Op log test" });
+
+    // Apply a doc write via saveScenePatch.
+    const nodeId = created.scene.nodes[0]?.id;
+    expect(nodeId).toBeDefined();
+    await storage.saveScenePatch({ removeNodeIds: [nodeId!] });
+
+    // The events row should be visible via readClientEvents for "local-shell".
+    const events = await storage.readClientEvents("local-shell", 10);
+    expect(events.length).toBeGreaterThan(0);
+    // Each row carries a parseable payload with the expected fields.
+    const payload = JSON.parse(events[0].payloadJson) as Record<string, unknown>;
+    expect(payload.actorType).toBe("human");
+    expect(payload.clientId).toBe("local-shell");
+    expect(typeof payload.operationId).toBe("string");
+    expect(typeof payload.baseRevision).toBe("number");
+  });
+
+  it("saveScenePatch selection-only patch does NOT append to events or bump sceneVersion", async () => {
+    const { storage } = await createTempStorage();
+    const created = await storage.createGroup({ prompt: "Selection ephemeral test" });
+    const nodeId = created.scene.nodes[0]?.id;
+    const versionBefore = created.scene.sceneVersion;
+
+    await storage.saveScenePatch({ selection: { kind: "node", id: nodeId! } });
+
+    const sceneAfter = await storage.readFullScene();
+    // sceneVersion must NOT have bumped for a selection-only patch.
+    expect(sceneAfter.sceneVersion).toBe(versionBefore);
+
+    // No events row should be present for local-shell (we didn't do any doc write above).
+    const events = await storage.readClientEvents("local-shell", 10);
+    expect(events.length).toBe(0);
+  });
+
+  it("saveScenePatch with MCP meta writes mcp actorType to events", async () => {
+    const { storage } = await createTempStorage();
+    const created = await storage.createGroup({ prompt: "MCP op log test" });
+    const node = created.scene.nodes[0];
+    expect(node).toBeDefined();
+
+    await storage.saveScenePatch(
+      { nodes: [{ ...node!, title: "Updated" }] },
+      { actorType: "mcp", actorId: "mcp-agent", clientId: "mcp-session-1", sourceToolCall: { tool: "patch_scene" } }
+    );
+
+    const events = await storage.readClientEvents("mcp-session-1", 10);
+    expect(events.length).toBeGreaterThan(0);
+    const payload = JSON.parse(events[0].payloadJson) as Record<string, unknown>;
+    expect(payload.actorType).toBe("mcp");
+    expect(payload.clientId).toBe("mcp-session-1");
+    const toolCall = payload.sourceToolCall as { tool?: string } | undefined;
+    expect(toolCall?.tool).toBe("patch_scene");
+  });
 });
 
 function overlapArea(
