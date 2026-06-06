@@ -648,6 +648,45 @@ export default function App() {
     return preferred;
   }
 
+  function handleFocusTarget(target: unknown) {
+    if (!scene || !target || typeof target !== "object") return;
+    const t = target as { kind?: string; id?: string; groupId?: string; ids?: { kind: string; id: string }[] };
+    if (t.kind === "group" && t.id) {
+      const group = scene.groups.find((g) => g.id === t.id);
+      if (group) {
+        focusGroup(group, { fit: true });
+        void selectSceneItem({ kind: "group", id: t.id });
+      }
+    } else if (t.kind === "node" && t.id) {
+      const node = scene.nodes.find((n) => n.id === t.id);
+      if (node) {
+        focusNode(node);
+        void selectSceneItem({ kind: "node", id: t.id });
+      }
+    } else if (t.kind === "edge" && t.id) {
+      void selectSceneItem({ kind: "edge", id: t.id });
+    } else if (t.kind === "artifact" && t.groupId) {
+      const group = scene.groups.find((g) => g.id === t.groupId);
+      if (group) focusGroup(group, { fit: true });
+      void selectSceneItem({ kind: "group", id: t.groupId });
+    } else if (t.kind === "selection" && Array.isArray(t.ids) && t.ids.length > 0) {
+      const first = t.ids[0] as { kind: string; id: string };
+      if (first.kind === "group") {
+        const group = scene.groups.find((g) => g.id === first.id);
+        if (group) focusGroup(group, { fit: true });
+        void selectSceneItem({ kind: "group", id: first.id });
+      } else if (first.kind === "node") {
+        const node = scene.nodes.find((n) => n.id === first.id);
+        if (node) focusNode(node);
+        void selectSceneItem({ kind: "node", id: first.id });
+      } else if (first.kind === "edge") {
+        void selectSceneItem({ kind: "edge", id: first.id });
+      }
+    } else {
+      fitScene();
+    }
+  }
+
   function focusGroup(group: SceneGroup, options: { zoom?: number; fit?: boolean } = {}) {
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -721,7 +760,7 @@ export default function App() {
     <div className="app-shell">
       <main className="studio-stage">
         <section className={`canvas-panel ${selection.kind === "node" ? "has-card-focus" : ""}`}>
-          <CompanionDock clients={mcpClients} />
+          <CompanionDock clients={mcpClients} onFocusTarget={handleFocusTarget} />
           <div className="flow-wrap renderer-scene-surface" ref={canvasRef}>
             <div className="canvas-watermark" aria-hidden="true">
               <BrainCircuit size={28} />
@@ -797,6 +836,7 @@ export default function App() {
               open={traceOpen}
               clients={mcpClients}
               onClose={() => setTraceOpen(false)}
+              onFocusTarget={handleFocusTarget}
             />
 
             <RendererCanvasHost

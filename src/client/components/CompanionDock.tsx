@@ -2,6 +2,7 @@ import type { McpClientInfo } from "../lib/api";
 
 type Props = {
   clients: McpClientInfo[];
+  onFocusTarget?: (target: unknown) => void;
 };
 
 const STATE_COLORS: Record<McpClientInfo["dockState"], string> = {
@@ -26,7 +27,7 @@ function chipTitle(client: McpClientInfo): string {
     .join("\n");
 }
 
-export function CompanionDock({ clients }: Props) {
+export function CompanionDock({ clients, onFocusTarget }: Props) {
   if (clients.length === 0) {
     return (
       <div className="companion-dock companion-dock-empty" aria-label="MCP companions">
@@ -55,13 +56,19 @@ export function CompanionDock({ clients }: Props) {
         const initial = (client.label[0] ?? "?").toUpperCase();
         const isActive = client.dockState === "active";
         const isDisconnected = client.dockState === "disconnected";
+        const target = client.lastTarget as { kind?: string } | null;
+        const hasSpatialTarget = target !== null && target?.kind !== undefined && target.kind !== "canvas";
+        const clickable = hasSpatialTarget && onFocusTarget !== undefined;
         return (
           <div
             key={client.clientId}
-            className={`companion-chip ${isActive ? "companion-chip-active" : ""} ${isDisconnected ? "companion-chip-disconnected" : ""}`}
+            className={`companion-chip ${isActive ? "companion-chip-active" : ""} ${isDisconnected ? "companion-chip-disconnected" : ""} ${clickable ? "companion-chip-focusable" : ""}`}
             title={chipTitle(client)}
-            role="listitem"
+            role={clickable ? "button" : "listitem"}
             aria-label={`${client.label}: ${client.dockState}`}
+            tabIndex={clickable ? 0 : undefined}
+            onClick={clickable ? () => onFocusTarget(client.lastTarget) : undefined}
+            onKeyDown={clickable ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onFocusTarget(client.lastTarget); } } : undefined}
           >
             <span
               className="companion-chip-icon"

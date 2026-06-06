@@ -6,6 +6,7 @@ type CompanionTraceProps = {
   open: boolean;
   clients: McpClientInfo[];
   onClose: () => void;
+  onFocusTarget?: (target: unknown) => void;
 };
 
 const POLL_INTERVAL_MS = 4_000;
@@ -32,7 +33,7 @@ function relativeTime(at: number): string {
   return `${deltaH}h ago`;
 }
 
-export function CompanionTrace({ open, clients, onClose }: CompanionTraceProps) {
+export function CompanionTrace({ open, clients, onClose, onFocusTarget }: CompanionTraceProps) {
   const [activeClientId, setActiveClientId] = useState<string | null>(null);
   const [events, setEvents] = useState<McpTraceEvent[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -126,6 +127,7 @@ export function CompanionTrace({ open, clients, onClose }: CompanionTraceProps) 
               key={event.operationId ?? `read-${index}-${event.at}`}
               event={event}
               clientColor={activeClient?.color ?? "#888"}
+              onFocusTarget={onFocusTarget}
             />
           ))}
         </ol>
@@ -137,15 +139,30 @@ export function CompanionTrace({ open, clients, onClose }: CompanionTraceProps) 
 type TraceRowProps = {
   event: McpTraceEvent;
   clientColor: string;
+  onFocusTarget?: (target: unknown) => void;
 };
 
-function TraceRow({ event, clientColor }: TraceRowProps) {
+function isSpatialTarget(target: unknown): boolean {
+  if (!target || typeof target !== "object") return false;
+  const t = target as { kind?: unknown };
+  return typeof t.kind === "string" && t.kind !== "canvas";
+}
+
+function TraceRow({ event, clientColor, onFocusTarget }: TraceRowProps) {
   const kindLabel = KIND_LABELS[event.kind] ?? event.kind;
   const isError = event.kind === "error";
   const isPending = event.kind === "proposal-created";
+  const clickable = onFocusTarget !== undefined && isSpatialTarget(event.target);
 
   return (
-    <li className={`companion-trace-row ${isError ? "is-error" : ""} ${isPending ? "is-pending" : ""}`}>
+    <li
+      className={`companion-trace-row ${isError ? "is-error" : ""} ${isPending ? "is-pending" : ""} ${clickable ? "companion-trace-row-focusable" : ""}`}
+      role={clickable ? "button" : "listitem"}
+      tabIndex={clickable ? 0 : undefined}
+      title={clickable ? "Focus on canvas" : undefined}
+      onClick={clickable ? () => onFocusTarget(event.target) : undefined}
+      onKeyDown={clickable ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onFocusTarget(event.target); } } : undefined}
+    >
       <span
         className="companion-trace-kind-dot"
         style={{ background: isError ? "var(--bad)" : clientColor }}
