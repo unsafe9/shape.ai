@@ -5,6 +5,7 @@
     createComment,
     createGroup,
     createTag,
+    exportGroup,
     fetchMcpClients,
     fetchScene,
     saveScenePatch,
@@ -18,6 +19,7 @@
   import { primarySelection } from "../../shared/schema";
   import type {
     EdgeType,
+    ExportType,
     GraphComment,
     GraphNode,
     NodeType,
@@ -53,6 +55,9 @@
   import SelectedNodeInspector from "./node/SelectedNodeInspector.svelte";
   import NodeContextMenu from "./NodeContextMenu.svelte";
   import CompanionDock from "./CompanionDock.svelte";
+  import CompanionTrace from "./CompanionTrace.svelte";
+  import RendererDiagnosticsDrawer from "./RendererDiagnosticsDrawer.svelte";
+  import ExportDrawer, { type ExportPreview } from "./ExportDrawer.svelte";
 
   const cardWidth = 270;
   const cardHeight = 178;
@@ -94,6 +99,10 @@
   let copiedNode = $state<SceneNode | null>(null);
   let commentValue = $state("");
 
+  // ----- export drawer slice -----
+  let exportPreview = $state<ExportPreview | null>(null);
+  let exportPreviewCopied = $state(false);
+
   // ----- MCP companions + follow mode -----
   let mcpClients = $state<McpClientInfo[]>([]);
   let followState = $state<FollowState>(initialFollowState);
@@ -120,6 +129,16 @@
   const readyState = $derived(rendererHealth?.state ?? "wasm-unavailable");
   const rendererDetail = $derived(rendererHealth?.detail ?? "Detecting Rust/WASM package.");
   const hasRenderableScene = $derived(Boolean(scene?.groups.length));
+  const artifacts = $derived(scene?.artifacts.filter((artifact) => artifact.target.kind === "group" && artifact.target.id === activeGroupId) ?? []);
+  const selectedTargetLabel = $derived(
+    selectedNode
+      ? `node:${selectedNode.id} - ${selectedNode.title}`
+      : selection.kind === "canvas"
+        ? "canvas"
+        : selection.kind === "multi"
+          ? `multi:${selection.ids.length} objects`
+          : `${selection.kind}:${selection.id}`
+  );
 
   // T6.2 §1: debounced, gesture-gated renderer-patch save lives in the
   // framework-neutral patchSaver module; the shell only feeds it.
@@ -540,6 +559,47 @@
     return preferred;
   }
 
+  // ----- export ------------------------------------------------------------
+
+  async function runExport(type: ExportType): Promise<void> {
+    if (!activeGroupId) return;
+    const groupId = activeGroupId;
+    await withBusy(`Exporting ${type}`, async () => {
+      const response = await exportGroup(groupId, type, { kind: "group", id: groupId });
+      scene = response.scene;
+      exportPreview = response.preview;
+      exportPreviewCopied = false;
+      status = `Export created: ${response.artifact.title}`;
+    });
+  }
+
+  async function copyExportPreview(): Promise<void> {
+    if (!exportPreview) return;
+    if (await writeClipboardText(exportPreview.content)) {
+      exportPreviewCopied = true;
+      status = "Export preview copied";
+      window.setTimeout(() => (exportPreviewCopied = false), 1400);
+      return;
+    }
+    if (selectExportPreviewText()) {
+      status = "Export preview selected";
+      return;
+    }
+    status = "Copy failed";
+  }
+
+  function selectExportPreviewText(): boolean {
+    const preview = document.querySelector(".export-preview-body");
+    if (!preview) return false;
+    const sel = window.getSelection();
+    if (!sel) return false;
+    const range = document.createRange();
+    range.selectNodeContents(preview);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+  }
+
   // ----- comments ----------------------------------------------------------
 
   async function runAddComment(): Promise<void> {
@@ -743,6 +803,8 @@
   function onSelectGroupFromSidebar(group: SceneGroup): void {
     selection = { kind: "group", id: group.id };
     editingNodeId = null;
+    exportPreview = null;
+    exportPreviewCopied = false;
     groupPanelOpen = false;
     focusGroup(group, { fit: true });
     void selectSceneItem({ kind: "group", id: group.id });
@@ -987,18 +1049,18 @@
             onClose={() => (templatePickerOpen = false)}
           />
         {/if}
-        {#if diagnosticsOpen && rendererStats}
-          <div class="renderer-diagnostics" id="renderer-diagnostics" aria-label="Renderer diagnostics">
-            <strong>Renderer</strong>
-            <span>backend: {rendererStats.backend}</span>
-            <span>draw: {rendererStats.drawBackend}</span>
-            <span>groups: {rendererStats.visibleGroups}/{rendererStats.totalGroups}</span>
-            <span>cards: {rendererStats.visibleCards}/{rendererStats.totalCards}</span>
-            <span>edges: {rendererStats.visibleEdges}/{rendererStats.totalEdges}</span>
-            <span>frame: {rendererStats.frameMs.toFixed(2)}ms</span>
-            <span>status: {rendererStatus}</span>
-          </div>
-        {/if}
+        <RendererDiagnosticsDrawer
+          open={diagnosticsOpen}
+          stats={rendererStats}
+          health={rendererHealth}
+          {camera}
+          {selection}
+          {selectedTargetLabel}
+          {status}
+          {rendererStatus}
+          onClose={() => (diagnosticsOpen = false)}
+        />
+        <CompanionTrace open={traceOpen} clients={mcpClients} onClose={() => (traceOpen = false)} onFocusTarget={handleFocusTarget} />
 
         <CanvasHost
           initialCamera={camera}
@@ -1116,6 +1178,17 @@
           {status}
         </div>
       {/if}
+
+      <ExportDrawer
+        {artifacts}
+        {busy}
+        groupId={activeGroupId}
+        onExport={(type) => void runExport(type)}
+        preview={exportPreview}
+        previewCopied={exportPreviewCopied}
+        onCopyPreview={() => void copyExportPreview()}
+        onClosePreview={() => (exportPreview = null)}
+      />
     </section>
   </main>
 </div>
