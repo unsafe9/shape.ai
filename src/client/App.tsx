@@ -6,10 +6,12 @@ import {
   createGroup,
   createTag,
   exportGroup,
+  fetchMcpClients,
   fetchScene,
   saveScenePatch,
   updateComment,
-  updateGroupTags
+  updateGroupTags,
+  type McpClientInfo
 } from "./lib/api";
 import {
   boundsIntersect,
@@ -22,6 +24,7 @@ import { RendererCanvasHost, type RendererCanvasHostHandle, type RendererHealth,
 import { RendererDiagnosticsDrawer } from "./components/RendererDiagnosticsDrawer";
 import { Sidebar } from "./components/Sidebar";
 import { ExportDrawer, type ExportPreview } from "./components/ExportDrawer";
+import { CompanionDock } from "./components/CompanionDock";
 import { TemplatePicker } from "./components/TemplatePicker";
 import { buildTemplateInsertion, templateCatalog } from "./lib/templates";
 import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../shared/renderPatch";
@@ -88,6 +91,7 @@ export default function App() {
   const [rendererHealth, setRendererHealth] = useState<RendererHealth | null>(null);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [rendererStatus, setRendererStatus] = useState("No renderer status yet");
+  const [mcpClients, setMcpClients] = useState<McpClientInfo[]>([]);
   const canvasRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<RendererCanvasHostHandle | null>(null);
   const sceneRequestRef = useRef(0);
@@ -121,6 +125,18 @@ export default function App() {
     return () => {
       if (rendererPatchSaveTimerRef.current !== null) window.clearTimeout(rendererPatchSaveTimerRef.current);
     };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    function poll() {
+      fetchMcpClients()
+        .then(({ clients }) => { if (!cancelled) setMcpClients(clients); })
+        .catch(() => { /* best-effort; dock shows last known state */ });
+    }
+    poll();
+    const id = window.setInterval(poll, 4_000);
+    return () => { cancelled = true; window.clearInterval(id); };
   }, []);
 
   const handleRendererHealth = useCallback((health: RendererHealth) => {
@@ -699,6 +715,7 @@ export default function App() {
     <div className="app-shell">
       <main className="studio-stage">
         <section className={`canvas-panel ${selection.kind === "node" ? "has-card-focus" : ""}`}>
+          <CompanionDock clients={mcpClients} />
           <div className="flow-wrap renderer-scene-surface" ref={canvasRef}>
             <div className="canvas-watermark" aria-hidden="true">
               <BrainCircuit size={28} />
