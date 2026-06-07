@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, untrack } from "svelte";
+  import { onDestroy } from "svelte";
   import {
     Clipboard,
     Copy,
@@ -11,14 +11,12 @@
     Ungroup,
     Activity,
     BrainCircuit,
-    History,
     Loader2,
     Ellipsis,
     PanelLeft,
     X
   } from "lucide-svelte";
   import { createComment, createGroup, exportGroup, updateComment } from "../lib/sceneServerApi";
-  import { fetchMcpClients, type McpClientInfo } from "../lib/mcpDock";
   import { boundsIntersect, expandedBounds, nodeBounds } from "../../shared/graph";
   import type { RenderScenePatch } from "../../shared/renderPatch";
   import { applyRenderPatchSync, loadSceneCore, type RenderResult, type SceneCore } from "../scene/sceneCoreWasm";
@@ -40,20 +38,6 @@
     Tag
   } from "../../shared/schema";
   import { cloneNodeForPaste, formatNodeMarkdown } from "../lib/nodeClipboard";
-  import {
-    decideFollowCommand,
-    initialFollowState,
-    jumpToCurrentTarget,
-    onUserGrab,
-    pauseFollow,
-    reconcileFollowee,
-    resolveFollowee,
-    resumeFollow,
-    stopFollow,
-    targetKey,
-    toggleFollow,
-    type FollowState
-  } from "../lib/followController";
   import { ShapeCanvasHost, type RendererHealth, type RendererStats, type ShapeCanvasHostCallbacks } from "../lib/canvasHost";
   import { SceneClient, type CanvasSummary } from "../lib/sceneClient";
   import type { PeerPresence } from "../lib/peers";
@@ -78,8 +62,6 @@
   import SelectedNodeInspector from "./node/SelectedNodeInspector.svelte";
   import NodeContextMenu from "./NodeContextMenu.svelte";
   import ContextMenu, { type ContextMenuItem } from "./ContextMenu.svelte";
-  import CompanionDock from "./CompanionDock.svelte";
-  import CompanionTrace from "./CompanionTrace.svelte";
   import PeerCursors from "./PeerCursors.svelte";
   import RendererDiagnosticsDrawer from "./RendererDiagnosticsDrawer.svelte";
   import ExportDrawer, { type ExportPreview } from "./ExportDrawer.svelte";
@@ -124,7 +106,6 @@
   let busy = $state(false);
   let groupPanelOpen = $state(false);
   let diagnosticsOpen = $state(false);
-  let traceOpen = $state(false);
 
   // ----- node editing slice -----
   let editingNodeId = $state<string | null>(null);
@@ -145,10 +126,6 @@
   // ----- export drawer slice -----
   let exportPreview = $state<ExportPreview | null>(null);
   let exportPreviewCopied = $state(false);
-
-  // ----- MCP companions + follow mode -----
-  let mcpClients = $state<McpClientInfo[]>([]);
-  let followState = $state<FollowState>(initialFollowState);
 
   // ----- realtime peers (MG6.2): live peer cursors over the canvas -----
   let peers = $state<PeerPresence[]>([]);
@@ -186,38 +163,6 @@
   let canvases = $state<CanvasSummary[]>([]);
   let connectionStatus = $state<ConnectionStatus>("offline");
   let canvasBusy = $state(false);
-  // Mirror the follow state for the poll-driven effect so it can read the latest
-  // machine without subscribing (matching App.tsx's followStateRef).
-  let followStateRef: FollowState = initialFollowState;
-
-  // MG6.2 follow integration: a realtime peer is followable just like an MCP
-  // companion. Project each live peer cursor into an McpClientInfo-shaped chip
-  // whose lastTarget is the peer's viewport (so following re-frames to what the
-  // peer is looking at) — falling back to its cursor point. This reuses the whole
-  // followController (decideFollowCommand/followTarget) + CompanionDock unchanged.
-  const peerCompanions = $derived<McpClientInfo[]>(
-    peers.map((peer) => ({
-      clientId: peer.userId,
-      actorType: "mcp",
-      label: peer.userId,
-      name: peer.userId,
-      version: "live",
-      color: peer.color,
-      iconRef: null,
-      transport: "http",
-      dockState: "active",
-      lastTarget: peer.viewport
-        ? { kind: "viewport", rect: peer.viewport }
-        : peer.cursor
-          ? { kind: "viewport", rect: { x: peer.cursor.x - 200, y: peer.cursor.y - 150, width: 400, height: 300 } }
-          : { kind: "canvas" },
-      connectedAt: 0,
-      lastActivityAt: peer.lastSeen,
-      muted: false
-    }))
-  );
-  // The dock + follow machinery operate over MCP companions and live peers alike.
-  const companions = $derived<McpClientInfo[]>([...mcpClients, ...peerCompanions]);
 
   const activeGroupId = $derived(activeGroupIdForSelection(scene, selection) ?? currentGroupId ?? scene?.groups[0]?.id);
   const activeGroup = $derived(scene?.groups.find((group) => group.id === activeGroupId) ?? null);
@@ -317,20 +262,12 @@
     sceneClient.saveSelection(nextSelection);
   }
 
-  // T5.1 MCP companion poll (best-effort; dock shows last known state). MG6.2: the
-  // same tick re-reads the peer cursor set so a peer that has gone fully silent
-  // (no new presence frames to drive ingest-time expiry) drops within one poll
-  // interval — peerCursors expires stale peers lazily on read.
+  // MG6.2 peer cursor poll: re-read the peer cursor set so a peer that has gone
+  // fully silent (no new presence frames to drive ingest-time expiry) drops
+  // within one poll interval — peerCursors expires stale peers lazily on read.
   $effect(() => {
     let cancelled = false;
     function poll() {
-      fetchMcpClients()
-        .then(({ clients }) => {
-          if (!cancelled) mcpClients = clients;
-        })
-        .catch(() => {
-          /* best-effort */
-        });
       if (!cancelled && sceneClientReady && sceneClient) peers = sceneClient.peerCursors;
     }
     poll();
@@ -339,32 +276,6 @@
       cancelled = true;
       window.clearInterval(id);
     };
-  });
-
-  // T5.3 pinned follow (§3) + followee reconcile (§1/§8). When the MCP poll reports
-  // a new lastTarget for the pinned followee — and no user gesture is active (§8) —
-  // re-frame the camera through the existing focus path.
-  $effect(() => {
-    const clients = companions;
-    const reconciled = reconcileFollowee(followStateRef, clients);
-    if (reconciled !== followStateRef) {
-      followState = reconciled;
-      followStateRef = reconciled;
-      return;
-    }
-    if (reconciled.mode !== "pinned") return;
-    const followee = resolveFollowee(reconciled, clients);
-    const command = decideFollowCommand(reconciled, followee, gestureActive);
-    if (command.state !== reconciled) {
-      followState = command.state;
-      followStateRef = command.state;
-    }
-    if (command.target !== null) followTarget(command.target);
-  });
-
-  // Keep followStateRef in sync with the reactive followState.
-  $effect(() => {
-    followStateRef = followState;
   });
 
   // Push the document scene into the engine whenever it or the tag filter
@@ -662,13 +573,7 @@
 
   function handleRendererGesture(active: boolean): void {
     gestureActive = active;
-    // T5.3 §8 rule 2: a user grab during pinned follow demotes to paused (soft
-    // handoff). The followee is remembered; one tap of Resume re-engages.
-    if (active) {
-      const grabbed = onUserGrab(followStateRef);
-      if (grabbed !== followStateRef) followState = grabbed;
-      return;
-    }
+    if (active) return;
     if (scene) commitScene(scene, selection);
     // MG-7: flush the engine's coalesced gesture buffer at gesture end.
     sceneClient?.flush();
@@ -852,23 +757,15 @@
     activeTool = tool;
   }
 
-  // Esc priority handoff: follow → trace → diagnostics → settings → template
-  // library → context menu → node menu → editing → clear selection.
+  // Esc priority handoff: settings → template library → diagnostics → context
+  // menu → node menu → editing → clear selection.
   function handleEscape(): void {
-    if (followStateRef.mode !== "off") {
-      followState = stopFollow(followStateRef);
-      return;
-    }
     if (settingsOpen) {
       settingsOpen = false;
       return;
     }
     if (templateLibraryOpen) {
       templateLibraryOpen = false;
-      return;
-    }
-    if (traceOpen) {
-      traceOpen = false;
       return;
     }
     if (diagnosticsOpen) {
@@ -1216,120 +1113,6 @@
   }
 
   // ----- focus / follow ----------------------------------------------------
-
-  function handleFocusTarget(target: unknown): void {
-    if (!scene || !target || typeof target !== "object") return;
-    const t = target as { kind?: string; id?: string; groupId?: string; ids?: { kind: string; id: string }[]; rect?: WorldRect };
-    if (t.kind === "viewport" && t.rect) {
-      focusBounds(t.rect);
-      return;
-    }
-    if (t.kind === "group" && t.id) {
-      const group = scene.groups.find((g) => g.id === t.id);
-      if (group) {
-        focusGroup(group, { fit: true });
-        void selectSceneItem({ kind: "group", id: t.id });
-      }
-    } else if (t.kind === "node" && t.id) {
-      const node = scene.nodes.find((n) => n.id === t.id);
-      if (node) {
-        focusNode(node);
-        void selectSceneItem({ kind: "node", id: t.id });
-      }
-    } else if (t.kind === "edge" && t.id) {
-      void selectSceneItem({ kind: "edge", id: t.id });
-    } else if (t.kind === "artifact" && t.groupId) {
-      const group = scene.groups.find((g) => g.id === t.groupId);
-      if (group) focusGroup(group, { fit: true });
-      void selectSceneItem({ kind: "group", id: t.groupId });
-    } else if (t.kind === "selection" && Array.isArray(t.ids) && t.ids.length > 0) {
-      const first = t.ids[0] as { kind: string; id: string };
-      if (first.kind === "group") {
-        const group = scene.groups.find((g) => g.id === first.id);
-        if (group) focusGroup(group, { fit: true });
-        void selectSceneItem({ kind: "group", id: first.id });
-      } else if (first.kind === "node") {
-        const node = scene.nodes.find((n) => n.id === first.id);
-        if (node) focusNode(node);
-        void selectSceneItem({ kind: "node", id: first.id });
-      } else if (first.kind === "edge") {
-        void selectSceneItem({ kind: "edge", id: first.id });
-      }
-    } else {
-      fitScene();
-    }
-  }
-
-  // T5.3 follow framing: the camera-only subset of handleFocusTarget. Follow is
-  // observe-only (§0/§8) — frames the followee's target but never writes state.
-  function followTarget(target: unknown): void {
-    // Read scene untracked: followTarget is called synchronously from the follow
-    // $effect, and a tracked read here would make every scene mutation (e.g. each
-    // edit keystroke) re-trigger the effect and snap the camera back.
-    const currentScene = untrack(() => scene);
-    if (!currentScene || !target || typeof target !== "object") return;
-    const t = target as { kind?: string; id?: string; groupId?: string; ids?: { kind: string; id: string }[]; rect?: WorldRect };
-    // MG6.2: a peer/companion viewport target re-frames the camera to the rect the
-    // peer is looking at (the follow camera command for a live peer).
-    if (t.kind === "viewport" && t.rect) {
-      focusBounds(t.rect);
-      return;
-    }
-    if (t.kind === "group" && t.id) {
-      const group = currentScene.groups.find((g) => g.id === t.id);
-      if (group) focusGroup(group, { fit: true });
-    } else if (t.kind === "node" && t.id) {
-      const node = currentScene.nodes.find((n) => n.id === t.id);
-      if (node) focusNode(node);
-    } else if (t.kind === "artifact" && t.groupId) {
-      const group = currentScene.groups.find((g) => g.id === t.groupId);
-      if (group) focusGroup(group, { fit: true });
-    } else if (t.kind === "selection" && Array.isArray(t.ids) && t.ids.length > 0) {
-      const first = t.ids[0] as { kind: string; id: string };
-      if (first.kind === "group") {
-        const group = currentScene.groups.find((g) => g.id === first.id);
-        if (group) focusGroup(group, { fit: true });
-      } else if (first.kind === "node") {
-        const node = currentScene.nodes.find((n) => n.id === first.id);
-        if (node) focusNode(node);
-      }
-    }
-  }
-
-  function handleToggleFollow(client: McpClientInfo): void {
-    const next = toggleFollow(followStateRef, client);
-    if (next === followStateRef) return;
-    if (next.mode === "pinned") {
-      followState = { ...next, lastFramedKey: targetKey(client.lastTarget) };
-      followTarget(client.lastTarget);
-    } else {
-      followState = next;
-    }
-  }
-
-  function handlePauseResumeFollow(): void {
-    const current = followStateRef;
-    if (current.mode === "pinned") {
-      followState = pauseFollow(current);
-      return;
-    }
-    if (current.mode === "paused") {
-      const resumed = resumeFollow(current);
-      const followee = resolveFollowee(resumed, companions);
-      if (followee && targetKey(followee.lastTarget) !== null) {
-        followState = { ...resumed, lastFramedKey: targetKey(followee.lastTarget) };
-        followTarget(followee.lastTarget);
-      } else {
-        followState = resumed;
-      }
-    }
-  }
-
-  function handleJumpToCurrent(): void {
-    const followee = resolveFollowee(followStateRef, companions);
-    const target = jumpToCurrentTarget(followee);
-    if (target !== null) followTarget(target);
-  }
 
   // ----- selection / scene helpers ----------------------------------------
 
@@ -1848,17 +1631,6 @@
 <div class="app-shell">
   <main class="studio-stage">
     <section class={`canvas-panel ${selection.kind === "node" ? "has-card-focus" : ""}`}>
-      <CompanionDock
-        clients={companions}
-        onFocusTarget={handleFocusTarget}
-        follow={{
-          followeeClientId: followState.followeeClientId,
-          mode: followState.mode,
-          onToggleFollow: handleToggleFollow,
-          onPauseResume: handlePauseResumeFollow,
-          onJumpToCurrent: handleJumpToCurrent
-        }}
-      />
       <div class="flow-wrap renderer-scene-surface" data-tool={activeTool} bind:this={canvasWrap} onpointermove={handlePointerMove}>
         <div class="canvas-watermark" aria-hidden="true">
           <BrainCircuit size={28} />
@@ -1886,16 +1658,6 @@
             title={diagnosticsOpen ? "Close diagnostics" : "Open diagnostics"}
           >
             <Activity size={15} />
-          </button>
-          <button
-            class="icon-button {traceOpen ? 'is-active' : ''}"
-            type="button"
-            onclick={() => (traceOpen = !traceOpen)}
-            aria-label={traceOpen ? "Close agent trace" : "Open agent trace"}
-            aria-expanded={traceOpen}
-            title={traceOpen ? "Close agent trace" : "Open agent trace"}
-          >
-            <History size={15} />
           </button>
         </div>
         <CockpitRemote
@@ -1932,7 +1694,6 @@
           {rendererStatus}
           onClose={() => (diagnosticsOpen = false)}
         />
-        <CompanionTrace open={traceOpen} clients={mcpClients} onClose={() => (traceOpen = false)} onFocusTarget={handleFocusTarget} />
 
         <CanvasHost
           initialCamera={camera}

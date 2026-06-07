@@ -16,6 +16,32 @@ import type { Scene, SceneComment, SceneSelection, Tag } from "../../shared/sche
 import type { RenderScenePatch } from "../../shared/renderPatch";
 import type { WorldPoint } from "../../shared/renderScene";
 import type { Command } from "../lib/commandCatalog";
+import type { Object as SceneObject, ObjectOp, ObjectScene } from "../../shared/object";
+
+/**
+ * Result of `apply_object_op` (OB4.3). On success `scene` is the next object
+ * scene and `inverse` is the captured inverse op (the undo entry, D21). On a
+ * domain failure the scene is returned unchanged, `inverse` is null, and the
+ * message rides `errors` — mirroring {@link RenderResult}'s error policy.
+ */
+export type ObjectApplyResult = {
+  scene: ObjectScene;
+  inverse: ObjectOp | null;
+  errors: string[];
+};
+
+/** A row of the object command catalog (label/category/shortcut/op mapping). */
+export type ObjectCommand = {
+  id: string;
+  label: string;
+  category: string;
+  defaultShortcut?: string;
+  description?: string;
+  [extra: string]: unknown;
+};
+
+/** A derived outline/region for an object's geometry (OB1.3, reference stub). */
+export type DerivedRegion = Record<string, unknown>;
 
 /** Result of `apply_render_patch` / `update_group_tags`. */
 export type RenderResult = {
@@ -82,6 +108,16 @@ type SceneCoreModule = {
     now: string
   ) => string;
   command_catalog: () => string;
+  // OB4.3 object-native bridges (the same Rust the object-native server runs).
+  apply_object_op: (sceneJson: string, opJson: string) => string;
+  derive_region: (geometryJson: string, flatness: number) => string;
+  object_command_catalog: () => string;
+  build_object_template: (
+    templateId: string,
+    anchorX: number,
+    anchorY: number,
+    idPrefix: string
+  ) => string;
 };
 
 /** Typed handle returned by {@link loadSceneCore}. */
@@ -108,6 +144,17 @@ export type SceneCore = {
     now: string
   ): RenderScenePatch[];
   commandCatalog(): Command[];
+  // OB4.3 object-native op-apply + derived contracts. These run the SAME Rust the
+  // object-native server runs, so an object op applies identically on both sides.
+  applyObjectOp(scene: ObjectScene, op: ObjectOp): ObjectApplyResult;
+  deriveRegion(geometry: SceneObject["geometry"], flatness: number): DerivedRegion;
+  objectCommandCatalog(): ObjectCommand[];
+  buildObjectTemplate(
+    templateId: string,
+    anchorX: number,
+    anchorY: number,
+    idPrefix: string
+  ): SceneObject[];
 };
 
 let modulePromise: Promise<SceneCoreModule> | null = null;
@@ -222,6 +269,30 @@ export async function loadSceneCore(): Promise<SceneCore> {
     },
     commandCatalog() {
       return parseBridge<Command[]>("command_catalog", mod.command_catalog());
+    },
+    applyObjectOp(scene, op) {
+      return parseBridge<ObjectApplyResult>(
+        "apply_object_op",
+        mod.apply_object_op(JSON.stringify(scene), JSON.stringify(op))
+      );
+    },
+    deriveRegion(geometry, flatness) {
+      return parseBridge<DerivedRegion>(
+        "derive_region",
+        mod.derive_region(JSON.stringify(geometry), flatness)
+      );
+    },
+    objectCommandCatalog() {
+      return parseBridge<ObjectCommand[]>(
+        "object_command_catalog",
+        mod.object_command_catalog()
+      );
+    },
+    buildObjectTemplate(templateId, anchorX, anchorY, idPrefix) {
+      return parseBridge<SceneObject[]>(
+        "build_object_template",
+        mod.build_object_template(templateId, anchorX, anchorY, idPrefix)
+      );
     }
   };
 }
@@ -249,5 +320,22 @@ export function applyRenderPatchSync(scene: Scene, patch: RenderScenePatch, now:
   return parseBridge<RenderResult>(
     "apply_render_patch",
     readyModule.apply_render_patch(JSON.stringify(scene), JSON.stringify(patch), now)
+  );
+}
+
+/**
+ * Synchronous object op-apply (OB4.3), the object sync engine's hot path. Like
+ * {@link applyRenderPatchSync} it requires {@link ensureSceneCore} to have
+ * resolved; it runs THE scene-core object op-apply — the same Rust the
+ * object-native server runs — and returns the next scene plus the inverse op
+ * (undo entry, D21).
+ */
+export function applyObjectOpSync(scene: ObjectScene, op: ObjectOp): ObjectApplyResult {
+  if (!readyModule) {
+    throw new Error("scene-core wasm is not initialized; await ensureSceneCore() before applyObjectOpSync()");
+  }
+  return parseBridge<ObjectApplyResult>(
+    "apply_object_op",
+    readyModule.apply_object_op(JSON.stringify(scene), JSON.stringify(op))
   );
 }

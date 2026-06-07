@@ -89,6 +89,40 @@ pub fn renderer_backend() -> String {
     "rust-wasm-scene-core".to_string()
 }
 
+/// OB-4 object render entry (web build). Parses a [`RenderObjectScene`] (the
+/// object-substrate render view) from JSON and builds the CPU-side draw geometry
+/// — fill megabuffer + stroke ribbons — that the GPU `ObjectPipeline` uploads.
+/// Returns a summary `{ objects, fillVertices, fillTriangles, strokeVertices,
+/// draws }` so the client can confirm the object scene reaches the renderer in
+/// the web wasm. This proves the object render model + geometry build compile and
+/// run for the web target (not only `wgpu-probe` tests); the full GPU draw wiring
+/// (device/surface, `ObjectRenderer::render`) is wired at the renderer cutover
+/// alongside the client object render adapter.
+#[wasm_bindgen(js_name = buildObjectSceneGeometry)]
+pub fn build_object_scene_geometry(scene_json: &str) -> Result<JsValue, JsValue> {
+    let scene: render_object::RenderObjectScene = serde_json::from_str(scene_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid object scene: {e}")))?;
+    let geometry = build_scene_geometry(&scene);
+    serde_wasm(ObjectGeometrySummary {
+        objects: scene.objects.len(),
+        fill_vertices: geometry.fill.vertices.len(),
+        fill_triangles: geometry.fill.indices.len() / 3,
+        stroke_vertices: geometry.stroke_vertices.len(),
+        draws: geometry.draws.len(),
+    })
+}
+
+/// The CPU geometry summary returned by [`build_object_scene_geometry`].
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObjectGeometrySummary {
+    objects: usize,
+    fill_vertices: usize,
+    fill_triangles: usize,
+    stroke_vertices: usize,
+    draws: usize,
+}
+
 #[cfg(not(feature = "wgpu-probe"))]
 #[wasm_bindgen(js_name = probeWebGpu)]
 pub fn probe_web_gpu(
