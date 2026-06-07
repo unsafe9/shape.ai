@@ -119,7 +119,10 @@ fn shard_of(id: &str, shard_count: u32) -> u32 {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    (hash % shard_count as u64) as u32
+    // The modulus is a u32, so `hash % shard_count` always fits in u32.
+    #[allow(clippy::cast_possible_truncation, reason = "modulo a u32 result fits u32")]
+    let shard = (hash % u64::from(shard_count)) as u32;
+    shard
 }
 
 /// Incremental CRC-32 (IEEE), dependency-free. Fed left-to-right so streaming
@@ -171,16 +174,23 @@ fn put_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+/// A length/count as the format's `u32`. Every field is framed with a u32
+/// length; a field at or beyond the 4 GiB cap is a programming error, not a
+/// runtime condition, so this asserts the cap rather than silently truncating.
+fn field_len(n: usize) -> u32 {
+    u32::try_from(n).expect("bundle field length exceeds u32 (4 GiB cap)")
+}
+
 /// Append one record's frame to `buf` (no header; body framing only).
 fn encode_record_frame(buf: &mut Vec<u8>, r: &Record) {
     let id = r.id.as_bytes();
     let kind = r.kind.as_bytes();
-    put_u32(buf, id.len() as u32);
+    put_u32(buf, field_len(id.len()));
     buf.extend_from_slice(id);
-    put_u32(buf, kind.len() as u32);
+    put_u32(buf, field_len(kind.len()));
     buf.extend_from_slice(kind);
     put_u64(buf, r.version);
-    put_u32(buf, r.payload.len() as u32);
+    put_u32(buf, field_len(r.payload.len()));
     buf.extend_from_slice(&r.payload);
 }
 
@@ -468,7 +478,7 @@ where
 
     // Re-frame and rewrite just this shard, with a streaming CRC.
     let mut crc = Crc32::new();
-    let header = shard_header(records.len() as u32);
+    let header = shard_header(field_len(records.len()));
     crc.update(&header);
     let mut out = BufWriter::new(File::create(root.join(shard_file_name(index)))?);
     out.write_all(&header)?;
@@ -489,7 +499,7 @@ where
         .iter_mut()
         .find(|e| e.index == index)
         .ok_or_else(|| StorageError::Format(format!("shard {index} missing from manifest")))?;
-    entry.records = after as u32;
+    entry.records = field_len(after);
     entry.crc32 = crc.finish();
     manifest.shard_count = shard_count;
     manifest.total_records = manifest.total_records + after as u64 - before as u64;
@@ -718,6 +728,11 @@ fn clear_stale_shards(root: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "test fixtures intentionally truncate to byte/u32 values"
+)]
 mod tests {
     use super::*;
 

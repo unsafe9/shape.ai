@@ -79,7 +79,7 @@ impl SqliteAdapter {
     pub fn len(&self) -> usize {
         self.conn
             .query_row("SELECT COUNT(*) FROM records", [], |row| row.get::<_, i64>(0))
-            .map(|n| n as usize)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
             .unwrap_or(0)
     }
 
@@ -97,7 +97,7 @@ impl SqliteAdapter {
                  kind = excluded.kind,
                  version = excluded.version,
                  payload = excluded.payload",
-            params![record.id, record.kind, record.version as i64, record.payload],
+            params![record.id, record.kind, version_to_sql(record.version), record.payload],
         )
         .map(|_| ())
         .map_err(map_err)
@@ -194,7 +194,7 @@ impl StorageAdapter for SqliteAdapter {
                 stmt.execute(params![
                     record.id,
                     record.kind,
-                    record.version as i64,
+                    version_to_sql(record.version),
                     record.payload
                 ])
                 .map(|_| ())
@@ -284,9 +284,10 @@ impl<'c> KeysetCursor<'c> {
                    WHERE (?1 IS NULL OR id > ?1)
                    ORDER BY id LIMIT ?2";
         let mut stmt = self.conn.prepare(sql).map_err(map_err)?;
+        let limit = i64::try_from(CURSOR_CHUNK).expect("CURSOR_CHUNK fits i64");
         let rows = stmt
             .query_map(
-                params![self.last_id, CURSOR_CHUNK as i64],
+                params![self.last_id, limit],
                 row_to_record,
             )
             .map_err(map_err)?;
@@ -384,6 +385,7 @@ impl<'c> RegionCursor<'c> {
             Some(b) => (Some(b.0), Some(b.1), Some(b.2), Some(b.3)),
             None => (None, None, None, None),
         };
+        let limit = i64::try_from(CURSOR_CHUNK).expect("CURSOR_CHUNK fits i64");
         let rows = stmt
             .query_map(
                 params![
@@ -393,7 +395,7 @@ impl<'c> RegionCursor<'c> {
                     qmaxx,
                     qminy,
                     qmaxy,
-                    CURSOR_CHUNK as i64
+                    limit
                 ],
                 row_to_record,
             )
@@ -445,9 +447,19 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
     Ok(Record {
         id: row.get(0)?,
         kind: row.get(1)?,
-        version: row.get::<_, i64>(2)? as u64,
+        version: version_from_sql(row.get::<_, i64>(2)?),
         payload: row.get(3)?,
     })
+}
+
+/// sqlite INTEGER columns are i64; `Record::version` is u64. Persist via a
+/// lossless bit reinterpretation — round-trips for every value, and queries
+/// order by id (never version), so the sign reinterpretation is inert.
+fn version_to_sql(v: u64) -> i64 {
+    i64::from_ne_bytes(v.to_ne_bytes())
+}
+fn version_from_sql(v: i64) -> u64 {
+    u64::from_ne_bytes(v.to_ne_bytes())
 }
 
 /// Map a rusqlite error into a [`StorageError`] without panicking.
@@ -456,6 +468,11 @@ fn map_err(e: rusqlite::Error) -> StorageError {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "test fixtures intentionally truncate to byte values"
+)]
 mod tests {
     use super::*;
     use crate::adapters::MemoryAdapter;

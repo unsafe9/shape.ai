@@ -45,6 +45,11 @@ pub use record::{Record, StoreSnapshot};
 pub use spatial::{RegionKey, SpatialStore};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "test fixtures intentionally truncate to byte values"
+)]
 mod tests {
     use super::*;
     use std::env;
@@ -294,6 +299,11 @@ static GLOBAL: alloc_probe::CountingAlloc = alloc_probe::CountingAlloc;
 /// the on-disk adapters via a shared harness. These enforce the integrity
 /// contract documented in `src/adapters/CLAUDE.md`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "test fixtures intentionally truncate to byte values"
+)]
 mod integrity {
     use super::*;
     use crate::format::{import_stream, shard_index_of};

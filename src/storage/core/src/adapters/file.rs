@@ -76,7 +76,7 @@ impl FileAdapter {
     /// Number of records held (reads the manifest only; does not load records).
     pub fn len(&self) -> usize {
         crate::format::manifest_of(&self.root)
-            .map(|m| m.total_records as usize)
+            .map(|m| usize::try_from(m.total_records).unwrap_or(usize::MAX))
             .unwrap_or(0)
     }
 

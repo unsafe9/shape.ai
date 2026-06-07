@@ -161,6 +161,7 @@ mod bytes_as_base64 {
     }
 
     /// Matching standard base64 decoder.
+    #[allow(clippy::cast_possible_truncation, reason = "base64 decode extracts bytes from a packed u32")]
     pub fn decode(input: &str) -> Result<Vec<u8>, String> {
         fn val(c: u8) -> Result<u32, String> {
             match c {
@@ -196,6 +197,7 @@ mod bytes_as_base64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, reason = "test fixtures intentionally truncate to byte values")]
 mod tests {
     use super::*;
 

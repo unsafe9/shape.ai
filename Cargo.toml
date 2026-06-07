@@ -11,3 +11,18 @@ members = [
 exclude = [
     "src/renderer/core",
 ]
+
+# Pointer-width-agnostic discipline for the wasm32+native pure cores (scene-core,
+# storage-core) — see CLAUDE.md Conventions. Opt in per-crate with
+# `[lints] workspace = true`. Surfaces 32-bit address assumptions: width-narrowing
+# casts and raw-pointer `as` coercions. Denied: genuine width conversions use
+# checked `try_from`; intentional truncations carry a scoped `#[allow(.., reason)]`.
+[workspace.lints.rust]
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+
+[workspace.lints.clippy]
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+ptr_as_ptr = "deny"
+ref_as_ptr = "deny"

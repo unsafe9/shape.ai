@@ -220,6 +220,7 @@ pub fn export_type_labels(export_type: ExportType) -> &'static str {
 
 /// `Math.round` rounds half toward +Infinity; for `confidence` in `[0, 1]`,
 /// `confidence * 100` is non-negative, so half-away-from-zero matches.
+#[allow(clippy::cast_possible_truncation, reason = "rounded percentage in [0,100] fits i64")]
 fn round_pct(confidence: f64) -> i64 {
     (confidence * 100.0).round() as i64
 }
