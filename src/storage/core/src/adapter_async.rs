@@ -29,7 +29,7 @@ pub struct RegionWindow {
 impl RegionWindow {
     /// The inclusive Morton code range bounding this window (see
     /// [`crate::morton::morton_range`]). Callers feed it to an ordered range
-    /// scan, then refilter with [`RegionWindow::contains_bbox`].
+    /// scan, then refilter with [`RegionWindow::overlaps`].
     pub fn morton_range(&self) -> (u64, u64) {
         crate::morton::morton_range(self.min_x, self.min_y, self.max_x, self.max_y)
     }

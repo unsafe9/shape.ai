@@ -16,6 +16,8 @@ pub enum AdapterKind {
     Memory,
     /// Fully-implemented single-file store.
     File,
+    /// Fully-implemented embedded redb-on-file store (native-only).
+    Redb,
     /// Stub: needs an external sqlite backend.
     Sqlite,
     /// Stub: needs an external postgres backend.
@@ -32,6 +34,7 @@ impl AdapterKind {
         match self {
             AdapterKind::Memory => "memory",
             AdapterKind::File => "file",
+            AdapterKind::Redb => "redb",
             AdapterKind::Sqlite => "sqlite",
             AdapterKind::Postgres => "postgres",
             AdapterKind::S3 => "s3",

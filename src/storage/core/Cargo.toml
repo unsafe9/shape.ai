@@ -10,6 +10,12 @@ crate-type = ["rlib"]
 [features]
 default = ["sqlite"]
 sqlite = ["dep:rusqlite"]
+# Native embedded redb-on-file adapter (OB3) + zstd payload compression at rest.
+# Both deps are native-only (std::fs); see the cfg-gated dependency table below.
+redb = ["dep:redb", "dep:zstd"]
+# Client-side redb-on-OPFS backend (OB3.T3). wasm32-only: pulls redb + the
+# web-sys OPFS bindings. The DEFAULT wasm build stays redb-free — opfs is opt-in.
+opfs = ["dep:redb", "dep:web-sys", "dep:wasm-bindgen"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -19,9 +25,26 @@ serde_json = "1"
 # OS threads. wasm32-unknown-unknown has none, so the whole std::fs + rayon
 # bundle path (format.rs, FileAdapter) is gated to native targets and rayon with
 # it. wasm keeps Record / StoreSnapshot / StorageAdapter / MemoryAdapter only.
+# redb + zstd are likewise native-only optional deps (std::fs), behind `redb`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+redb = { version = "2", optional = true }
+zstd = { version = "0.13", optional = true }
+
+# wasm32-only deps for the `opfs` feature: the redb-on-OPFS backend needs redb and
+# the web-sys OPFS sync-access bindings. Inactive in the default wasm build.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+redb = { version = "2", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "FileSystemSyncAccessHandle",
+    "FileSystemReadWriteOptions",
+    "StorageManager",
+    "Navigator",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+] }
 
 [lints]
 workspace = true

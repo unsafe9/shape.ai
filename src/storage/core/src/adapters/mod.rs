@@ -21,6 +21,11 @@ mod file;
 // and behind the default `sqlite` feature.
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 mod sqlite;
+// The redb adapter is native-only (redb + zstd are native-only optional deps)
+// and behind the `redb` feature. The file is named `redb_store` to avoid a
+// name collision with the `redb` crate at module-path resolution.
+#[cfg(all(not(target_arch = "wasm32"), feature = "redb"))]
+mod redb_store;
 #[cfg(not(target_arch = "wasm32"))]
 mod stubs;
 
@@ -29,5 +34,7 @@ pub use memory::MemoryAdapter;
 pub use file::FileAdapter;
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 pub use sqlite::SqliteAdapter;
+#[cfg(all(not(target_arch = "wasm32"), feature = "redb"))]
+pub use redb_store::RedbAdapter;
 #[cfg(not(target_arch = "wasm32"))]
 pub use stubs::{PostgresAdapter, RemoteServerAdapter, S3Adapter};

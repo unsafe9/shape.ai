@@ -15,9 +15,11 @@
 //! * [`format`] — the one portable bundle format: a sharded directory written
 //!   and read incrementally (streaming, bounded buffers) and in parallel via
 //!   rayon, with per-shard CRCs for stability.
-//! * [`MemoryAdapter`] / [`FileAdapter`] / [`SqliteAdapter`] — real,
-//!   fully-tested adapters living under [`adapters`]. (`SqliteAdapter` is
-//!   native-only and behind the default `sqlite` feature.)
+//! * [`MemoryAdapter`] / [`FileAdapter`] / [`SqliteAdapter`] / `RedbAdapter` —
+//!   real, fully-tested adapters living under [`adapters`]. (`SqliteAdapter` is
+//!   native-only and behind the default `sqlite` feature; `RedbAdapter` is the
+//!   embedded redb-on-file store, native-only and behind the `redb` feature,
+//!   adding the async region-query surface.)
 //! * [`PostgresAdapter`] / [`S3Adapter`] / [`RemoteServerAdapter`] —
 //!   clearly-marked stubs (drivers unavailable offline) that still keep the
 //!   portability contract.
@@ -27,6 +29,11 @@ mod adapter_async;
 mod adapters;
 mod error;
 pub mod morton;
+// The OPFS redb backend is wasm32-only and behind the `opfs` feature; the
+// default wasm build never pulls redb/web-sys. The module's own inner `#![cfg]`
+// also gates it, so this mod line mirrors the file/sqlite gating style.
+#[cfg(all(target_arch = "wasm32", feature = "opfs"))]
+pub mod opfs_backend;
 // The portable bundle format depends on std::fs + rayon, so it is native-only;
 // wasm32 keeps the data model + trait + MemoryAdapter and no on-disk format.
 #[cfg(not(target_arch = "wasm32"))]
@@ -41,6 +48,8 @@ pub use adapters::MemoryAdapter;
 pub use adapters::{FileAdapter, PostgresAdapter, RemoteServerAdapter, S3Adapter};
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 pub use adapters::SqliteAdapter;
+#[cfg(all(not(target_arch = "wasm32"), feature = "redb"))]
+pub use adapters::RedbAdapter;
 pub use error::{Result, StorageError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use format::{Manifest, ShardEntry, DEFAULT_SHARD_COUNT, FORMAT_VERSION};
@@ -224,6 +233,7 @@ mod tests {
     fn adapter_kind_names_match_idea_vocabulary() {
         assert_eq!(AdapterKind::Memory.as_str(), "memory");
         assert_eq!(AdapterKind::File.as_str(), "file");
+        assert_eq!(AdapterKind::Redb.as_str(), "redb");
         assert_eq!(AdapterKind::Sqlite.as_str(), "sqlite");
         assert_eq!(AdapterKind::Postgres.as_str(), "postgres");
         assert_eq!(AdapterKind::S3.as_str(), "s3");
