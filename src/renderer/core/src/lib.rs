@@ -6,27 +6,24 @@ mod render_cache;
 mod stats;
 mod text;
 
-// OB-3 object render-model groundwork (additive). These modules are pure-CPU
-// object-pipeline pieces wired into the GPU draw path at the OB-4 cutover; until
-// then they are unused by the live 2D pipeline, so they carry module-local
-// `#[allow(dead_code)]` to avoid tripping warnings before they are consumed.
-#[allow(dead_code)]
+// OB-3 object render-model groundwork (additive). These pure-CPU object-pipeline
+// pieces are consumed by `object_pipeline` (the OB-4 GPU draw path) under the
+// `wgpu-probe` feature; the ones still unused by any draw path keep a
+// module-local `#[allow(dead_code)]` until they are wired in.
 mod curve_lod;
 #[allow(dead_code)]
 mod hit_test_object;
 #[allow(dead_code)]
 mod outline;
-#[allow(dead_code)]
 mod render_object;
-#[allow(dead_code)]
 mod shaders;
-#[allow(dead_code)]
 mod stroke_expand;
-#[allow(dead_code)]
 mod tessellate;
 #[allow(dead_code)]
 mod text_layout;
 
+#[cfg(feature = "wgpu-probe")]
+mod object_pipeline;
 #[cfg(feature = "wgpu-probe")]
 mod webgpu;
 
@@ -42,6 +39,15 @@ pub use model::{
 pub use stats::{CoreHitResult, WebGpuFrameStats, WebGpuProbeReport};
 #[cfg(feature = "wgpu-probe")]
 pub use webgpu::ShapeWebGpuRenderer;
+
+// OB-4 object GPU pipeline (additive; the client flips to it at the cutover).
+#[cfg(feature = "wgpu-probe")]
+#[allow(unused_imports)]
+pub use object_pipeline::{
+    build_scene_geometry, FillInstance, FillVertex, ObjectDraw, ObjectMatrixUniform,
+    ObjectPipeline, ObjectRenderer, SceneGeometry, StrokeInstance, StrokeParamsUniform,
+    StrokeVertex,
+};
 
 // OB-3 object render-model surface (additive; consumed at the OB-4 cutover).
 #[allow(unused_imports)]
@@ -59,6 +65,7 @@ pub use render_object::{
     default_fill, default_stroke, parse_path_d, resolve_visual, FocusRing, RFill, RGradientStop,
     RHandle, RNode, RPaint, RStroke, RStrokeCap, RStrokeJoin, RSubPath, RText, RTextAlign,
     RTextRun, RTextValign, RenderObject, RenderObjectScene, ResolvedStyle, VisualState,
+    QUANT_PER_PX,
 };
 #[allow(unused_imports)]
 pub use shaders::{CLIP_WGSL, MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_STROKE_WGSL};
