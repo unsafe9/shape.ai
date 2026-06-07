@@ -12,71 +12,54 @@
 //! Identity is `userId`-only with **no auth** (C13).
 //! TODO(auth): real authn/authz attaches here when identity moves past userId.
 //!
-//! Phasing: this file exposes the building blocks (`Config`, `build_router`,
-//! `serve`) so integration tests can drive the router directly and later phases
-//! can add the canvas actor + MCP without reshaping the entry points.
+//! OB4.1 — the object model is the LIVE server path: the per-canvas actor holds an
+//! [`ObjectScene`](shape_scene_core::object::ObjectScene) driven through
+//! [`ObjectStore`], the WS transport is object-native, and the MCP endpoint serves
+//! the object toolset. The legacy Group/Card/Edge server path is removed.
 
 pub mod app;
 pub mod canvas_actor;
 pub mod canvas_index;
 pub mod config;
-pub mod group_seed;
-pub mod local_export;
 pub mod mcp;
-pub mod mcp_clients;
-// Object-native path (OB-3), built alongside the legacy server; the OB-4 cutover
-// rewires the router/actor onto these and removes the legacy modules.
 pub mod object_feature;
 pub mod object_mcp;
 pub mod object_store;
 pub mod registry;
-pub mod scene_api;
-pub mod scene_store;
 pub mod sync;
 pub mod template_store;
 pub mod ws;
 
 pub use app::{build_router, build_router_with_mcp};
-pub use canvas_actor::{
-    ActorHandle, ApplyResult, ArtifactResult, CanvasActor, CommentResult, PatchBroadcast,
-};
-pub use sync::{DedupTable, OpAck, OpEnvelope, OpId, CHECKPOINT_INTERVAL};
+pub use canvas_actor::{ActorHandle, ApplyResult, CanvasActor, PatchBroadcast, SharedStore};
 pub use config::Config;
 pub use mcp::{SceneMcp, DEFAULT_CANVAS_ID};
-pub use mcp_clients::ClientRegistry;
-pub use object_feature::{
-    decode_feature, encode_feature_response, handle_feature, FeatureCtx,
-};
+pub use object_feature::{decode_feature, encode_feature_response, handle_feature, FeatureCtx};
 pub use object_mcp::{
     object_mcp_tools, CreateObjectSpec, McpToolMeta, ObjectSummary, PatchObjectSpec, QueryFilter,
 };
 pub use object_store::{ObjectStore, ObjectStoreError, KIND_CANVAS, KIND_OBJECT};
 pub use registry::{CanvasRegistry, SpawnError};
+pub use sync::{DedupTable, OpAck, OpEnvelope, OpId, CHECKPOINT_INTERVAL};
 pub use ws::{ws_handler, WsClientMessage, WsServerMessage};
 
 /// Bind to the configured address and serve until the process is terminated.
 ///
-/// The shared application state — the canvas actor registry and the in-memory
-/// MCP companion registry — is constructed here, before the router, and threaded
-/// into [`build_router_with_mcp`]. MG-3 hangs the WebSocket transport off the
-/// same registry.
+/// The shared application state — the canvas actor registry — is constructed here,
+/// before the router, and threaded into [`build_router_with_mcp`].
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    // Persist under SHAPE_AI_DATA_DIR/.local (canvas redb); MG-9 adds canvas
-    // CRUD and per-canvas db routing.
     let data_dir = std::env::var("SHAPE_AI_DATA_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(".local"));
     std::fs::create_dir_all(&data_dir)?;
     let canvases = CanvasRegistry::open(data_dir.join("shape.redb"))?;
-    let clients = ClientRegistry::new();
 
-    let router = build_router_with_mcp(&config, canvases.clone(), clients);
+    let router = build_router_with_mcp(&config, canvases.clone());
     let addr = config.socket_addr()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "shape_server listening");
-    // MG8.3 graceful shutdown: on ctrl_c, stop accepting connections, then drain
-    // the registry (flush + checkpoint every actor, release every lease) so a
-    // restart/successor recovers with no data loss.
+    // Graceful shutdown: on ctrl_c, stop accepting connections, then drain the
+    // registry (flush + checkpoint every actor, release every lease).
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

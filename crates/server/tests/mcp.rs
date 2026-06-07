@@ -1,34 +1,19 @@
-//! MG2.3 integration tests: exercise the MCP tool surface through the rmcp tool
-//! handler fns (the same fns the streamable-HTTP transport dispatches) and the
-//! companion-dock HTTP endpoints.
-//!
-//! The transport itself is rmcp's; these tests drive the underlying handlers
-//! directly (no socket, no JSON-RPC framing) plus the dock HTTP routes via
-//! `tower::ServiceExt::oneshot`.
+//! OB4.1 integration tests for the object-native MCP tool surface, driving the
+//! rmcp tool handler fns directly (the same fns the streamable-HTTP transport
+//! dispatches — no socket, no JSON-RPC framing).
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
 use rmcp::handler::server::wrapper::Parameters;
-use serde_json::{json, Value};
-use shape_server::mcp::{CreateGroupArgs, GetClientTraceArgs, PatchSceneArgs, QuerySceneArgs};
-use shape_server::{build_router_with_mcp, CanvasRegistry, ClientRegistry, Config, SceneMcp};
-use tower::ServiceExt;
+use serde_json::Value;
+use shape_server::mcp::{
+    AddCommentArgs, CanvasOnlyArgs, CreateObjectArgs, GetObjectArgs, PatchObjectArgs, QueryArgs,
+    TagObjectArgs,
+};
+use shape_server::{CanvasRegistry, SceneMcp};
 
-fn test_config() -> Config {
-    Config {
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        client_dir: std::env::temp_dir().join("shape_server_mcp_test_no_client_dir"),
-    }
-}
-
-/// Build a SceneMcp over a fresh in-memory canvas registry + client registry.
-fn mcp_instance() -> (SceneMcp, ClientRegistry) {
+/// Build a SceneMcp over a fresh in-memory canvas registry.
+fn mcp_instance() -> SceneMcp {
     let canvases = CanvasRegistry::open_in_memory().unwrap();
-    let clients = ClientRegistry::new();
-    let mcp = SceneMcp::new(canvases, clients.clone(), "test-client");
-    (mcp, clients)
+    SceneMcp::new(canvases)
 }
 
 /// Extract the JSON text from a tool result's single text content block.
@@ -43,30 +28,22 @@ fn result_json(result: &rmcp::model::CallToolResult) -> Value {
 }
 
 #[test]
-fn tool_router_lists_all_eleven_tools() {
+fn tool_router_lists_object_tools() {
     let tools = SceneMcp::tool_definitions();
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert!(
-        tools.len() >= 10,
-        "expected at least 10 tools, got {}: {names:?}",
-        tools.len()
-    );
     for expected in [
-        "query_scene",
-        "list_groups",
-        "get_group",
-        "create_group",
-        "patch_scene",
-        "create_tag",
-        "update_group_tags",
-        "set_selection",
+        "list_objects",
+        "get_object",
+        "create_object",
+        "patch_object",
+        "tag_object",
         "add_comment",
-        "export_group",
-        "get_client_trace",
+        "query",
+        "export",
+        "set_selection",
     ] {
         assert!(names.contains(&expected), "missing tool {expected} in {names:?}");
     }
-    // Every tool must advertise an input schema for tools/list.
     for tool in &tools {
         assert!(
             !tool.input_schema.is_empty(),
@@ -77,280 +54,232 @@ fn tool_router_lists_all_eleven_tools() {
 }
 
 #[tokio::test]
-async fn patch_scene_create_group_changes_the_canvas() {
-    let (mcp, _clients) = mcp_instance();
+async fn create_object_then_list_and_get() {
+    let mcp = mcp_instance();
 
-    // Scene starts empty.
     let before = mcp
-        .query_scene(Parameters(QuerySceneArgs::default()))
+        .list_objects(Parameters(CanvasOnlyArgs::default()))
         .await
         .unwrap();
-    let before = result_json(&before);
-    assert_eq!(before["scene"]["groups"].as_array().unwrap().len(), 0);
+    assert_eq!(result_json(&before)["objects"].as_array().unwrap().len(), 0);
 
-    // patch_scene with a create-group RenderScenePatch.
-    let patch = json!({
-        "kind": "create-group",
-        "group": {
-            "id": "g-mcp",
-            "title": "From MCP",
-            "summary": "",
-            "bounds": { "x": 0.0, "y": 0.0, "width": 400.0, "height": 300.0 },
-            "tagIds": [],
-            "zIndex": 0.0,
-            "styleKey": ""
-        }
-    });
-    let res = mcp
-        .patch_scene(Parameters(PatchSceneArgs {
-            patch,
-            canvas_id: None,
-        }))
-        .await
-        .expect("patch_scene applies");
-    let res = result_json(&res);
-    let groups = res["scene"]["groups"].as_array().unwrap();
-    assert_eq!(groups.len(), 1, "create-group added a group");
-    assert_eq!(groups[0]["id"], "g-mcp");
-    assert_eq!(groups[0]["title"], "From MCP");
-
-    // The change is durable on the canvas: a fresh query sees it.
-    let after = mcp
-        .query_scene(Parameters(QuerySceneArgs::default()))
-        .await
-        .unwrap();
-    let after = result_json(&after);
-    assert_eq!(after["scene"]["groups"].as_array().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn patch_scene_rejects_invalid_patch_with_error() {
-    let (mcp, _clients) = mcp_instance();
-    // create-card against a missing group is rejected by scene-core.
-    let patch = json!({
-        "kind": "create-card",
-        "card": {
-            "id": "n1",
-            "groupId": "missing",
-            "title": "x",
-            "bounds": { "x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0 }
-        }
-    });
-    let err = mcp
-        .patch_scene(Parameters(PatchSceneArgs {
-            patch,
-            canvas_id: None,
-        }))
-        .await
-        .expect_err("invalid patch is an error");
-    assert!(
-        err.message.contains("Unknown group id"),
-        "got {:?}",
-        err.message
-    );
-}
-
-#[tokio::test]
-async fn create_group_then_get_group_returns_digest() {
-    let (mcp, _clients) = mcp_instance();
     let created = mcp
-        .create_group(Parameters(CreateGroupArgs {
-            prompt: "Choose a database".to_string(),
-            title: None,
-            parent_group_id: None,
-            tag_ids: None,
+        .create_object(Parameters(CreateObjectArgs {
+            id: Some("rect-1".into()),
+            order: Some("a0".into()),
+            shape: "rect".into(),
+            x: 100.0,
+            y: 50.0,
+            width: Some(160),
+            height: Some(100),
+            text: Some("Hello".into()),
+            style: Some("decision".into()),
+            tags: vec!["t-blue".into()],
             canvas_id: None,
         }))
         .await
-        .expect("create_group");
+        .expect("create_object");
     let created = result_json(&created);
-    let group_id = created["group"]["id"].as_str().unwrap().to_string();
-    assert!(group_id.starts_with("group-"));
-    assert_eq!(created["group"]["title"], "Choose a database");
+    assert_eq!(created["object"]["id"], "rect-1");
 
-    let detail = mcp
-        .get_group(Parameters(shape_server::mcp::GetGroupArgs {
-            group_id: group_id.clone(),
+    // The change is durable: list + get see it.
+    let listed = mcp
+        .list_objects(Parameters(CanvasOnlyArgs::default()))
+        .await
+        .unwrap();
+    let listed = result_json(&listed);
+    let objects = listed["objects"].as_array().unwrap();
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0]["id"], "rect-1");
+    assert_eq!(objects[0]["kind"], "shape", "a rect is a descriptive 'shape'");
+
+    let got = mcp
+        .get_object(Parameters(GetObjectArgs {
+            id: "rect-1".into(),
             canvas_id: None,
         }))
         .await
-        .expect("get_group");
-    let detail = result_json(&detail);
-    assert_eq!(detail["group"]["id"], group_id);
-    // Digest is the scene-core text digest (empty group => placeholders).
-    assert!(detail["digest"].as_str().unwrap().contains("Nodes:"));
+        .expect("get_object");
+    assert_eq!(result_json(&got)["object"]["id"], "rect-1");
 }
 
 #[tokio::test]
-async fn create_tag_update_group_tags_and_export() {
-    let (mcp, _clients) = mcp_instance();
-
-    // Make a group + a tag, attach the tag, then export.
-    let g = mcp
-        .create_group(Parameters(CreateGroupArgs {
-            prompt: "Architecture".to_string(),
-            title: Some("Arch".to_string()),
-            parent_group_id: None,
-            tag_ids: None,
+async fn create_object_rejects_invalid_spec_with_error() {
+    let mcp = mcp_instance();
+    let err = mcp
+        .create_object(Parameters(CreateObjectArgs {
+            id: Some("bad".into()),
+            order: Some("a0".into()),
+            shape: "rect".into(),
+            x: 0.0,
+            y: 0.0,
+            width: Some(0),
+            height: Some(10),
+            text: None,
+            style: None,
+            tags: vec![],
             canvas_id: None,
         }))
         .await
-        .unwrap();
-    let group_id = result_json(&g)["group"]["id"].as_str().unwrap().to_string();
-
-    let t = mcp
-        .create_tag(Parameters(shape_server::mcp::CreateTagArgs {
-            name: "Backend".to_string(),
-            color: "#3d82e0".to_string(),
-            description: None,
-            canvas_id: None,
-        }))
-        .await
-        .unwrap();
-    let tag_id = result_json(&t)["tag"]["id"].as_str().unwrap().to_string();
-    assert!(tag_id.starts_with("tag-backend-"));
-
-    let updated = mcp
-        .update_group_tags(Parameters(shape_server::mcp::UpdateGroupTagsArgs {
-            group_id: group_id.clone(),
-            tag_ids: vec![tag_id.clone()],
-            canvas_id: None,
-        }))
-        .await
-        .expect("update_group_tags");
-    let updated = result_json(&updated);
-    let tag_ids = updated["group"]["tagIds"].as_array().unwrap();
-    assert_eq!(tag_ids.len(), 1);
-    assert_eq!(tag_ids[0], tag_id);
-
-    // Export a couple of formats; content is returned inline.
-    let exported = mcp
-        .export_group(Parameters(shape_server::mcp::ExportGroupArgs {
-            group_id: group_id.clone(),
-            r#type: Some("mermaid".to_string()),
-            types: Some(vec!["madr".to_string()]),
-            canvas_id: None,
-        }))
-        .await
-        .expect("export_group");
-    let exported = result_json(&exported);
-    let exports = exported["exports"].as_array().unwrap();
-    assert_eq!(exports.len(), 2);
-    assert_eq!(exports[0]["type"], "mermaid");
-    assert!(exports[0]["content"].as_str().unwrap().contains("flowchart LR"));
+        .expect_err("zero-width rect is an error");
+    assert!(err.message.contains("positive"), "got {:?}", err.message);
 }
 
 #[tokio::test]
-async fn add_comment_attaches_to_a_group() {
-    let (mcp, _clients) = mcp_instance();
-    let g = mcp
-        .create_group(Parameters(CreateGroupArgs {
-            prompt: "Commentable".to_string(),
-            title: None,
-            parent_group_id: None,
-            tag_ids: None,
-            canvas_id: None,
-        }))
-        .await
-        .unwrap();
-    let group_id = result_json(&g)["group"]["id"].as_str().unwrap().to_string();
-
-    let res = mcp
-        .add_comment(Parameters(shape_server::mcp::AddCommentArgs {
-            target: json!({ "kind": "group", "id": group_id }),
-            body: "looks good".to_string(),
-            author: None,
-            canvas_id: None,
-        }))
-        .await
-        .expect("add_comment");
-    let res = result_json(&res);
-    assert_eq!(res["comment"]["body"], "looks good");
-    assert_eq!(res["scene"]["comments"].as_array().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn trace_records_tool_activity_for_the_client() {
-    let (mcp, clients) = mcp_instance();
-    // Register the client so its ring exists (the transport does this on init).
-    clients.register("test-client", "tester", "0.1", "http");
-
-    mcp.query_scene(Parameters(QuerySceneArgs::default()))
-        .await
-        .unwrap();
-    mcp.create_group(Parameters(CreateGroupArgs {
-        prompt: "traced".to_string(),
-        title: None,
-        parent_group_id: None,
-        tag_ids: None,
+async fn patch_object_moves_and_resizes() {
+    let mcp = mcp_instance();
+    mcp.create_object(Parameters(CreateObjectArgs {
+        id: Some("r".into()),
+        order: Some("a0".into()),
+        shape: "rect".into(),
+        x: 0.0,
+        y: 0.0,
+        width: Some(80),
+        height: Some(40),
+        text: None,
+        style: None,
+        tags: vec![],
         canvas_id: None,
     }))
     .await
     .unwrap();
 
-    let trace = mcp
-        .get_client_trace(Parameters(GetClientTraceArgs {
-            client_id: "test-client".to_string(),
-            limit: None,
+    let patched = mcp
+        .patch_object(Parameters(PatchObjectArgs {
+            id: "r".into(),
+            text: Some("New".into()),
+            style: None,
+            x: Some(10.0),
+            y: Some(20.0),
+            width: Some(120),
+            height: Some(60),
+            canvas_id: None,
         }))
         .await
-        .unwrap();
-    let trace = result_json(&trace);
-    let entries = trace["trace"].as_array().unwrap();
-    assert!(entries.len() >= 2, "read + write traced, got {entries:?}");
-    // Newest first: the create_group write is on top.
-    assert_eq!(entries[0]["verb"], "create_group");
+        .expect("patch_object");
+    let object = result_json(&patched)["object"].clone();
+    // Transform3x3 is `#[serde(transparent)]` over its 3x3 array, so the world
+    // placement is the translation column [0][2], [1][2].
+    assert_eq!(object["transform"][0][2], 10.0);
+    assert_eq!(object["transform"][1][2], 20.0);
 }
 
 #[tokio::test]
-async fn dock_clients_and_trace_endpoints_return_json() {
-    let canvases = CanvasRegistry::open_in_memory().unwrap();
-    let clients = ClientRegistry::new();
-    clients.register("c1", "claude", "1.0", "http");
-    clients.push_trace(
-        "c1",
-        shape_server::mcp_clients::TraceKind::Write,
-        "create-group",
-        "made g".to_string(),
-        None,
-    );
-
-    let app = build_router_with_mcp(&test_config(), canvases, clients);
-
-    // /api/mcp/clients
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/mcp/clients")
-                .body(Body::empty())
-                .unwrap(),
-        )
+async fn tag_object_then_query_by_tag() {
+    let mcp = mcp_instance();
+    for (id, tag) in [("a", "keep"), ("b", "other")] {
+        mcp.create_object(Parameters(CreateObjectArgs {
+            id: Some(id.into()),
+            order: Some(format!("a{id}")),
+            shape: "rect".into(),
+            x: 0.0,
+            y: 0.0,
+            width: Some(40),
+            height: Some(40),
+            text: None,
+            style: None,
+            tags: vec![tag.into()],
+            canvas_id: None,
+        }))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    let list = body["clients"].as_array().unwrap();
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0]["clientId"], "c1");
-    assert_eq!(list[0]["label"], "claude");
-    assert_eq!(list[0]["color"], shape_server::mcp_clients::color_from_client_id("c1"));
+    }
 
-    // /api/mcp/trace?clientId=c1
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/mcp/trace?clientId=c1&limit=10")
-                .body(Body::empty())
-                .unwrap(),
-        )
+    // Retag b to also carry "keep".
+    mcp.tag_object(Parameters(TagObjectArgs {
+        id: "b".into(),
+        tags: vec!["keep".into()],
+        canvas_id: None,
+    }))
+    .await
+    .unwrap();
+
+    let res = mcp
+        .query(Parameters(QueryArgs {
+            tags: vec!["keep".into()],
+            connected_to: None,
+            region: None,
+            canvas_id: None,
+        }))
+        .await
+        .expect("query");
+    let ids: Vec<String> = result_json(&res)["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["a".to_string(), "b".to_string()], "both carry 'keep'");
+}
+
+#[tokio::test]
+async fn add_comment_attaches_to_object() {
+    let mcp = mcp_instance();
+    mcp.create_object(Parameters(CreateObjectArgs {
+        id: Some("o1".into()),
+        order: Some("a0".into()),
+        shape: "rect".into(),
+        x: 0.0,
+        y: 0.0,
+        width: Some(80),
+        height: Some(40),
+        text: None,
+        style: None,
+        tags: vec![],
+        canvas_id: None,
+    }))
+    .await
+    .unwrap();
+
+    let res = mcp
+        .add_comment(Parameters(AddCommentArgs {
+            id: "o1".into(),
+            comment_id: Some("c-1".into()),
+            author: Some("agent".into()),
+            body: "looks good".into(),
+            node_index: None,
+            canvas_id: None,
+        }))
+        .await
+        .expect("add_comment");
+    let res = result_json(&res);
+    assert_eq!(res["commentId"], "c-1");
+    assert_eq!(res["object"]["comments"].as_array().unwrap().len(), 1);
+    assert_eq!(res["object"]["comments"][0]["body"], "looks good");
+}
+
+#[tokio::test]
+async fn export_of_two_connected_objects_mentions_both() {
+    let mcp = mcp_instance();
+    for (id, x, text) in [("src", 0.0, "Source"), ("dst", 300.0, "Dest")] {
+        mcp.create_object(Parameters(CreateObjectArgs {
+            id: Some(id.into()),
+            order: Some(format!("a{id}")),
+            shape: "rect".into(),
+            x,
+            y: 0.0,
+            width: Some(80),
+            height: Some(40),
+            text: Some(text.into()),
+            style: None,
+            tags: vec![],
+            canvas_id: None,
+        }))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["clientId"], "c1");
-    assert_eq!(body["total"], 1);
-    assert_eq!(body["trace"][0]["verb"], "create-group");
+    }
+
+    let res = mcp
+        .export(Parameters(shape_server::mcp::ExportArgs {
+            scope_ids: vec![],
+            export_type: Some("digest".into()),
+            canvas_id: None,
+        }))
+        .await
+        .expect("export");
+    let content = result_json(&res)["content"].as_str().unwrap().to_string();
+    assert!(content.contains("Source"), "digest mentions source: {content}");
+    assert!(content.contains("Dest"), "digest mentions dest: {content}");
 }

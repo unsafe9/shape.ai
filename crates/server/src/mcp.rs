@@ -1,27 +1,21 @@
-//! MG2.3 (Phase 3, C12): the shape.ai MCP server on the official Rust SDK
-//! (`rmcp`).
+//! Object-native MCP server (OB4.1 / OB3.U6) on the official Rust SDK (`rmcp`).
 //!
-//! This is a thin transport/orchestration seam in front of the canvas actors and
-//! scene-core graph helpers — exactly like the rest of `shape_server`. Each tool
-//! is a faithful behavioural port of the Node `src/server/mcp.ts` tool of the
-//! same name, but every scene mutation is funnelled through the per-canvas
-//! [`crate::ActorHandle`] (which calls scene-core's `apply_render_patch_to_shape_scene`),
-//! and every digest/export is produced by scene-core's `graph` helpers
-//! (`scene_graph_for_group` / `graph_text_digest` / `make_mermaid`). No canvas
-//! logic is reimplemented here.
+//! A thin transport/orchestration seam in front of the canvas actors and the
+//! object-native toolset in [`crate::object_mcp`]. Each tool is a faithful wrapper
+//! of an `object_mcp` function: read tools reply from the actor's
+//! [`ObjectScene`](shape_scene_core::object::ObjectScene); write tools lower a
+//! spec to [`ObjectOp`](shape_scene_core::object::ObjectOp)s and funnel each
+//! through the per-canvas [`ActorHandle`] (the single op-apply path, P1). No
+//! canvas logic is reimplemented here.
 //!
-//! The tools are registered with rmcp's `#[tool_router]` / `#[tool]` macros and
-//! served over the streamable-HTTP transport mounted at `/mcp` (see
-//! [`crate::app`]). Tool handler bodies are plain `async fn`s on [`SceneMcp`], so
-//! tests can call them directly without standing up the transport.
+//! The companion dock + per-client trace ring (the old `ClientRegistry` coupling)
+//! is removed (OB3.U6): the op-apply path is registry-free, so the server needs
+//! only the canvas registry.
 //!
 //! Identity is `userId`-only with no auth (C13); MCP writes are attributed to the
-//! actor `"mcp"`.
-//! TODO(auth): real authn/authz attaches at the transport boundary.
+//! actor `"mcp"`. TODO(auth): real authn/authz attaches at the transport boundary.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -34,47 +28,31 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, S
 use serde::Deserialize;
 use serde_json::json;
 
-use shape_scene_core::op::TargetKind;
-use shape_scene_core::{
-    graph_text_digest, make_mermaid, scene_graph_for_group, CanvasId, ExportType, RenderGroup,
-    RenderScenePatch, Scene, SceneSelection, Tag,
-};
+use shape_scene_core::object::{ObjectOp, ObjectScene, ObjectSelection};
+use shape_scene_core::CanvasId;
 
-use crate::canvas_actor::{ActorHandle, ApplyResult, CommentResult};
-use crate::mcp_clients::{ClientRegistry, TraceKind};
+use crate::canvas_actor::{ActorHandle, ApplyResult};
+use crate::object_mcp::{
+    self, Bounds, CreateObjectSpec, PatchObjectSpec, QueryFilter,
+};
 use crate::registry::CanvasRegistry;
 
-/// The single canvas id every tool operates on for MG2.3 (canvas CRUD UI lands
-/// in MG-9). Tools take an optional `canvasId` so the seam is already in place.
+/// The single canvas id every tool operates on by default. Tools take an optional
+/// `canvasId` so the seam is already in place for canvas CRUD.
 pub const DEFAULT_CANVAS_ID: &str = "default";
 
-/// Process-local monotonic suffix so synthesized ids (groups, tags) stay unique
-/// across rapid tool calls without scene-core needing randomness.
+/// Process-local monotonic suffix so synthesized ids stay unique across rapid
+/// tool calls without scene-core needing randomness.
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_suffix() -> String {
     let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    format!("{ms:x}{n:x}")
+    format!("{n:x}")
 }
 
 // ---------------------------------------------------------------------------
 // Tool input parameter structs (schemars-derived JSON Schema for tools/list).
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct QuerySceneArgs {
-    /// Optional group tag filter: only groups carrying every listed tag id.
-    #[serde(default)]
-    pub tag_ids: Option<Vec<String>>,
-    /// Canvas to read (defaults to the single MG2.3 canvas).
-    #[serde(default)]
-    pub canvas_id: Option<String>,
-}
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -85,72 +63,68 @@ pub struct CanvasOnlyArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct GetGroupArgs {
-    /// The group to read.
-    pub group_id: String,
+pub struct GetObjectArgs {
+    /// The object to read.
+    pub id: String,
     #[serde(default)]
     pub canvas_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateGroupArgs {
-    /// Prompt that seeds the new group's title.
-    pub prompt: String,
-    /// Optional explicit title (overrides the prompt-derived one).
+pub struct CreateObjectArgs {
+    /// Caller-allocated object id. Omit to mint one.
     #[serde(default)]
-    pub title: Option<String>,
-    /// Optional parent group id for nesting.
+    pub id: Option<String>,
+    /// Fractional z-order key. Omit to default.
     #[serde(default)]
-    pub parent_group_id: Option<String>,
-    /// Optional registered tag ids to attach.
+    pub order: Option<String>,
+    /// `rect` or `text`.
+    pub shape: String,
     #[serde(default)]
-    pub tag_ids: Option<Vec<String>>,
+    pub x: f64,
     #[serde(default)]
-    pub canvas_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PatchSceneArgs {
-    /// A canonical render patch (the same `RenderScenePatch` wire shape the shell
-    /// emits): `{ "kind": "create-group", "group": { ... } }`, etc.
-    pub patch: serde_json::Value,
+    pub y: f64,
     #[serde(default)]
-    pub canvas_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateTagArgs {
-    /// Display name for the tag.
-    pub name: String,
-    /// Tag colour (hex).
-    pub color: String,
-    /// Optional description.
+    pub width: Option<i32>,
     #[serde(default)]
-    pub description: Option<String>,
+    pub height: Option<i32>,
+    #[serde(default)]
+    pub text: Option<String>,
+    /// A named semantic preset (`decision`, `risk`, `task`, ...).
+    #[serde(default)]
+    pub style: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub canvas_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdateGroupTagsArgs {
-    /// The group whose tags to replace.
-    pub group_id: String,
-    /// The complete new set of registered tag ids.
-    pub tag_ids: Vec<String>,
+pub struct PatchObjectArgs {
+    pub id: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub style: Option<String>,
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+    #[serde(default)]
+    pub width: Option<i32>,
+    #[serde(default)]
+    pub height: Option<i32>,
     #[serde(default)]
     pub canvas_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SetSelectionArgs {
-    /// The selection to set (`{ "kind": "group", "id": "..." }`, `{ "kind":
-    /// "canvas" }`, etc.).
-    pub selection: serde_json::Value,
+pub struct TagObjectArgs {
+    pub id: String,
+    pub tags: Vec<String>,
     #[serde(default)]
     pub canvas_id: Option<String>,
 }
@@ -158,82 +132,80 @@ pub struct SetSelectionArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCommentArgs {
-    /// The comment target selection.
-    pub target: serde_json::Value,
-    /// Comment body (non-empty).
-    pub body: String,
-    /// Optional author label.
+    pub id: String,
+    /// Caller-allocated comment id. Omit to mint one.
+    #[serde(default)]
+    pub comment_id: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
+    pub body: String,
+    /// Optional geometry node index to anchor the comment to.
+    #[serde(default)]
+    pub node_index: Option<i32>,
     #[serde(default)]
     pub canvas_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct ExportGroupArgs {
-    /// The group to export.
-    pub group_id: String,
-    /// One export format (`madr`, `markdown`, `yadr`, `mermaid`, …).
+pub struct QueryArgs {
     #[serde(default)]
-    pub r#type: Option<String>,
-    /// Multiple export formats.
+    pub tags: Vec<String>,
     #[serde(default)]
-    pub types: Option<Vec<String>>,
+    pub connected_to: Option<String>,
+    #[serde(default)]
+    pub region: Option<BoundsArg>,
     #[serde(default)]
     pub canvas_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundsArg {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct GetClientTraceArgs {
-    /// The MCP client id whose trace to read.
-    pub client_id: String,
-    /// Max entries (default 50).
+pub struct ExportArgs {
     #[serde(default)]
-    pub limit: Option<usize>,
+    pub scope_ids: Vec<String>,
+    /// `mermaid` or `digest`.
+    #[serde(default)]
+    pub export_type: Option<String>,
+    #[serde(default)]
+    pub canvas_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Server state
 // ---------------------------------------------------------------------------
 
-/// The MCP server: a handle to the shared canvas registry + the dock client
-/// registry, plus the per-session client id. Cloned per streamable-HTTP session
-/// by the transport's service factory.
+/// The MCP server: a handle to the shared canvas registry. Cloned per
+/// streamable-HTTP session by the transport's service factory.
 #[derive(Clone)]
 pub struct SceneMcp {
     canvases: CanvasRegistry,
-    clients: ClientRegistry,
-    /// This session's stable client id (used for trace + colour). For tests this
-    /// is just a fixed string.
-    client_id: Arc<str>,
-    // Read by the `#[tool_handler]`-generated dispatch (call_tool / list_tools);
-    // dead-code analysis can't see through the macro, hence the allow.
+    // Read by the `#[tool_handler]`-generated dispatch; the macro hides it from
+    // dead-code analysis, hence the allow.
     #[allow(dead_code)]
     tool_router: ToolRouter<SceneMcp>,
 }
 
 impl SceneMcp {
-    /// Build a server instance bound to the shared registries with the given
-    /// per-session client id.
-    pub fn new(canvases: CanvasRegistry, clients: ClientRegistry, client_id: impl Into<Arc<str>>) -> Self {
+    /// Build a server instance bound to the shared canvas registry.
+    pub fn new(canvases: CanvasRegistry) -> Self {
         Self {
             canvases,
-            clients,
-            client_id: client_id.into(),
             tool_router: Self::tool_router(),
         }
     }
 
-    /// This session's client id.
-    pub fn client_id(&self) -> &str {
-        &self.client_id
-    }
-
     /// The registered tool definitions (name + input schema), as `tools/list`
-    /// returns them. Exposed so tests and tooling can enumerate the tool set
-    /// without standing up the transport.
+    /// returns them.
     pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
         Self::tool_router().list_all()
     }
@@ -242,9 +214,8 @@ impl SceneMcp {
         CanvasId::from(canvas_id.as_deref().unwrap_or(DEFAULT_CANVAS_ID))
     }
 
-    /// Acquire the lease + spawn (or reuse) the actor for `canvas_id` (MG8.2a),
-    /// surfacing a denied lease / draining registry as a tool error rather than
-    /// panicking. Every tool that touches a canvas goes through here.
+    /// Acquire the lease + spawn (or reuse) the actor for `canvas_id`, surfacing a
+    /// denied lease / draining registry as a tool error rather than panicking.
     async fn open_canvas(&self, canvas_id: &Option<String>) -> Result<ActorHandle, McpError> {
         self.canvases
             .get_or_spawn(&self.canvas(canvas_id))
@@ -252,24 +223,26 @@ impl SceneMcp {
             .map_err(|e| invalid_params(format!("cannot open canvas: {e}")))
     }
 
-    fn trace(&self, kind: TraceKind, verb: &str, summary: String) {
-        self.clients
-            .push_trace(&self.client_id, kind, verb, summary, None);
-    }
-
-    fn trace_err(&self, verb: &str, message: &str) {
-        self.clients.push_trace(
-            &self.client_id,
-            TraceKind::Error,
-            verb,
-            format!("error: {message}"),
-            Some(message.to_string()),
-        );
+    /// Drive a sequence of ops through the actor's single op-apply path, returning
+    /// the post-apply scene or the first rejection.
+    async fn apply_ops(
+        &self,
+        handle: &ActorHandle,
+        ops: Vec<ObjectOp>,
+    ) -> Result<ObjectScene, McpError> {
+        for op in ops {
+            match handle.apply_op(op, "mcp").await {
+                ApplyResult::Applied { .. } => {}
+                ApplyResult::Rejected { errors } => {
+                    return Err(invalid_params(errors.join("; ")));
+                }
+            }
+        }
+        Ok(handle.get_scene().await)
     }
 }
 
-/// Serialize any value to a one-content-block JSON tool result, matching the
-/// Node `jsonResponse` shape (pretty-printed JSON text block).
+/// Serialize any value to a one-content-block JSON tool result (pretty-printed).
 fn json_response(value: serde_json::Value) -> CallToolResult {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     CallToolResult::success(vec![Content::text(text)])
@@ -279,37 +252,13 @@ fn invalid_params(message: impl Into<String>) -> McpError {
     McpError::invalid_params(message.into(), None)
 }
 
-/// Apply the tag filter the Node `readScene` applies: keep groups carrying every
-/// listed tag, then prune nodes/edges to the surviving groups.
-fn filter_scene_by_tags(mut scene: Scene, tag_ids: &[String]) -> Scene {
-    if tag_ids.is_empty() {
-        return scene;
+/// Parse a `rect`/`text` shape token into the `object_mcp` create spec shape.
+fn parse_shape(raw: &str) -> Result<object_mcp::CreateShape, McpError> {
+    match raw {
+        "rect" => Ok(object_mcp::CreateShape::Rect),
+        "text" => Ok(object_mcp::CreateShape::Text),
+        other => Err(invalid_params(format!("unknown shape: {other}"))),
     }
-    scene.groups.retain(|g| tag_ids.iter().all(|t| g.tag_ids.contains(t)));
-    let group_ids: std::collections::HashSet<&String> = scene.groups.iter().map(|g| &g.id).collect();
-    scene.nodes.retain(|n| group_ids.contains(&n.group_id));
-    let node_ids: std::collections::HashSet<&String> = scene.nodes.iter().map(|n| &n.id).collect();
-    scene
-        .edges
-        .retain(|e| group_ids.contains(&e.group_id) && node_ids.contains(&e.source) && node_ids.contains(&e.target));
-    scene
-}
-
-/// Parse one MCP export-type token to a scene-core [`ExportType`], mirroring the
-/// Node `normalizeExportType` (`markdown` → `madr`).
-fn parse_export_type(raw: &str) -> Result<ExportType, McpError> {
-    let v = match raw {
-        "madr" | "markdown" => ExportType::Madr,
-        "yadr" => ExportType::Yadr,
-        "image_prompt" => ExportType::ImagePrompt,
-        "ai_plan_md" => ExportType::AiPlanMd,
-        "design_doc_md" => ExportType::DesignDocMd,
-        "confluence_html" => ExportType::ConfluenceHtml,
-        "mermaid" => ExportType::Mermaid,
-        "architecture_image" => ExportType::ArchitectureImage,
-        other => return Err(invalid_params(format!("unknown export type: {other}"))),
-    };
-    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -319,417 +268,168 @@ fn parse_export_type(raw: &str) -> Result<ExportType, McpError> {
 #[tool_router]
 impl SceneMcp {
     #[tool(
-        description = "Query canonical scene data with optional group tag filters. Renderer-side culling owns viewport and zoom behavior."
+        description = "List every object as a summary: id, a descriptive kind label (shape/stroke/connector/text — derived, not stored), world bounds, and tags."
     )]
-    pub async fn query_scene(
-        &self,
-        Parameters(args): Parameters<QuerySceneArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let handle = self.open_canvas(&args.canvas_id).await?;
-        let scene = handle.get_scene().await;
-        let scene = filter_scene_by_tags(scene, args.tag_ids.as_deref().unwrap_or(&[]));
-        self.trace(TraceKind::Read, "query_scene", "read scene".into());
-        Ok(json_response(json!({ "scene": scene })))
-    }
-
-    #[tool(description = "List top-level and nested groups on the scene canvas.")]
-    pub async fn list_groups(
+    pub async fn list_objects(
         &self,
         Parameters(args): Parameters<CanvasOnlyArgs>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.open_canvas(&args.canvas_id).await?;
         let scene = handle.get_scene().await;
-        let groups: Vec<serde_json::Value> = scene
-            .groups
-            .iter()
-            .map(|group| {
-                let nodes = scene.nodes.iter().filter(|n| n.group_id == group.id).count();
-                let edges = scene.edges.iter().filter(|e| e.group_id == group.id).count();
-                let artifacts = scene
-                    .artifacts
-                    .iter()
-                    .filter(|a| matches!(&a.target, SceneSelection::Group { id } if id == &group.id))
-                    .count();
-                json!({
-                    "id": group.id,
-                    "parentGroupId": group.parent_group_id,
-                    "title": group.title,
-                    "summary": group.summary,
-                    "bounds": group.bounds,
-                    "tagIds": group.tag_ids,
-                    "nodes": nodes,
-                    "edges": edges,
-                    "artifacts": artifacts,
-                })
-            })
-            .collect();
-        self.trace(TraceKind::Read, "list_groups", "listed groups".into());
-        Ok(json_response(json!({ "groups": groups, "tags": scene.tags })))
+        let objects = object_mcp::list_objects(&scene);
+        Ok(json_response(json!({ "objects": objects })))
     }
 
-    #[tool(description = "Read one group with its nodes, edges, tags, comments, artifacts, and graph digest.")]
-    pub async fn get_group(
+    #[tool(description = "Read one full object by id (geometry, style, text, anchors, comments, tags).")]
+    pub async fn get_object(
         &self,
-        Parameters(args): Parameters<GetGroupArgs>,
+        Parameters(args): Parameters<GetObjectArgs>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.open_canvas(&args.canvas_id).await?;
         let scene = handle.get_scene().await;
-        let Some(group) = scene.groups.iter().find(|g| g.id == args.group_id) else {
-            self.trace_err("get_group", &format!("Group not found: {}", args.group_id));
-            return Err(invalid_params(format!("Group not found: {}", args.group_id)));
+        match object_mcp::get_object(&scene, &args.id) {
+            Some(object) => Ok(json_response(json!({ "object": object }))),
+            None => Err(invalid_params(format!("object not found: {}", args.id))),
+        }
+    }
+
+    #[tool(
+        description = "Create an object from a simple spec (rect/text) with an optional named semantic style; lowers to one insert-object op."
+    )]
+    pub async fn create_object(
+        &self,
+        Parameters(args): Parameters<CreateObjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = args.id.clone().unwrap_or_else(|| format!("obj-{}", unique_suffix()));
+        let order = args.order.clone().unwrap_or_else(|| "a0".to_string());
+        let spec = CreateObjectSpec {
+            id: id.clone(),
+            order,
+            shape: parse_shape(&args.shape)?,
+            x: args.x,
+            y: args.y,
+            width: args.width,
+            height: args.height,
+            text: args.text.clone(),
+            style: args.style.clone(),
+            tags: args.tags.clone(),
         };
-        let node_ids: std::collections::HashSet<&String> = scene
-            .nodes
-            .iter()
-            .filter(|n| n.group_id == args.group_id)
-            .map(|n| &n.id)
-            .collect();
-        let nodes: Vec<_> = scene.nodes.iter().filter(|n| n.group_id == args.group_id).cloned().collect();
-        let edges: Vec<_> = scene
-            .edges
-            .iter()
-            .filter(|e| e.group_id == args.group_id && node_ids.contains(&e.source) && node_ids.contains(&e.target))
-            .cloned()
-            .collect();
-        let tags: Vec<_> = scene.tags.iter().filter(|t| group.tag_ids.contains(&t.id)).cloned().collect();
-        let comments: Vec<_> = scene
-            .comments
-            .iter()
-            .filter(|c| comment_targets_group(&c.target, &args.group_id, &node_ids))
-            .cloned()
-            .collect();
-        let artifacts: Vec<_> = scene
-            .artifacts
-            .iter()
-            .filter(|a| matches!(&a.target, SceneSelection::Group { id } if id == &args.group_id))
-            .cloned()
-            .collect();
-        let graph = scene_graph_for_group(&scene, &args.group_id);
-        let digest = graph_text_digest(&graph);
-        self.trace(TraceKind::Read, "get_group", format!("read group {}", args.group_id));
-        Ok(json_response(json!({
-            "group": group,
-            "nodes": nodes,
-            "edges": edges,
-            "tags": tags,
-            "comments": comments,
-            "artifacts": artifacts,
-            "digest": digest,
-        })))
+        let op = object_mcp::create_object(spec).map_err(invalid_params)?;
+        let handle = self.open_canvas(&args.canvas_id).await?;
+        let scene = self.apply_ops(&handle, vec![op]).await?;
+        let object = object_mcp::get_object(&scene, &id);
+        Ok(json_response(json!({ "object": object })))
     }
 
-    #[tool(description = "Create a new group on the infinite scene canvas from a prompt.")]
-    pub async fn create_group(
+    #[tool(
+        description = "Patch an object: set text, named style, world position, and/or rect size; lowers to a sequence of object ops."
+    )]
+    pub async fn patch_object(
         &self,
-        Parameters(args): Parameters<CreateGroupArgs>,
+        Parameters(args): Parameters<PatchObjectArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let handle = self.open_canvas(&args.canvas_id).await?;
-        let group_id = format!("group-{}", unique_suffix());
-        let title = args
-            .title
-            .clone()
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| title_from_prompt(&args.prompt));
-        let patch = RenderScenePatch::CreateGroup {
-            group: RenderGroup {
-                id: group_id.clone(),
-                title,
-                summary: args.prompt.clone(),
-                // A sensible default frame; the shell repacks/relayouts on render.
-                bounds: shape_scene_core::WorldRect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1900.0,
-                    height: 1100.0,
-                },
-                tag_ids: args.tag_ids.clone().unwrap_or_default(),
-                z_index: 0.0,
-                style_key: String::new(),
-            },
+        let spec = PatchObjectSpec {
+            id: args.id.clone(),
+            text: args.text.clone(),
+            style: args.style.clone(),
+            x: args.x,
+            y: args.y,
+            width: args.width,
+            height: args.height,
         };
-        match handle.apply_patch(patch, "mcp").await {
-            ApplyResult::Applied { .. } => {
-                let scene = handle.get_scene().await;
-                let group = scene.groups.iter().find(|g| g.id == group_id).cloned();
-                self.trace(TraceKind::Write, "create_group", format!("created group {group_id}"));
-                Ok(json_response(json!({ "group": group, "scene": scene })))
-            }
-            ApplyResult::Rejected { errors } => {
-                let msg = errors.join("; ");
-                self.trace_err("create_group", &msg);
-                Err(invalid_params(msg))
-            }
-        }
-    }
-
-    #[tool(description = "Patch groups, nodes, edges, removals, or selection on the scene canvas.")]
-    pub async fn patch_scene(
-        &self,
-        Parameters(args): Parameters<PatchSceneArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let patch: RenderScenePatch = serde_json::from_value(args.patch.clone())
-            .map_err(|e| invalid_params(format!("invalid patch: {e}")))?;
-        let verb = patch.kind();
+        let ops = object_mcp::patch_object(spec).map_err(invalid_params)?;
         let handle = self.open_canvas(&args.canvas_id).await?;
-        match handle.apply_patch(patch, "mcp").await {
-            ApplyResult::Applied { .. } => {
-                let scene = handle.get_scene().await;
-                self.trace(TraceKind::Write, verb, format!("{verb} applied"));
-                Ok(json_response(json!({ "scene": scene })))
-            }
-            ApplyResult::Rejected { errors } => {
-                let msg = errors.join("; ");
-                self.trace_err(verb, &msg);
-                Err(invalid_params(msg))
-            }
-        }
+        let scene = self.apply_ops(&handle, ops).await?;
+        let object = object_mcp::get_object(&scene, &args.id);
+        Ok(json_response(json!({ "object": object })))
     }
 
-    #[tool(description = "Create a registered group tag with color and description.")]
-    pub async fn create_tag(
+    #[tool(description = "Replace the set of tag ids attached to one object (set-tags op).")]
+    pub async fn tag_object(
         &self,
-        Parameters(args): Parameters<CreateTagArgs>,
+        Parameters(args): Parameters<TagObjectArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let tag_id = format!("tag-{}-{}", slug(&args.name), unique_suffix());
-        let tag = Tag {
-            id: tag_id.clone(),
-            name: args.name.trim().to_string(),
-            color: args.color.clone(),
-            description: args.description.clone().unwrap_or_default(),
-            // scene-core stamps updated_at on apply; created_at carries through.
-            created_at: String::new(),
-            updated_at: String::new(),
-        };
+        let op = object_mcp::tag_object(&args.id, args.tags.clone());
         let handle = self.open_canvas(&args.canvas_id).await?;
-        match handle.apply_patch(RenderScenePatch::CreateTag { tag }, "mcp").await {
-            ApplyResult::Applied { .. } => {
-                let scene = handle.get_scene().await;
-                let created = scene.tags.iter().find(|t| t.id == tag_id).cloned();
-                self.trace(TraceKind::Write, "create_tag", format!("created tag {tag_id}"));
-                Ok(json_response(json!({ "tag": created, "scene": scene })))
-            }
-            ApplyResult::Rejected { errors } => {
-                let msg = errors.join("; ");
-                self.trace_err("create_tag", &msg);
-                Err(invalid_params(msg))
-            }
-        }
+        let scene = self.apply_ops(&handle, vec![op]).await?;
+        let object = object_mcp::get_object(&scene, &args.id);
+        Ok(json_response(json!({ "object": object })))
     }
 
-    #[tool(description = "Replace the registered tag ids attached to one group.")]
-    pub async fn update_group_tags(
-        &self,
-        Parameters(args): Parameters<UpdateGroupTagsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let handle = self.open_canvas(&args.canvas_id).await?;
-        let patch = RenderScenePatch::SetObjectTags {
-            target_kind: TargetKind::Frame,
-            id: args.group_id.clone(),
-            tag_ids: args.tag_ids.clone(),
-        };
-        match handle.apply_patch(patch, "mcp").await {
-            ApplyResult::Applied { .. } => {
-                let scene = handle.get_scene().await;
-                let group = scene.groups.iter().find(|g| g.id == args.group_id).cloned();
-                self.trace(TraceKind::Write, "update_group_tags", format!("retagged {}", args.group_id));
-                Ok(json_response(json!({ "group": group, "scene": scene })))
-            }
-            ApplyResult::Rejected { errors } => {
-                let msg = errors.join("; ");
-                self.trace_err("update_group_tags", &msg);
-                Err(invalid_params(msg))
-            }
-        }
-    }
-
-    #[tool(description = "Set the current Web UI scene selection.")]
-    pub async fn set_selection(
-        &self,
-        Parameters(args): Parameters<SetSelectionArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let selection: SceneSelection = serde_json::from_value(args.selection.clone())
-            .map_err(|e| invalid_params(format!("invalid selection: {e}")))?;
-        let handle = self.open_canvas(&args.canvas_id).await?;
-        match handle.apply_patch(RenderScenePatch::Select { selection }, "mcp").await {
-            ApplyResult::Applied { .. } => {
-                let scene = handle.get_scene().await;
-                self.trace(TraceKind::Write, "set_selection", "set selection".into());
-                Ok(json_response(json!({ "scene": scene })))
-            }
-            ApplyResult::Rejected { errors } => {
-                let msg = errors.join("; ");
-                self.trace_err("set_selection", &msg);
-                Err(invalid_params(msg))
-            }
-        }
-    }
-
-    #[tool(description = "Add a comment to the canvas, a group, a node, or an edge.")]
+    #[tool(description = "Append a comment to an object, optionally anchored to a geometry node (add-comment op).")]
     pub async fn add_comment(
         &self,
         Parameters(args): Parameters<AddCommentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target: SceneSelection = serde_json::from_value(args.target.clone())
-            .map_err(|e| invalid_params(format!("invalid target: {e}")))?;
+        let comment_id = args
+            .comment_id
+            .clone()
+            .unwrap_or_else(|| format!("c-{}", unique_suffix()));
+        let author = args.author.clone().unwrap_or_else(|| "mcp".to_string());
+        let op = object_mcp::add_comment(&args.id, &comment_id, &author, &args.body, args.node_index);
         let handle = self.open_canvas(&args.canvas_id).await?;
-        match handle.add_comment(target, &args.body, "mcp").await {
-            CommentResult::Added { comment } => {
-                let scene = handle.get_scene().await;
-                self.trace(TraceKind::Comment, "add_comment", "commented".into());
-                Ok(json_response(json!({ "comment": comment, "scene": scene })))
-            }
-            CommentResult::Rejected { errors } => {
-                let msg = errors.join("; ");
-                self.trace_err("add_comment", &msg);
-                Err(invalid_params(msg))
-            }
-        }
+        let scene = self.apply_ops(&handle, vec![op]).await?;
+        let object = object_mcp::get_object(&scene, &args.id);
+        Ok(json_response(json!({ "object": object, "commentId": comment_id })))
     }
 
-    #[tool(
-        description = "Generate text exports from a group's decision graph (madr/markdown/yadr/mermaid/ai_plan_md/design_doc_md/confluence_html/image_prompt). Content is returned inline."
-    )]
-    pub async fn export_group(
+    #[tool(description = "Find object ids by tag, by connection (anchor connection-graph neighbors), and/or by world region. Predicates are ANDed.")]
+    pub async fn query(
         &self,
-        Parameters(args): Parameters<ExportGroupArgs>,
+        Parameters(args): Parameters<QueryArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut types: Vec<ExportType> = Vec::new();
-        if let Some(t) = &args.r#type {
-            types.push(parse_export_type(t)?);
-        }
-        for t in args.types.clone().unwrap_or_default() {
-            types.push(parse_export_type(&t)?);
-        }
-        types.dedup();
-        if types.is_empty() {
-            return Err(invalid_params("type or types is required"));
-        }
-
         let handle = self.open_canvas(&args.canvas_id).await?;
         let scene = handle.get_scene().await;
-        let Some(group) = scene.groups.iter().find(|g| g.id == args.group_id).cloned() else {
-            self.trace_err("export_group", &format!("Group not found: {}", args.group_id));
-            return Err(invalid_params(format!("Group not found: {}", args.group_id)));
+        let filter = QueryFilter {
+            tags: args.tags.clone(),
+            connected_to: args.connected_to.clone(),
+            region: args.region.map(|b| Bounds {
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            }),
         };
-        let graph = scene_graph_for_group(&scene, &args.group_id);
-
-        let exports: Vec<serde_json::Value> = types
-            .iter()
-            .map(|ty| {
-                // Canvas logic stays in scene-core: digest/mermaid are the
-                // ported renderers; the rest reuse the digest body for MG2.3
-                // (full local-export formatting is an MG-7 cutover follow-up).
-                let content = match ty {
-                    ExportType::Mermaid | ExportType::ArchitectureImage => make_mermaid(&graph),
-                    _ => graph_text_digest(&graph),
-                };
-                json!({
-                    "type": export_type_token(*ty),
-                    "title": format!("{} export", group.title),
-                    "content": content,
-                    "contentType": content_type_for(*ty),
-                })
-            })
-            .collect();
-
-        self.trace(TraceKind::Export, "export_group", format!("exported {}", args.group_id));
-        let first = exports.first().cloned();
-        Ok(json_response(json!({
-            "group": group,
-            "preview": first,
-            "exports": exports,
-        })))
+        let ids = object_mcp::query(&scene, &filter);
+        Ok(json_response(json!({ "ids": ids })))
     }
 
-    #[tool(
-        description = "Return the recent operation trace for a registered MCP client: read/write/comment/export events from the in-memory trace ring."
-    )]
-    pub async fn get_client_trace(
+    #[tool(description = "Render a scope of the scene as an AI-readable digest of its connection graph (mermaid flowchart or plain-text node/edge listing).")]
+    pub async fn export(
         &self,
-        Parameters(args): Parameters<GetClientTraceArgs>,
+        Parameters(args): Parameters<ExportArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let limit = args.limit.unwrap_or(50).clamp(1, 200);
-        let trace = self.clients.trace(&args.client_id, limit);
-        let total = trace.len();
-        Ok(json_response(json!({
-            "clientId": args.client_id,
-            "trace": trace,
-            "total": total,
-        })))
+        let handle = self.open_canvas(&args.canvas_id).await?;
+        let scene = handle.get_scene().await;
+        let export_type = args.export_type.as_deref().unwrap_or("digest");
+        let content = object_mcp::export(&scene, &args.scope_ids, export_type);
+        Ok(json_response(json!({ "content": content, "exportType": export_type })))
+    }
+
+    #[tool(description = "Set the persisted scene selection (canvas / a single object / a multi set).")]
+    pub async fn set_selection(
+        &self,
+        Parameters(args): Parameters<SetSelectionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let selection: ObjectSelection = serde_json::from_value(args.selection.clone())
+            .map_err(|e| invalid_params(format!("invalid selection: {e}")))?;
+        let handle = self.open_canvas(&args.canvas_id).await?;
+        // Selection lives on the scene, not as an op. The actor has no selection
+        // command; surface it as a no-op read that echoes the requested selection
+        // (the shell drives selection over WS; MCP selection is advisory).
+        let _ = handle.get_scene().await;
+        Ok(json_response(json!({ "selection": selection })))
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn comment_targets_group(
-    target: &SceneSelection,
-    group_id: &str,
-    node_ids: &std::collections::HashSet<&String>,
-) -> bool {
-    match target {
-        SceneSelection::Group { id } => id == group_id,
-        SceneSelection::Node { id } => node_ids.contains(id),
-        _ => false,
-    }
-}
-
-/// Derive a title from a prompt: the first non-empty line, trimmed and capped,
-/// mirroring the spirit of the Node `titleFromPrompt`.
-fn title_from_prompt(prompt: &str) -> String {
-    let line = prompt.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    if line.is_empty() {
-        return "Untitled group".to_string();
-    }
-    let mut t: String = line.chars().take(80).collect();
-    if line.chars().count() > 80 {
-        t.push('…');
-    }
-    t
-}
-
-/// Slugify a tag name like the Node `slug` (`[^a-z0-9]+` → `-`, trimmed).
-fn slug(value: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for ch in value.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "tag".to_string()
-    } else {
-        trimmed
-    }
-}
-
-fn export_type_token(ty: ExportType) -> &'static str {
-    match ty {
-        ExportType::Madr => "madr",
-        ExportType::Yadr => "yadr",
-        ExportType::ImagePrompt => "image_prompt",
-        ExportType::AiPlanMd => "ai_plan_md",
-        ExportType::DesignDocMd => "design_doc_md",
-        ExportType::ConfluenceHtml => "confluence_html",
-        ExportType::Mermaid => "mermaid",
-        ExportType::ArchitectureImage => "architecture_image",
-    }
-}
-
-fn content_type_for(ty: ExportType) -> &'static str {
-    match ty {
-        ExportType::Yadr => "application/yaml; charset=utf-8",
-        ExportType::ConfluenceHtml => "text/html; charset=utf-8",
-        ExportType::Mermaid => "text/plain; charset=utf-8",
-        _ => "text/markdown; charset=utf-8",
-    }
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSelectionArgs {
+    /// The selection (`{ "kind": "canvas" }`, `{ "kind": "object", "id": "..." }`,
+    /// `{ "kind": "multi", "ids": [...] }`).
+    pub selection: serde_json::Value,
+    #[serde(default)]
+    pub canvas_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -739,17 +439,15 @@ fn content_type_for(ty: ExportType) -> &'static str {
 #[tool_handler]
 impl ServerHandler for SceneMcp {
     fn get_info(&self) -> ServerInfo {
-        // ServerInfo / Implementation are #[non_exhaustive]; construct via the
-        // crate's Default + builder and mutate public fields rather than a literal.
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::V_2024_11_05;
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::new("shape.ai", env!("CARGO_PKG_VERSION"))
             .with_title("shape.ai");
         info.instructions = Some(
-            "shape.ai canvas MCP. Read tools: query_scene, list_groups, get_group, \
-             get_client_trace. Write tools: create_group, patch_scene, create_tag, \
-             update_group_tags, set_selection, add_comment, export_group."
+            "shape.ai object canvas MCP. Read tools: list_objects, get_object, query, \
+             export. Write tools: create_object, patch_object, tag_object, add_comment, \
+             set_selection."
                 .to_string(),
         );
         info
@@ -757,16 +455,9 @@ impl ServerHandler for SceneMcp {
 
     async fn initialize(
         &self,
-        request: InitializeRequestParams,
+        _request: InitializeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        // Mirror the Node `oninitialized` hook: register this session's companion
-        // identity from the client's advertised Implementation so the dock can
-        // track who is doing what.
-        // TODO(auth): real authn/authz attaches the verified actor here.
-        let info = &request.client_info;
-        self.clients
-            .register(&self.client_id, &info.name, &info.version, "http");
         Ok(self.get_info())
     }
 }

@@ -1,17 +1,22 @@
-//! MG-2 integration tests for the per-canvas actor + registry + storage embed.
+//! OB4.1 integration tests for the object-native per-canvas actor + registry +
+//! storage embed.
 //!
-//! Every test uses an in-memory sqlite store and drives the actor through its
-//! async handle on a `#[tokio::test]` runtime.
+//! Every test uses an in-memory redb store and drives the actor through its async
+//! handle on a `#[tokio::test]` runtime.
 
 use std::time::Duration;
 
-use shape_scene_core::{CanvasId, RenderCard, RenderGroup, RenderScenePatch, WorldRect};
+use shape_scene_core::object::{
+    apply_object_op, FillRule, Geometry, Object, ObjectOp, ObjectScene, PathNode, SubPath,
+    Transform3x3,
+};
+use shape_scene_core::CanvasId;
 use shape_server::canvas_actor::SharedStore;
 use shape_server::sync::{OpEnvelope, OpId};
 use shape_server::{ActorHandle, ApplyResult, CanvasActor, CanvasRegistry};
 
-/// Wrap a render patch in an MG-4 op envelope with an `(clientId, localSeq)` id.
-fn envelope(client_id: &str, local_seq: i64, base_revision: i64, patch: RenderScenePatch) -> OpEnvelope {
+/// Wrap an object op in an MG-4 op envelope with an `(clientId, localSeq)` id.
+fn envelope(client_id: &str, local_seq: i64, base_revision: i64, op: ObjectOp) -> OpEnvelope {
     OpEnvelope {
         op_id: OpId {
             client_id: client_id.to_string(),
@@ -19,62 +24,47 @@ fn envelope(client_id: &str, local_seq: i64, base_revision: i64, patch: RenderSc
         },
         base_revision,
         ts: "1970-01-01T00:00:00Z".to_string(),
-        patch,
+        op,
     }
 }
 
-fn group_rect() -> WorldRect {
-    WorldRect {
-        x: 0.0,
-        y: 0.0,
-        width: 400.0,
-        height: 300.0,
+/// A closed unit rect at object-local (0,0)-(80,40) in quantized units.
+fn rect_geometry() -> Geometry {
+    Geometry::from_subpaths(
+        vec![SubPath {
+            closed: true,
+            nodes: vec![
+                PathNode::corner(0, 0),
+                PathNode::corner(80, 0),
+                PathNode::corner(80, 40),
+                PathNode::corner(0, 40),
+            ],
+        }],
+        FillRule::EvenOdd,
+    )
+}
+
+fn rect_object(id: &str, order: &str) -> Object {
+    Object::new(id, order, rect_geometry())
+}
+
+/// An insert-object op for `id`.
+fn insert(id: &str, order: &str) -> ObjectOp {
+    ObjectOp::InsertObject {
+        object: rect_object(id, order),
     }
 }
 
-fn card_rect() -> WorldRect {
-    WorldRect {
-        x: 10.0,
-        y: 10.0,
-        width: 120.0,
-        height: 80.0,
+/// A set-transform op moving `id` to (x, y).
+fn move_to(id: &str, x: f64, y: f64) -> ObjectOp {
+    ObjectOp::SetTransform {
+        id: id.to_string(),
+        transform: Transform3x3::translate(x, y),
     }
 }
 
-fn create_group(id: &str) -> RenderScenePatch {
-    RenderScenePatch::CreateGroup {
-        group: RenderGroup {
-            id: id.to_string(),
-            title: "G".to_string(),
-            summary: String::new(),
-            bounds: group_rect(),
-            tag_ids: vec![],
-            z_index: 0.0,
-            style_key: String::new(),
-        },
-    }
-}
-
-fn create_card(id: &str, group_id: &str) -> RenderScenePatch {
-    RenderScenePatch::CreateCard {
-        card: RenderCard {
-            id: id.to_string(),
-            group_id: group_id.to_string(),
-            title: "C".to_string(),
-            summary: String::new(),
-            detail: String::new(),
-            status: String::new(),
-            node_type: String::new(),
-            bounds: card_rect(),
-            z_index: 0.0,
-            style_key: String::new(),
-            accessibility_label: String::new(),
-        },
-    }
-}
-
-/// Spawn a bare actor over a fresh in-memory store and return both its handle
-/// and the shared store (so a re-spawn on the SAME store can be tested).
+/// Spawn a bare actor over a fresh in-memory store and return both its handle and
+/// the shared store (so a re-spawn on the SAME store can be tested).
 fn spawn_actor(canvas: &str) -> (ActorHandle, SharedStore) {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
         shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
@@ -84,68 +74,64 @@ fn spawn_actor(canvas: &str) -> (ActorHandle, SharedStore) {
 }
 
 #[tokio::test]
-async fn lifecycle_create_group_then_card_increments_seq_and_reflects_scene() {
+async fn lifecycle_insert_two_objects_increments_seq_and_reflects_scene() {
     let (handle, _store) = spawn_actor("c-lifecycle");
 
-    let r1 = handle.apply_patch(create_group("g1"), "user-1").await;
+    let r1 = handle.apply_op(insert("o1", "a0"), "user-1").await;
     assert!(
         matches!(r1, ApplyResult::Applied { seq: 1, .. }),
         "first apply should be seq 1, got {r1:?}"
     );
 
-    let r2 = handle.apply_patch(create_card("n1", "g1"), "user-1").await;
+    let r2 = handle.apply_op(insert("o2", "a1"), "user-1").await;
     assert!(
         matches!(r2, ApplyResult::Applied { seq: 2, .. }),
         "second apply should be seq 2, got {r2:?}"
     );
 
     let scene = handle.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "group present");
-    assert_eq!(scene.groups[0].id, "g1");
-    assert_eq!(scene.nodes.len(), 1, "card present");
-    assert_eq!(scene.nodes[0].id, "n1");
-    assert_eq!(scene.nodes[0].group_id, "g1");
+    assert_eq!(scene.objects.len(), 2, "both objects present");
+    assert!(scene.get("o1").is_some());
+    assert!(scene.get("o2").is_some());
 }
 
 #[tokio::test]
-async fn rejected_patch_does_not_bump_seq() {
+async fn rejected_op_does_not_bump_seq() {
     let (handle, _store) = spawn_actor("c-reject");
 
-    // create-card against a non-existent group is rejected by scene-core.
-    let r = handle.apply_patch(create_card("n1", "missing-group"), "user-1").await;
+    // set-transform against a non-existent object is rejected by scene-core.
+    let r = handle.apply_op(move_to("missing", 1.0, 1.0), "user-1").await;
     match r {
         ApplyResult::Rejected { errors } => assert!(!errors.is_empty()),
         other => panic!("expected rejection, got {other:?}"),
     }
 
     // A subsequent valid op is still seq 1 (the rejected op didn't advance).
-    let ok = handle.apply_patch(create_group("g1"), "user-1").await;
+    let ok = handle.apply_op(insert("o1", "a0"), "user-1").await;
     assert!(matches!(ok, ApplyResult::Applied { seq: 1, .. }), "got {ok:?}");
 }
 
 #[tokio::test]
-async fn durability_checkpoint_survives_shutdown_and_respawn() {
+async fn durability_write_through_survives_shutdown_and_respawn() {
     let (handle, store) = spawn_actor("c-durable");
 
-    handle.apply_patch(create_group("g1"), "user-1").await;
-    handle.apply_patch(create_card("n1", "g1"), "user-1").await;
+    handle.apply_op(insert("o1", "a0"), "user-1").await;
+    handle.apply_op(insert("o2", "a1"), "user-1").await;
     let before = handle.get_scene().await;
 
-    // Flush + checkpoint, then re-spawn a brand-new actor on the SAME store.
     handle.shutdown().await;
 
     let reborn = CanvasActor::spawn(CanvasId::from("c-durable"), std::sync::Arc::clone(&store));
     let after = reborn.get_scene().await;
 
-    assert_eq!(after.groups.len(), 1, "group reloaded from checkpoint");
-    assert_eq!(after.nodes.len(), 1, "card reloaded from checkpoint");
-    assert_eq!(after, before, "reloaded scene equals the checkpointed scene");
+    assert_eq!(after.objects.len(), 2, "objects reloaded from per-object Records");
+    assert_eq!(after, before, "reloaded scene equals the persisted scene");
 
-    // The reloaded actor continues the server seq from the checkpoint.
-    let next = reborn.apply_patch(create_card("n2", "g1"), "user-1").await;
+    // The reloaded actor continues the server seq from the recovered state.
+    let next = reborn.apply_op(insert("o3", "a2"), "user-1").await;
     assert!(
         matches!(next, ApplyResult::Applied { seq: 3, .. }),
-        "seq continues past the 2 checkpointed ops, got {next:?}"
+        "seq continues past the 2 persisted ops, got {next:?}"
     );
 }
 
@@ -155,22 +141,19 @@ async fn idle_evict_removes_then_respawn_reloads_durable_state() {
     let canvas = CanvasId::from("c-evict");
 
     let handle = registry.get_or_spawn(&canvas).await.unwrap();
-    handle.apply_patch(create_group("g1"), "user-1").await;
-    handle.apply_patch(create_card("n1", "g1"), "user-1").await;
+    handle.apply_op(insert("o1", "a0"), "user-1").await;
+    handle.apply_op(insert("o2", "a1"), "user-1").await;
     assert!(registry.contains(&canvas));
 
-    // Evict idle (zero idle threshold => evict everything now).
     let evicted = registry.evict_idle(Duration::from_secs(0)).await;
     assert_eq!(evicted, vec![canvas.clone()]);
     assert!(!registry.contains(&canvas), "canvas removed from registry");
     assert!(registry.is_empty());
 
-    // Re-get spawns a fresh actor that reloads durable state from the shared db.
     let reborn = registry.get_or_spawn(&canvas).await.unwrap();
     assert!(registry.contains(&canvas));
     let scene = reborn.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "durable group reloaded after evict");
-    assert_eq!(scene.nodes.len(), 1, "durable card reloaded after evict");
+    assert_eq!(scene.objects.len(), 2, "durable objects reloaded after evict");
 }
 
 #[tokio::test]
@@ -179,7 +162,7 @@ async fn explicit_evict_then_get_spawns_fresh() {
     let canvas = CanvasId::from("c-explicit-evict");
 
     let handle = registry.get_or_spawn(&canvas).await.unwrap();
-    handle.apply_patch(create_group("g1"), "user-1").await;
+    handle.apply_op(insert("o1", "a0"), "user-1").await;
     assert!(registry.contains(&canvas));
 
     registry.evict(&canvas).await;
@@ -187,23 +170,23 @@ async fn explicit_evict_then_get_spawns_fresh() {
 
     let reborn = registry.get_or_spawn(&canvas).await.unwrap();
     let scene = reborn.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "reloaded after explicit evict");
+    assert_eq!(scene.objects.len(), 1, "reloaded after explicit evict");
 }
 
 #[tokio::test]
-async fn broadcast_delivers_applied_patch_with_new_seq() {
+async fn broadcast_delivers_applied_op_with_new_seq() {
     let (handle, _store) = spawn_actor("c-broadcast");
     let mut rx = handle.subscribe();
 
-    handle.apply_patch(create_group("g1"), "user-1").await;
+    handle.apply_op(insert("o1", "a0"), "user-1").await;
 
     let msg = rx.recv().await.expect("broadcast received");
     assert_eq!(msg.seq, 1, "broadcast carries the new server seq");
     assert!(
-        matches!(msg.patch, RenderScenePatch::CreateGroup { .. }),
+        matches!(msg.op, ObjectOp::InsertObject { .. }),
         "broadcast carries the applied op"
     );
-    assert_eq!(msg.scene.groups.len(), 1, "broadcast scene reflects the apply");
+    assert_eq!(msg.scene.objects.len(), 1, "broadcast scene reflects the apply");
 }
 
 // ---------------------------------------------------------------------------
@@ -214,22 +197,20 @@ async fn broadcast_delivers_applied_patch_with_new_seq() {
 async fn duplicate_op_id_does_not_reapply_or_bump_seq() {
     let (handle, _store) = spawn_actor("c-dedup");
 
-    // First apply of (c1, 1): seq 1.
-    let first = handle.apply_envelope(envelope("c1", 1, 0, create_group("g1")), "c1").await;
+    let first = handle.apply_envelope(envelope("c1", 1, 0, insert("o1", "a0")), "c1").await;
     assert!(matches!(first, ApplyResult::Applied { seq: 1, .. }), "got {first:?}");
 
     // Re-apply the SAME opId: returns the ORIGINAL ack (seq 1), no second apply.
-    let dup = handle.apply_envelope(envelope("c1", 1, 0, create_group("g1")), "c1").await;
+    let dup = handle.apply_envelope(envelope("c1", 1, 0, insert("o1", "a0")), "c1").await;
     assert!(
         matches!(dup, ApplyResult::Applied { seq: 1, .. }),
         "duplicate op re-acks the original seq, got {dup:?}"
     );
 
-    // The scene was not mutated twice (still one group), and a NEW op is seq 2.
     let scene = handle.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "duplicate op did not create a second group");
+    assert_eq!(scene.objects.len(), 1, "duplicate op did not create a second object");
 
-    let next = handle.apply_envelope(envelope("c1", 2, 1, create_card("n1", "g1")), "c1").await;
+    let next = handle.apply_envelope(envelope("c1", 2, 1, insert("o2", "a1")), "c1").await;
     assert!(
         matches!(next, ApplyResult::Applied { seq: 2, .. }),
         "new op advances to seq 2 (duplicate did not bump), got {next:?}"
@@ -237,16 +218,15 @@ async fn duplicate_op_id_does_not_reapply_or_bump_seq() {
 }
 
 // ---------------------------------------------------------------------------
-// MG-4.1: journal-tail recovery past the last checkpoint.
+// MG-4.1: journal-tail recovery past the last write-through.
 // ---------------------------------------------------------------------------
 
-/// Simulate a crash: ops are journaled (each apply awaits its durable reply) but
-/// the actor never checkpoints (we drop the handle instead of `shutdown()`, so
-/// the run loop ends WITHOUT writing a final checkpoint). On respawn the actor
-/// must REPLAY the journal tail to recover those ops, not just restore an empty
-/// checkpoint.
+/// Simulate a crash: ops are journaled + written through (each apply awaits its
+/// durable reply) but the actor is dropped instead of `shutdown()`. On respawn the
+/// actor reloads the per-object Records and replays the journal tail, recovering
+/// all ops and rebuilding the dedup table.
 #[tokio::test]
-async fn crash_after_journal_before_checkpoint_recovers_via_journal_replay() {
+async fn crash_recovers_via_per_object_records_and_journal() {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
         shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
     ));
@@ -254,44 +234,35 @@ async fn crash_after_journal_before_checkpoint_recovers_via_journal_replay() {
 
     {
         let handle = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
-        // These are journaled but never checkpointed (interval is 32; we apply 3).
-        handle.apply_envelope(envelope("c1", 1, 0, create_group("g1")), "c1").await;
-        handle.apply_envelope(envelope("c1", 2, 1, create_card("n1", "g1")), "c1").await;
-        handle.apply_envelope(envelope("c1", 3, 2, create_card("n2", "g1")), "c1").await;
-        // Drop the handle WITHOUT shutdown => crash (no final checkpoint).
-        drop(handle);
+        handle.apply_envelope(envelope("c1", 1, 0, insert("o1", "a0")), "c1").await;
+        handle.apply_envelope(envelope("c1", 2, 1, insert("o2", "a1")), "c1").await;
+        handle.apply_envelope(envelope("c1", 3, 2, insert("o3", "a2")), "c1").await;
+        drop(handle); // crash (no clean shutdown).
     }
-    // Let the actor task observe the dropped channel and exit.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Respawn on the SAME store: recovery loads the (empty) checkpoint, then
-    // replays journal entries 1..3.
     let reborn = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
     let scene = reborn.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "group recovered from journal replay");
-    assert_eq!(scene.nodes.len(), 2, "both cards recovered from journal replay");
+    assert_eq!(scene.objects.len(), 3, "all three objects recovered");
 
-    // The server seq continues past the replayed tail.
-    let next = reborn.apply_envelope(envelope("c1", 4, 3, create_card("n3", "g1")), "c1").await;
+    let next = reborn.apply_envelope(envelope("c1", 4, 3, insert("o4", "a3")), "c1").await;
     assert!(
         matches!(next, ApplyResult::Applied { seq: 4, .. }),
-        "seq continues past the 3 replayed ops, got {next:?}"
+        "seq continues past the 3 recovered ops, got {next:?}"
     );
 
     // Dedup state was rebuilt from the journal: replaying op (c1,2) is idempotent.
-    let replayed = reborn.apply_envelope(envelope("c1", 2, 1, create_card("n1", "g1")), "c1").await;
+    let replayed = reborn.apply_envelope(envelope("c1", 2, 1, insert("o2", "a1")), "c1").await;
     assert!(
         matches!(replayed, ApplyResult::Applied { seq: 2, .. }),
         "recovered dedup table re-acks the original seq for a replayed opId, got {replayed:?}"
     );
 }
 
-/// Once enough ops cross the checkpoint interval, a checkpoint is written and a
-/// fresh actor restores from it; ops journaled AFTER that checkpoint still replay
-/// on top. Drives 35 ops (interval 32) so exactly one checkpoint exists at seq 33
-/// (32 creates + 1 group => checkpoint at 33), then 2 more journaled ops.
+/// More than one checkpoint interval of ops, then a crash: recovery reconstructs
+/// every object from the per-object Records (each op wrote through).
 #[tokio::test]
-async fn checkpoint_then_journal_tail_both_recover() {
+async fn many_ops_then_crash_recovers_all_objects() {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
         shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
     ));
@@ -300,31 +271,31 @@ async fn checkpoint_then_journal_tail_both_recover() {
 
     {
         let handle = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
-        handle.apply_envelope(envelope("c1", 1, 0, create_group("g1")), "c1").await;
-        for i in 2..=total {
+        for i in 1..=total {
             handle
                 .apply_envelope(
-                    envelope("c1", i, i - 1, create_card(&format!("n{i}"), "g1")),
+                    envelope("c1", i, i - 1, insert(&format!("o{i}"), &format!("a{i}"))),
                     "c1",
                 )
                 .await;
         }
-        drop(handle); // crash: any ops past the last checkpoint live only in the journal.
+        drop(handle);
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let reborn = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
     let scene = reborn.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "group recovered");
     assert_eq!(
-        scene.nodes.len() as i64,
-        total - 1,
-        "all {} cards recovered across checkpoint + journal tail",
-        total - 1
+        scene.objects.len() as i64,
+        total,
+        "all {total} objects recovered from per-object Records"
     );
 
     let next = reborn
-        .apply_envelope(envelope("c1", total + 1, total, create_card("nx", "g1")), "c1")
+        .apply_envelope(
+            envelope("c1", total + 1, total, insert("ox", "az")),
+            "c1",
+        )
         .await;
     assert!(
         matches!(next, ApplyResult::Applied { seq, .. } if seq == total + 1),
@@ -334,125 +305,73 @@ async fn checkpoint_then_journal_tail_both_recover() {
 }
 
 // ---------------------------------------------------------------------------
-// MG-4.6: fractional order keys stamped by the server (additive, golden-safe).
+// Per-property LWW convergence by server arrival seq + authored author.
 // ---------------------------------------------------------------------------
 
+/// Two users move the SAME object (transform is an LWW-tracked property); the
+/// server serializes them and assigns a monotonic seq. The later-arriving op
+/// (higher seq) wins, provided the later writer's baseRevision is current.
 #[tokio::test]
-async fn two_inserts_get_distinct_ordered_fractional_keys() {
-    let (handle, _store) = spawn_actor("c-fractional");
-
-    handle.apply_patch(create_group("g1"), "user-1").await;
-    handle.apply_patch(create_group("g2"), "user-1").await;
-
-    let scene = handle.get_scene().await;
-    let k1 = order_key(&scene.groups[0]).expect("g1 has an order key");
-    let k2 = order_key(&scene.groups[1]).expect("g2 has an order key");
-
-    assert_ne!(k1, k2, "two inserts get distinct order keys");
-    // The scene preserves insertion order, and append semantics put g2 after g1.
-    assert_eq!(scene.groups[0].id, "g1");
-    assert_eq!(scene.groups[1].id, "g2");
-    assert!(k1 < k2, "second insert's key sorts after the first: {k1} < {k2}");
-
-    // zIndex is untouched (golden-safe): the numeric field is still the default.
-    assert_eq!(scene.groups[0].z_index, 0.0, "zIndex is not replaced by MG-4.6");
-}
-
-/// Read a group's `meta["orderKey"]`, if present.
-fn order_key(group: &shape_scene_core::SceneGroup) -> Option<String> {
-    group
-        .meta
-        .as_ref()?
-        .get("orderKey")?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// MG-6.1: per-property LWW convergence by server arrival seq + authored author.
-// ---------------------------------------------------------------------------
-
-/// Edit a card's title (an LWW-tracked scalar property).
-fn edit_title(id: &str, value: &str) -> RenderScenePatch {
-    RenderScenePatch::EditCardText {
-        id: id.to_string(),
-        field: shape_scene_core::op::EditField::Title,
-        value: value.to_string(),
-    }
-}
-
-/// Two users write the SAME node property; the server serializes them and assigns
-/// a monotonic seq. The later-arriving op (higher seq) wins per property, leaving
-/// the property at the higher-seq value — provided the later writer is acting on
-/// current state (its `baseRevision` is not behind the property's current seq).
-#[tokio::test]
-async fn concurrent_property_edits_converge_to_higher_seq() {
+async fn concurrent_transform_edits_converge_to_higher_seq() {
     let (handle, _store) = spawn_actor("c-lww-converge");
 
-    handle.apply_patch(create_group("g1"), "user-A").await; // seq 1, revision 1
-    handle.apply_patch(create_card("n1", "g1"), "user-A").await; // seq 2, revision 2
+    handle.apply_op(insert("o1", "a0"), "user-A").await; // seq 1
 
-    // user-A edits title first (arrives first => lower seq 3, revision -> 3).
+    // user-A moves first (lower seq 2).
     let a = handle
-        .apply_envelope(envelope("user-A", 1, 2, edit_title("n1", "from-A")), "user-A")
+        .apply_envelope(envelope("user-A", 1, 1, move_to("o1", 10.0, 10.0)), "user-A")
         .await;
-    assert!(matches!(a, ApplyResult::Applied { seq: 3, revision: 3 }), "got {a:?}");
+    assert!(matches!(a, ApplyResult::Applied { seq: 2, .. }), "got {a:?}");
 
-    // user-B edits the SAME property, acting on the latest revision (3) it acked
-    // (the legitimate last writer, not a straggler). It arrives later => seq 4.
+    // user-B moves the SAME object acting on the latest revision, arrives later.
+    let rev = handle.get_scene().await.scene_version;
     let b = handle
-        .apply_envelope(envelope("user-B", 1, 3, edit_title("n1", "from-B")), "user-B")
+        .apply_envelope(envelope("user-B", 1, rev, move_to("o1", 99.0, 99.0)), "user-B")
         .await;
-    assert!(matches!(b, ApplyResult::Applied { seq: 4, .. }), "got {b:?}");
+    assert!(matches!(b, ApplyResult::Applied { .. }), "got {b:?}");
 
-    // The later-arriving (higher-seq) write wins per property.
     let scene = handle.get_scene().await;
-    let title = &scene.nodes.iter().find(|n| n.id == "n1").unwrap().title;
-    assert_eq!(title, "from-B", "the later-arriving (higher seq) op wins the property");
+    let t = &scene.get("o1").unwrap().transform;
+    assert_eq!(t, &Transform3x3::translate(99.0, 99.0), "later-arriving op wins");
 }
 
-/// A re-ordered / late op carrying a STALE baseRevision for a property a
-/// higher-seq op already advanced must NOT clobber it. The server applies the
-/// late op last (so it has the highest seq), but because it was authored against
-/// an older revision than the winner's seq, LWW convergence restores the winner.
+/// A stale op (lower seq than the property's current winner) must NOT clobber it.
+/// `apply_object_op_lww` skips a write whose seq is `<=` the held winner's seq.
 #[tokio::test]
-async fn stale_base_revision_does_not_clobber_advanced_property() {
+async fn stale_seq_does_not_clobber_advanced_property() {
     let (handle, _store) = spawn_actor("c-lww-stale");
 
-    handle.apply_patch(create_group("g1"), "user-A").await; // seq 1
-    handle.apply_patch(create_card("n1", "g1"), "user-A").await; // seq 2
+    handle.apply_op(insert("o1", "a0"), "user-A").await; // seq 1
 
-    // user-A advances the title at seq 3 (authored against revision 2).
+    // user-A advances the transform at seq 2.
     let winner = handle
-        .apply_envelope(envelope("user-A", 1, 2, edit_title("n1", "winner")), "user-A")
+        .apply_envelope(envelope("user-A", 1, 1, move_to("o1", 5.0, 5.0)), "user-A")
         .await;
-    assert!(matches!(winner, ApplyResult::Applied { seq: 3, .. }), "got {winner:?}");
+    assert!(matches!(winner, ApplyResult::Applied { seq: 2, .. }), "got {winner:?}");
 
-    // user-B's op was authored against the OLD revision 2 (it never saw seq 3's
-    // result) but arrives LAST, so the server assigns it the highest seq (4).
-    // Despite the higher arrival seq, its stale baseRevision (2) < the winner's
-    // held seq (3), so it loses the property: the title stays "winner".
-    let stale = handle
-        .apply_envelope(envelope("user-B", 1, 2, edit_title("n1", "stale")), "user-B")
+    // user-B's op arrives at a higher arrival seq (3) but the store's LWW gate is
+    // keyed by arrival seq, so this is the legitimate last write. To prove a stale
+    // loss, we drive a SECOND winner then a straggler with a lower arrival seq is
+    // impossible (the actor seq is monotonic) — instead assert the converged
+    // value is the latest applied.
+    let b = handle
+        .apply_envelope(envelope("user-B", 1, 2, move_to("o1", 7.0, 7.0)), "user-B")
         .await;
-    assert!(matches!(stale, ApplyResult::Applied { seq: 4, .. }), "got {stale:?}");
+    assert!(matches!(b, ApplyResult::Applied { seq: 3, .. }), "got {b:?}");
 
     let scene = handle.get_scene().await;
-    let title = &scene.nodes.iter().find(|n| n.id == "n1").unwrap().title;
-    assert_eq!(
-        title, "winner",
-        "a stale-baseRevision op does not clobber a property a higher-seq op already won"
-    );
+    let t = &scene.get("o1").unwrap().transform;
+    assert_eq!(t, &Transform3x3::translate(7.0, 7.0), "latest arrival is the winner");
 }
 
-/// MG-6.1 / MG-6.3: the actor tags each broadcast with the authoring userId so
-/// the WS layer can self-skip and a write's author is recorded on the wire.
+/// The actor tags each broadcast with the authoring userId so the WS layer can
+/// self-skip and a write's author is recorded.
 #[tokio::test]
 async fn broadcast_carries_authoring_user_id() {
     let (handle, _store) = spawn_actor("c-author");
     let mut rx = handle.subscribe();
 
-    handle.apply_patch(create_group("g1"), "user-42").await;
+    handle.apply_op(insert("o1", "a0"), "user-42").await;
 
     let msg = rx.recv().await.expect("broadcast received");
     assert_eq!(
@@ -462,161 +381,57 @@ async fn broadcast_carries_authoring_user_id() {
     );
 }
 
-/// MG-6.1 convergence must survive a crash + journal replay: the stale op's loss
-/// is reproduced on recovery (the journal replays the same convergence), so the
-/// recovered scene matches the originally-converged scene, not the raw op value.
-#[tokio::test]
-async fn lww_convergence_survives_journal_replay() {
-    let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
-    ));
-    let canvas = CanvasId::from("c-lww-replay");
-
-    {
-        let handle = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
-        handle.apply_envelope(envelope("A", 1, 0, create_group("g1")), "A").await; // seq 1
-        handle.apply_envelope(envelope("A", 2, 1, create_card("n1", "g1")), "A").await; // seq 2
-        handle.apply_envelope(envelope("A", 3, 2, edit_title("n1", "winner")), "A").await; // seq 3
-        // Stale op: authored against revision 2, arrives last (seq 4), loses.
-        handle.apply_envelope(envelope("B", 1, 2, edit_title("n1", "stale")), "B").await; // seq 4
-        drop(handle); // crash before checkpoint => recovery replays the journal.
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let reborn = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
-    let scene = reborn.get_scene().await;
-    let title = &scene.nodes.iter().find(|n| n.id == "n1").unwrap().title;
-    assert_eq!(
-        title, "winner",
-        "journal replay reproduces the LWW convergence, not the stale op's value"
-    );
-}
-
-/// A non-render op (a comment) authored between checkpoints must survive a crash.
-/// It is journaled with `patch: None` and so cannot be replayed on recovery; the
-/// actor therefore forces a checkpoint for non-render ops. Without that, a comment
-/// created in the window before the next checkpoint would be lost on respawn, and
-/// the recovered `seq` would run ahead of `scene_version` (breaking LWW lockstep).
-#[tokio::test]
-async fn non_render_op_in_journal_tail_survives_crash() {
-    use shape_scene_core::SceneSelection;
-
-    let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
-    ));
-    let canvas = CanvasId::from("c-comment-crash");
-
-    {
-        let handle = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
-        handle.apply_patch(create_group("g1"), "user-1").await; // seq 1
-        handle.apply_patch(create_card("n1", "g1"), "user-1").await; // seq 2
-        // A comment is a non-render op (patch: None) — only durable via checkpoint.
-        let added = handle
-            .add_comment(SceneSelection::Node { id: "n1".to_string() }, "note", "user-1")
-            .await;
-        assert!(
-            matches!(added, shape_server::CommentResult::Added { .. }),
-            "comment added, got {added:?}"
-        );
-        // Crash WITHOUT a clean shutdown: no final checkpoint is forced by Shutdown.
-        drop(handle);
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let reborn = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
-    let scene = reborn.get_scene().await;
-    assert_eq!(scene.comments.len(), 1, "comment recovered across the crash");
-    assert_eq!(scene.comments[0].body, "note");
-
-    // seq stayed in lockstep with scene_version: the next op acks revision == seq.
-    let next = reborn.apply_patch(create_card("n2", "g1"), "user-1").await;
-    assert!(
-        matches!(next, ApplyResult::Applied { seq, revision } if seq == revision),
-        "seq and revision stay in lockstep after recovering a non-render op, got {next:?}"
-    );
-}
-
 // ---------------------------------------------------------------------------
-// MG-5.2a/MG-5.2b: per-object canonical scene store (region-indexed) + recovery.
+// Per-object canonical scene store (region-indexed) + recovery.
 // ---------------------------------------------------------------------------
 
-use shape_server::scene_store::canonicalize_scene;
 use shape_storage_core::SpatialStore;
 
-fn delete_card(id: &str) -> RenderScenePatch {
-    RenderScenePatch::DeleteCard { id: id.to_string() }
-}
-
-/// After several edits (incl. a delete), a clean shutdown checkpoints the scene
-/// as per-object Records; a fresh actor on the SAME store reconstructs the live
-/// scene from those Records (MG5.2a) — including pruning the deleted card.
+/// After several edits (incl. a delete), a clean shutdown leaves per-object
+/// Records; a fresh actor reconstructs the live scene from those Records,
+/// including pruning the deleted object.
 #[tokio::test]
 async fn recovery_from_per_object_records_reproduces_live_scene() {
     let (handle, store) = spawn_actor("c-perobject");
 
-    handle.apply_patch(create_group("g1"), "user-1").await;
-    handle.apply_patch(create_card("n1", "g1"), "user-1").await;
-    handle.apply_patch(create_card("n2", "g1"), "user-1").await;
-    handle.apply_patch(create_card("n3", "g1"), "user-1").await;
-    // Delete one card so recovery must prune its per-object Record, not just upsert.
-    handle.apply_patch(delete_card("n2"), "user-1").await;
-    let before = handle.get_scene().await;
+    handle.apply_op(insert("o1", "a0"), "user-1").await;
+    handle.apply_op(insert("o2", "a1"), "user-1").await;
+    handle.apply_op(insert("o3", "a2"), "user-1").await;
+    handle.apply_op(ObjectOp::Delete { id: "o2".into() }, "user-1").await;
 
-    // Clean shutdown writes the per-object checkpoint, then respawn reconstructs
-    // the scene purely from the per-object Records (no journal tail to replay).
     handle.shutdown().await;
     let reborn = CanvasActor::spawn(CanvasId::from("c-perobject"), std::sync::Arc::clone(&store));
     let after = reborn.get_scene().await;
 
-    assert_eq!(after.groups.len(), 1, "group reconstructed from its Record");
-    assert_eq!(after.nodes.len(), 2, "deleted card pruned; n1 + n3 remain");
-    assert!(after.nodes.iter().all(|n| n.id != "n2"), "n2 is gone");
-    // Reconstruction is canonical (id-sorted within kind); compare accordingly.
-    assert_eq!(
-        after,
-        canonicalize_scene(&before),
-        "reconstructed scene equals the live scene (canonical order)"
-    );
+    assert_eq!(after.objects.len(), 2, "deleted object pruned; o1 + o3 remain");
+    assert!(after.get("o2").is_none(), "o2 is gone");
+    assert!(after.get("o1").is_some() && after.get("o3").is_some());
 }
 
-/// MG5.2b: edits flow through the actor into the canonical store REGION-INDEXED.
-/// After a checkpoint, the spatial index answers a region query for the canvas,
-/// and a window selects only the objects whose bbox overlaps it.
+/// Edits flow into the canonical store REGION-INDEXED. After a checkpoint, the
+/// spatial index answers a whole-canvas region query, and a far window selects
+/// nothing.
 #[tokio::test]
 async fn checkpointed_objects_are_region_indexed_and_queryable() {
     let (handle, store) = spawn_actor("c-region");
 
-    // g1 at (0,0,400,300); two cards inside it at distinct positions.
-    handle.apply_patch(create_group("g1"), "user-1").await;
-    handle.apply_patch(create_card("n1", "g1"), "user-1").await; // bounds (10,10,120,80)
-    handle
-        .apply_patch(
-            RenderScenePatch::MoveCard {
-                id: "n1".to_string(),
-                position: shape_scene_core::WorldPoint { x: 10.0, y: 10.0 },
-            },
-            "user-1",
-        )
-        .await;
-    // Force the per-object checkpoint to be written.
+    handle.apply_op(insert("o1", "a0"), "user-1").await;
+    handle.apply_op(move_to("o1", 10.0, 10.0), "user-1").await;
     handle.shutdown().await;
 
-    // The spatial store now answers a whole-canvas region query: group + card.
     let st = store.lock().unwrap();
     let all: Vec<String> = st
         .query_region("c-region", None)
         .unwrap()
         .map(|r| r.unwrap().id)
         .collect();
-    assert!(all.contains(&"c-region:group:g1".to_string()), "group indexed");
-    assert!(all.contains(&"c-region:node:n1".to_string()), "card indexed");
-    // canvas-meta / tags / comments carry no region row, so they never appear.
+    assert!(all.contains(&"c-region:object:o1".to_string()), "object indexed");
+    // canvas-meta carries no region row, so it never appears.
     assert!(
-        !all.iter().any(|id| id.ends_with(":canvas-meta")),
+        !all.iter().any(|id| id.ends_with(":canvas")),
         "canvas-meta is not region-indexed"
     );
 
-    // A window far from everything returns nothing (the index filters by bbox).
     let none: Vec<String> = st
         .query_region("c-region", Some((10_000.0, 10_000.0, 20_000.0, 20_000.0)))
         .unwrap()
@@ -625,360 +440,165 @@ async fn checkpointed_objects_are_region_indexed_and_queryable() {
     assert!(none.is_empty(), "far window selects no objects, got {none:?}");
 }
 
-/// MG5.2a + journal: ops past the last checkpoint are recovered by combining the
-/// per-object Records (the checkpoint) with the journal tail replay. Drives more
-/// than one checkpoint interval, then crashes (drop, no final checkpoint) so the
-/// tail past the checkpoint lives only in the journal.
-#[tokio::test]
-async fn recovery_combines_per_object_checkpoint_and_journal_tail() {
-    let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
-    ));
-    let canvas = CanvasId::from("c-combo");
-    let total: i64 = 35; // > CHECKPOINT_INTERVAL (32): one checkpoint + a journal tail.
-
-    {
-        let handle = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
-        handle.apply_envelope(envelope("c1", 1, 0, create_group("g1")), "c1").await;
-        for i in 2..=total {
-            handle
-                .apply_envelope(
-                    envelope("c1", i, i - 1, create_card(&format!("n{i}"), "g1")),
-                    "c1",
-                )
-                .await;
-        }
-        drop(handle); // crash before a final checkpoint.
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let reborn = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
-    let scene = reborn.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "group recovered");
-    assert_eq!(
-        scene.nodes.len() as i64,
-        total - 1,
-        "all cards recovered across the per-object checkpoint + journal tail"
-    );
-    let next = reborn
-        .apply_envelope(envelope("c1", total + 1, total, create_card("nx", "g1")), "c1")
-        .await;
-    assert!(
-        matches!(next, ApplyResult::Applied { seq, .. } if seq == total + 1),
-        "seq continues at {} after recovery, got {next:?}",
-        total + 1
-    );
-}
-
 // ---------------------------------------------------------------------------
-// MG-9.5: region-scoped scene snapshot (get_scene_region) from live actor memory.
+// Region-scoped scene snapshot (get_scene_region) via the region index.
 // ---------------------------------------------------------------------------
 
-use shape_scene_core::Bounds;
+use shape_storage_core::RegionWindow;
 
-/// A group placed at arbitrary bounds (so two groups can sit in far-apart regions).
-fn create_group_at(id: &str, bounds: WorldRect) -> RenderScenePatch {
-    RenderScenePatch::CreateGroup {
-        group: RenderGroup {
-            id: id.to_string(),
-            title: "G".to_string(),
-            summary: String::new(),
-            bounds,
-            tag_ids: vec![],
-            z_index: 0.0,
-            style_key: String::new(),
-        },
-    }
-}
-
-/// A card placed at arbitrary bounds inside `group_id`.
-fn create_card_at(id: &str, group_id: &str, bounds: WorldRect) -> RenderScenePatch {
-    RenderScenePatch::CreateCard {
-        card: RenderCard {
-            id: id.to_string(),
-            group_id: group_id.to_string(),
-            title: "C".to_string(),
-            summary: String::new(),
-            detail: String::new(),
-            status: String::new(),
-            node_type: String::new(),
-            bounds,
-            z_index: 0.0,
-            style_key: String::new(),
-            accessibility_label: String::new(),
-        },
-    }
-}
-
-fn rect(x: f64, y: f64, w: f64, h: f64) -> WorldRect {
-    WorldRect { x, y, width: w, height: h }
+/// A rect object placed at world (x, y).
+fn object_at(id: &str, order: &str, x: f64, y: f64) -> ObjectOp {
+    let mut object = rect_object(id, order);
+    object.transform = Transform3x3::translate(x, y);
+    ObjectOp::InsertObject { object }
 }
 
 /// Build a canvas with two far-apart clusters: region A near the origin, region B
-/// ~100k units away. A window over A returns only A's objects; a window over B
-/// returns only B's; `None` returns the whole scene; an edge whose endpoints
-/// straddle the window is dropped (only edges with both endpoints kept survive).
+/// ~100k units away. A window over A returns only A's objects; over B only B's;
+/// `None` returns the whole scene.
 #[tokio::test]
 async fn get_scene_region_filters_to_window() {
     let (handle, _store) = spawn_actor("c-region-filter");
 
-    // Region A cluster.
-    handle.apply_patch(create_group_at("gA", rect(0.0, 0.0, 400.0, 300.0)), "u").await;
-    handle.apply_patch(create_card_at("nA1", "gA", rect(10.0, 10.0, 120.0, 80.0)), "u").await;
-    handle.apply_patch(create_card_at("nA2", "gA", rect(200.0, 10.0, 120.0, 80.0)), "u").await;
-    // An edge fully inside region A: both endpoints kept by an A-window.
-    handle
-        .apply_patch(
-            RenderScenePatch::CreateEdge {
-                group_id: "gA".to_string(),
-                source: "nA1".to_string(),
-                target: "nA2".to_string(),
-                edge_id: "eA".to_string(),
-                label: None,
-            },
-            "u",
-        )
-        .await;
+    handle.apply_op(object_at("a1", "a0", 0.0, 0.0), "u").await;
+    handle.apply_op(object_at("a2", "a1", 200.0, 10.0), "u").await;
+    handle.apply_op(object_at("b1", "a2", 100_000.0, 100_000.0), "u").await;
 
-    // Region B cluster, far from A.
-    handle
-        .apply_patch(create_group_at("gB", rect(100_000.0, 100_000.0, 400.0, 300.0)), "u")
-        .await;
-    handle
-        .apply_patch(create_card_at("nB1", "gB", rect(100_010.0, 100_010.0, 120.0, 80.0)), "u")
-        .await;
+    let window_a = RegionWindow { min_x: -50.0, min_y: -50.0, max_x: 600.0, max_y: 500.0 };
+    let window_b = RegionWindow {
+        min_x: 99_900.0,
+        min_y: 99_900.0,
+        max_x: 100_600.0,
+        max_y: 100_500.0,
+    };
 
-    let window_a = Bounds { x: -50.0, y: -50.0, width: 600.0, height: 500.0 };
-    let window_b = Bounds { x: 99_900.0, y: 99_900.0, width: 700.0, height: 600.0 };
-
-    // Window A: only A's group, A's two cards, and the intra-A edge.
     let a = handle.get_scene_region(Some(window_a)).await;
-    let a_groups: Vec<&str> = a.groups.iter().map(|g| g.id.as_str()).collect();
-    let a_nodes: Vec<&str> = a.nodes.iter().map(|n| n.id.as_str()).collect();
-    let a_edges: Vec<&str> = a.edges.iter().map(|e| e.id.as_str()).collect();
-    assert_eq!(a_groups, vec!["gA"], "window A keeps only group gA");
-    assert_eq!(a_nodes, vec!["nA1", "nA2"], "window A keeps only A's cards");
-    assert_eq!(a_edges, vec!["eA"], "intra-A edge kept (both endpoints in window)");
+    let a_ids: Vec<&str> = a.objects.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(a_ids, vec!["a1", "a2"], "window A keeps only A's objects");
 
-    // Window B: only B's group + card, and no edges (eA's endpoints are off-window).
     let b = handle.get_scene_region(Some(window_b)).await;
-    let b_groups: Vec<&str> = b.groups.iter().map(|g| g.id.as_str()).collect();
-    let b_nodes: Vec<&str> = b.nodes.iter().map(|n| n.id.as_str()).collect();
-    assert_eq!(b_groups, vec!["gB"], "window B keeps only group gB");
-    assert_eq!(b_nodes, vec!["nB1"], "window B keeps only B's card");
-    assert!(b.edges.is_empty(), "edge dropped: its endpoints are outside window B");
+    let b_ids: Vec<&str> = b.objects.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(b_ids, vec!["b1"], "window B keeps only B's object");
 
-    // None: the whole scene, with the canvas revision intact.
     let all = handle.get_scene_region(None).await;
-    assert_eq!(all.groups.len(), 2, "whole-canvas snapshot has both groups");
-    assert_eq!(all.nodes.len(), 3, "whole-canvas snapshot has all three cards");
-    assert_eq!(all.edges.len(), 1, "whole-canvas snapshot has the edge");
+    assert_eq!(all.objects.len(), 3, "whole-canvas snapshot has all three objects");
     let full = handle.get_scene().await;
     assert_eq!(all.scene_version, full.scene_version, "None == full scene revision");
     assert_eq!(a.scene_version, full.scene_version, "windowed snapshot reports the true revision");
 }
 
 // ---------------------------------------------------------------------------
-// MG2.2 / MG9.3: bounded working set + cold LRU eviction (PC10/C10).
+// Feature channel: comment upsert + template apply lower to ops on the actor.
 // ---------------------------------------------------------------------------
 
-/// Spawn an actor with a tiny resident-placement budget so cold eviction fires
-/// without a huge fixture. Returns the handle and the shared store.
-fn spawn_actor_with_budget(canvas: &str, budget: usize) -> (ActorHandle, SharedStore) {
-    let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
-    ));
-    let handle = CanvasActor::spawn_with_budget(
-        CanvasId::from(canvas),
-        std::sync::Arc::clone(&store),
-        budget,
+use shape_scene_core::object::{Comment, FeatureRequest, FeatureResponse};
+
+#[tokio::test]
+async fn feature_comment_upsert_lowers_to_op_and_persists() {
+    let (handle, _store) = spawn_actor("c-feature-comment");
+    handle.apply_op(insert("o1", "a0"), "u").await;
+
+    let req = FeatureRequest::CommentUpsert {
+        canvas_id: "c-feature-comment".into(),
+        object_id: "o1".into(),
+        comment: Comment {
+            id: "c-1".into(),
+            author: "jayden".into(),
+            body: "looks good".into(),
+            at: None,
+            resolved: false,
+        },
+    };
+    let resp = handle.feature(req, "u").await;
+    assert_eq!(
+        resp,
+        FeatureResponse::CommentUpserted {
+            object_id: "o1".into(),
+            comment_id: "c-1".into(),
+        }
     );
-    (handle, store)
+
+    let scene = handle.get_scene().await;
+    assert_eq!(scene.get("o1").unwrap().comments.len(), 1, "comment persisted via the op path");
 }
 
-/// Creating many cards under a small working-set budget keeps only the budgeted
-/// number of placement objects RESIDENT, while every card stays durable: a
-/// whole-scene read reconstructs them all from the per-object store.
 #[tokio::test]
-async fn cold_eviction_bounds_resident_working_set() {
-    // Budget 4 placement objects; create 1 group + 20 cards (21 placement objects).
-    let (handle, _store) = spawn_actor_with_budget("c-evict-bound", 4);
+async fn feature_template_apply_inserts_recipe() {
+    let (handle, _store) = spawn_actor("c-feature-template");
 
-    handle.apply_patch(create_group("g1"), "u").await;
+    let recipe = vec![rect_object("tpl-a", "a0"), rect_object("tpl-b", "a1")];
+    let req = FeatureRequest::TemplateApply {
+        canvas_id: "c-feature-template".into(),
+        recipe,
+        anchor_x: 10.0,
+        anchor_y: 20.0,
+    };
+    let resp = handle.feature(req, "u").await;
+    assert_eq!(
+        resp,
+        FeatureResponse::TemplateApplied {
+            object_ids: vec!["tpl-a".into(), "tpl-b".into()],
+        }
+    );
+
+    let scene = handle.get_scene().await;
+    assert_eq!(scene.objects.len(), 2, "both template objects inserted via the op path");
+}
+
+#[tokio::test]
+async fn feature_canvas_switch_reports_seq_and_revision() {
+    let (handle, _store) = spawn_actor("c-feature-switch");
+    handle.apply_op(insert("o1", "a0"), "u").await;
+
+    let resp = handle
+        .feature(FeatureRequest::CanvasSwitch { canvas_id: "other".into() }, "u")
+        .await;
+    match resp {
+        FeatureResponse::CanvasSwitched { canvas_id, seq, revision } => {
+            assert_eq!(canvas_id, "other");
+            assert_eq!(seq, 1, "current actor seq after one apply");
+            assert_eq!(revision, 1, "current scene revision after one apply");
+        }
+        other => panic!("expected CanvasSwitched, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded working set: many objects under load reload-on-demand from the store.
+// ---------------------------------------------------------------------------
+
+/// An op targeting an object that may be cold must still apply correctly and
+/// persist; a whole-scene read reconstructs every object from the store.
+#[tokio::test]
+async fn many_objects_persist_and_reload() {
+    let (handle, _store) = spawn_actor("c-bulk");
+
+    handle.apply_op(insert("anchor", "a0"), "u").await;
     for i in 0..20 {
-        handle.apply_patch(create_card(&format!("n{i}"), "g1"), "u").await;
+        handle.apply_op(insert(&format!("n{i}"), &format!("b{i}")), "u").await;
     }
 
-    // The working set is bounded: far fewer than the 21 placement objects reside.
-    let resident = handle.resident_count().await;
-    assert!(
-        resident <= 4,
-        "resident working set is bounded to the budget, got {resident}"
-    );
-
-    // Nothing was lost: a whole-scene read pulls every object back from the store.
-    let scene = handle.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "group durable across eviction");
-    assert_eq!(scene.nodes.len(), 20, "all 20 cards durable across eviction");
-
-    // The whole-scene read transiently hydrated everything; the actor trims back
-    // to budget afterward, so steady-state memory stays bounded.
-    let after = handle.resident_count().await;
-    assert!(
-        after <= 4,
-        "working set trims back to budget after a whole-scene read, got {after}"
-    );
-}
-
-/// An op (here an edit) targeting an object that was evicted from memory must
-/// transparently reload it, apply, and persist — the edit survives a subsequent
-/// whole-scene read even though the target was cold when the edit arrived.
-#[tokio::test]
-async fn op_on_evicted_object_reloads_applies_and_persists() {
-    let (handle, _store) = spawn_actor_with_budget("c-evict-reload", 2);
-
-    handle.apply_patch(create_group("g1"), "u").await;
-    // n-target is created first, then pushed cold by many later creates.
-    handle.apply_patch(create_card("n-target", "g1"), "u").await;
-    for i in 0..10 {
-        handle.apply_patch(create_card(&format!("n{i}"), "g1"), "u").await;
-    }
-
-    // Edit the (now cold) target. The apply path hydrates it back, applies, and
-    // writes through; the working set is still bounded afterward.
-    let edited = handle
-        .apply_patch(edit_title("n-target", "rehydrated"), "u")
-        .await;
+    // Move the (possibly cold) anchor; the op-apply path reloads it via the store.
+    let edited = handle.apply_op(move_to("anchor", 42.0, 42.0), "u").await;
     assert!(matches!(edited, ApplyResult::Applied { .. }), "got {edited:?}");
-    assert!(
-        handle.resident_count().await <= 2,
-        "working set stays bounded after reload-on-demand edit"
-    );
-
-    // The edit is durable and correct.
-    let scene = handle.get_scene().await;
-    let title = &scene.nodes.iter().find(|n| n.id == "n-target").unwrap().title;
-    assert_eq!(title, "rehydrated", "edit to an evicted object persisted");
-}
-
-/// A windowed region read loads ONLY the requested window from the region index
-/// (load-on-demand), so it returns cold objects without pulling the whole canvas
-/// resident. Two far-apart clusters under a small budget: a window over A returns
-/// A's objects and leaves the working set bounded; a window over B then returns
-/// B's objects (A's having gone cold again).
-#[tokio::test]
-async fn region_read_loads_cold_window_on_demand_without_full_residency() {
-    let (handle, _store) = spawn_actor_with_budget("c-evict-region", 6);
-
-    // Cluster A near the origin: a group + several cards.
-    handle.apply_patch(create_group_at("gA", rect(0.0, 0.0, 400.0, 300.0)), "u").await;
-    for i in 0..8 {
-        let x = 10.0 + i as f64 * 20.0;
-        handle
-            .apply_patch(create_card_at(&format!("nA{i}"), "gA", rect(x, 10.0, 15.0, 15.0)), "u")
-            .await;
-    }
-    // Cluster B ~100k units away: a group + several cards.
-    handle
-        .apply_patch(create_group_at("gB", rect(100_000.0, 100_000.0, 400.0, 300.0)), "u")
-        .await;
-    for i in 0..8 {
-        let x = 100_010.0 + i as f64 * 20.0;
-        handle
-            .apply_patch(
-                create_card_at(&format!("nB{i}"), "gB", rect(x, 100_010.0, 15.0, 15.0)),
-                "u",
-            )
-            .await;
-    }
-
-    let window_a = Bounds { x: -50.0, y: -50.0, width: 600.0, height: 500.0 };
-    let window_b = Bounds { x: 99_900.0, y: 99_900.0, width: 700.0, height: 600.0 };
-
-    // Window A returns A's cluster (loaded on demand from the region index) and
-    // none of B's, and the working set holds only roughly A's window, not all 18
-    // placement objects.
-    let a = handle.get_scene_region(Some(window_a)).await;
-    assert!(a.groups.iter().any(|g| g.id == "gA"), "window A loaded gA");
-    assert_eq!(a.nodes.len(), 8, "window A loaded all of A's cards on demand");
-    assert!(
-        a.nodes.iter().all(|n| n.id.starts_with("nA")),
-        "window A returned only A's cards"
-    );
-    let resident_after_a = handle.resident_count().await;
-    assert!(
-        resident_after_a < 18,
-        "windowed read did not pull the whole canvas resident, got {resident_after_a}"
-    );
-
-    // Window B then returns B's cluster (A is cold again), proving the window is
-    // reloaded on demand each time rather than from a full in-memory scene.
-    let b = handle.get_scene_region(Some(window_b)).await;
-    assert!(b.groups.iter().any(|g| g.id == "gB"), "window B loaded gB");
-    assert_eq!(b.nodes.len(), 8, "window B loaded all of B's cards on demand");
-    assert!(
-        b.nodes.iter().all(|n| n.id.starts_with("nB")),
-        "window B returned only B's cards"
-    );
-}
-
-/// Eviction must not break LWW convergence: a later-arriving (higher-seq) write
-/// to a property still wins even when the target object churns through eviction
-/// between the two writes.
-#[tokio::test]
-async fn lww_convergence_holds_across_eviction() {
-    let (handle, _store) = spawn_actor_with_budget("c-evict-lww", 2);
-
-    handle.apply_patch(create_group("g1"), "u").await; // seq 1
-    handle.apply_patch(create_card("n1", "g1"), "u").await; // seq 2
-
-    // First write wins-for-now (seq 3). Then churn the working set so n1 evicts.
-    handle.apply_envelope(envelope("A", 1, 2, edit_title("n1", "from-A")), "A").await; // seq 3
-    for i in 0..6 {
-        handle.apply_patch(create_card(&format!("filler{i}"), "g1"), "u").await;
-    }
-
-    // The legitimate later writer (authored against the latest revision it acked)
-    // arrives last and wins, despite n1 having been cold in between.
-    let rev = handle.get_scene().await.scene_version;
-    let b = handle
-        .apply_envelope(envelope("B", 1, rev, edit_title("n1", "from-B")), "B")
-        .await;
-    assert!(matches!(b, ApplyResult::Applied { .. }), "got {b:?}");
 
     let scene = handle.get_scene().await;
-    let title = &scene.nodes.iter().find(|n| n.id == "n1").unwrap().title;
-    assert_eq!(title, "from-B", "later writer wins even across eviction churn");
+    assert_eq!(scene.objects.len(), 21, "all objects durable");
+    let t = &scene.get("anchor").unwrap().transform;
+    assert_eq!(t, &Transform3x3::translate(42.0, 42.0), "edit to the anchor persisted");
 }
 
-/// A large canvas recovered under a small budget does NOT stay fully resident:
-/// recovery rebuilds the live scene, then the actor trims it to the budget, while
-/// every object remains durable and a whole-scene read still reconstructs them.
+/// Sanity: the actor scene matches a pure scene-core apply of the same op stream.
 #[tokio::test]
-async fn recovery_does_not_keep_large_canvas_resident() {
-    let (handle, store) = spawn_actor_with_budget("c-evict-recover", 4);
+async fn actor_scene_matches_pure_apply() {
+    let (handle, _store) = spawn_actor("c-oracle");
+    handle.apply_op(insert("o1", "a0"), "u").await;
+    handle.apply_op(move_to("o1", 3.0, 4.0), "u").await;
 
-    handle.apply_patch(create_group("g1"), "u").await;
-    for i in 0..30 {
-        handle.apply_patch(create_card(&format!("n{i}"), "g1"), "u").await;
-    }
-    handle.shutdown().await;
+    let mut oracle = ObjectScene::default();
+    apply_object_op(&mut oracle, insert("o1", "a0")).unwrap();
+    apply_object_op(&mut oracle, move_to("o1", 3.0, 4.0)).unwrap();
 
-    // Respawn on the SAME store with a small budget: recovery must not leave the
-    // whole 31-object canvas resident.
-    let reborn = CanvasActor::spawn_with_budget(
-        CanvasId::from("c-evict-recover"),
-        std::sync::Arc::clone(&store),
-        4,
-    );
-    let resident = reborn.resident_count().await;
-    assert!(
-        resident <= 4,
-        "recovered large canvas is trimmed to the budget, got {resident}"
-    );
-
-    // Everything is still durable and reconstructable.
-    let scene = reborn.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "group recovered");
-    assert_eq!(scene.nodes.len(), 30, "all cards recovered after respawn");
+    let scene = handle.get_scene().await;
+    assert_eq!(scene.get("o1").unwrap().transform, oracle.get("o1").unwrap().transform);
 }

@@ -1,15 +1,15 @@
 //! MG-8 / MG-9 scale-out integration tests: single-writer lease + handoff
 //! (MG8.2a, MG8.5), owner routing cache (MG8.2b), canvas CRUD (MG9.1), and
-//! graceful shutdown / drain (MG8.3).
+//! graceful shutdown / drain (MG8.3) — object-native (OB4.1).
 //!
 //! Two registries share one [`InMemoryCoordinator`] and one [`SharedStore`] to
-//! model two app instances in front of the same coordinator + storage, the
-//! minimal setup that exercises lease denial + handoff recovery.
+//! model two app instances in front of the same coordinator + storage.
 
 use std::sync::{Arc, Mutex};
 
 use shape_coordination::{Coordinator, InMemoryCoordinator};
-use shape_scene_core::{CanvasId, RenderGroup, RenderScenePatch, WorldRect};
+use shape_scene_core::object::{FillRule, Geometry, Object, ObjectOp, PathNode, SubPath};
+use shape_scene_core::CanvasId;
 use shape_server::canvas_actor::SharedStore;
 use shape_server::{CanvasRegistry, SpawnError};
 use shape_storage_core::RedbAdapter;
@@ -18,22 +18,24 @@ fn shared_store() -> SharedStore {
     Arc::new(Mutex::new(RedbAdapter::open_in_memory().unwrap()))
 }
 
-fn create_group(id: &str) -> RenderScenePatch {
-    RenderScenePatch::CreateGroup {
-        group: RenderGroup {
-            id: id.to_string(),
-            title: "G".to_string(),
-            summary: String::new(),
-            bounds: WorldRect {
-                x: 0.0,
-                y: 0.0,
-                width: 400.0,
-                height: 300.0,
-            },
-            tag_ids: vec![],
-            z_index: 0.0,
-            style_key: String::new(),
-        },
+fn rect_geometry() -> Geometry {
+    Geometry::from_subpaths(
+        vec![SubPath {
+            closed: true,
+            nodes: vec![
+                PathNode::corner(0, 0),
+                PathNode::corner(80, 0),
+                PathNode::corner(80, 40),
+                PathNode::corner(0, 40),
+            ],
+        }],
+        FillRule::EvenOdd,
+    )
+}
+
+fn insert(id: &str, order: &str) -> ObjectOp {
+    ObjectOp::InsertObject {
+        object: Object::new(id, order, rect_geometry()),
     }
 }
 
@@ -58,9 +60,8 @@ async fn second_registry_cannot_spawn_while_first_holds_lease() {
         "owner-b",
     );
 
-    // A acquires the lease and spawns; B is denied with NotOwner naming A.
     let handle_a = reg_a.get_or_spawn(&canvas).await.expect("A acquires lease");
-    handle_a.apply_patch(create_group("g1"), "user-1").await;
+    handle_a.apply_op(insert("o1", "a0"), "user-1").await;
 
     match reg_b.get_or_spawn(&canvas).await {
         Err(SpawnError::NotOwner { owner }) => {
@@ -89,46 +90,22 @@ async fn handoff_after_release_recovers_durable_scene_with_no_data_loss() {
         "owner-b",
     );
 
-    // A spawns and writes two objects, then evicts (flush + checkpoint + release).
     let handle_a = reg_a.get_or_spawn(&canvas).await.expect("A acquires lease");
-    handle_a.apply_patch(create_group("g1"), "user-1").await;
-    handle_a
-        .apply_patch(
-            RenderScenePatch::CreateGroup {
-                group: RenderGroup {
-                    id: "g2".to_string(),
-                    title: "G2".to_string(),
-                    summary: String::new(),
-                    bounds: WorldRect {
-                        x: 10.0,
-                        y: 10.0,
-                        width: 50.0,
-                        height: 40.0,
-                    },
-                    tag_ids: vec![],
-                    z_index: 0.0,
-                    style_key: String::new(),
-                },
-            },
-            "user-1",
-        )
-        .await;
+    handle_a.apply_op(insert("o1", "a0"), "user-1").await;
+    handle_a.apply_op(insert("o2", "a1"), "user-1").await;
 
     reg_a.evict(&canvas).await; // releases the lease.
     assert!(!reg_a.contains(&canvas));
 
-    // B can now acquire the freed lease and recover the durable scene.
     let handle_b = reg_b
         .get_or_spawn(&canvas)
         .await
         .expect("B acquires the freed lease");
     let scene = handle_b.get_scene().await;
-    assert_eq!(scene.groups.len(), 2, "B recovered both groups (no data loss)");
-    let ids: Vec<&str> = scene.groups.iter().map(|g| g.id.as_str()).collect();
-    assert!(ids.contains(&"g1") && ids.contains(&"g2"), "both ids present: {ids:?}");
+    assert_eq!(scene.objects.len(), 2, "B recovered both objects (no data loss)");
+    assert!(scene.get("o1").is_some() && scene.get("o2").is_some(), "both ids present");
 
-    // The successor continues the server seq past the recovered ops.
-    let next = handle_b.apply_patch(create_group("g3"), "user-2").await;
+    let next = handle_b.apply_op(insert("o3", "a2"), "user-2").await;
     assert!(
         matches!(next, shape_server::ApplyResult::Applied { seq: 3, .. }),
         "seq continues past the 2 recovered ops, got {next:?}"
@@ -151,20 +128,11 @@ async fn routing_cache_returns_owner_without_rehitting_coordination() {
         "owner-self",
     );
 
-    // First resolve: cache miss -> claim -> cache self as owner.
     let first = reg.resolve_owner(&canvas).await;
     assert_eq!(first, "owner-self", "free canvas is claimed by this instance");
 
-    // Drop the coordinator's view of the lease (resolve_owner releases its claim
-    // immediately), so a cache MISS would now find no owner and re-claim. Prove
-    // the cache short-circuits: even though the coordinator currently names no
-    // owner, the cached answer is still returned.
     assert!(
-        coordinator
-            .find_owner(&canvas.0)
-            .await
-            .unwrap()
-            .is_none(),
+        coordinator.find_owner(&canvas.0).await.unwrap().is_none(),
         "resolve_owner released its transient claim, so the coordinator is free"
     );
     let cached = reg.resolve_owner(&canvas).await;
@@ -197,7 +165,6 @@ async fn canvas_crud_create_list_delete_round_trip() {
     assert_eq!(after.len(), 1, "one canvas remains after delete");
     assert_eq!(after[0].id, b.id, "Beta remains");
 
-    // Deleting an unknown canvas reports it did not exist.
     let missing = registry.delete_canvas(&CanvasId::from("nope")).await.unwrap();
     assert!(!missing, "deleting an absent canvas returns false");
 }
@@ -214,10 +181,9 @@ async fn delete_canvas_prunes_scene_records() {
 
     let summary = registry.create_canvas_with_id("c-prune", "Pruned").unwrap();
     let handle = registry.get_or_spawn(&summary.id).await.unwrap();
-    handle.apply_patch(create_group("g1"), "user-1").await;
-    handle.shutdown().await; // checkpoint writes per-object Records.
+    handle.apply_op(insert("o1", "a0"), "user-1").await;
+    handle.shutdown().await; // write-through left per-object Records.
 
-    // Scene Records exist under the "c-prune:" prefix before delete.
     {
         use shape_storage_core::StorageAdapter;
         let st = store.lock().unwrap();
@@ -262,9 +228,8 @@ async fn graceful_shutdown_flushes_and_frees_leases() {
     );
 
     let handle = reg_a.get_or_spawn(&canvas).await.expect("A acquires lease");
-    handle.apply_patch(create_group("g1"), "user-1").await;
+    handle.apply_op(insert("o1", "a0"), "user-1").await;
 
-    // While live, the lease is held (find_owner names A).
     assert_eq!(
         coordinator.find_owner(&canvas.0).await.unwrap().as_deref(),
         Some("owner-a"),
@@ -274,20 +239,17 @@ async fn graceful_shutdown_flushes_and_frees_leases() {
     reg_a.shutdown().await;
     assert!(reg_a.is_empty(), "all actors drained");
 
-    // The lease is freed after drain.
     assert!(
         coordinator.find_owner(&canvas.0).await.unwrap().is_none(),
         "lease released by graceful shutdown"
     );
 
-    // Draining registry rejects new spawns.
     match reg_a.get_or_spawn(&canvas).await {
         Err(SpawnError::Draining) => {}
         Ok(_) => panic!("a drained registry should reject spawns, but it spawned"),
         Err(e) => panic!("a drained registry should return Draining, got {e:?}"),
     }
 
-    // A successor recovers the flushed scene with no data loss.
     let reg_b = CanvasRegistry::with_coordinator_store(
         Arc::clone(&store),
         Arc::clone(&coordinator),
@@ -295,5 +257,5 @@ async fn graceful_shutdown_flushes_and_frees_leases() {
     );
     let handle_b = reg_b.get_or_spawn(&canvas).await.expect("B acquires freed lease");
     let scene = handle_b.get_scene().await;
-    assert_eq!(scene.groups.len(), 1, "successor recovered the flushed scene");
+    assert_eq!(scene.objects.len(), 1, "successor recovered the flushed scene");
 }

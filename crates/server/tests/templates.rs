@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use shape_server::{build_router_with_mcp, CanvasRegistry, ClientRegistry, Config};
+use shape_server::{build_router_with_mcp, CanvasRegistry, Config};
 use tower::ServiceExt;
 
 fn test_config() -> Config {
@@ -42,9 +42,8 @@ async fn body_json(response: axum::response::Response) -> Value {
 #[tokio::test]
 async fn list_seeds_builtins_post_and_delete_user_template() {
     let canvases = CanvasRegistry::open_in_memory().unwrap();
-    let clients = ClientRegistry::new();
     // build_router_with_mcp seeds the builtins on assembly.
-    let app = build_router_with_mcp(&test_config(), canvases, clients);
+    let app = build_router_with_mcp(&test_config(), canvases);
 
     // GET lists the seeded builtins.
     let response = app
@@ -141,8 +140,7 @@ async fn list_seeds_builtins_post_and_delete_user_template() {
 #[tokio::test]
 async fn deleting_a_builtin_via_http_tombstones_it() {
     let canvases = CanvasRegistry::open_in_memory().unwrap();
-    let clients = ClientRegistry::new();
-    let app = build_router_with_mcp(&test_config(), canvases.clone(), clients);
+    let app = build_router_with_mcp(&test_config(), canvases.clone());
 
     let victim = shape_scene_core::registry()[0].metadata.id.clone();
     let builtin_count = shape_scene_core::registry().len();
