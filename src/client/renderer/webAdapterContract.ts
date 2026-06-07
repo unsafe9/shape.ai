@@ -27,8 +27,8 @@
  * ## Boundary invariants (binding Verify guards)
  *
  *  - The adapter does **not** define product templates.
- *    It speaks render primitives + ops only (`SceneSnapshot` with business fields
- *    already stripped by `excludedBusinessFields()`).
+ *    It speaks the object render view + object ops only (`RenderObjectScene`;
+ *    the object substrate carries no business fields).
  *  - The adapter does **not** define canonical persistence rules.
  *    It relays ops via `{ type: "patch" }` events; the server (`storage.ts`) is
  *    the system of record.  T2.5 op metadata rides opaquely through the same
@@ -57,8 +57,7 @@ import type {
 } from "./wasmLoader";
 
 import type {
-  SceneSnapshot,
-  ScenePatch,
+  RenderObjectScene,
   SceneSelection,
   HitResult,
   DomOverlayRequest,
@@ -67,6 +66,8 @@ import type {
   WorldPoint,
   WorldRect
 } from "./scene";
+
+import type { ObjectOp } from "../../shared/object";
 
 // ─── re-exports (convenience) ─────────────────────────────────────────────────
 
@@ -81,8 +82,8 @@ export type {
   RustCanvasInputEvent,
   RustInputBatchResult,
   RustDebugSnapshot,
-  SceneSnapshot,
-  ScenePatch,
+  RenderObjectScene,
+  ObjectOp,
   SceneSelection,
   HitResult,
   DomOverlayRequest,
@@ -242,8 +243,8 @@ export type WebAdapterInputContract = {
  *    `<textarea>` glued to the moving card.
  *  - IME composition events (`event.isComposing`) are guarded; Enter/Escape are
  *    only processed outside a composition sequence.
- *  - When the overlay is committed, the adapter emits a `{ kind: "edit-card-text" }`
- *    `ScenePatch` via the shell integration event stream.
+ *  - When the overlay is committed, the adapter emits a `set-text` `ObjectOp`
+ *    via the shell integration event stream.
  *  - The overlay is never mounted when `webGpuRenderer` is null; a
  *    `{ type: "overlay", request: null }` event is emitted on cancel.
  */
@@ -326,12 +327,13 @@ export type WebAdapterClipboardContract = {
 
 /**
  * The adapter's clipboard wire format.
- * Contains only render primitive data; business fields
- * (`confidence`, `evidenceRefs`, `nodeType`, etc.) are excluded.
+ * Carries only canvas objects (`src/shared/object.ts` `Object`); no business
+ * fields (the object substrate has none) cross the clipboard.
  */
-export type CanvasClipboardPayload =
-  | { kind: "card"; card: import("./scene").SceneSnapshot["cards"][number] }
-  | { kind: "edge"; edge: import("./scene").SceneSnapshot["edges"][number] };
+export type CanvasClipboardPayload = {
+  kind: "objects";
+  objects: import("../../shared/object").Object[];
+};
 
 // ─── Surface 6 — Diagnostics bridge ──────────────────────────────────────────
 
@@ -396,23 +398,15 @@ export type WebAdapterDiagnosticsContract = {
  */
 export type WebAdapterShellContract = {
   /**
-   * Load (or reload) the scene into the renderer.
-   * `activeTagIds` controls which groups are visible.
-   * The adapter passes the **render snapshot** (business fields already stripped
-   * by `excludedBusinessFields()`), never the full `Scene`.
+   * Load (or reload) the scene into the renderer. The shell projects its
+   * canonical `ObjectScene` (D1) into the renderer-core `RenderObjectScene`
+   * render view; `activeTagIds` controls which objects are visible.
    */
-  loadScene(snapshot: SceneSnapshot, activeTagIds: string[]): void;
+  loadObjectScene(scene: RenderObjectScene, activeTagIds: string[]): void;
 
   /**
-   * Apply a single `RenderScenePatch` to the renderer.
-   * Returns validation errors (empty array on success).
-   * The adapter forwards the patch opaquely; it does not invent op kinds.
-   */
-  applyPatch(patch: ScenePatch): string[];
-
-  /**
-   * Synchronise the selection highlight without emitting a `patch` event.
-   * No-ops when the selection is already identical to the current snapshot.
+   * Synchronise the selection highlight without re-loading the scene.
+   * No-ops when the selection is already identical to the current scene.
    */
   syncSelection(selection: SceneSelection): void;
 
@@ -438,11 +432,6 @@ export type WebAdapterShellContract = {
   wheelAtScreen(screen: WorldPoint, deltaY: number): void;
 
   /**
-   * Return the last accepted `SceneSnapshot` or `null` before first load.
-   */
-  getSnapshot(): SceneSnapshot | null;
-
-  /**
    * Typed event stream from adapter to shell.
    * Delivered via the `onEvent` callback passed to `ShapeCanvasEngineOptions`.
    *
@@ -450,7 +439,7 @@ export type WebAdapterShellContract = {
    * | ------------ | -------------------------------- | -------------------------------------------- |
    * | `"stats"`    | `FrameStats`                     | Diagnostics drawer + camera echo             |
    * | `"selection"`| `HitResult \| null`              | Shell selection state                        |
-   * | `"patch"`    | `ScenePatch` + `errors`          | Persist via API or MCP                       |
+   * | `"patch"`    | `ObjectOp` + `errors`            | Persist via the WS transport client          |
    * | `"overlay"`  | `DomOverlayRequest \| null`      | Open/closed indicator                        |
    * | `"gesture"`  | `active: boolean`                | Suppress React/Svelte re-sync during drag    |
    * | `"status"`   | `message: string`                | Status bar / toast                           |
@@ -485,28 +474,27 @@ export type AdapterCoreCallBoundary = RustWebGpuRenderer;
  *
  * | Direction    | TS type                        | Wire        | Core entry          |
  * | ------------ | ------------------------------ | ----------- | ------------------- |
- * | Load scene   | `SceneSnapshot`                | JSON string | `loadScene`         |
- * | Apply edit   | `ScenePatch` / `ScenePatch[]`  | JSON string | `applyPatchBatch`   |
+ * | Load scene   | `RenderObjectScene`            | JSON string | object draw entry   |
+ * | Apply edit   | `ObjectOp` / `ObjectOp[]`      | JSON string | scene-core wasm     |
  * | Input        | `RustCanvasInputEvent[]`       | JSON string | `inputBatch`        |
- * | Overlay rect | `(cardId, field)`              | call args   | `overlayRequest`    |
+ * | Overlay rect | `(objectId, field)`            | call args   | `overlayRequest`    |
  * | Frame stats  | —                              | struct      | `renderFrame`       |
  * | Debug        | —                              | struct      | `debugSnapshot`     |
  *
  * Contract rules:
- *  a. The adapter passes the **render snapshot** (`SceneSnapshot`, business
- *     fields already stripped by `excludedBusinessFields()`), never the full
- *     `Scene`.
- *  b. The adapter does not invent op kinds — it forwards the `RenderScenePatch`
- *     union that `renderPatch.ts` defines.
- *  c. When T2.5 adds operation metadata (`operationId`, `actorId`, `targetIds`,
- *     `baseRevision`, …), it rides **inside** the existing op/JSON envelope —
- *     the adapter relays it opaquely and gains no new responsibility.
+ *  a. The adapter passes the **object render view** (`RenderObjectScene`, the
+ *     object substrate has no business fields), never the full app `Scene`.
+ *  b. The adapter does not invent op kinds — edits are `ObjectOp`s applied by the
+ *     scene-core wasm (the single op-apply source of truth).
+ *  c. Operation metadata (`operationId`, `actorId`, `targetIds`, `baseRevision`,
+ *     …) rides **inside** the op/JSON envelope — the adapter relays it opaquely
+ *     and gains no new responsibility.
  */
 export type AdapterSceneTransportContract = {
-  /** Serialise and forward a `SceneSnapshot` to the core. */
-  loadScene(snapshot: SceneSnapshot): void;
-  /** Serialise and forward one or more `ScenePatch` ops to the core. */
-  applyPatchBatch(patches: ScenePatch[]): string[];
+  /** Serialise and forward a `RenderObjectScene` to the renderer object draw entry. */
+  loadObjectScene(scene: RenderObjectScene): void;
+  /** Serialise and forward one or more `ObjectOp`s to the scene-core wasm. */
+  applyObjectOps(ops: ObjectOp[]): string[];
   /** Serialise and forward input events to the core. */
   sendInputBatch(events: RustCanvasInputEvent[]): RustInputBatchResult | null;
 };

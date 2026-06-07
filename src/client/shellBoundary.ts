@@ -49,11 +49,9 @@
 export type { EngineEvent, FocusBoundsOptions } from "./renderer/engine";
 
 import type { EngineEvent } from "./renderer/engine";
-import type { SceneSnapshot } from "./renderer/scene";
-import type { CameraState, WorldRect } from "../shared/renderScene";
-import type { RenderScenePatch } from "../shared/renderPatch";
+import type { RenderObjectScene } from "./renderer/scene";
+import type { CameraState, WorldPoint, WorldRect } from "../shared/geometry";
 import type { FocusBoundsOptions } from "./renderer/engine";
-import type { WorldPoint } from "./renderer/scene";
 
 /**
  * The shell→canvas imperative command surface. Originally exported by the React
@@ -67,8 +65,7 @@ export type RendererCanvasHostHandle = {
   focusBounds: (bounds: WorldRect, options?: FocusBoundsOptions) => void;
   wheelAtScreen: (screen: { x: number; y: number }, deltaY: number) => void;
   setCamera: (camera: CameraState) => void;
-  applyPatch: (patch: RenderScenePatch) => string[];
-  getSnapshot: () => SceneSnapshot | null;
+  loadObjectScene: (scene: RenderObjectScene) => void;
 };
 
 // ---------------------------------------------------------------------------
@@ -107,27 +104,16 @@ export interface ShapeCanvasHost {
   mount(inputCanvas: HTMLCanvasElement, webGpuCanvas: HTMLCanvasElement, overlayRoot: HTMLElement): Promise<void>;
 
   /**
-   * Load (or reload) the full scene.  Maps `Scene` → `SceneSnapshot` via
-   * `shapeSceneToFilteredRenderSnapshot` before handing off to the engine.
-   * The engine is authoritative for camera, hit, and selection geometry after
-   * this call.
+   * Load (or reload) the full scene.  The shell projects its canonical
+   * `ObjectScene` (D1) into the renderer-core `RenderObjectScene` render view
+   * before handing off to the renderer's object draw entry. The renderer is
+   * authoritative for camera, hit, and selection geometry after this call.
    *
-   * Must NOT be called during an active input gesture (`EngineEvent.gesture`
-   * active); the engine will defer the load automatically if called during a
-   * gesture, but callers should also avoid re-loading the scene on every
-   * keystroke — debounce or wait for gesture end.
+   * Edits do NOT flow through this path — they are object ops applied by the
+   * scene-core wasm (via the WS transport client); the shell re-loads the
+   * resulting `ObjectScene` here.
    */
-  loadScene(snapshot: SceneSnapshot): void;
-
-  /**
-   * Apply a single render-level patch.  Delegates to `applyPatchBatch([patch])`
-   * inside the engine.  Returns a (possibly empty) list of error strings; an
-   * empty list means the patch was accepted.
-   *
-   * For bulk mutations, prefer calling `applyPatch` once with a `batch` patch
-   * rather than calling this method in a loop.
-   */
-  applyPatch(patch: RenderScenePatch): string[];
+  loadObjectScene(scene: RenderObjectScene): void;
 
   /** Overwrite the camera directly (e.g. from follow/spectator — T5.3). */
   setCamera(camera: CameraState): void;
@@ -147,13 +133,6 @@ export interface ShapeCanvasHost {
    * Used by the shell zoom-in/zoom-out buttons (`App.tsx#zoomAtCanvasCenter`).
    */
   wheelAtScreen(screen: WorldPoint, deltaY: number): void;
-
-  /**
-   * Return the current in-memory scene snapshot, or `null` if no scene has
-   * been loaded yet.  The shell uses this for read-only diagnostics only; it
-   * must never mutate the returned value.
-   */
-  getSnapshot(): SceneSnapshot | null;
 
   /**
    * Register the single callback that receives all canvas→shell events.
@@ -202,9 +181,8 @@ export interface DocumentShellState {
   scene: unknown; // typed as Scene in the shell — kept `unknown` here to avoid a circular dep
 
   /**
-   * Active tag filter.  Passed to `shapeSceneToFilteredRenderSnapshot`; affects
-   * which nodes are visible on canvas.  Applied client-side over the
-   * WS-held scene, not as a top-level scene field.
+   * Active tag filter.  Applied client-side over the WS-held object scene to
+   * pick which objects are visible on canvas; not a top-level scene field.
    */
   activeTagIds: string[];
 

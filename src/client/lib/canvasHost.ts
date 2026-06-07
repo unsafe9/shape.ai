@@ -9,14 +9,20 @@
 // geometry through the crate's `buildObjectSceneGeometry`
 // (`ObjectPipeline::build_scene_geometry`), proving the object→geometry path.
 //
-// RUNTIME-DEFERRED (no GPU in CI): the live object GPU PASS — uploading the built
-// geometry through the visible renderer's frame loop — needs a renderer-crate
-// `ShapeWebGpuRenderer.drawObjects` method that does not exist yet. Until that
-// lands, the legacy `ShapeCanvasEngine` keeps the camera/input/stats loop alive
-// for navigation; the object geometry is built (and its vertex/instance counts
-// surfaced) but not yet rasterized. This is the flagged live-pixels gap.
+// The renderer crate now exposes `ShapeWebGpuRenderer.loadObjectScene` (build +
+// upload the object geometry on the live device/surface) and `.drawObjects` (record
+// the object GPU pass). `loadObjectScene` below feature-detects and calls them when
+// the live renderer is present.
+//
+// RUNTIME-DEFERRED (no GPU in CI): the live object GPU PASS still cannot run in the
+// test/build environment because there is no WebGPU device — `createWebGpuRenderer`
+// only succeeds in a real browser. So in CI the object geometry is built through the
+// CPU `buildObjectSceneGeometry` entry (and its counts surfaced); the actual
+// `loadObjectScene`/`drawObjects` rasterization is exercised at runtime in the
+// browser. The legacy `ShapeCanvasEngine` keeps the camera/input/stats loop alive.
+// This is the flagged live-pixels gap: build-verified, GPU-runtime-deferred.
 
-import type { CameraState } from "../../shared/renderScene";
+import type { CameraState } from "../../shared/geometry";
 import type { ObjectScene, ObjectSelection } from "../../shared/object";
 import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions } from "../renderer/engine";
 import type { FrameStats, WorldRect } from "../renderer/scene";
@@ -218,28 +224,44 @@ export class ShapeCanvasHost {
 
   /**
    * Push the canonical `ObjectScene` to the renderer. Projects it to the
-   * renderer-core `RenderObjectScene` and builds CPU object geometry through the
-   * crate's `buildObjectSceneGeometry`. Returns the geometry build (counts +
-   * raw), or null when the object build entry is unavailable.
+   * renderer-core `RenderObjectScene`, then:
+   *  - if a live `ShapeWebGpuRenderer` with `loadObjectScene` is present, uploads
+   *    the object geometry to the GPU (and draws it via `drawObjects`), and
+   *  - always builds the CPU geometry through the crate's `buildObjectSceneGeometry`
+   *    for the returned counts.
    *
-   * The live GPU object PASS is runtime-deferred (see file header): this builds
-   * and validates the geometry but does not yet rasterize it through the visible
-   * renderer's frame loop.
+   * Returns the geometry build (counts + raw), or null when no build entry is
+   * available. The live GPU PASS only runs in a real browser (no WebGPU device in
+   * CI); see file header for the flagged live-pixels gap.
    */
   loadObjectScene(scene: ObjectScene, selection: ObjectSelection): ObjectGeometryBuild {
     this.lastObjectScene = scene;
     this.lastSelection = selection;
+    const json = JSON.stringify(
+      objectSceneToRenderObjectScene(scene, this.camera, selection, `object-scene-v${scene.sceneVersion}`)
+    );
+    this.uploadObjectSceneToRenderer(json);
     const build = this.rustStatus.buildObjectSceneGeometry;
     if (!build) return null;
     try {
-      const json = JSON.stringify(
-        objectSceneToRenderObjectScene(scene, this.camera, selection, `object-scene-v${scene.sceneVersion}`)
-      );
       const raw = build(json);
       return summarizeObjectGeometry(raw);
     } catch (error) {
       this.callbacks.onStatus(errorMessage(error, "Object geometry build failed."));
       return null;
+    }
+  }
+
+  /** Upload + draw the object scene through the live renderer when available. The
+   *  live GPU pass needs a WebGPU device (browser-only); a no-op without one. */
+  private uploadObjectSceneToRenderer(sceneJson: string): void {
+    const renderer = this.webGpuRenderer;
+    if (!renderer || typeof renderer.loadObjectScene !== "function") return;
+    try {
+      renderer.loadObjectScene(sceneJson);
+      renderer.drawObjects?.();
+    } catch (error) {
+      this.callbacks.onStatus(errorMessage(error, "Object scene draw failed."));
     }
   }
 

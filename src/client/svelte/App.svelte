@@ -2,7 +2,7 @@
   import { onDestroy } from "svelte";
   import { BrainCircuit, Loader2, Copy, Trash2, Group as GroupIcon, Ungroup, MessageSquarePlus, LayoutTemplate } from "lucide-svelte";
   import { screenToWorld } from "../renderer/scene";
-  import type { CameraState } from "../../shared/renderScene";
+  import type { CameraState } from "../../shared/geometry";
   import {
     emptyObjectScene,
     translateTransform,

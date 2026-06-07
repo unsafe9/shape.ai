@@ -12,7 +12,7 @@
 // shell publishes: { cursor?: {x,y}, viewport?: {x,y,width,height}, userId }.
 // A frame missing a userId is dropped (it cannot be attributed to a peer lane).
 
-import type { WorldPoint, WorldRect } from "../../shared/renderScene";
+import type { WorldPoint, WorldRect } from "../../shared/geometry";
 
 /** The presence payload shape the shell publishes/consumes (opaque on the wire). */
 export type PresencePayload = {

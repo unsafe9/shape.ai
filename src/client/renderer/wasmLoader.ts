@@ -157,6 +157,13 @@ export type RustWebGpuRenderer = {
   loadScene(sceneJson: string): void;
   applyPatchBatch(patchesJson: string): void;
   renderFrame(): RustWebGpuFrameStats;
+  // OB-4 object draw path. `loadObjectScene` builds + uploads the object geometry
+  // for a `RenderObjectScene` JSON and returns `{ objects, fillIndices,
+  // strokeVertices }`; `drawObjects` records the live object GPU pass. Optional so
+  // a wasm build (or test mock) predating these methods still satisfies the type;
+  // the host feature-detects before calling.
+  loadObjectScene?(sceneJson: string): { objects: number; fillIndices: number; strokeVertices: number };
+  drawObjects?(): void;
   inputBatch(eventsJson: string): RustInputBatchResult;
   overlayRequest(cardId: string, field: string): DomOverlayRequest | null;
   debugSnapshot(): RustDebugSnapshot;

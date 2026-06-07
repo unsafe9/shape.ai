@@ -8,6 +8,8 @@ use crate::model::{
     RenderScenePatch, SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken,
     WorldPoint, WorldRect,
 };
+use crate::object_pipeline::{ObjectPipeline, ObjectRenderer};
+use crate::render_object::RenderObjectScene;
 use crate::serde_wasm;
 use crate::stats::{
     CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreOverlayRequest, CoreOverlayStyle,
@@ -17,8 +19,20 @@ use crate::text::{
     CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_HEIGHT,
     TEXT_ATLAS_SOLID_UV, TEXT_ATLAS_WIDTH,
 };
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
+
+/// OB-4 object-scene load counts returned by
+/// [`ShapeWebGpuRenderer::load_object_scene`] so the client can confirm the object
+/// geometry reached the renderer.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObjectSceneLoadResult {
+    objects: usize,
+    fill_indices: usize,
+    stroke_vertices: usize,
+}
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(js_name = probeWebGpu)]
@@ -546,6 +560,13 @@ pub struct ShapeWebGpuRenderer {
     multi_select: Vec<String>,
     last_hit: Option<CoreHitResult>,
     last_lod_tiers: HashMap<String, LodTier>,
+    // OB-4 object draw path (additive). The pipeline is built lazily on the first
+    // `load_object_scene`; the renderer holds the CPU-built + uploaded object
+    // geometry for the current object scene. The legacy `load_scene`/`render_frame`
+    // 2D path above is untouched — this is a parallel object pass that shares the
+    // same device/queue/surface/format.
+    object_pipeline: Option<ObjectPipeline>,
+    object_renderer: Option<ObjectRenderer>,
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -777,6 +798,8 @@ impl ShapeWebGpuRenderer {
             multi_select: Vec::new(),
             last_hit: None,
             last_lod_tiers: HashMap::new(),
+            object_pipeline: None,
+            object_renderer: None,
         };
         renderer.write_uniform();
         Ok(renderer)
@@ -1363,6 +1386,82 @@ impl ShapeWebGpuRenderer {
             group_slot_free_count: self.vertex_ranges.group_free_offsets.len(),
             backend: "rust-wgpu-visible".to_string(),
         })
+    }
+
+    /// OB-4 object draw entry: parse a [`RenderObjectScene`] and build + upload its
+    /// object geometry (fill megabuffer + stroke ribbons + per-object instances)
+    /// through an [`ObjectRenderer`] on this renderer's existing device/queue.
+    /// The `ObjectPipeline` is built lazily against the live surface format on the
+    /// first call. Additive: the legacy `load_scene` 2D path is untouched.
+    ///
+    /// Returns the built draw counts `{ objects, fillIndices, strokeVertices }` so
+    /// the client can confirm the object scene reached the renderer. The live GPU
+    /// PASS (recording the object render) is [`Self::draw_objects`].
+    #[wasm_bindgen(js_name = loadObjectScene)]
+    pub fn load_object_scene(&mut self, scene_json: &str) -> Result<JsValue, JsValue> {
+        let scene: RenderObjectScene = serde_json::from_str(scene_json)
+            .map_err(|error| JsValue::from_str(&format!("Invalid object scene: {error}")))?;
+        if self.object_pipeline.is_none() {
+            self.object_pipeline = Some(ObjectPipeline::new(
+                &self.device,
+                &self.queue,
+                self.config.format,
+            ));
+        }
+        let pipeline = self.object_pipeline.as_ref().unwrap();
+        let renderer = ObjectRenderer::new(
+            &self.device,
+            &self.queue,
+            pipeline,
+            &scene,
+            self.config.width as f32,
+            self.config.height as f32,
+        );
+        let counts = ObjectSceneLoadResult {
+            objects: scene.objects.len(),
+            fill_indices: renderer.fill_index_count() as usize,
+            stroke_vertices: renderer.stroke_vertex_count() as usize,
+        };
+        self.object_renderer = Some(renderer);
+        serde_wasm(counts)
+    }
+
+    /// OB-4 live GPU object PASS: acquire the surface texture and record the object
+    /// render through the [`ObjectRenderer`] built by [`Self::load_object_scene`],
+    /// clearing the surface (the object path owns the whole surface at the cutover).
+    /// A no-op when no object scene has been loaded.
+    ///
+    /// NOTE: the live frame loop on the client does not yet route through this; the
+    /// engine keeps the camera/input/stats loop alive while the object pixels are
+    /// wired in (the flagged live-pixels gap, documented in `lib/canvasHost.ts`).
+    #[wasm_bindgen(js_name = drawObjects)]
+    pub fn draw_objects(&mut self) -> Result<(), JsValue> {
+        let (Some(pipeline), Some(renderer)) =
+            (self.object_pipeline.as_ref(), self.object_renderer.as_ref())
+        else {
+            return Ok(());
+        };
+        let surface_texture = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            other => {
+                return Err(JsValue::from_str(&format!(
+                    "WebGPU surface texture unavailable: {other:?}"
+                )))
+            }
+        };
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("shape.ai object draw encoder"),
+            });
+        renderer.render(&mut encoder, &view, pipeline, true);
+        self.queue.submit(Some(encoder.finish()));
+        surface_texture.present();
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = inputBatch)]

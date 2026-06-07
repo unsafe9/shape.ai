@@ -24,7 +24,7 @@
 //     rebases on the freshest `welcome` and replays the unacked outbox on top.
 
 import type { ObjectScene, ObjectOp, ObjectSelection, FeatureRequest, FeatureResponse } from "../../shared/object";
-import type { WorldPoint, WorldRect } from "../../shared/renderScene";
+import type { WorldPoint, WorldRect } from "../../shared/geometry";
 import { WsTransport, type ConnectionStatus, type ReconnectOptions, type WebSocketFactory } from "./wsTransport";
 import { SyncEngine, type AuthorResult } from "./syncEngine";
 import { ensureSceneCore } from "../scene/sceneCoreWasm";

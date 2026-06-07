@@ -15,6 +15,7 @@ mod curve_lod;
 mod hit_test_object;
 #[allow(dead_code)]
 mod outline;
+mod object_pipeline;
 mod render_object;
 mod shaders;
 mod stroke_expand;
@@ -22,8 +23,6 @@ mod tessellate;
 #[allow(dead_code)]
 mod text_layout;
 
-#[cfg(feature = "wgpu-probe")]
-mod object_pipeline;
 #[cfg(feature = "wgpu-probe")]
 mod webgpu;
 
@@ -40,14 +39,19 @@ pub use stats::{CoreHitResult, WebGpuFrameStats, WebGpuProbeReport};
 #[cfg(feature = "wgpu-probe")]
 pub use webgpu::ShapeWebGpuRenderer;
 
-// OB-4 object GPU pipeline (additive; the client flips to it at the cutover).
-#[cfg(feature = "wgpu-probe")]
+// OB-4 object CPU geometry build (device-independent; builds for every target,
+// incl. the web wasm and a no-wgpu build, so `build_object_scene_geometry` works
+// without the GPU pipeline).
 #[allow(unused_imports)]
 pub use object_pipeline::{
-    build_scene_geometry, FillInstance, FillVertex, ObjectDraw, ObjectMatrixUniform,
-    ObjectPipeline, ObjectRenderer, SceneGeometry, StrokeInstance, StrokeParamsUniform,
-    StrokeVertex,
+    build_scene_geometry, FillInstance, FillVertex, ObjectDraw, ObjectMatrixUniform, SceneGeometry,
+    StrokeInstance, StrokeParamsUniform, StrokeVertex,
 };
+
+// OB-4 object GPU pipeline (needs `wgpu`; the client flips to it at the cutover).
+#[cfg(feature = "wgpu-probe")]
+#[allow(unused_imports)]
+pub use object_pipeline::{ObjectPipeline, ObjectRenderer};
 
 // OB-3 object render-model surface (additive; consumed at the OB-4 cutover).
 #[allow(unused_imports)]

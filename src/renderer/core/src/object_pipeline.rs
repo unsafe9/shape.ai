@@ -31,9 +31,14 @@
 //! affine camera, byte-identical to the legacy `ViewUniform` — and lets the VS do
 //! the projective `M * vec3(local, 1)` divide per object.
 
-#![cfg(feature = "wgpu-probe")]
+// The CPU geometry build (`build_scene_geometry` + the `bytemuck` vertex/instance
+// structs) compiles for any target — it needs no `wgpu`. Only the GPU pipeline /
+// uploader items (`ObjectPipeline`, `ObjectRenderer`, and their wgpu helpers) are
+// gated behind `wgpu-probe` (the feature that pulls in `wgpu`), so the object
+// render model + geometry build the web wasm exports stay available without it.
 
 use crate::render_object::{resolve_visual, RPaint, RenderObject, RenderObjectScene, VisualState};
+#[cfg(feature = "wgpu-probe")]
 use crate::shaders::{OBJECT_FILL_WGSL, OBJECT_STROKE_WGSL};
 use crate::stroke_expand::{dash_segments, expand_stroke, Cap, Join};
 use crate::tessellate::{
@@ -149,6 +154,7 @@ impl StrokeParamsUniform {
 /// Fill + stroke render pipelines for the object path, plus the shared camera
 /// bind group layout. Built once from a device; the actual draw buffers are
 /// owned by [`ObjectRenderer`].
+#[cfg(feature = "wgpu-probe")]
 pub struct ObjectPipeline {
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     pub stroke_bind_group_layout: wgpu::BindGroupLayout,
@@ -156,6 +162,7 @@ pub struct ObjectPipeline {
     pub stroke_pipeline: wgpu::RenderPipeline,
 }
 
+#[cfg(feature = "wgpu-probe")]
 impl ObjectPipeline {
     /// Build the object fill and stroke pipelines for the given surface
     /// `format`. The `queue` is unused at construction (kept in the signature to
@@ -366,6 +373,7 @@ impl ObjectPipeline {
 
 /// Instance-step vertex attributes for the fill pipeline (`m0`/`m1`/`m2` columns
 /// then the inline fill color), packed to match [`FillInstance`].
+#[cfg(feature = "wgpu-probe")]
 fn fill_instance_attributes() -> [wgpu::VertexAttribute; 4] {
     let vec3 = std::mem::size_of::<[f32; 3]>() as u64;
     [
@@ -395,6 +403,7 @@ fn fill_instance_attributes() -> [wgpu::VertexAttribute; 4] {
 /// Instance-step vertex attributes for the stroke pipeline (`m0`/`m1`/`m2`
 /// columns at locations 5..7, stroke color at 8), packed to match
 /// [`StrokeInstance`].
+#[cfg(feature = "wgpu-probe")]
 fn stroke_instance_attributes() -> [wgpu::VertexAttribute; 4] {
     let vec3 = std::mem::size_of::<[f32; 3]>() as u64;
     [
@@ -445,6 +454,7 @@ pub struct ObjectDraw {
 
 /// Owns the CPU-built object draw data and the GPU buffers it uploads to, and
 /// records the object render pass.
+#[cfg(feature = "wgpu-probe")]
 pub struct ObjectRenderer {
     pub uniform_buffer: wgpu::Buffer,
     pub stroke_params_buffer: wgpu::Buffer,
@@ -460,6 +470,7 @@ pub struct ObjectRenderer {
     stroke_vertex_count: u32,
 }
 
+#[cfg(feature = "wgpu-probe")]
 impl ObjectRenderer {
     /// Build the renderer for a scene: tessellate each object's fill into a
     /// shared megabuffer, expand its stroke into a ribbon, resolve per-object
@@ -671,10 +682,21 @@ impl ObjectRenderer {
             }
         }
     }
+
+    /// Number of fill indices uploaded for the loaded scene (diagnostics).
+    pub fn fill_index_count(&self) -> u32 {
+        self.fill_index_count
+    }
+
+    /// Number of stroke ribbon vertices uploaded for the loaded scene (diagnostics).
+    pub fn stroke_vertex_count(&self) -> u32 {
+        self.stroke_vertex_count
+    }
 }
 
 /// Create a `VERTEX | COPY_DST` buffer sized for `data` (min 4 bytes so an empty
 /// scene still produces a valid, non-zero-sized buffer handle).
+#[cfg(feature = "wgpu-probe")]
 fn create_vertex_buffer<T: bytemuck::Pod>(
     device: &wgpu::Device,
     label: &str,
@@ -688,6 +710,7 @@ fn create_vertex_buffer<T: bytemuck::Pod>(
     })
 }
 
+#[cfg(feature = "wgpu-probe")]
 fn create_index_buffer(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
