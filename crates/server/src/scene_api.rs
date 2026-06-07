@@ -1,26 +1,31 @@
-//! MG-7 Phase A — the legacy Node `/api/*` scene routes, ported onto the Rust
-//! server so the web client's relative `/api` calls (src/client/lib/api.ts) are
-//! served entirely by `shape_server`.
+//! Server-side scene operations that have no scene-core op and so cannot ride the
+//! WS op path. After the MG-7 client cutover, the web shell drives every op-shaped
+//! mutation through the WS transport client; only these genuinely server-computed
+//! operations remain on HTTP:
+//!
+//! - `POST /api/groups`            — server-side decision-graph seed (group_seed).
+//! - `POST /api/groups/:id/export` — server-side artifact generation + file write.
+//! - `GET  /api/groups/:gid/artifacts/:aid` — artifact file download.
+//! - `POST /api/comments` / `PATCH /api/comments/:id` — `add-comment` is an
+//!   ExtendedOpPatch with no scene-core apply path; comment update has no op.
 //!
 //! Every mutation goes through the per-canvas [`ActorHandle`] (scene-core apply +
-//! persistence + broadcast); reads go through `get_scene`. Response shapes match
-//! the Node routes byte-for-byte (camelCase JSON) so the Svelte shell needs no
-//! change. Identity is `userId`-only / no-auth (C13); writes are attributed to the
-//! actor `"http"`.
+//! persistence + broadcast). Response shapes are camelCase JSON the Svelte shell
+//! consumes directly. Identity is `userId`-only / no-auth (C13); writes are
+//! attributed to the actor `"http"`.
 
 use std::path::PathBuf;
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::{Json, Router};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use shape_scene_core::{
-    scene_graph_for_group, CanvasId, ExportType, RenderScenePatch, Scene, SceneArtifact,
-    ScenePatch, SceneSelection, Tag,
+    scene_graph_for_group, CanvasId, ExportType, Scene, SceneArtifact, SceneSelection,
 };
 
 use crate::canvas_actor::{ActorHandle, ApplyResult, ArtifactResult, CommentResult};
@@ -46,18 +51,14 @@ pub struct SceneApiState {
 /// [`crate::build_router_with_mcp`].
 pub fn scene_api_router(state: SceneApiState) -> Router {
     Router::new()
-        .route("/api/scene", get(get_scene).patch(patch_scene))
         .route("/api/groups", post(create_group))
-        .route("/api/groups/:id/tags", patch(update_group_tags))
         .route("/api/groups/:id/export", post(export_group))
         .route(
             "/api/groups/:groupId/artifacts/:artifactId",
             get(download_artifact),
         )
-        .route("/api/tags", post(create_tag))
-        .route("/api/tags/:id", patch(update_tag).delete(delete_tag))
         .route("/api/comments", post(create_comment))
-        .route("/api/comments/:id", patch(update_comment))
+        .route("/api/comments/:id", axum::routing::patch(update_comment))
         .with_state(state)
 }
 
@@ -75,27 +76,6 @@ async fn open_default(state: &SceneApiState) -> Result<ActorHandle, ApiError> {
         .get_or_spawn(&default_canvas())
         .await
         .map_err(|e| ApiError::internal(format!("cannot open canvas: {e}")))
-}
-
-/// Apply the AND-tag filter the Node `readScene` applies: keep groups carrying
-/// every listed tag, then prune nodes/edges to the surviving groups.
-fn filter_scene_by_tags(mut scene: Scene, tag_ids: &[String]) -> Scene {
-    if tag_ids.is_empty() {
-        return scene;
-    }
-    scene
-        .groups
-        .retain(|g| tag_ids.iter().all(|t| g.tag_ids.contains(t)));
-    let group_ids: std::collections::HashSet<&String> =
-        scene.groups.iter().map(|g| &g.id).collect();
-    scene.nodes.retain(|n| group_ids.contains(&n.group_id));
-    let node_ids: std::collections::HashSet<&String> = scene.nodes.iter().map(|n| &n.id).collect();
-    scene.edges.retain(|e| {
-        group_ids.contains(&e.group_id)
-            && node_ids.contains(&e.source)
-            && node_ids.contains(&e.target)
-    });
-    scene
 }
 
 /// A JSON error envelope matching the Node error shape (`{ error, message }`).
@@ -136,56 +116,6 @@ impl IntoResponse for ApiError {
             Json(json!({ "error": self.error, "message": self.message })),
         )
             .into_response()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GET /api/scene
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct SceneQuery {
-    tags: Option<String>,
-}
-
-/// `GET /api/scene?tags=a,b` -> `{ scene }` with server-side AND-tag filtering.
-async fn get_scene(
-    State(state): State<SceneApiState>,
-    Query(query): Query<SceneQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let handle = open_default(&state).await?;
-    let scene = handle.get_scene().await;
-    let tag_ids: Vec<String> = query
-        .tags
-        .as_deref()
-        .map(|raw| {
-            raw.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let scene = filter_scene_by_tags(scene, &tag_ids);
-    Ok(Json(json!({ "scene": scene })))
-}
-
-// ---------------------------------------------------------------------------
-// PATCH /api/scene
-// ---------------------------------------------------------------------------
-
-/// `PATCH /api/scene` body `ScenePatch` -> `{ scene }`. Applies a bulk patch
-/// through the actor (scene-core `apply_scene_patch`).
-async fn patch_scene(
-    State(state): State<SceneApiState>,
-    Json(patch): Json<ScenePatch>,
-) -> Result<Json<Value>, ApiError> {
-    let handle = open_default(&state).await?;
-    match handle.apply_scene_patch(patch, "http").await {
-        ApplyResult::Applied { .. } => {
-            let scene = handle.get_scene().await;
-            Ok(Json(json!({ "scene": scene })))
-        }
-        ApplyResult::Rejected { errors } => Err(ApiError::internal(errors.join("; "))),
     }
 }
 
@@ -258,138 +188,6 @@ fn group_suffix(scene: &Scene) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{:x}{:x}", scene.groups.len(), n)
-}
-
-// ---------------------------------------------------------------------------
-// Tags
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct CreateTagBody {
-    name: String,
-    color: String,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-/// `POST /api/tags` -> `{ tag, scene }`.
-async fn create_tag(
-    State(state): State<SceneApiState>,
-    Json(body): Json<CreateTagBody>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let handle = open_default(&state).await?;
-    let scene = handle.get_scene().await;
-    let tag_id = format!("tag-{}-{}", slug(&body.name), tag_suffix(&scene));
-    let tag = Tag {
-        id: tag_id.clone(),
-        name: body.name.trim().to_string(),
-        color: body.color.clone(),
-        description: body.description.clone().unwrap_or_default(),
-        created_at: HTTP_NOW.to_string(),
-        updated_at: HTTP_NOW.to_string(),
-    };
-    match handle.apply_patch(RenderScenePatch::CreateTag { tag }, "http").await {
-        ApplyResult::Applied { .. } => {
-            let scene = handle.get_scene().await;
-            let created = scene.tags.iter().find(|t| t.id == tag_id).cloned();
-            Ok((StatusCode::CREATED, Json(json!({ "tag": created, "scene": scene }))))
-        }
-        ApplyResult::Rejected { errors } => Err(ApiError::internal(errors.join("; "))),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateTagBody {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    color: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-/// `PATCH /api/tags/:id` -> `{ tag, scene }`. scene-core has no update-tag op, so
-/// this re-creates the tag in place (read-modify-rewrite) through a bulk patch is
-/// not available for tags; instead it builds the next scene via a delete+create
-/// equivalent. To stay within scene-core's op set we read the tag, mutate it, and
-/// write it back via a direct scene replace on the actor.
-async fn update_tag(
-    State(state): State<SceneApiState>,
-    AxumPath(id): AxumPath<String>,
-    Json(body): Json<UpdateTagBody>,
-) -> Result<Json<Value>, ApiError> {
-    let handle = open_default(&state).await?;
-    let scene = handle.get_scene().await;
-    let Some(current) = scene.tags.iter().find(|t| t.id == id).cloned() else {
-        return Err(ApiError::internal(format!("Tag not found: {id}")));
-    };
-    let updated = Tag {
-        id: current.id.clone(),
-        name: body.name.unwrap_or(current.name),
-        color: body.color.unwrap_or(current.color),
-        description: body.description.unwrap_or(current.description),
-        created_at: current.created_at,
-        updated_at: HTTP_NOW.to_string(),
-    };
-    match handle.update_tag(updated).await {
-        ApplyResult::Applied { .. } => {
-            let scene = handle.get_scene().await;
-            let tag = scene.tags.iter().find(|t| t.id == id).cloned();
-            Ok(Json(json!({ "tag": tag, "scene": scene })))
-        }
-        ApplyResult::Rejected { errors } => Err(ApiError::internal(errors.join("; "))),
-    }
-}
-
-/// `DELETE /api/tags/:id` -> `{ scene }`. Refuses a tag still attached to a group
-/// (mirrors `deleteUnusedTag`).
-async fn delete_tag(
-    State(state): State<SceneApiState>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, ApiError> {
-    let handle = open_default(&state).await?;
-    let scene = handle.get_scene().await;
-    let in_use = scene.groups.iter().any(|g| g.tag_ids.contains(&id));
-    if in_use {
-        return Err(ApiError::internal(
-            "Cannot delete a tag that is still attached to groups".to_string(),
-        ));
-    }
-    match handle.delete_tag(&id).await {
-        ApplyResult::Applied { .. } => {
-            let scene = handle.get_scene().await;
-            Ok(Json(json!({ "scene": scene })))
-        }
-        ApplyResult::Rejected { errors } => Err(ApiError::internal(errors.join("; "))),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateGroupTagsBody {
-    tag_ids: Vec<String>,
-}
-
-/// `PATCH /api/groups/:id/tags` -> `{ group, scene }`.
-async fn update_group_tags(
-    State(state): State<SceneApiState>,
-    AxumPath(id): AxumPath<String>,
-    Json(body): Json<UpdateGroupTagsBody>,
-) -> Result<Json<Value>, ApiError> {
-    let handle = open_default(&state).await?;
-    let patch = RenderScenePatch::SetObjectTags {
-        target_kind: shape_scene_core::op::TargetKind::Frame,
-        id: id.clone(),
-        tag_ids: body.tag_ids.clone(),
-    };
-    match handle.apply_patch(patch, "http").await {
-        ApplyResult::Applied { .. } => {
-            let scene = handle.get_scene().await;
-            let group = scene.groups.iter().find(|g| g.id == id).cloned();
-            Ok(Json(json!({ "group": group, "scene": scene })))
-        }
-        ApplyResult::Rejected { errors } => Err(ApiError::internal(errors.join("; "))),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -644,31 +442,3 @@ fn export_type_token(export_type: ExportType) -> &'static str {
     }
 }
 
-/// Slugify a tag name like the Node `slug` (`[^a-z0-9]+` -> `-`, trimmed).
-fn slug(value: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for ch in value.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "tag".to_string()
-    } else {
-        trimmed
-    }
-}
-
-/// A process-unique-enough id suffix for a new tag.
-fn tag_suffix(scene: &Scene) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}{:x}", scene.tags.len(), n)
-}

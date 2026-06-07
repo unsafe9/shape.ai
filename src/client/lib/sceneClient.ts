@@ -1,8 +1,8 @@
 // Transport-backed scene data layer (MG5.3).
 //
-// This is the seam that begins retiring the HTTP `api.ts` data path: instead of
-// `fetchScene` / `saveScenePatch` over REST, the shell loads and mutates the
-// scene through the WS transport client. It composes the existing pieces —
+// This is the seam that replaced the HTTP scene data path (MG-7): instead of
+// REST scene load/save, the shell loads and mutates the scene through the WS
+// transport client. It composes the existing pieces —
 // `WsTransport` (the wire), `SyncEngine` (optimistic apply + durable outbox +
 // coalescing + reconnect reconcile), and an `OutboxStore` — into one handle the
 // shell can drive in place of the REST calls.
@@ -27,7 +27,7 @@
 //
 // The shell consumes `scene` (current optimistic scene), `onScene` (reactive
 // updates), and `onPatch` (remote applied patches, for incremental renderer
-// feeds) in place of `fetchScene` / `saveScenePatch`.
+// feeds) as the sole scene load + save surface.
 
 import type { Bounds, Scene, ScenePatch, SceneSelection } from "../../shared/schema";
 import type { RenderScenePatch } from "../../shared/renderPatch";
@@ -458,6 +458,17 @@ export class SceneClient {
   /** Flush any buffered coalesced frame immediately (e.g. on gesture end). */
   flush(): void {
     this.engine?.flush();
+  }
+
+  /**
+   * Re-request the authoritative snapshot on the open socket. The server replies
+   * with a fresh `welcome` (honoring the current window) on the welcome stream,
+   * which the attached engine reconciles — adopting the server scene and replaying
+   * the unacked outbox on top. This is the explicit "refresh" the shell drives in
+   * place of the retired HTTP scene reload; a no-op while offline.
+   */
+  resync(): void {
+    this.transport?.resume();
   }
 
   /** Close the socket and drop all subscriptions. */

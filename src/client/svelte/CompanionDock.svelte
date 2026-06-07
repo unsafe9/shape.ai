@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Crosshair, Pause, Play } from "lucide-svelte";
-  import type { McpClientInfo } from "../lib/api";
+  import type { McpClientInfo } from "../lib/mcpDock";
   import type { FollowMode } from "../lib/followController";
 
   type FollowControls = {
