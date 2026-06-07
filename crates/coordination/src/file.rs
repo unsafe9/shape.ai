@@ -88,12 +88,22 @@ impl FileCoordinator {
         format!("{owner}-{n}")
     }
 
-    /// `/`-and-friends-safe stem for a canvas id so it maps to one filename.
+    /// Filesystem-safe, collision-free stem for a canvas id.
+    ///
+    /// A readable sanitized prefix (non-alphanumerics → `_`) keeps the on-disk
+    /// files debuggable, but that mapping is lossy, so distinct ids like
+    /// `canvas-1` and `canvas_1` would otherwise collapse to one stem and share a
+    /// lock/lease/presence/log. We append a `-{hex}` suffix derived from a stable
+    /// FNV-1a hash of the *full* raw id; equal ids always hash equally and
+    /// distinct ids effectively never share both prefix and hash, so each canvas
+    /// gets its own files. The hash is fixed and inline (no rng, no time) to keep
+    /// the crate deterministic across processes and restarts.
     fn stem(canvas_id: &str) -> String {
-        canvas_id
+        let prefix: String = canvas_id
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect()
+            .collect();
+        format!("{prefix}-{:016x}", fnv1a64(canvas_id))
     }
 
     fn lock_path(&self, canvas_id: &str) -> PathBuf {
@@ -199,6 +209,19 @@ impl FileCoordinator {
             }
         });
     }
+}
+
+/// FNV-1a 64-bit hash. A small, stable, deterministic non-cryptographic hash
+/// used to disambiguate canvas-id file stems (no external crate, no rng).
+fn fnv1a64(s: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 /// Append a length-prefixed (u32 LE) frame to the log file.

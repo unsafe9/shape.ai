@@ -273,3 +273,38 @@ async fn file_pubsub_delivers_in_process() {
         .unwrap();
     assert_eq!(got, b"hello");
 }
+
+#[tokio::test]
+async fn file_distinct_ids_sharing_a_stem_do_not_collide() {
+    // `canvas-1` and `canvas_1` both sanitize to the same readable prefix, and
+    // `a/b` / `a-b` likewise — they must still map to distinct on-disk files so
+    // they neither contend for the same lease nor cross-deliver pub/sub.
+    for (id_a, id_b) in [("canvas-1", "canvas_1"), ("a/b", "a-b")] {
+        let (c, _d) = file_coord(FakeClock::new());
+
+        // Lease isolation: a lease on id_a must not block one on id_b.
+        c.acquire_lease(id_a, "alice", ttl()).await.unwrap();
+        c.acquire_lease(id_b, "bob", ttl())
+            .await
+            .expect("distinct canvas must not contend for the same lease");
+        assert_eq!(c.find_owner(id_a).await.unwrap(), Some("alice".to_string()));
+        assert_eq!(c.find_owner(id_b).await.unwrap(), Some("bob".to_string()));
+
+        // Pub/sub isolation: a publish to id_a must not leak to id_b's subscriber.
+        let mut rx_b = c.subscribe(id_b);
+        c.publish(id_a, b"to-a".to_vec()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx_b.recv())
+                .await
+                .is_err(),
+            "{id_b} must not receive a frame published to {id_a}"
+        );
+        // A publish to id_b proves its own channel is live and distinct.
+        c.publish(id_b, b"to-b".to_vec()).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+            .await
+            .expect("id_b's own frame should arrive")
+            .unwrap();
+        assert_eq!(got, b"to-b");
+    }
+}
