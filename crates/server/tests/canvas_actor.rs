@@ -777,3 +777,208 @@ async fn get_scene_region_filters_to_window() {
     assert_eq!(all.scene_version, full.scene_version, "None == full scene revision");
     assert_eq!(a.scene_version, full.scene_version, "windowed snapshot reports the true revision");
 }
+
+// ---------------------------------------------------------------------------
+// MG2.2 / MG9.3: bounded working set + cold LRU eviction (PC10/C10).
+// ---------------------------------------------------------------------------
+
+/// Spawn an actor with a tiny resident-placement budget so cold eviction fires
+/// without a huge fixture. Returns the handle and the shared store.
+fn spawn_actor_with_budget(canvas: &str, budget: usize) -> (ActorHandle, SharedStore) {
+    let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
+        shape_storage_core::SqliteAdapter::open_in_memory().unwrap(),
+    ));
+    let handle = CanvasActor::spawn_with_budget(
+        CanvasId::from(canvas),
+        std::sync::Arc::clone(&store),
+        budget,
+    );
+    (handle, store)
+}
+
+/// Creating many cards under a small working-set budget keeps only the budgeted
+/// number of placement objects RESIDENT, while every card stays durable: a
+/// whole-scene read reconstructs them all from the per-object store.
+#[tokio::test]
+async fn cold_eviction_bounds_resident_working_set() {
+    // Budget 4 placement objects; create 1 group + 20 cards (21 placement objects).
+    let (handle, _store) = spawn_actor_with_budget("c-evict-bound", 4);
+
+    handle.apply_patch(create_group("g1"), "u").await;
+    for i in 0..20 {
+        handle.apply_patch(create_card(&format!("n{i}"), "g1"), "u").await;
+    }
+
+    // The working set is bounded: far fewer than the 21 placement objects reside.
+    let resident = handle.resident_count().await;
+    assert!(
+        resident <= 4,
+        "resident working set is bounded to the budget, got {resident}"
+    );
+
+    // Nothing was lost: a whole-scene read pulls every object back from the store.
+    let scene = handle.get_scene().await;
+    assert_eq!(scene.groups.len(), 1, "group durable across eviction");
+    assert_eq!(scene.nodes.len(), 20, "all 20 cards durable across eviction");
+
+    // The whole-scene read transiently hydrated everything; the actor trims back
+    // to budget afterward, so steady-state memory stays bounded.
+    let after = handle.resident_count().await;
+    assert!(
+        after <= 4,
+        "working set trims back to budget after a whole-scene read, got {after}"
+    );
+}
+
+/// An op (here an edit) targeting an object that was evicted from memory must
+/// transparently reload it, apply, and persist — the edit survives a subsequent
+/// whole-scene read even though the target was cold when the edit arrived.
+#[tokio::test]
+async fn op_on_evicted_object_reloads_applies_and_persists() {
+    let (handle, _store) = spawn_actor_with_budget("c-evict-reload", 2);
+
+    handle.apply_patch(create_group("g1"), "u").await;
+    // n-target is created first, then pushed cold by many later creates.
+    handle.apply_patch(create_card("n-target", "g1"), "u").await;
+    for i in 0..10 {
+        handle.apply_patch(create_card(&format!("n{i}"), "g1"), "u").await;
+    }
+
+    // Edit the (now cold) target. The apply path hydrates it back, applies, and
+    // writes through; the working set is still bounded afterward.
+    let edited = handle
+        .apply_patch(edit_title("n-target", "rehydrated"), "u")
+        .await;
+    assert!(matches!(edited, ApplyResult::Applied { .. }), "got {edited:?}");
+    assert!(
+        handle.resident_count().await <= 2,
+        "working set stays bounded after reload-on-demand edit"
+    );
+
+    // The edit is durable and correct.
+    let scene = handle.get_scene().await;
+    let title = &scene.nodes.iter().find(|n| n.id == "n-target").unwrap().title;
+    assert_eq!(title, "rehydrated", "edit to an evicted object persisted");
+}
+
+/// A windowed region read loads ONLY the requested window from the region index
+/// (load-on-demand), so it returns cold objects without pulling the whole canvas
+/// resident. Two far-apart clusters under a small budget: a window over A returns
+/// A's objects and leaves the working set bounded; a window over B then returns
+/// B's objects (A's having gone cold again).
+#[tokio::test]
+async fn region_read_loads_cold_window_on_demand_without_full_residency() {
+    let (handle, _store) = spawn_actor_with_budget("c-evict-region", 6);
+
+    // Cluster A near the origin: a group + several cards.
+    handle.apply_patch(create_group_at("gA", rect(0.0, 0.0, 400.0, 300.0)), "u").await;
+    for i in 0..8 {
+        let x = 10.0 + i as f64 * 20.0;
+        handle
+            .apply_patch(create_card_at(&format!("nA{i}"), "gA", rect(x, 10.0, 15.0, 15.0)), "u")
+            .await;
+    }
+    // Cluster B ~100k units away: a group + several cards.
+    handle
+        .apply_patch(create_group_at("gB", rect(100_000.0, 100_000.0, 400.0, 300.0)), "u")
+        .await;
+    for i in 0..8 {
+        let x = 100_010.0 + i as f64 * 20.0;
+        handle
+            .apply_patch(
+                create_card_at(&format!("nB{i}"), "gB", rect(x, 100_010.0, 15.0, 15.0)),
+                "u",
+            )
+            .await;
+    }
+
+    let window_a = Bounds { x: -50.0, y: -50.0, width: 600.0, height: 500.0 };
+    let window_b = Bounds { x: 99_900.0, y: 99_900.0, width: 700.0, height: 600.0 };
+
+    // Window A returns A's cluster (loaded on demand from the region index) and
+    // none of B's, and the working set holds only roughly A's window, not all 18
+    // placement objects.
+    let a = handle.get_scene_region(Some(window_a)).await;
+    assert!(a.groups.iter().any(|g| g.id == "gA"), "window A loaded gA");
+    assert_eq!(a.nodes.len(), 8, "window A loaded all of A's cards on demand");
+    assert!(
+        a.nodes.iter().all(|n| n.id.starts_with("nA")),
+        "window A returned only A's cards"
+    );
+    let resident_after_a = handle.resident_count().await;
+    assert!(
+        resident_after_a < 18,
+        "windowed read did not pull the whole canvas resident, got {resident_after_a}"
+    );
+
+    // Window B then returns B's cluster (A is cold again), proving the window is
+    // reloaded on demand each time rather than from a full in-memory scene.
+    let b = handle.get_scene_region(Some(window_b)).await;
+    assert!(b.groups.iter().any(|g| g.id == "gB"), "window B loaded gB");
+    assert_eq!(b.nodes.len(), 8, "window B loaded all of B's cards on demand");
+    assert!(
+        b.nodes.iter().all(|n| n.id.starts_with("nB")),
+        "window B returned only B's cards"
+    );
+}
+
+/// Eviction must not break LWW convergence: a later-arriving (higher-seq) write
+/// to a property still wins even when the target object churns through eviction
+/// between the two writes.
+#[tokio::test]
+async fn lww_convergence_holds_across_eviction() {
+    let (handle, _store) = spawn_actor_with_budget("c-evict-lww", 2);
+
+    handle.apply_patch(create_group("g1"), "u").await; // seq 1
+    handle.apply_patch(create_card("n1", "g1"), "u").await; // seq 2
+
+    // First write wins-for-now (seq 3). Then churn the working set so n1 evicts.
+    handle.apply_envelope(envelope("A", 1, 2, edit_title("n1", "from-A")), "A").await; // seq 3
+    for i in 0..6 {
+        handle.apply_patch(create_card(&format!("filler{i}"), "g1"), "u").await;
+    }
+
+    // The legitimate later writer (authored against the latest revision it acked)
+    // arrives last and wins, despite n1 having been cold in between.
+    let rev = handle.get_scene().await.scene_version;
+    let b = handle
+        .apply_envelope(envelope("B", 1, rev, edit_title("n1", "from-B")), "B")
+        .await;
+    assert!(matches!(b, ApplyResult::Applied { .. }), "got {b:?}");
+
+    let scene = handle.get_scene().await;
+    let title = &scene.nodes.iter().find(|n| n.id == "n1").unwrap().title;
+    assert_eq!(title, "from-B", "later writer wins even across eviction churn");
+}
+
+/// A large canvas recovered under a small budget does NOT stay fully resident:
+/// recovery rebuilds the live scene, then the actor trims it to the budget, while
+/// every object remains durable and a whole-scene read still reconstructs them.
+#[tokio::test]
+async fn recovery_does_not_keep_large_canvas_resident() {
+    let (handle, store) = spawn_actor_with_budget("c-evict-recover", 4);
+
+    handle.apply_patch(create_group("g1"), "u").await;
+    for i in 0..30 {
+        handle.apply_patch(create_card(&format!("n{i}"), "g1"), "u").await;
+    }
+    handle.shutdown().await;
+
+    // Respawn on the SAME store with a small budget: recovery must not leave the
+    // whole 31-object canvas resident.
+    let reborn = CanvasActor::spawn_with_budget(
+        CanvasId::from("c-evict-recover"),
+        std::sync::Arc::clone(&store),
+        4,
+    );
+    let resident = reborn.resident_count().await;
+    assert!(
+        resident <= 4,
+        "recovered large canvas is trimmed to the budget, got {resident}"
+    );
+
+    // Everything is still durable and reconstructable.
+    let scene = reborn.get_scene().await;
+    assert_eq!(scene.groups.len(), 1, "group recovered");
+    assert_eq!(scene.nodes.len(), 30, "all cards recovered after respawn");
+}

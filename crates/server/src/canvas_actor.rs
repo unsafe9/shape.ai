@@ -32,21 +32,40 @@
 //! value. See [`CanvasActor::converge_lww`].
 //!
 //! MG-9.5 adds region-scoped reads ([`CanvasActor::get_scene_region`]): a windowed
-//! subscriber is answered from the actor's LIVE in-memory scene filtered by bbox,
-//! not from the storage region index. The in-memory scene is always current and
-//! correct, so this is the right source for a *read*; the spatial store
-//! (`SpatialStore::query_region`) exists to back a *different*, future capability.
+//! subscriber is answered from the actor's resident working set, hydrated for the
+//! requested window from the storage region index first so the read covers cold
+//! objects too.
 //!
-//! Follow-up — actor-memory eviction (not yet built). Today the actor holds the
-//! WHOLE canvas in memory; a very large canvas should hold only its hot regions
-//! and LRU-evict cold ones, reloading a region on demand via
-//! `SpatialStore::query_region(canvas_id, bbox)`. That is the reason the
-//! checkpoint persists per-object Records region-indexed (MG5.2b). It is NOT live
-//! yet because eviction needs per-op region-indexed persistence so a reloaded cold
-//! region is exact-to-the-last-op; the current store persists at the checkpoint
-//! cadence (MG-5), so a freshly reloaded region could miss un-checkpointed tail
-//! ops. Region *reads* (MG-9.5) sidestep this entirely by reading live memory.
+//! MG2.2 / MG9.3 — bounded working set + cold LRU eviction (PC10/C10: no
+//! full-canvas-in-memory assumption). `self.scene` is no longer the WHOLE canvas;
+//! it is the **resident working set**: a small always-resident "spine" (scene
+//! meta, tags, comments, artifacts, proposals) plus the placement objects
+//! (groups/nodes/edges) that are in or near actively-touched/queried regions. The
+//! complete canvas always lives durably in the per-object, region-indexed store
+//! (`SpatialStore`), and the actor loads placement objects on demand.
+//!
+//! The blocker the old design named — "a reloaded cold region could miss
+//! un-checkpointed tail ops" — is removed by **per-op write-through**: every
+//! applied op checkpoints immediately (see [`CanvasActor::persist`]), upserting
+//! the Records it touched (region-indexed) and deleting the Records it removed, so
+//! any object reloaded from the store is exact-to-the-last-op. The journal still
+//! records every op for crash recovery of the in-flight tail; the periodic
+//! whole-scene checkpoint (and its recovery floor in `canvas-meta`) is kept.
+//!
+//! Two load-on-demand shapes:
+//! * **Region read / windowed op** — hydrate only the queried window from the
+//!   region index ([`CanvasActor::hydrate_region`]) and mark it hot.
+//! * **Whole-scene op / read** (`get_scene`, bulk scene patch, create order-key
+//!   append, anything that must see the full canvas) — transiently hydrate the
+//!   full canvas ([`CanvasActor::hydrate_full`]), do the work, then
+//!   [`CanvasActor::evict_cold`] trims the working set back to
+//!   [`WORKING_SET_BUDGET`]. So a large canvas never *stays* resident: between ops
+//!   and after region reads only the hot working set is held. This transient
+//!   whole-canvas hydrate on a whole-scene write is the deliberate tradeoff that
+//!   keeps every existing invariant (delete/reparent/LWW/order-key all see the
+//!   complete scene) while still bounding steady-state memory.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use shape_scene_core::{
@@ -63,12 +82,19 @@ use crate::scene_store::{
 };
 use crate::sync::{
     created_object_id, next_order_key, stamp_order_key, DedupTable, JournalEntry, OpAck,
-    OpEnvelope, OpId, CHECKPOINT_INTERVAL,
+    OpEnvelope, OpId, MAX_SEEN_OPS,
 };
 
 /// A single shared storage adapter, guarded so concurrent canvas actors can
 /// persist into the same backing store without racing.
 pub type SharedStore = Arc<Mutex<SqliteAdapter>>;
+
+/// How many placement objects (groups + nodes + edges) the resident working set
+/// holds before [`CanvasActor::evict_cold`] starts dropping the least-recently-
+/// used ones back to the durable store. The "spine" (scene meta, tags, comments,
+/// artifacts, proposals) is always resident and is not counted against this
+/// budget. A whole-scene op transiently exceeds it while hydrated, then trims.
+pub const WORKING_SET_BUDGET: usize = 1024;
 
 /// Outcome of an [`CanvasCommand::ApplyPatch`].
 #[derive(Clone, Debug, PartialEq)]
@@ -168,6 +194,12 @@ pub enum CanvasCommand {
     GetSceneRegion {
         bbox: Option<Bounds>,
         reply: oneshot::Sender<Scene>,
+    },
+    /// MG2.2 observability: the current resident placement-object count (groups +
+    /// nodes + edges in memory), WITHOUT hydrating. Lets a test prove cold
+    /// eviction actually shed objects from the working set.
+    ResidentCount {
+        reply: oneshot::Sender<usize>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -409,6 +441,18 @@ impl ActorHandle {
         rx.await.expect("canvas actor dropped reply")
     }
 
+    /// The actor's current resident placement-object count (groups + nodes +
+    /// edges held in memory), without triggering a hydrate. MG2.2 observability:
+    /// lets a caller/test see that cold eviction bounded the working set.
+    pub async fn resident_count(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CanvasCommand::ResidentCount { reply })
+            .await
+            .expect("canvas actor task dropped");
+        rx.await.expect("canvas actor dropped reply")
+    }
+
     /// Subscribe to the fan-out of applied patches.
     pub fn subscribe(&self) -> broadcast::Receiver<PatchBroadcast> {
         self.broadcast_tx.subscribe()
@@ -443,13 +487,26 @@ pub struct CanvasActor {
     /// recovery reconstructed from the per-object Records.
     persisted_scene: Scene,
     /// Seen-opId table for idempotent dedup (MG4.2). Session-scoped + bounded;
-    /// rebuilt from the journal tail on recovery.
+    /// rebuilt from the journal suffix on recovery (see
+    /// [`rebuild_dedup_from_suffix`]).
     dedup: DedupTable,
     /// Per-property LWW authority (MG4.4 remote side): records each property
     /// write keyed by server `seq`, so a lower-seq op cannot clobber a property a
     /// higher-seq op already won. Built + unit-tested now; the multi-writer
     /// convergence that consults it lands in MG-6.
     props: PropertyStore,
+    /// MG2.2 working-set LRU: a logical clock and the last-touch tick of every
+    /// resident placement object (group/node/edge) keyed by its store Record id.
+    /// [`CanvasActor::evict_cold`] drops the lowest-tick entries first. The spine
+    /// (tags/comments/artifacts/meta) is never tracked here — it is always
+    /// resident — so cold eviction only ever sheds placement bulk.
+    lru: HashMap<String, u64>,
+    /// Monotonic touch counter feeding `lru`. Bumped once per touch so ties break
+    /// by insertion order.
+    lru_clock: u64,
+    /// Resident placement-object budget before `evict_cold` sheds the coldest.
+    /// Defaults to [`WORKING_SET_BUDGET`]; lowered by tests to force eviction.
+    budget: usize,
     store: SharedStore,
     rx: mpsc::Receiver<CanvasCommand>,
     broadcast_tx: broadcast::Sender<PatchBroadcast>,
@@ -488,14 +545,22 @@ fn journal_record_id(canvas_id: &CanvasId, seq: i64) -> String {
 
 impl CanvasActor {
     /// Spawn the actor task for `canvas_id`, loading durable state from `store`,
-    /// and return a clone-able handle to it.
+    /// and return a clone-able handle to it. Uses the default
+    /// [`WORKING_SET_BUDGET`].
     pub fn spawn(canvas_id: CanvasId, store: SharedStore) -> ActorHandle {
+        Self::spawn_with_budget(canvas_id, store, WORKING_SET_BUDGET)
+    }
+
+    /// Spawn with an explicit resident placement-object `budget`. The production
+    /// path uses [`spawn`](CanvasActor::spawn) (default budget); tests use a small
+    /// budget to force cold eviction without a huge fixture.
+    pub fn spawn_with_budget(canvas_id: CanvasId, store: SharedStore, budget: usize) -> ActorHandle {
         let (tx, rx) = mpsc::channel(64);
         let (broadcast_tx, _) = broadcast::channel(256);
 
         let recovered = recover_durable_state(&canvas_id, &store);
 
-        let actor = CanvasActor {
+        let mut actor = CanvasActor {
             canvas_id,
             scene: recovered.scene.clone(),
             seq: recovered.seq,
@@ -503,10 +568,18 @@ impl CanvasActor {
             persisted_scene: recovered.persisted_scene,
             dedup: recovered.dedup,
             props: recovered.props,
+            lru: HashMap::new(),
+            lru_clock: 0,
+            budget,
             store,
             rx,
             broadcast_tx: broadcast_tx.clone(),
         };
+        // Recovery rebuilds the full live scene in memory; trim it down to the
+        // working-set budget immediately so a large recovered canvas does not stay
+        // fully resident. Everything trimmed is already durable in the store.
+        actor.touch_all_resident();
+        actor.evict_cold();
         tokio::spawn(actor.run());
 
         ActorHandle { tx, broadcast_tx }
@@ -580,17 +653,33 @@ impl CanvasActor {
                     let _ = reply.send(result);
                 }
                 CanvasCommand::GetScene { reply } => {
+                    // A whole-canvas read must see every object, including cold
+                    // ones: hydrate the full canvas, snapshot, then trim back.
+                    self.hydrate_full();
                     let _ = reply.send(self.scene.clone());
+                    self.evict_cold();
                 }
                 CanvasCommand::GetSceneRegion { bbox, reply } => {
+                    // A windowed read hydrates only the requested window from the
+                    // region index (load-on-demand), so it covers cold objects too
+                    // without pulling the whole canvas resident.
+                    self.hydrate_region(bbox);
                     let _ = reply.send(scene_in_region(&self.scene, bbox));
+                    self.evict_cold();
+                }
+                CanvasCommand::ResidentCount { reply } => {
+                    let count = self.scene.groups.len()
+                        + self.scene.nodes.len()
+                        + self.scene.edges.len();
+                    let _ = reply.send(count);
                 }
                 CanvasCommand::Shutdown { reply } => {
-                    // Checkpoints are written on the interval, so the journal tail
-                    // since the last one is only durable as journal entries. Force
-                    // a final checkpoint on clean shutdown so a graceful stop never
-                    // needs journal replay; an unclean stop (dropped handle) still
-                    // recovers via the journal tail.
+                    // Every op already writes through to the per-object store, so a
+                    // clean shutdown is durable without a final checkpoint. Still
+                    // hydrate fully and re-checkpoint so the pruning diff runs over
+                    // the COMPLETE scene (a trimmed working set must never make the
+                    // shutdown checkpoint delete cold objects' durable Records).
+                    self.hydrate_full();
                     self.checkpoint_scene();
                     let _ = reply.send(());
                     break;
@@ -633,9 +722,16 @@ impl CanvasActor {
         actor_user_id: &str,
     ) -> ApplyResult {
         let now = now();
+        // A render op may reference, reparent, delete, or order objects anywhere
+        // on the canvas (and the fractional order-key append scans all siblings of
+        // a kind), so the apply path must see the COMPLETE scene, not just the hot
+        // working set. Hydrate the full canvas (load-on-demand from the store),
+        // apply, write the touched objects through, then trim back to budget.
+        self.hydrate_full();
         // Canvas logic stays in scene-core; the actor never reimplements apply.
         let applied = apply_render_patch_to_shape_scene(&self.scene, &patch, &now, None);
         if !applied.errors.is_empty() {
+            self.evict_cold();
             return ApplyResult::Rejected {
                 errors: applied.errors,
             };
@@ -683,6 +779,14 @@ impl CanvasActor {
             author: Some(actor_user_id.to_string()),
         });
 
+        // `persist` already wrote this op through to the per-object store (every
+        // op checkpoints now, see `persist`), so every Record is exact to this op
+        // — the property that makes cold reload-on-demand lossless. Mark any object
+        // created by this op hot, then trim the working set back to budget; evicted
+        // objects stay durable in the store.
+        self.touch_all_resident();
+        self.evict_cold();
+
         ApplyResult::Applied {
             seq: self.seq,
             revision,
@@ -715,10 +819,15 @@ impl CanvasActor {
         body: &str,
         actor_user_id: &str,
     ) -> CommentResult {
+        // A comment targets an object that may be cold; the checkpoint after this
+        // op diffs the full scene to prune removed objects, so it must see the
+        // complete canvas. Hydrate fully, then trim back after.
+        self.hydrate_full();
         let now = now();
         // Canvas logic stays in scene-core; the actor never reimplements comment add.
         let applied = add_shape_scene_comment(&self.scene, target, body, &now);
         if !applied.errors.is_empty() {
+            self.evict_cold();
             return CommentResult::Rejected {
                 errors: applied.errors,
             };
@@ -755,6 +864,7 @@ impl CanvasActor {
             author: Some(actor_user_id.to_string()),
         });
 
+        self.evict_cold();
         CommentResult::Added { comment }
     }
 
@@ -766,9 +876,11 @@ impl CanvasActor {
         resolved: Option<bool>,
         actor_user_id: &str,
     ) -> CommentResult {
+        self.hydrate_full();
         let now = now();
         let applied = update_shape_scene_comment(&self.scene, comment_id, body, resolved, &now);
         if !applied.errors.is_empty() {
+            self.evict_cold();
             return CommentResult::Rejected {
                 errors: applied.errors,
             };
@@ -799,6 +911,7 @@ impl CanvasActor {
             scene: self.scene.clone(),
             author: Some(actor_user_id.to_string()),
         });
+        self.evict_cold();
         CommentResult::Added { comment }
     }
 
@@ -812,6 +925,9 @@ impl CanvasActor {
         patch: ScenePatch,
         actor_user_id: &str,
     ) -> ApplyResult {
+        // A bulk patch can add/remove/reorder objects anywhere; apply against the
+        // complete scene, persist through, then trim back.
+        self.hydrate_full();
         let now = now();
         let next = apply_scene_patch(&self.scene, &patch, &now);
         self.seq += 1;
@@ -831,6 +947,7 @@ impl CanvasActor {
             scene: self.scene.clone(),
             author: Some(actor_user_id.to_string()),
         });
+        self.evict_cold();
         ApplyResult::Applied {
             seq: self.seq,
             revision,
@@ -845,7 +962,11 @@ impl CanvasActor {
         group_id: &str,
         mut artifact: SceneArtifact,
     ) -> ArtifactResult {
+        // The target group may be cold; hydrate fully so the lookup and the
+        // post-op checkpoint both see the complete canvas.
+        self.hydrate_full();
         if !self.scene.groups.iter().any(|g| g.id == group_id) {
+            self.evict_cold();
             return ArtifactResult::Rejected {
                 errors: vec![format!("Group not found: {group_id}")],
             };
@@ -879,6 +1000,7 @@ impl CanvasActor {
             // Server-internal op (HTTP export): no client author to self-skip.
             author: None,
         });
+        self.evict_cold();
         ArtifactResult::Added { artifact }
     }
 
@@ -886,6 +1008,10 @@ impl CanvasActor {
     /// `Applied`) if the id is absent. Tags are global metadata, so this is a
     /// direct registry mutation, not a scene-core op.
     fn handle_update_tag(&mut self, tag: shape_scene_core::Tag) -> ApplyResult {
+        // The rebuild below spreads `self.scene`; hydrate fully first so it carries
+        // the complete placement set (else the post-op checkpoint would prune cold
+        // objects), then trim back after.
+        self.hydrate_full();
         let now = now();
         let tags: Vec<_> = self
             .scene
@@ -916,11 +1042,15 @@ impl CanvasActor {
             // Server-internal op (HTTP tag PATCH): no client author to self-skip.
             author: None,
         });
+        self.evict_cold();
         ApplyResult::Applied { seq: self.seq, revision }
     }
 
     /// Remove one tag from the registry, then persist + broadcast.
     fn handle_delete_tag(&mut self, tag_id: &str) -> ApplyResult {
+        // See `handle_update_tag`: hydrate fully so the scene rebuild + checkpoint
+        // carry the complete placement set.
+        self.hydrate_full();
         let now = now();
         let tags: Vec<_> = self
             .scene
@@ -952,22 +1082,27 @@ impl CanvasActor {
             // Server-internal op (HTTP tag DELETE): no client author to self-skip.
             author: None,
         });
+        self.evict_cold();
         ApplyResult::Applied { seq: self.seq, revision }
     }
 
     /// Append `entry` to the durable journal (every op), then checkpoint the
-    /// whole scene only every [`CHECKPOINT_INTERVAL`] ops (MG4.1). Between
-    /// checkpoints, recovery replays the journal tail past the last checkpoint,
-    /// so a crash after the last checkpoint still recovers every journaled op.
+    /// per-object store.
     ///
-    /// A non-render entry (`patch: None` — comment/tag/bulk-patch/artifact) cannot
-    /// be replayed on recovery: `recover_durable_state` skips entries with no
-    /// patch, so such an op is only durable once folded into a checkpoint. Force a
-    /// checkpoint for those ops so a crash between intervals neither loses the op
-    /// nor leaves the server `seq` ahead of the recovered `scene_version` (the two
-    /// must stay in lockstep for the per-property LWW convergence to be correct).
+    /// MG2.2 changes the cadence: with a bounded working set, a cold object can be
+    /// evicted and reloaded mid-session, so its per-object Record must be exact to
+    /// the last op that touched it — not merely current as of the last interval
+    /// checkpoint. The actor therefore checkpoints (write-through) on EVERY op.
+    /// Because the apply path hydrates the full scene before applying,
+    /// `checkpoint_scene` sees the complete canvas and writes every changed object
+    /// through region-indexed, so a later reload-on-demand is lossless. The
+    /// journal is still written per op (and never pruned) so the dedup table can be
+    /// rebuilt from its suffix on recovery (see [`rebuild_dedup_from_suffix`]).
+    ///
+    /// This also subsumes the older "non-render ops force a checkpoint" fix:
+    /// comment/tag/bulk-patch/artifact ops are folded in immediately, so a crash
+    /// never loses one nor leaves the server `seq` ahead of `scene_version`.
     fn persist(&mut self, entry: JournalEntry) {
-        let is_non_render = entry.patch.is_none();
         let journal_payload = serde_json::to_vec(&entry).expect("journal entry serializes");
         {
             let mut store = self.store.lock().expect("storage mutex poisoned");
@@ -981,9 +1116,7 @@ impl CanvasActor {
                 .expect("journal entry persists");
         }
 
-        if is_non_render || self.seq - self.checkpoint_seq >= CHECKPOINT_INTERVAL {
-            self.checkpoint_scene();
-        }
+        self.checkpoint_scene();
     }
 
     /// Checkpoint the scene as per-object Records (MG5.2a/MG5.2b): upsert one
@@ -1024,6 +1157,139 @@ impl CanvasActor {
 
         self.persisted_scene = self.scene.clone();
         self.checkpoint_seq = seq;
+    }
+
+    // --- MG2.2 bounded working set + cold LRU eviction -----------------------
+
+    /// The store Record ids of every resident placement object (group/node/edge) —
+    /// the LRU keys. Mirrors the ids `checkpoint_scene` writes, so an evicted
+    /// object reloads by the same id. Spine kinds (tags/comments/artifacts/meta)
+    /// are excluded: they are never tracked or evicted.
+    fn placement_record_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        for g in &self.scene.groups {
+            ids.push(object_record_id(&self.canvas_id, KIND_GROUP, &g.id));
+        }
+        for n in &self.scene.nodes {
+            ids.push(object_record_id(&self.canvas_id, KIND_NODE, &n.id));
+        }
+        for e in &self.scene.edges {
+            ids.push(object_record_id(&self.canvas_id, KIND_EDGE, &e.id));
+        }
+        ids
+    }
+
+    /// Mark every currently-resident placement object as touched. Used after a
+    /// full/region hydrate so freshly loaded objects are hot, and at spawn after
+    /// recovery so the initial trim has tick data for all of them.
+    fn touch_all_resident(&mut self) {
+        for id in self.placement_record_ids() {
+            self.lru.entry(id).or_insert_with(|| {
+                self.lru_clock += 1;
+                self.lru_clock
+            });
+        }
+    }
+
+    /// Replace the resident placement objects with the ones reconstructed from
+    /// `records` (a store read), preserving the spine (meta/tags/comments/
+    /// artifacts) from the current `self.scene`. The records carry the latest
+    /// per-object state because every op writes through (see `persist`), so this
+    /// is lossless. Each loaded placement object is marked hot.
+    fn install_placement_from_records(&mut self, records: Vec<Record>) {
+        // `records_to_scene` rebuilds a whole scene from records; we only adopt its
+        // placement collections, then re-stitch the live spine + meta back on so a
+        // partial (region) read never clobbers global metadata.
+        let loaded = records_to_scene(&self.canvas_id, records);
+        self.scene.groups = loaded.groups;
+        self.scene.nodes = loaded.nodes;
+        self.scene.edges = loaded.edges;
+        // Reset LRU to exactly the now-resident placement set; touch them all hot.
+        self.lru.clear();
+        self.touch_all_resident();
+    }
+
+    /// Hydrate the COMPLETE canvas into the working set from the durable store.
+    /// After this, `self.scene` holds every object, so a whole-scene op/read is
+    /// correct. Callers trim back with `evict_cold` afterward.
+    fn hydrate_full(&mut self) {
+        let records = self.load_canvas_records(None);
+        self.install_placement_from_records(records);
+    }
+
+    /// Hydrate only the placement objects overlapping `bbox` (load-on-demand for a
+    /// windowed read). `None` degrades to a full hydrate. The loaded window
+    /// REPLACES the resident placement set: a windowed reader holds only its
+    /// window, never the whole canvas.
+    fn hydrate_region(&mut self, bbox: Option<Bounds>) {
+        let window = bbox.map(|b| (b.x, b.y, b.x + b.width, b.y + b.height));
+        let records = self.load_canvas_records(window);
+        self.install_placement_from_records(records);
+    }
+
+    /// Load this canvas's per-object placement Records from the store, optionally
+    /// filtered to a region window. Region-indexed kinds (groups/nodes/edges) come
+    /// from `query_region`; the spine stays in memory and is not reloaded here.
+    fn load_canvas_records(&self, window: Option<(f64, f64, f64, f64)>) -> Vec<Record> {
+        let store = self.store.lock().expect("storage mutex poisoned");
+        store
+            .query_region(&self.canvas_id.0, window)
+            .expect("region query")
+            .map(|r| r.expect("record loads"))
+            .collect()
+    }
+
+    /// Trim the resident placement set down to `self.budget` (default
+    /// [`WORKING_SET_BUDGET`]) by dropping the least-recently-touched objects.
+    /// Evicted objects are NOT deleted from
+    /// the store (every op already wrote them through); they are only removed from
+    /// `self.scene` and the LRU map, so memory is bounded while durability is not
+    /// affected. The spine (meta/tags/comments/artifacts) is never evicted.
+    ///
+    /// An edge is kept only while BOTH its endpoint nodes are resident, so the
+    /// resident scene never holds a dangling edge after a node eviction; the edge
+    /// reloads with its endpoints on the next hydrate.
+    fn evict_cold(&mut self) {
+        let resident = self.scene.groups.len() + self.scene.nodes.len() + self.scene.edges.len();
+        if resident <= self.budget {
+            return;
+        }
+
+        // Rank resident placement objects by last-touch tick (ascending = coldest
+        // first) and choose the coldest to drop until we are within budget.
+        let mut ranked: Vec<(u64, String)> = self
+            .placement_record_ids()
+            .into_iter()
+            .map(|id| (self.lru.get(&id).copied().unwrap_or(0), id))
+            .collect();
+        ranked.sort_by_key(|(tick, _)| *tick);
+
+        let evict_count = resident - self.budget;
+        let mut evicted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, id) in ranked.into_iter().take(evict_count) {
+            evicted.insert(id);
+        }
+
+        let group_evicted = |id: &str| evicted.contains(&object_record_id(&self.canvas_id, KIND_GROUP, id));
+        let node_evicted = |id: &str| evicted.contains(&object_record_id(&self.canvas_id, KIND_NODE, id));
+        let edge_evicted = |id: &str| evicted.contains(&object_record_id(&self.canvas_id, KIND_EDGE, id));
+
+        self.scene.groups.retain(|g| !group_evicted(&g.id));
+        self.scene.nodes.retain(|n| !node_evicted(&n.id));
+        // Drop an edge if it was selected for eviction OR either endpoint node was
+        // evicted (no dangling edges in the resident set).
+        let resident_nodes: std::collections::HashSet<String> =
+            self.scene.nodes.iter().map(|n| n.id.clone()).collect();
+        self.scene.edges.retain(|e| {
+            !edge_evicted(&e.id)
+                && resident_nodes.contains(&e.source)
+                && resident_nodes.contains(&e.target)
+        });
+
+        // Forget the LRU ticks of everything no longer resident.
+        let still_resident: std::collections::HashSet<String> =
+            self.placement_record_ids().into_iter().collect();
+        self.lru.retain(|id, _| still_resident.contains(id));
     }
 }
 
@@ -1073,14 +1339,15 @@ struct RecoveredState {
 /// the live scene. This is what makes a crash after the last checkpoint
 /// recoverable, not just a checkpoint-only restore.
 ///
-/// Replay also rebuilds the dedup table (so a reconnecting client's replayed
-/// outbox stays idempotent across a restart) and the LWW property store (so
-/// per-property seq ordering survives recovery).
+/// Replay also rebuilds the LWW property store for the tail (so per-property seq
+/// ordering survives recovery). The dedup table is rebuilt SEPARATELY from a
+/// bounded journal suffix (not just the tail), because MG2.2 checkpoints every op
+/// — the tail is normally empty, yet a reconnecting client's replayed outbox must
+/// still be deduplicated across a restart. See [`rebuild_dedup_from_suffix`].
 fn recover_durable_state(canvas_id: &CanvasId, store: &SharedStore) -> RecoveredState {
     let (mut scene, checkpoint_seq) = load_checkpoint(canvas_id, store);
     let persisted_scene = scene.clone();
     let mut seq = checkpoint_seq;
-    let mut dedup = DedupTable::new();
     let mut props = PropertyStore::new();
 
     for entry in load_journal_tail(canvas_id, store, checkpoint_seq) {
@@ -1107,10 +1374,9 @@ fn recover_durable_state(canvas_id: &CanvasId, store: &SharedStore) -> Recovered
         // higher-seq winner), so the rebuilt scene + PropertyStore match the
         // originally-applied state byte for byte, not the raw op value.
         converge_lww_into(&mut props, &mut scene, &patch, entry.base_revision, entry.seq);
-        if let Some(op_id) = entry.op_id {
-            dedup.record(op_id, OpAck { seq: entry.seq, revision: scene.scene_version });
-        }
     }
+
+    let dedup = rebuild_dedup_from_suffix(canvas_id, store);
 
     RecoveredState {
         scene,
@@ -1120,6 +1386,27 @@ fn recover_durable_state(canvas_id: &CanvasId, store: &SharedStore) -> Recovered
         dedup,
         props,
     }
+}
+
+/// Rebuild the dedup table from the journal's last [`MAX_SEEN_OPS`] entries, in
+/// seq order, recording each entry's `(opId -> ack)`. The journal is never pruned,
+/// so the suffix is always available; this keeps idempotent re-apply working even
+/// though the per-op checkpoint usually leaves the replay tail empty. Mirrors the
+/// in-memory dedup bound so the recovered table matches a long-lived one.
+fn rebuild_dedup_from_suffix(canvas_id: &CanvasId, store: &SharedStore) -> DedupTable {
+    let mut dedup = DedupTable::new();
+    for entry in load_journal_suffix(canvas_id, store, MAX_SEEN_OPS) {
+        if let Some(op_id) = entry.op_id {
+            dedup.record(
+                op_id,
+                OpAck {
+                    seq: entry.seq,
+                    revision: entry.seq,
+                },
+            );
+        }
+    }
+    dedup
 }
 
 /// Load `(scene, checkpoint_seq)` by reconstructing the canvas from its per-object
@@ -1195,6 +1482,32 @@ fn load_journal_tail(
     tail
 }
 
+/// Load the last `max` journal entries by seq, in ascending seq order. Used to
+/// rebuild the bounded dedup table independent of the checkpoint floor (the
+/// per-op checkpoint usually leaves the replay tail empty, but recorded opIds must
+/// still survive a restart).
+fn load_journal_suffix(canvas_id: &CanvasId, store: &SharedStore, max: usize) -> Vec<JournalEntry> {
+    let store = store.lock().expect("storage mutex poisoned");
+    let prefix = format!("{canvas_id}:journal:");
+    let mut ids: Vec<String> = store
+        .list()
+        .expect("journal ids list")
+        .into_iter()
+        .filter(|id| id.starts_with(&prefix))
+        .collect();
+    ids.sort_by_key(|id| journal_seq_of(id, &prefix));
+    let start = ids.len().saturating_sub(max);
+
+    let mut suffix = Vec::new();
+    for id in &ids[start..] {
+        let record = store.load(id).expect("journal record loads");
+        let entry: JournalEntry =
+            serde_json::from_slice(&record.payload).expect("journal entry deserializes");
+        suffix.push(entry);
+    }
+    suffix
+}
+
 /// Parse the trailing `:journal:{seq}` integer from a journal record id.
 fn journal_seq_of(id: &str, prefix: &str) -> i64 {
     id.strip_prefix(prefix)
@@ -1202,10 +1515,10 @@ fn journal_seq_of(id: &str, prefix: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// Filter a scene to the objects intersecting `bbox` (MG9.5). Answered from the
-/// actor's live in-memory scene (correct + up to date), NOT from the storage
-/// region index — the spatial store backs a future actor-memory-eviction path,
-/// documented as a follow-up, not this region read.
+/// Filter a scene to the objects intersecting `bbox` (MG9.5). Applied to the
+/// actor's resident working set, which the `GetSceneRegion` command first hydrates
+/// for the requested window from the storage region index (MG2.2), so the filter
+/// covers cold objects without keeping the whole canvas resident.
 ///
 /// `bbox == None` returns the whole scene unchanged. Otherwise:
 /// - **groups**: kept when `group.bounds` intersects `bbox`.
