@@ -15,7 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Bounds, Scene};
+use crate::model::Bounds;
+use crate::object::ObjectScene;
 
 // ---------------------------------------------------------------------------
 // Subscription region.
@@ -106,7 +107,7 @@ pub enum ServerMessage {
     #[serde(rename_all = "camelCase")]
     Welcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        snapshot: Option<Scene>,
+        snapshot: Option<ObjectScene>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delta_since: Option<i64>,
         seq: i64,
@@ -304,18 +305,10 @@ mod tests {
 
     #[test]
     fn server_welcome_snapshot_round_trips() {
-        let snapshot = Scene {
-            version: 1,
+        let snapshot = ObjectScene {
             scene_version: 3,
-            groups: vec![],
-            nodes: vec![],
-            edges: vec![],
-            tags: vec![],
-            comments: vec![],
-            artifacts: vec![],
-            proposals: None,
-            selection: crate::model::SceneSelection::Canvas,
             updated_at: "2026-06-07T00:00:00.000Z".to_string(),
+            ..Default::default()
         };
         let msg = ServerMessage::Welcome {
             snapshot: Some(snapshot),

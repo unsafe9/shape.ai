@@ -2,11 +2,9 @@
 //! which canvas tool is currently armed.
 //!
 //! This is **ephemeral shell state**: scene-core owns only the type (and its
-//! default) so every platform shell shares one vocabulary, the same way the
-//! command catalog is shared. There is no persistence, no `Scene` field, and no
-//! op variant for the active tool — picking a tool is a UI concern; the result
-//! of *using* one is an ordinary `RenderScenePatch` (see [`crate::tool`] callers
-//! and `insert_primitive_ops`).
+//! default) so every platform shell shares one vocabulary. There is no
+//! persistence and no op variant for the active tool — picking a tool is a UI
+//! concern; the result of *using* one is an ordinary object op (`crate::object`).
 
 use serde::{Deserialize, Serialize};
 
