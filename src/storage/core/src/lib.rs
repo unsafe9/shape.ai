@@ -23,8 +23,10 @@
 //!   portability contract.
 
 mod adapter;
+mod adapter_async;
 mod adapters;
 mod error;
+pub mod morton;
 // The portable bundle format depends on std::fs + rayon, so it is native-only;
 // wasm32 keeps the data model + trait + MemoryAdapter and no on-disk format.
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,6 +35,7 @@ mod record;
 mod spatial;
 
 pub use adapter::{AdapterKind, RecordCursor, StorageAdapter};
+pub use adapter_async::{AsyncStorageAdapter, RegionWindow};
 pub use adapters::MemoryAdapter;
 #[cfg(not(target_arch = "wasm32"))]
 pub use adapters::{FileAdapter, PostgresAdapter, RemoteServerAdapter, S3Adapter};

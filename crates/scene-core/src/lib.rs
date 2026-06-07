@@ -19,6 +19,7 @@ pub mod fractional;
 pub mod graph;
 pub mod lww;
 pub mod model;
+pub mod object;
 pub mod op;
 pub mod primitive;
 pub mod templates;
