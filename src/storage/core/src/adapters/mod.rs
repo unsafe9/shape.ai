@@ -17,10 +17,6 @@ mod memory;
 // so they are native-only. wasm32 keeps just the in-memory adapter.
 #[cfg(not(target_arch = "wasm32"))]
 mod file;
-// The sqlite adapter is native-only (rusqlite is a native-only optional dep)
-// and behind the default `sqlite` feature.
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
-mod sqlite;
 // The redb adapter is native-only (redb + zstd are native-only optional deps)
 // and behind the `redb` feature. The file is named `redb_store` to avoid a
 // name collision with the `redb` crate at module-path resolution.
@@ -32,8 +28,6 @@ mod stubs;
 pub use memory::MemoryAdapter;
 #[cfg(not(target_arch = "wasm32"))]
 pub use file::FileAdapter;
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
-pub use sqlite::SqliteAdapter;
 #[cfg(all(not(target_arch = "wasm32"), feature = "redb"))]
 pub use redb_store::RedbAdapter;
 #[cfg(not(target_arch = "wasm32"))]

@@ -7,7 +7,7 @@
 //!   `{kind, version, payload}` with the payload **zstd-compressed at rest**
 //!   (T4); `load` decompresses transparently, so the payload round-trips byte
 //!   for byte.
-//! * **region** (`region_row_key(canvas, morton) -> value`): the Morton (Z-order)
+//! * **region** (`region_row_key(canvas, morton, object_id) -> value`): the Morton (Z-order)
 //!   region index (T2). The value frames `{object_id, bbox}`, so
 //!   [`query_region`](AsyncStorageAdapter::query_region) can range-scan the
 //!   Z-order window and refilter on the exact bbox **without loading the main
@@ -29,9 +29,9 @@
 use crate::adapter::{AdapterKind, RecordCursor, StorageAdapter};
 use crate::adapter_async::{AsyncStorageAdapter, RegionWindow};
 use crate::error::{Result, StorageError};
-use crate::morton::{morton_of_world, region_row_key};
+use crate::morton::{morton_of_world, region_row_key, region_scan_end_excl, region_scan_start};
 use crate::record::{Record, StoreSnapshot};
-use crate::spatial::RegionKey;
+use crate::spatial::{RegionKey, SpatialStore};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ use std::sync::Arc;
 /// The main record table: `id -> framed record value`.
 const MAIN: TableDefinition<&str, &[u8]> = TableDefinition::new("main");
 
-/// The region index table: `region_row_key(canvas, morton) -> framed region value`.
+/// The region index table: `region_row_key(canvas, morton, object_id) -> framed region value`.
 const REGION: TableDefinition<&[u8], &[u8]> = TableDefinition::new("region");
 
 /// redb-on-file store. Cloneable: the underlying [`Database`] is shared behind an
@@ -55,8 +55,23 @@ impl RedbAdapter {
     /// on first write; opening only needs the database file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Database::create(path.as_ref()).map_err(map_db)?;
-        // Materialize both tables so reads on a fresh store see empty tables
-        // rather than "table not found".
+        Self::from_db(db)
+    }
+
+    /// Open a redb store backed by an in-memory backend (for tests). Shares the
+    /// same surface as [`open`](Self::open) but never touches the filesystem, so
+    /// the server's in-memory registry/actor tests run without a temp file.
+    pub fn open_in_memory() -> Result<Self> {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(map_db)?;
+        Self::from_db(db)
+    }
+
+    /// Materialize both tables so reads on a fresh store see empty tables rather
+    /// than "table not found", then wrap the database. Shared by `open` and
+    /// `open_in_memory`.
+    fn from_db(db: Database) -> Result<Self> {
         let txn = db.begin_write().map_err(map_txn)?;
         {
             let _ = txn.open_table(MAIN).map_err(map_table)?;
@@ -220,7 +235,7 @@ impl RedbAdapter {
                 let cx = (key.min_x + key.max_x) / 2.0;
                 let cy = (key.min_y + key.max_y) / 2.0;
                 let morton = morton_of_world(cx, cy);
-                let row_key = region_row_key(&key.canvas_id, morton);
+                let row_key = region_row_key(&key.canvas_id, morton, &record.id);
                 let value = encode_region_value(&record.id, key);
                 region
                     .insert(row_key.as_slice(), value.as_slice())
@@ -239,18 +254,17 @@ impl RedbAdapter {
         let txn = self.db.begin_read().map_err(map_txn)?;
         let region = txn.open_table(REGION).map_err(map_table)?;
 
-        // Decide the inclusive key range to scan: a Morton window for a bounded
-        // query, or the whole canvas prefix when `window` is None.
-        let (lo_key, hi_key) = match window {
-            Some(w) => {
-                let (lo, hi) = w.morton_range();
-                (region_row_key(canvas_id, lo), region_row_key(canvas_id, hi))
-            }
-            None => (
-                region_row_key(canvas_id, u64::MIN),
-                region_row_key(canvas_id, u64::MAX),
-            ),
+        // Decide the half-open key range to scan: a Morton window for a bounded
+        // query, or the whole canvas's Morton space when `window` is None. The
+        // row keys carry an `object_id` tail (so co-located objects don't collide),
+        // so the end is the EXCLUSIVE first key of the cell past `hi` — covering
+        // every object id within the `hi` cell.
+        let (lo, hi) = match window {
+            Some(w) => w.morton_range(),
+            None => (u64::MIN, u64::MAX),
         };
+        let lo_key = region_scan_start(canvas_id, lo);
+        let hi_key = region_scan_end_excl(canvas_id, hi);
 
         // Range-scan the Z-order window, refilter each candidate on its exact
         // bbox, and collect surviving object ids. Only the survivors' main
@@ -258,7 +272,7 @@ impl RedbAdapter {
         // never touches the main table.
         let mut ids: Vec<String> = Vec::new();
         let range = region
-            .range(lo_key.as_slice()..=hi_key.as_slice())
+            .range(lo_key.as_slice()..hi_key.as_slice())
             .map_err(map_storage)?;
         for entry in range {
             let (_, v) = entry.map_err(map_storage)?;
@@ -400,6 +414,31 @@ impl AsyncStorageAdapter for RedbAdapter {
         let this = self.clone();
         let canvas_id = canvas_id.to_string();
         async move { this.region_query(&canvas_id, window) }
+    }
+}
+
+impl SpatialStore for RedbAdapter {
+    fn save_indexed(&mut self, record: Record, key: Option<RegionKey>) -> Result<()> {
+        self.put_indexed(&record, key.as_ref())
+    }
+
+    fn query_region(
+        &self,
+        canvas_id: &str,
+        bbox: Option<(f64, f64, f64, f64)>,
+    ) -> Result<RecordCursor<'_>> {
+        // The sync `SpatialStore` window is a raw `(min, max)` AABB tuple; the
+        // redb core scans by `RegionWindow`. region_query already returns the
+        // window's records id-sorted, so hand back an owning iterator (bounded by
+        // the window, exactly like the async surface).
+        let window = bbox.map(|(min_x, min_y, max_x, max_y)| RegionWindow {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        });
+        let records = self.region_query(canvas_id, window)?;
+        Ok(Box::new(records.into_iter().map(Ok)))
     }
 }
 

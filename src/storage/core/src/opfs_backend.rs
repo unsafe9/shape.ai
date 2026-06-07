@@ -65,6 +65,10 @@
 
 use std::io;
 
+// The wasm OPFS redb is keyed `redb_wasm` in Cargo.toml (renamed via `package`)
+// so the default-on native `redb` feature can't pull it into the default wasm
+// build; alias it back to `redb` here so every `redb::...` path below is unchanged.
+use redb_wasm as redb;
 use redb::{Database, StorageBackend};
 use web_sys::wasm_bindgen::JsValue;
 use web_sys::{FileSystemReadWriteOptions, FileSystemSyncAccessHandle};

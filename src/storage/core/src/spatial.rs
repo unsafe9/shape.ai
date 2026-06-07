@@ -179,19 +179,19 @@ mod tests {
         run_contract(MemoryAdapter::new());
     }
 
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "redb")]
     #[test]
-    fn sqlite_region_contract() {
-        run_contract(crate::adapters::SqliteAdapter::open_in_memory().unwrap());
+    fn redb_region_contract() {
+        run_contract(crate::adapters::RedbAdapter::open_in_memory().unwrap());
     }
 
-    /// sqlite and memory must return the *same id set* for the same query, across
+    /// redb and memory must return the *same id set* for the same query, across
     /// a varied multi-canvas dataset spanning more than one keyset page.
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "redb")]
     #[test]
-    fn sqlite_matches_memory() {
+    fn redb_matches_memory() {
         let mut mem = MemoryAdapter::new();
-        let mut sql = crate::adapters::SqliteAdapter::open_in_memory().unwrap();
+        let mut redb = crate::adapters::RedbAdapter::open_in_memory().unwrap();
 
         // Enough records to cross the cursor's keyset page boundary.
         for i in 0..600usize {
@@ -200,7 +200,7 @@ mod tests {
             let cy = (i % 7) as f64 * 10.0;
             let (record, key) = at(&format!("n-{i:04}"), canvas, cx, cy, 3.0);
             mem.save_indexed(record.clone(), Some(key.clone())).unwrap();
-            sql.save_indexed(record, Some(key)).unwrap();
+            redb.save_indexed(record, Some(key)).unwrap();
         }
 
         let queries: [(&str, Option<(f64, f64, f64, f64)>); 5] = [
@@ -212,8 +212,8 @@ mod tests {
         ];
         for (canvas, bbox) in queries {
             let m = ids(mem.query_region(canvas, bbox).unwrap());
-            let s = ids(sql.query_region(canvas, bbox).unwrap());
-            assert_eq!(m, s, "id set differs for query ({canvas}, {bbox:?})");
+            let r = ids(redb.query_region(canvas, bbox).unwrap());
+            assert_eq!(m, r, "id set differs for query ({canvas}, {bbox:?})");
             // And both stay id-sorted.
             let mut sorted = m.clone();
             sorted.sort();

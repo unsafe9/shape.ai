@@ -4,8 +4,7 @@
 //! require external crates or services that cannot be fetched in this
 //! environment. Each is a real `StorageAdapter` *shape* so callers can name and
 //! route to it, but the per-record I/O returns [`StorageError::Unsupported`]
-//! until a backend is wired in. (The `sqlite` kind has a real adapter now; see
-//! [`crate::adapters::SqliteAdapter`].)
+//! until a backend is wired in.
 //!
 //! Crucially, the portability surface is *not* faked: a real backend just needs
 //! to implement the streaming pair (`records`/`ingest`) plus `snapshot`/

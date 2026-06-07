@@ -73,7 +73,7 @@ use shape_scene_core::{
     bounds_intersect, node_bounds, update_shape_scene_comment, Bounds, CanvasId, PropertyStore,
     RenderScenePatch, Scene, SceneArtifact, SceneComment, ScenePatch, SceneSelection,
 };
-use shape_storage_core::{Record, SpatialStore, SqliteAdapter, StorageAdapter};
+use shape_storage_core::{Record, RedbAdapter, SpatialStore, StorageAdapter};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::scene_store::{
@@ -87,7 +87,7 @@ use crate::sync::{
 
 /// A single shared storage adapter, guarded so concurrent canvas actors can
 /// persist into the same backing store without racing.
-pub type SharedStore = Arc<Mutex<SqliteAdapter>>;
+pub type SharedStore = Arc<Mutex<RedbAdapter>>;
 
 /// How many placement objects (groups + nodes + edges) the resident working set
 /// holds before [`CanvasActor::evict_cold`] starts dropping the least-recently-

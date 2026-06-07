@@ -12,10 +12,10 @@ use shape_coordination::{Coordinator, InMemoryCoordinator};
 use shape_scene_core::{CanvasId, RenderGroup, RenderScenePatch, WorldRect};
 use shape_server::canvas_actor::SharedStore;
 use shape_server::{CanvasRegistry, SpawnError};
-use shape_storage_core::SqliteAdapter;
+use shape_storage_core::RedbAdapter;
 
 fn shared_store() -> SharedStore {
-    Arc::new(Mutex::new(SqliteAdapter::open_in_memory().unwrap()))
+    Arc::new(Mutex::new(RedbAdapter::open_in_memory().unwrap()))
 }
 
 fn create_group(id: &str) -> RenderScenePatch {

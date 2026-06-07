@@ -15,11 +15,10 @@
 //! * [`format`] — the one portable bundle format: a sharded directory written
 //!   and read incrementally (streaming, bounded buffers) and in parallel via
 //!   rayon, with per-shard CRCs for stability.
-//! * [`MemoryAdapter`] / [`FileAdapter`] / [`SqliteAdapter`] / `RedbAdapter` —
-//!   real, fully-tested adapters living under [`adapters`]. (`SqliteAdapter` is
-//!   native-only and behind the default `sqlite` feature; `RedbAdapter` is the
-//!   embedded redb-on-file store, native-only and behind the `redb` feature,
-//!   adding the async region-query surface.)
+//! * [`MemoryAdapter`] / [`FileAdapter`] / `RedbAdapter` —
+//!   real, fully-tested adapters living under [`adapters`]. (`RedbAdapter` is the
+//!   embedded redb-on-file store, the durable backend, native-only and behind the
+//!   default `redb` feature, adding the async region-query surface.)
 //! * [`PostgresAdapter`] / [`S3Adapter`] / [`RemoteServerAdapter`] —
 //!   clearly-marked stubs (drivers unavailable offline) that still keep the
 //!   portability contract.
@@ -46,8 +45,6 @@ pub use adapter_async::{AsyncStorageAdapter, RegionWindow};
 pub use adapters::MemoryAdapter;
 #[cfg(not(target_arch = "wasm32"))]
 pub use adapters::{FileAdapter, PostgresAdapter, RemoteServerAdapter, S3Adapter};
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
-pub use adapters::SqliteAdapter;
 #[cfg(all(not(target_arch = "wasm32"), feature = "redb"))]
 pub use adapters::RedbAdapter;
 pub use error::{Result, StorageError};
@@ -234,7 +231,6 @@ mod tests {
         assert_eq!(AdapterKind::Memory.as_str(), "memory");
         assert_eq!(AdapterKind::File.as_str(), "file");
         assert_eq!(AdapterKind::Redb.as_str(), "redb");
-        assert_eq!(AdapterKind::Sqlite.as_str(), "sqlite");
         assert_eq!(AdapterKind::Postgres.as_str(), "postgres");
         assert_eq!(AdapterKind::S3.as_str(), "s3");
         assert_eq!(AdapterKind::RemoteServer.as_str(), "remote-server");
@@ -326,9 +322,16 @@ mod integrity {
     use std::rc::Rc;
     use std::sync::Mutex;
 
-    /// Serializes the allocator-probing tests so only one arms the global probe
-    /// at a time (the probe's counters are process-global).
+    /// Serializes the allocator-probing tests (and any other test whose heavy,
+    /// concurrent allocations would pollute the process-global probe peak) so only
+    /// one of them is active at a time. Poison-tolerant: a probe-test assertion
+    /// failure poisons this guard, but it protects only a measurement window, not
+    /// shared data, so a later holder may safely reuse it.
     static PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn probe_guard() -> std::sync::MutexGuard<'static, ()> {
+        PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     struct TempDir(PathBuf);
     impl TempDir {
@@ -571,43 +574,51 @@ mod integrity {
     }
 
     /// The capstone byte-stability proof: the SAME logical dataset exported from
-    /// every real adapter — Memory (RAM), File (bundle dir), and Sqlite (native
-    /// rusqlite) — must produce byte-identical bundles (manifest + every shard),
-    /// and each bundle must re-import into a fresh MemoryAdapter reproducing the
-    /// source snapshot exactly. This proves the sqlite adapter is a first-class
-    /// participant in the one portable, byte-stable bundle format.
-    #[cfg(feature = "sqlite")]
+    /// every real adapter — Memory (RAM), File (bundle dir), and Redb (native
+    /// embedded engine, in-memory backend) — must produce byte-identical bundles
+    /// (manifest + every shard), and each bundle must re-import into a fresh
+    /// MemoryAdapter reproducing the source snapshot exactly. This proves the redb
+    /// adapter is a first-class participant in the one portable, byte-stable
+    /// bundle format.
+    #[cfg(feature = "redb")]
     #[test]
     fn all_adapters_export_byte_identical_and_reimport() {
+        // The redb in-memory backend + zstd buffers allocate several MB; hold the
+        // probe lock so this never overlaps an armed bounded-memory probe whose
+        // peak is process-global.
+        let _probe = probe_guard();
         let tmp = TempDir::new("alladapters");
 
         // Same dataset into all three adapter kinds.
         let (mem, expected) = loaded(MemoryAdapter::new());
         let (file, _) = loaded(open_file(&tmp, "store.shapestore"));
-        let mut sqlite = SqliteAdapter::open_in_memory().unwrap();
+        let mut redb = RedbAdapter::open_in_memory().unwrap();
         for r in &expected {
-            sqlite.save(r.clone()).unwrap();
+            // RedbAdapter impls both the sync `StorageAdapter` and the async
+            // `AsyncStorageAdapter` (both in scope via `use super::*`); disambiguate
+            // to the sync save the export path here relies on.
+            StorageAdapter::save(&mut redb, r.clone()).unwrap();
         }
 
         let mem_bundle = tmp.path().join("mem.shapestore");
         let file_bundle = tmp.path().join("file.shapestore");
-        let sqlite_bundle = tmp.path().join("sqlite.shapestore");
+        let redb_bundle = tmp.path().join("redb.shapestore");
         let man_mem = mem.export(&mem_bundle).unwrap();
         let man_file = file.export(&file_bundle).unwrap();
-        let man_sqlite = sqlite.export(&sqlite_bundle).unwrap();
+        let man_redb = redb.export(&redb_bundle).unwrap();
 
         // Manifests identical across all three adapter kinds.
         assert_eq!(man_mem, man_file, "memory vs file manifest");
-        assert_eq!(man_mem, man_sqlite, "memory vs sqlite manifest");
+        assert_eq!(man_mem, man_redb, "memory vs redb manifest");
 
         // And the full on-disk bundle bytes (manifest + every shard) identical.
         let bytes_mem = read_bundle_bytes(&mem_bundle);
         assert_eq!(bytes_mem, read_bundle_bytes(&file_bundle), "memory vs file bytes");
-        assert_eq!(bytes_mem, read_bundle_bytes(&sqlite_bundle), "memory vs sqlite bytes");
+        assert_eq!(bytes_mem, read_bundle_bytes(&redb_bundle), "memory vs redb bytes");
 
         // Every bundle re-imports into a fresh MemoryAdapter reproducing the snapshot.
         let source_snapshot = mem.snapshot().unwrap();
-        for bundle in [&mem_bundle, &file_bundle, &sqlite_bundle] {
+        for bundle in [&mem_bundle, &file_bundle, &redb_bundle] {
             let mut into = MemoryAdapter::new();
             into.import(bundle).unwrap();
             assert_eq!(
@@ -738,7 +749,7 @@ mod integrity {
         const PAYLOAD: usize = 128;
         let total_payload_bytes = N * PAYLOAD;
 
-        let _probe = PROBE_LOCK.lock().unwrap();
+        let _probe = probe_guard();
         let tmp = TempDir::new("large");
         let bundle = tmp.path().join("big.shapestore");
 
@@ -818,7 +829,7 @@ mod integrity {
         const PAYLOAD: usize = 48;
         // Avoid overlapping the allocator-probing large test (process-global
         // probe + heavy allocations would pollute its peak measurement).
-        let _probe = PROBE_LOCK.lock().unwrap();
+        let _probe = probe_guard();
         let tmp = TempDir::new("largefile");
         let src = tmp.path().join("src.shapestore");
         crate::format::export_stream(big_records(N, PAYLOAD), &src, DEFAULT_SHARD_COUNT).unwrap();

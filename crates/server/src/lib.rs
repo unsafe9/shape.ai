@@ -61,13 +61,13 @@ pub use ws::{ws_handler, WsClientMessage, WsServerMessage};
 /// into [`build_router_with_mcp`]. MG-3 hangs the WebSocket transport off the
 /// same registry.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    // Persist under SHAPE_AI_DATA_DIR/.local (canvas sqlite); MG-9 adds canvas
+    // Persist under SHAPE_AI_DATA_DIR/.local (canvas redb); MG-9 adds canvas
     // CRUD and per-canvas db routing.
     let data_dir = std::env::var("SHAPE_AI_DATA_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(".local"));
     std::fs::create_dir_all(&data_dir)?;
-    let canvases = CanvasRegistry::open(data_dir.join("shape.sqlite"))?;
+    let canvases = CanvasRegistry::open(data_dir.join("shape.redb"))?;
     let clients = ClientRegistry::new();
 
     let router = build_router_with_mcp(&config, canvases.clone(), clients);

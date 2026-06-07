@@ -77,7 +77,7 @@ fn create_card(id: &str, group_id: &str) -> RenderScenePatch {
 /// and the shared store (so a re-spawn on the SAME store can be tested).
 fn spawn_actor(canvas: &str) -> (ActorHandle, SharedStore) {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::SqliteAdapter::open_in_memory().unwrap(),
+        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
     ));
     let handle = CanvasActor::spawn(CanvasId::from(canvas), std::sync::Arc::clone(&store));
     (handle, store)
@@ -248,7 +248,7 @@ async fn duplicate_op_id_does_not_reapply_or_bump_seq() {
 #[tokio::test]
 async fn crash_after_journal_before_checkpoint_recovers_via_journal_replay() {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::SqliteAdapter::open_in_memory().unwrap(),
+        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
     ));
     let canvas = CanvasId::from("c-crash");
 
@@ -293,7 +293,7 @@ async fn crash_after_journal_before_checkpoint_recovers_via_journal_replay() {
 #[tokio::test]
 async fn checkpoint_then_journal_tail_both_recover() {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::SqliteAdapter::open_in_memory().unwrap(),
+        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
     ));
     let canvas = CanvasId::from("c-checkpoint");
     let total: i64 = 35;
@@ -468,7 +468,7 @@ async fn broadcast_carries_authoring_user_id() {
 #[tokio::test]
 async fn lww_convergence_survives_journal_replay() {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::SqliteAdapter::open_in_memory().unwrap(),
+        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
     ));
     let canvas = CanvasId::from("c-lww-replay");
 
@@ -502,7 +502,7 @@ async fn non_render_op_in_journal_tail_survives_crash() {
     use shape_scene_core::SceneSelection;
 
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::SqliteAdapter::open_in_memory().unwrap(),
+        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
     ));
     let canvas = CanvasId::from("c-comment-crash");
 
@@ -632,7 +632,7 @@ async fn checkpointed_objects_are_region_indexed_and_queryable() {
 #[tokio::test]
 async fn recovery_combines_per_object_checkpoint_and_journal_tail() {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::SqliteAdapter::open_in_memory().unwrap(),
+        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
     ));
     let canvas = CanvasId::from("c-combo");
     let total: i64 = 35; // > CHECKPOINT_INTERVAL (32): one checkpoint + a journal tail.
@@ -786,7 +786,7 @@ async fn get_scene_region_filters_to_window() {
 /// without a huge fixture. Returns the handle and the shared store.
 fn spawn_actor_with_budget(canvas: &str, budget: usize) -> (ActorHandle, SharedStore) {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
-        shape_storage_core::SqliteAdapter::open_in_memory().unwrap(),
+        shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
     ));
     let handle = CanvasActor::spawn_with_budget(
         CanvasId::from(canvas),

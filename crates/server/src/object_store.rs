@@ -21,13 +21,11 @@
 //!
 //! Region indexing rides the storage core's spatial capability. Two surfaces
 //! exist there: the **sync** [`SpatialStore`] (implemented by [`MemoryAdapter`]
-//! and `SqliteAdapter`) and the **async** [`AsyncStorageAdapter`] (implemented by
-//! `RedbAdapter`, the future cutover target). `MemoryAdapter` does *not* implement
-//! `AsyncStorageAdapter`, so the testable store here is built generically over the
-//! **sync** [`StorageAdapter`] for the basic save/load path and over
-//! [`SpatialStore`] for indexed writes + region queries. The async backend is
-//! wired in at the OB4.2 actor cutover, where the sync<->async bridge lives at the
-//! call site (never inside the store); the [`region_window_to_bbox`] helper and the
+//! and `RedbAdapter`) and the **async** [`AsyncStorageAdapter`] (also implemented
+//! by `RedbAdapter`). `MemoryAdapter` does *not* implement `AsyncStorageAdapter`,
+//! so the testable store here is built generically over the **sync**
+//! [`StorageAdapter`] for the basic save/load path and over [`SpatialStore`] for
+//! indexed writes + region queries; the [`region_window_to_bbox`] helper and the
 //! [`RegionKey`] computation here are shared by both paths.
 //!
 //! ## Working set
@@ -227,10 +225,8 @@ fn decode<T: for<'de> serde::Deserialize<'de>>(
 ///
 /// Generic over the **sync** [`StorageAdapter`]; the indexed-write and
 /// region-query methods add a [`SpatialStore`] bound so they compile only for
-/// backends that maintain a region index ([`MemoryAdapter`], `SqliteAdapter`). The
-/// async [`AsyncStorageAdapter`] backend (`RedbAdapter`) is bridged in at the actor
-/// seam during the OB4.2 cutover, reusing [`object_region_key`] and
-/// [`region_window_to_bbox`].
+/// backends that maintain a region index ([`MemoryAdapter`], `RedbAdapter`), reusing
+/// [`object_region_key`] and [`region_window_to_bbox`].
 pub struct ObjectStore<A: StorageAdapter> {
     adapter: A,
     /// Per-canvas working set: the hydrated scene plus its LWW property gate.

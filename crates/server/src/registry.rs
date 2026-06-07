@@ -1,7 +1,7 @@
 //! Canvas registry (MG2.4 + MG8 scale-out): the map from `canvasId` to its
 //! running actor, now lease-guarded and routable.
 //!
-//! One shared [`SqliteAdapter`] backs every canvas; the registry hands each
+//! One shared [`RedbAdapter`] backs every canvas; the registry hands each
 //! actor a clone of that shared store and tracks per-canvas last-activity so an
 //! idle canvas can be evicted (which flushes + checkpoints it). A re-`get` after
 //! eviction spawns a fresh actor that reloads the canvas's durable state.
@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use shape_coordination::{Coordinator, InMemoryCoordinator, Lease};
 use shape_scene_core::{CanvasId, CanvasSummary};
-use shape_storage_core::SqliteAdapter;
+use shape_storage_core::RedbAdapter;
 use tokio::sync::broadcast;
 
 use crate::canvas_actor::{ActorHandle, CanvasActor, SharedStore};
@@ -134,16 +134,16 @@ pub struct CanvasRegistry {
 }
 
 impl CanvasRegistry {
-    /// Build a registry over an open sqlite store with the default in-process
+    /// Build a registry over an open redb store with the default in-process
     /// coordinator and a default owner id. Single-process dev.
-    pub fn new(store: SqliteAdapter) -> Self {
+    pub fn new(store: RedbAdapter) -> Self {
         Self::with_coordinator(store, Arc::new(InMemoryCoordinator::new()), default_owner())
     }
 
     /// Build a registry with an explicit coordinator + owner id over a freshly
     /// wrapped store.
     pub fn with_coordinator(
-        store: SqliteAdapter,
+        store: RedbAdapter,
         coordinator: Arc<dyn Coordinator>,
         owner: impl Into<String>,
     ) -> Self {
@@ -154,7 +154,7 @@ impl CanvasRegistry {
     /// coordinator + owner id. The MG8.5 handoff tests use this so two registries
     /// share one coordinator AND one backing store (distinct owner ids), letting
     /// the successor recover the predecessor's durable scene after a lease
-    /// release — which an `open_in_memory` sqlite per registry could not do.
+    /// release — which an `open_in_memory` store per registry could not do.
     pub fn with_coordinator_store(
         store: SharedStore,
         coordinator: Arc<dyn Coordinator>,
@@ -171,16 +171,16 @@ impl CanvasRegistry {
         }
     }
 
-    /// Build a registry backed by an on-disk sqlite db at `path` (default
+    /// Build a registry backed by an on-disk redb db at `path` (default
     /// coordinator + owner).
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let store = SqliteAdapter::open(path)?;
+        let store = RedbAdapter::open(path)?;
         Ok(Self::new(store))
     }
 
-    /// Build a registry backed by an in-memory sqlite db (tests).
+    /// Build a registry backed by an in-memory redb db (tests).
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        let store = SqliteAdapter::open_in_memory()?;
+        let store = RedbAdapter::open_in_memory()?;
         Ok(Self::new(store))
     }
 
@@ -553,7 +553,7 @@ impl CanvasRegistry {
 
 /// Delete every Record under the `"{canvasId}:"` prefix (per-object, canvas-meta,
 /// and journal) so a deleted canvas leaves no scene state behind.
-fn prune_canvas_records(store: &mut SqliteAdapter, canvas_id: &CanvasId) {
+fn prune_canvas_records(store: &mut RedbAdapter, canvas_id: &CanvasId) {
     use shape_storage_core::StorageAdapter;
     let prefix = format!("{canvas_id}:");
     let ids: Vec<String> = store

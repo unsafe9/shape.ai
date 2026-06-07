@@ -14,7 +14,7 @@
 //! user removed is not silently resurrected on the next seed (e.g. after a
 //! restart that re-runs the seed guard against a fresh-looking metadata Record).
 //!
-//! These are plain functions over a `&mut SqliteAdapter`; the registry wraps
+//! These are plain functions over a `&mut RedbAdapter`; the registry wraps
 //! them with its shared-store mutex (see [`crate::registry`]).
 
 use shape_scene_core::{registry, TemplateContract};
@@ -142,10 +142,10 @@ mod tests {
         RecipeLayout, TemplateCategory, TemplateContract, TemplateExports, TemplateMetadata,
         TemplateRecipe, TemplateTags,
     };
-    use shape_storage_core::SqliteAdapter;
+    use shape_storage_core::RedbAdapter;
 
-    fn store() -> SqliteAdapter {
-        SqliteAdapter::open_in_memory().expect("in-memory sqlite")
+    fn store() -> RedbAdapter {
+        RedbAdapter::open_in_memory().expect("in-memory redb")
     }
 
     fn user_template(id: &str) -> TemplateContract {

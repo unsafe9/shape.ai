@@ -84,16 +84,44 @@ pub fn morton_range(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> (u64, u64
 }
 
 /// The big-endian keyspace row for a record: `canvas_id` bytes, a `0x00`
-/// separator, then the 8 big-endian Morton bytes. Byte order == (canvas, Morton)
-/// order, so an ordered KV range scan over `[canvas\0 lo .. canvas\0 hi]` yields
-/// exactly the Z-order window. Returned as bytes so any ordered KV (redb table,
-/// IndexedDB) can key on it directly.
-pub fn region_row_key(canvas_id: &str, morton: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(canvas_id.len() + 1 + 8);
+/// separator, the 8 big-endian Morton bytes, then the `object_id` bytes. Byte
+/// order == (canvas, Morton, object_id) order, so an ordered KV range scan over a
+/// Morton window yields exactly the Z-order window; the `object_id` tail makes the
+/// key UNIQUE per object, so two records whose bbox centers quantize to the same
+/// Morton cell get distinct rows instead of overwriting each other. Returned as
+/// bytes so any ordered KV (redb table, IndexedDB) can key on it directly.
+pub fn region_row_key(canvas_id: &str, morton: u64, object_id: &str) -> Vec<u8> {
+    let mut key = region_scan_start(canvas_id, morton);
+    key.extend_from_slice(object_id.as_bytes());
+    key
+}
+
+/// The inclusive lower bound of a Morton cell's rows: `canvas\0` + 8 Morton bytes,
+/// with no `object_id` tail, so it sorts at or before every [`region_row_key`] in
+/// that cell. Doubles as a region-scan window's start key.
+pub fn region_scan_start(canvas_id: &str, morton: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(canvas_id.len() + 1 + 8 + 16);
     key.extend_from_slice(canvas_id.as_bytes());
     key.push(0x00);
     key.extend_from_slice(&morton.to_be_bytes());
     key
+}
+
+/// The EXCLUSIVE upper bound that ends a region scan after every row in the
+/// Morton cell `hi_morton` (any `object_id` tail): the first key of the next cell,
+/// `canvas\0 + (hi_morton + 1)`. When `hi_morton == u64::MAX` there is no next
+/// cell, so bump the `0x00` canvas separator to `0x01` — the first key past the
+/// whole canvas's Morton space — which stays pointer-width-agnostic (no `usize`).
+pub fn region_scan_end_excl(canvas_id: &str, hi_morton: u64) -> Vec<u8> {
+    match hi_morton.checked_add(1) {
+        Some(next) => region_scan_start(canvas_id, next),
+        None => {
+            let mut key = Vec::with_capacity(canvas_id.len() + 1);
+            key.extend_from_slice(canvas_id.as_bytes());
+            key.push(0x01);
+            key
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,11 +159,26 @@ mod tests {
     }
 
     #[test]
-    fn region_row_key_orders_by_canvas_then_morton() {
-        let a = region_row_key("canvas-a", 5);
-        let b = region_row_key("canvas-a", 9);
-        let c = region_row_key("canvas-b", 1);
+    fn region_row_key_orders_by_canvas_then_morton_then_id() {
+        let a = region_row_key("canvas-a", 5, "obj");
+        let b = region_row_key("canvas-a", 9, "obj");
+        let c = region_row_key("canvas-b", 1, "obj");
         assert!(a < b, "same canvas orders by morton");
         assert!(b < c, "canvas prefix dominates");
+
+        // Two objects in the SAME Morton cell get distinct, id-ordered rows, and a
+        // scan over that cell brackets both (start inclusive, next-cell exclusive).
+        let o1 = region_row_key("canvas-a", 5, "id-1");
+        let o2 = region_row_key("canvas-a", 5, "id-2");
+        assert_ne!(o1, o2, "same cell, distinct ids -> distinct rows");
+        assert!(o1 < o2, "rows in a cell order by object id");
+        let start = region_scan_start("canvas-a", 5);
+        let end = region_scan_end_excl("canvas-a", 5);
+        assert!(start <= o1 && o1 < end && o2 < end, "scan brackets the cell");
+
+        // u64::MAX cell still gets a valid exclusive end past the whole canvas.
+        let max_row = region_row_key("canvas-a", u64::MAX, "z");
+        let max_end = region_scan_end_excl("canvas-a", u64::MAX);
+        assert!(max_row < max_end, "u64::MAX cell has a valid exclusive end");
     }
 }
