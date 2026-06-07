@@ -50,8 +50,15 @@ export type AppliedTemplate = Record<string, unknown>;
 // Shape of the generated wasm-pack module (`shape_scene_core.js`). Declared
 // locally — matching wasmLoader.ts — so this file does not statically import the
 // gitignored build artifact's types; the dynamic import is `@vite-ignore`d.
+//
+// The module is built `--target web`, which exposes BOTH an async `default`
+// (`__wbg_init`, browser: fetch the `.wasm` relative to the JS) and a sync
+// `initSync` (init from already-loaded wasm bytes/module). The browser uses
+// `default`; Node/vitest cannot `fetch()` the module, so it reads the `.wasm`
+// from the filesystem and inits synchronously via `initSync`.
 type SceneCoreModule = {
   default: (init?: unknown) => Promise<unknown>;
+  initSync: (module: { module: BufferSource | WebAssembly.Module }) => unknown;
   apply_render_patch: (sceneJson: string, patchJson: string, now: string) => string;
   add_comment: (sceneJson: string, targetJson: string, body: string, now: string) => string;
   update_group_tags: (
@@ -104,10 +111,42 @@ export type SceneCore = {
 };
 
 let modulePromise: Promise<SceneCoreModule> | null = null;
+// Set once the wasm instance is initialized; backs the synchronous op-apply the
+// sync engine uses on its hot path (after `ensureSceneCore` has resolved).
+let readyModule: SceneCoreModule | null = null;
 
 // `Tag` is part of scene-core's serde surface (tags ride inside Scene); imported
 // to anchor the type contract even though no wrapper takes a bare Tag yet.
 export type { Tag };
+
+/** True under Node/vitest (no `fetch`-served wasm), false in the browser. */
+function isNodeRuntime(): boolean {
+  return (
+    typeof process !== "undefined" &&
+    process.versions != null &&
+    process.versions.node != null &&
+    typeof (globalThis as { window?: unknown }).window === "undefined"
+  );
+}
+
+/**
+ * Init the wasm instance under Node/vitest. The `--target web` module cannot
+ * `fetch()`, so read the sibling `.wasm` from disk and init synchronously via
+ * `initSync`. The path is resolved from this file's URL so it works regardless of
+ * the test's cwd. Built by `npm run scene:wasm:build` into `./wasm`.
+ *
+ * The `node:` specifiers are assembled at runtime and `@vite-ignore`d so Vite's
+ * browser bundler never statically resolves (or warns about) them — this branch
+ * is only ever reached under Node, never in the browser.
+ */
+async function initUnderNode(mod: SceneCoreModule): Promise<void> {
+  const nodeImport = (name: string) => import(/* @vite-ignore */ `node:${name}`);
+  const { readFileSync } = (await nodeImport("fs")) as typeof import("node:fs");
+  const { fileURLToPath } = (await nodeImport("url")) as typeof import("node:url");
+  const wasmUrl = new URL("./wasm/shape_scene_core_bg.wasm", import.meta.url);
+  const bytes = readFileSync(fileURLToPath(wasmUrl));
+  mod.initSync({ module: bytes });
+}
 
 /**
  * Parse a bridge return string. If it is the `{ error }` shape the bridge emits
@@ -127,7 +166,11 @@ async function loadModule(): Promise<SceneCoreModule> {
     modulePromise = (async () => {
       const modulePath = "./wasm/shape_scene_core.js";
       const mod = (await import(/* @vite-ignore */ modulePath)) as SceneCoreModule;
-      await mod.default();
+      // Browser: `default` fetches the sibling `.wasm`. Node/vitest: read the
+      // bytes from disk and init synchronously (no `fetch`).
+      if (isNodeRuntime()) await initUnderNode(mod);
+      else await mod.default();
+      readyModule = mod;
       return mod;
     })();
   }
@@ -181,4 +224,30 @@ export async function loadSceneCore(): Promise<SceneCore> {
       return parseBridge<Command[]>("command_catalog", mod.command_catalog());
     }
   };
+}
+
+/**
+ * Idempotently initialize the scene-core wasm instance so the synchronous
+ * {@link applyRenderPatchSync} can run afterwards. The sync engine's owner awaits
+ * this once (e.g. before `connect`) — the same `--target web` artifact backs both
+ * the browser and Node/vitest, so the engine runs the SAME op-apply everywhere.
+ */
+export async function ensureSceneCore(): Promise<void> {
+  await loadModule();
+}
+
+/**
+ * Synchronous op-apply, the sync engine's hot path. Requires {@link ensureSceneCore}
+ * to have resolved first (the wasm instance must be initialized); throws if not,
+ * since the engine's `author`/`applyRemote`/`reconcileSnapshot` are synchronous
+ * and cannot await an init. This is THE op-apply — the same Rust the server runs.
+ */
+export function applyRenderPatchSync(scene: Scene, patch: RenderScenePatch, now: string): RenderResult {
+  if (!readyModule) {
+    throw new Error("scene-core wasm is not initialized; await ensureSceneCore() before applyRenderPatchSync()");
+  }
+  return parseBridge<RenderResult>(
+    "apply_render_patch",
+    readyModule.apply_render_patch(JSON.stringify(scene), JSON.stringify(patch), now)
+  );
 }

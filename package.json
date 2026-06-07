@@ -11,6 +11,7 @@
     "build": "npm run scene:wasm:build && npm run renderer:wasm:build && vite build",
     "build:svelte": "npm run build",
     "test": "vitest run",
+    "pretest:unit": "npm run scene:wasm:build",
     "test:unit": "vitest run",
     "renderer:test": "vitest run tests/infinite-canvas-renderer.test.ts",
     "renderer:rust:test": "scripts/renderer-toolchain.sh cargo test --manifest-path src/renderer/core/Cargo.toml --features wgpu-probe",

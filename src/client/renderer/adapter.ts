@@ -1,12 +1,10 @@
 import type { Scene, SceneEdge, SceneNode } from "../../shared/schema";
 
 export { excludedBusinessFields, shapeSceneToRenderSnapshot } from "../../shared/renderScene";
-export {
-  addShapeSceneComment,
-  applyRenderPatchToShapeScene,
-  shapeSceneToFilteredRenderSnapshot,
-  updateShapeSceneGroupTags
-} from "../../shared/renderPatch";
+// Render projection only; the op-apply (apply/updateGroupTags/addComment) is the
+// scene-core wasm at runtime and the golden-oracle TS only in tests, so it is not
+// re-exported through this client-runtime adapter (see CLAUDE.md Operating Notes).
+export { shapeSceneToFilteredRenderSnapshot } from "../../shared/renderPatch";
 export type { AppliedCommentUpdate, AppliedRenderPatch, RenderScenePatch } from "../../shared/renderPatch";
 
 const generatedAt = "2026-06-05T00:00:00.000Z";
