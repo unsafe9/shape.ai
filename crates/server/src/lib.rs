@@ -24,6 +24,11 @@ pub mod group_seed;
 pub mod local_export;
 pub mod mcp;
 pub mod mcp_clients;
+// Object-native path (OB-3), built alongside the legacy server; the OB-4 cutover
+// rewires the router/actor onto these and removes the legacy modules.
+pub mod object_feature;
+pub mod object_mcp;
+pub mod object_store;
 pub mod registry;
 pub mod scene_api;
 pub mod scene_store;
@@ -39,6 +44,13 @@ pub use sync::{DedupTable, OpAck, OpEnvelope, OpId, CHECKPOINT_INTERVAL};
 pub use config::Config;
 pub use mcp::{SceneMcp, DEFAULT_CANVAS_ID};
 pub use mcp_clients::ClientRegistry;
+pub use object_feature::{
+    decode_feature, encode_feature_response, handle_feature, FeatureCtx,
+};
+pub use object_mcp::{
+    object_mcp_tools, CreateObjectSpec, McpToolMeta, ObjectSummary, PatchObjectSpec, QueryFilter,
+};
+pub use object_store::{ObjectStore, ObjectStoreError, KIND_CANVAS, KIND_OBJECT};
 pub use registry::{CanvasRegistry, SpawnError};
 pub use ws::{ws_handler, WsClientMessage, WsServerMessage};
 
