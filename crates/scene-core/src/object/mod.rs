@@ -18,10 +18,12 @@
 pub mod anchors;
 pub mod apply;
 pub mod commands;
+pub mod drawing;
 pub mod layout_solve;
 pub mod model;
 pub mod op;
 pub mod region;
+pub mod templates;
 pub mod undo;
 pub mod validate;
 
@@ -30,7 +32,12 @@ pub use apply::{apply_object_op, apply_object_op_lww, apply_sequence, ApplyError
 pub use commands::{
     object_command_catalog, object_command_catalog_json, ObjectCommand, ObjectCommandCategory,
 };
+pub use drawing::{fit_beziers, pressure_to_width, rdp_simplify, Brush, DrawingSession};
 pub use layout_solve::solve_layout;
+pub use templates::{
+    build_template, object_template_catalog, semantic_preset_style, semantic_presets,
+    template_to_ops, ObjectTemplate, ObjectTemplateMeta, TemplateCategory,
+};
 pub use undo::{UndoEntry, UndoStack};
 pub use validate::{
     validate_anchor_targets, validate_geometry, validate_no_parent_cycle, validate_object,
