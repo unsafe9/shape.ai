@@ -9,13 +9,33 @@
 //! - [`op`] — the [`op::ObjectOp`] union + wire feature channels (D21/OB1.2).
 //! - [`region`] — derived outline/region contract (D6/OB1.3).
 //! - [`apply`] — op-apply + inverse-op capture (OB3.S1 slice).
+//! - [`anchors`] — anchor endpoint resolution + connection graph (OB3.S4/D5).
+//! - [`undo`] — per-actor undo/redo engine (OB3.S8/D21).
+//! - [`commands`] — object command catalog (OB3.S9).
+//! - [`layout_solve`] — thin auto-layout solve (OB3.A1/D3).
+//! - [`validate`] — pure structural validators (OB3.S2).
 
+pub mod anchors;
 pub mod apply;
+pub mod commands;
+pub mod layout_solve;
 pub mod model;
 pub mod op;
 pub mod region;
+pub mod undo;
+pub mod validate;
 
-pub use apply::{apply_object_op, apply_sequence, ApplyError};
+pub use anchors::{connection_graph, neighbors, reproject_object_anchors, resolve_endpoint};
+pub use apply::{apply_object_op, apply_object_op_lww, apply_sequence, ApplyError};
+pub use commands::{
+    object_command_catalog, object_command_catalog_json, ObjectCommand, ObjectCommandCategory,
+};
+pub use layout_solve::solve_layout;
+pub use undo::{UndoEntry, UndoStack};
+pub use validate::{
+    validate_anchor_targets, validate_geometry, validate_no_parent_cycle, validate_object,
+    validate_scene, ValidationError,
+};
 pub use model::{
     Anchor, Comment, CommentAnchor, ContentEmbed, Fill, FillRule, Geometry, GradientStop,
     HandlePoint, Layout, LayoutAlign, LayoutDirection, LayoutSizing, LineCap, LineJoin, LocalPoint,
