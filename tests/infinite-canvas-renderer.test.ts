@@ -800,6 +800,59 @@ describe("infinite canvas renderer contract", () => {
     expect(patchBatches).toHaveLength(0);
   });
 
+  it("pushes the transient multi-select set as a set-multi-select input event when the wasm lacks setMultiSelect", () => {
+    const fixture = createBenchmarkFixture({ seed: 21, cards: 4, edges: 2 });
+    const renderer = createOverlayTestRenderer(fixture);
+    const inputBatch = renderer.inputBatch.bind(renderer);
+    let inputEvents: unknown[] = [];
+    renderer.inputBatch = (eventsJson) => {
+      inputEvents = JSON.parse(eventsJson) as unknown[];
+      return inputBatch(eventsJson);
+    };
+    const engine = new ShapeCanvasEngine({
+      canvas: testCanvas(),
+      overlayRoot: testOverlayRoot(),
+      backend: "test",
+      webGpuRenderer: renderer,
+      onEvent() {}
+    });
+
+    engine.loadScene(fixture);
+    const ids = [fixture.cards[0].id, fixture.cards[1].id];
+    engine.setMultiSelect(ids);
+
+    expect(inputEvents).toEqual([{ kind: "set-multi-select", ids }]);
+  });
+
+  it("prefers the direct wasm setMultiSelect with JSON-encoded ids when available", () => {
+    const fixture = createBenchmarkFixture({ seed: 22, cards: 4, edges: 2 });
+    const renderer = createOverlayTestRenderer(fixture);
+    const directCalls: string[] = [];
+    let inputBatchCalls = 0;
+    const inputBatch = renderer.inputBatch.bind(renderer);
+    renderer.inputBatch = (eventsJson) => {
+      inputBatchCalls += 1;
+      return inputBatch(eventsJson);
+    };
+    renderer.setMultiSelect = (idsJson) => {
+      directCalls.push(idsJson);
+    };
+    const engine = new ShapeCanvasEngine({
+      canvas: testCanvas(),
+      overlayRoot: testOverlayRoot(),
+      backend: "test",
+      webGpuRenderer: renderer,
+      onEvent() {}
+    });
+
+    engine.loadScene(fixture);
+    const ids = [fixture.cards[0].id, fixture.cards[1].id];
+    engine.setMultiSelect(ids);
+
+    expect(directCalls).toEqual([JSON.stringify(ids)]);
+    expect(inputBatchCalls).toBe(0);
+  });
+
   it("defers full Rust scene reloads while a mouse drag is active", () => {
     const fixture = createBenchmarkFixture({ seed: 19, cards: 4, edges: 2 });
     const canvas = testCanvasWithListeners();

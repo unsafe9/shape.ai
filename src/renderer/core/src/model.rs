@@ -330,6 +330,11 @@ pub struct SceneSnapshot {
     pub styles: Vec<SceneStyleToken>,
     #[serde(default)]
     pub selection: SceneSelection,
+    // Transient shell-owned multi-select set, pushed via `set-multi-select`. Never
+    // serialized: the persisted single-anchor `selection` invariant stays intact,
+    // while the draw path highlights every id in this set in addition to it.
+    #[serde(skip)]
+    pub multi_select: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -471,6 +476,12 @@ pub(crate) enum CanvasInputEvent {
     },
     SetTool {
         tool: ActiveTool,
+    },
+    // Replace the transient multi-select set highlighted on the canvas. The shell
+    // pushes its `multiSelectIds`; an empty list clears the set. The persisted
+    // single-anchor selection is unaffected.
+    SetMultiSelect {
+        ids: Vec<String>,
     },
     // Right-click pick: returns the hit for `screen` in CoreInputBatchResult
     // without mutating selection or starting a drag, so the shell can show a
