@@ -959,7 +959,15 @@ impl CanvasActor {
     /// whole scene only every [`CHECKPOINT_INTERVAL`] ops (MG4.1). Between
     /// checkpoints, recovery replays the journal tail past the last checkpoint,
     /// so a crash after the last checkpoint still recovers every journaled op.
+    ///
+    /// A non-render entry (`patch: None` — comment/tag/bulk-patch/artifact) cannot
+    /// be replayed on recovery: `recover_durable_state` skips entries with no
+    /// patch, so such an op is only durable once folded into a checkpoint. Force a
+    /// checkpoint for those ops so a crash between intervals neither loses the op
+    /// nor leaves the server `seq` ahead of the recovered `scene_version` (the two
+    /// must stay in lockstep for the per-property LWW convergence to be correct).
     fn persist(&mut self, entry: JournalEntry) {
+        let is_non_render = entry.patch.is_none();
         let journal_payload = serde_json::to_vec(&entry).expect("journal entry serializes");
         {
             let mut store = self.store.lock().expect("storage mutex poisoned");
@@ -973,7 +981,7 @@ impl CanvasActor {
                 .expect("journal entry persists");
         }
 
-        if self.seq - self.checkpoint_seq >= CHECKPOINT_INTERVAL {
+        if is_non_render || self.seq - self.checkpoint_seq >= CHECKPOINT_INTERVAL {
             self.checkpoint_scene();
         }
     }

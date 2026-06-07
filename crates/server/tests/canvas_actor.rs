@@ -492,6 +492,50 @@ async fn lww_convergence_survives_journal_replay() {
     );
 }
 
+/// A non-render op (a comment) authored between checkpoints must survive a crash.
+/// It is journaled with `patch: None` and so cannot be replayed on recovery; the
+/// actor therefore forces a checkpoint for non-render ops. Without that, a comment
+/// created in the window before the next checkpoint would be lost on respawn, and
+/// the recovered `seq` would run ahead of `scene_version` (breaking LWW lockstep).
+#[tokio::test]
+async fn non_render_op_in_journal_tail_survives_crash() {
+    use shape_scene_core::SceneSelection;
+
+    let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
+        shape_storage_core::SqliteAdapter::open_in_memory().unwrap(),
+    ));
+    let canvas = CanvasId::from("c-comment-crash");
+
+    {
+        let handle = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
+        handle.apply_patch(create_group("g1"), "user-1").await; // seq 1
+        handle.apply_patch(create_card("n1", "g1"), "user-1").await; // seq 2
+        // A comment is a non-render op (patch: None) — only durable via checkpoint.
+        let added = handle
+            .add_comment(SceneSelection::Node { id: "n1".to_string() }, "note", "user-1")
+            .await;
+        assert!(
+            matches!(added, shape_server::CommentResult::Added { .. }),
+            "comment added, got {added:?}"
+        );
+        // Crash WITHOUT a clean shutdown: no final checkpoint is forced by Shutdown.
+        drop(handle);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let reborn = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
+    let scene = reborn.get_scene().await;
+    assert_eq!(scene.comments.len(), 1, "comment recovered across the crash");
+    assert_eq!(scene.comments[0].body, "note");
+
+    // seq stayed in lockstep with scene_version: the next op acks revision == seq.
+    let next = reborn.apply_patch(create_card("n2", "g1"), "user-1").await;
+    assert!(
+        matches!(next, ApplyResult::Applied { seq, revision } if seq == revision),
+        "seq and revision stay in lockstep after recovering a non-render op, got {next:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // MG-5.2a/MG-5.2b: per-object canonical scene store (region-indexed) + recovery.
 // ---------------------------------------------------------------------------
