@@ -1,0 +1,178 @@
+// U4 — toolbar shortcut dispatch + object-primitive mapping.
+//
+// The shortcut dispatcher matches a keydown against the object command catalog
+// (the wasm core's object_command_catalog(), loaded here via the real scene-core
+// WASM — P1, no TS mirror) and invokes a registered handler. The toolbar's
+// insert-* commands map to object-primitive kinds.
+
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  createShortcutDispatcher,
+  isTypingTarget,
+  matchCommand,
+  parseShortcut
+} from "../src/client/lib/shortcuts";
+import { ensureSceneCore, loadSceneCore, type ObjectCommand } from "../src/client/scene/sceneCoreWasm";
+import { insertCommandToPrimitive, primitiveForCommand, primitiveOrder } from "../src/client/lib/toolbar";
+
+let catalog: ObjectCommand[];
+
+beforeAll(async () => {
+  await ensureSceneCore();
+  const core = await loadSceneCore();
+  catalog = core.objectCommandCatalog();
+});
+
+function keyEvent(init: {
+  key: string;
+  code?: string;
+  meta?: boolean;
+  ctrl?: boolean;
+  shift?: boolean;
+  alt?: boolean;
+  target?: unknown;
+}): KeyboardEvent {
+  return {
+    key: init.key,
+    code: init.code ?? "",
+    metaKey: init.meta ?? false,
+    ctrlKey: init.ctrl ?? false,
+    shiftKey: init.shift ?? false,
+    altKey: init.alt ?? false,
+    target: init.target ?? null,
+    preventDefault: vi.fn()
+  } as unknown as KeyboardEvent;
+}
+
+describe("object command catalog (from the wasm core)", () => {
+  it("is non-empty with id/label/category rows", () => {
+    expect(catalog.length).toBeGreaterThan(0);
+    for (const command of catalog) {
+      expect(typeof command.id).toBe("string");
+      expect(typeof command.label).toBe("string");
+      expect(typeof command.category).toBe("string");
+    }
+  });
+
+  it("has unique command ids", () => {
+    const ids = catalog.map((command) => command.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("carries undo / redo with their bindings", () => {
+    expect(catalog.find((c) => c.id === "undo")?.defaultShortcut).toBe("Mod+Z");
+    expect(catalog.find((c) => c.id === "redo")?.defaultShortcut).toBe("Mod+Shift+Z");
+  });
+});
+
+describe("parseShortcut", () => {
+  it("parses a Mod+Shift combo", () => {
+    expect(parseShortcut("Mod+Shift+G")).toEqual({ key: "g", mod: true, shift: true, alt: false });
+  });
+
+  it("parses a bare key", () => {
+    expect(parseShortcut("V")).toEqual({ key: "v", mod: false, shift: false, alt: false });
+  });
+
+  it("parses symbol keys", () => {
+    expect(parseShortcut("[").key).toBe("[");
+    expect(parseShortcut("Mod+=").key).toBe("=");
+  });
+});
+
+describe("matchCommand (against the object catalog)", () => {
+  it("maps Backspace to delete", () => {
+    expect(matchCommand(keyEvent({ key: "Backspace" }), catalog, true)).toBe("delete");
+  });
+
+  it("resolves Mod to Cmd on mac and Ctrl elsewhere", () => {
+    expect(matchCommand(keyEvent({ key: "a", meta: true }), catalog, true)).toBe("select-all");
+    expect(matchCommand(keyEvent({ key: "a", ctrl: true }), catalog, false)).toBe("select-all");
+    expect(matchCommand(keyEvent({ key: "a", meta: true }), catalog, false)).toBeNull();
+  });
+
+  it("requires the exact modifier set (Mod+Z is undo, Mod+Shift+Z is redo)", () => {
+    expect(matchCommand(keyEvent({ key: "z", meta: true }), catalog, true)).toBe("undo");
+    expect(matchCommand(keyEvent({ key: "z", meta: true, shift: true }), catalog, true)).toBe("redo");
+  });
+
+  it("returns null for unbound keys", () => {
+    expect(matchCommand(keyEvent({ key: "q", meta: true }), catalog, true)).toBeNull();
+  });
+});
+
+describe("isTypingTarget", () => {
+  it("treats input/textarea/select as typing surfaces", () => {
+    expect(isTypingTarget({ tagName: "INPUT", isContentEditable: false } as unknown as HTMLElement)).toBe(true);
+    expect(isTypingTarget({ tagName: "TEXTAREA", isContentEditable: false } as unknown as HTMLElement)).toBe(true);
+    expect(isTypingTarget({ tagName: "SELECT", isContentEditable: false } as unknown as HTMLElement)).toBe(true);
+  });
+
+  it("treats contenteditable regions as typing surfaces", () => {
+    expect(isTypingTarget({ tagName: "DIV", isContentEditable: true } as unknown as HTMLElement)).toBe(true);
+  });
+
+  it("treats plain elements as non-typing", () => {
+    expect(isTypingTarget({ tagName: "DIV", isContentEditable: false } as unknown as HTMLElement)).toBe(false);
+    expect(isTypingTarget(null)).toBe(false);
+  });
+});
+
+describe("createShortcutDispatcher", () => {
+  it("invokes the registered handler and preventDefault for a matched command", () => {
+    const onDelete = vi.fn();
+    const dispatch = createShortcutDispatcher({ catalog, isMac: true, handlers: { delete: onDelete } });
+    const event = keyEvent({ key: "Backspace" });
+    expect(dispatch(event)).toBe("delete");
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    expect(event.preventDefault).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores commands with no registered handler (no preventDefault)", () => {
+    const dispatch = createShortcutDispatcher({ catalog, isMac: true, handlers: {} });
+    const event = keyEvent({ key: "Backspace" });
+    expect(dispatch(event)).toBeNull();
+    expect(event.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("suppresses shortcuts while typing in an input", () => {
+    const onDelete = vi.fn();
+    const dispatch = createShortcutDispatcher({ catalog, isMac: true, handlers: { delete: onDelete } });
+    const event = keyEvent({ key: "Backspace", target: { tagName: "INPUT", isContentEditable: false } });
+    expect(dispatch(event)).toBeNull();
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
+  it("still allows clear-selection (Escape) while typing", () => {
+    // clear-selection is a synthetic shell command (not in the wasm catalog); add
+    // it to the dispatcher's catalog to assert the focus-exempt path.
+    const clear = vi.fn();
+    const withEscape: ObjectCommand[] = [
+      ...catalog,
+      { id: "clear-selection", label: "Clear", category: "selection", defaultShortcut: "Escape", description: "" }
+    ];
+    const dispatch = createShortcutDispatcher({ catalog: withEscape, isMac: true, handlers: { "clear-selection": clear } });
+    const event = keyEvent({ key: "Escape", target: { tagName: "TEXTAREA", isContentEditable: false } });
+    expect(dispatch(event)).toBe("clear-selection");
+    expect(clear).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("toolbar object-primitive mapping (U1)", () => {
+  it("maps the exact insert-* primitive ids", () => {
+    expect(primitiveForCommand("insert-rectangle")).toBe("rectangle");
+    expect(primitiveForCommand("insert-ellipse")).toBe("ellipse");
+    expect(primitiveForCommand("insert-line")).toBe("line");
+    expect(primitiveForCommand("insert-text")).toBe("text");
+    expect(primitiveForCommand("insert-frame")).toBe("frame");
+  });
+
+  it("returns null for non-shape commands", () => {
+    expect(primitiveForCommand("select-all")).toBeNull();
+    expect(primitiveForCommand("undo")).toBeNull();
+  });
+
+  it("covers the same primitive set as the toolbar order", () => {
+    expect(new Set(Object.values(insertCommandToPrimitive))).toEqual(new Set(primitiveOrder));
+  });
+});

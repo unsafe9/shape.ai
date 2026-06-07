@@ -1,17 +1,18 @@
-// CC0.4 / CC6.1 — central shortcut dispatcher.
+// U4 — central shortcut dispatcher over the object command catalog.
 //
-// Loads the command catalog (the TS mirror of scene-core's command_catalog) and
-// maps a keydown to a command id, then to a registered handler. Keeping this in
-// lib/ (framework-neutral) means the cockpit test can exercise the parse/match
-// logic without mounting a Svelte tree, and the shell only registers handlers.
+// The catalog is the wasm core's `object_command_catalog()` (P1: no TS mirror).
+// The shell loads it once and hands it to {@link createShortcutDispatcher},
+// which maps a keydown to a command id, then to a registered handler. Keeping the
+// parse/match logic here (framework-neutral) lets the toolbar test exercise it
+// without mounting a Svelte tree, and the shell only registers handlers.
 //
 // Focus rule: shortcuts are ignored while typing in an input/textarea/select or
-// a contenteditable region, EXCEPT a small allowlist (Escape) that must always
-// reach the app. This mirrors the existing App.svelte keydown gate.
+// a contenteditable region, EXCEPT a small allowlist that must always reach the
+// app.
 
-import { commandCatalog, detectMac, type Command } from "./commandCatalog";
+import type { ObjectCommand } from "../scene/sceneCoreWasm";
 
-export type CommandId = Command["id"];
+export type CommandId = string;
 
 /** A handler runs the side effect for a command; return value is ignored. */
 export type CommandHandler = () => void;
@@ -28,6 +29,12 @@ export type ParsedShortcut = {
 
 // Commands that must fire even while a text field is focused.
 const FOCUS_EXEMPT_COMMANDS = new Set<string>(["clear-selection"]);
+
+/** True on macOS (decides whether `Mod` reads metaKey or ctrlKey). */
+export function detectMac(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent || "");
+}
 
 /**
  * Parse a catalog shortcut string ("Mod+Shift+G", "Backspace", "]") into a
@@ -50,20 +57,22 @@ export function parseShortcut(shortcut: string): ParsedShortcut {
 function normalizeKey(key: string): string {
   if (key === " " || key === "Spacebar") return "space";
   if (key === "=" || key === "Plus") return "=";
-  return key.length === 1 ? key.toLowerCase() : key.toLowerCase();
+  return key.toLowerCase();
 }
 
 /**
  * Resolve a KeyboardEvent to the command id whose binding it matches, or null.
- * `isMac` decides whether `Mod` reads metaKey (Cmd) or ctrlKey. The first
- * catalog entry whose binding matches wins (the catalog has unique bindings).
+ * `isMac` decides whether `Mod` reads metaKey (Cmd) or ctrlKey. The first catalog
+ * entry whose binding matches wins (the catalog has unique bindings).
  */
-export function matchCommand(event: KeyboardEvent, isMac = detectMac()): CommandId | null {
+export function matchCommand(
+  event: KeyboardEvent,
+  catalog: ObjectCommand[],
+  isMac = detectMac()
+): CommandId | null {
   const eventKey = normalizeKey(event.key);
   const eventMod = isMac ? event.metaKey : event.ctrlKey;
-  // The non-primary control key on mac is ctrl, which we don't bind, so ignore
-  // it; on non-mac, meta (Win/Cmd) is likewise unbound.
-  for (const command of commandCatalog) {
+  for (const command of catalog) {
     if (!command.defaultShortcut) continue;
     const parsed = parseShortcut(command.defaultShortcut);
     if (parsed.key !== eventKey) continue;
@@ -84,21 +93,38 @@ export function isTypingTarget(target: EventTarget | null): boolean {
   return element.isContentEditable === true;
 }
 
+/**
+ * Render a default shortcut for display, resolving the platform-agnostic `Mod`
+ * token to the host's primary modifier symbol. Pure; display-only.
+ */
+export function formatShortcut(shortcut: string, isMac = detectMac()): string {
+  return shortcut
+    .split("+")
+    .map((token) => {
+      if (token === "Mod") return isMac ? "⌘" : "Ctrl";
+      if (token === "Shift") return isMac ? "⇧" : "Shift";
+      if (token === "Alt") return isMac ? "⌥" : "Alt";
+      return token;
+    })
+    .join(isMac ? "" : "+");
+}
+
 export type ShortcutDispatcherOptions = {
+  /** The object command catalog from the wasm core (`objectCommandCatalog()`). */
+  catalog: ObjectCommand[];
   handlers: ShortcutHandlers;
   isMac?: boolean;
 };
 
 /**
  * Build a keydown handler that resolves the event to a command and invokes the
- * registered handler. Commands without a handler are ignored (no preventDefault),
- * so unhandled keys keep their browser behavior. Returns the matched id (or null)
- * so callers/tests can assert dispatch without observing the side effect.
+ * registered handler. Commands without a handler are ignored (no preventDefault).
+ * Returns the matched id (or null) so callers/tests can assert dispatch.
  */
 export function createShortcutDispatcher(options: ShortcutDispatcherOptions) {
   const isMac = options.isMac ?? detectMac();
   return function dispatch(event: KeyboardEvent): CommandId | null {
-    const id = matchCommand(event, isMac);
+    const id = matchCommand(event, options.catalog, isMac);
     if (!id) return null;
     if (isTypingTarget(event.target) && !FOCUS_EXEMPT_COMMANDS.has(id)) return null;
     const handler = options.handlers[id];

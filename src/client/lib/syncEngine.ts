@@ -1,27 +1,30 @@
-// Client sync engine (MG4.3 outbox, MG4.4 optimistic + unacked discard,
-// MG4.5 coalescing + reconnect reconcile).
+// Client object sync engine (OB4.3): durable outbox + optimistic apply +
+// transient ownership/unacked discard + coalescing + reconnect reconcile.
 //
 // The engine sits between the shell and the wire transport. It owns:
 //
-//   1. the durable outbox (MG4.3) — every authored op is persisted before it is
-//      sent, removed on ack, and replayed in localSeq order on (re)connect;
-//   2. the optimistic local scene (MG4.4) — ops apply locally the instant they
+//   1. the durable outbox — every authored op is persisted (as the `WireOp`
+//      envelope) before it is sent, removed on ack, and replayed in localSeq
+//      order on (re)connect;
+//   2. the optimistic local `ObjectScene` — ops apply locally the instant they
 //      are authored, so the shell never waits for a round-trip;
-//   3. transient ownership / unacked discard (MG4.4) — while a local write on an
-//      (object, field) is still unacked, an incoming REMOTE patch for that same
+//   3. transient ownership / unacked discard — while a local write on an
+//      (object, field) is still unacked, an incoming REMOTE op for that same
 //      (object, field) is ignored, so a peer/echo can't clobber the value the
 //      user is still dragging;
-//   4. coalescing (MG4.5) — rapid ops (continuous move/resize) are batched into
-//      one `ops` frame on a ~33ms timer instead of one frame per pointer event;
-//   5. reconnect reconcile (MG4.5) — on a fresh `welcome` snapshot the local
-//      base is reset to the snapshot and the outbox is replayed on top.
+//   4. coalescing — rapid ops (continuous move/transform) are batched into one
+//      `ops` frame on a ~33ms timer instead of one frame per pointer event;
+//   5. reconnect reconcile — on a fresh `welcome` snapshot the local base is
+//      reset to the snapshot and the outbox is replayed on top.
 //
-// It is transport-shaped via the `EngineTransport` seam so tests drive it with a
-// mock socket and the real `WsTransport` wires onto the same calls.
+// The op-apply is THE scene-core object op-apply (Rust compiled to wasm, the same
+// logic the server runs) via `applyObjectOpSync`; the wasm instance must be
+// initialized via `ensureSceneCore` before the engine authors. It is transport-
+// shaped via the `EngineTransport` seam so tests drive it with a mock socket.
 
-import type { Scene } from "../../shared/schema";
-import type { RenderScenePatch } from "../../shared/renderPatch";
-import { applyRenderPatchSync, type RenderResult } from "../scene/sceneCoreWasm";
+import type { ObjectScene, ObjectOp, WireOp } from "../../shared/object";
+import { opPrimaryTargetId } from "../../shared/object";
+import { applyObjectOpSync, type ObjectApplyResult } from "../scene/sceneCoreWasm";
 import {
   opIdKey,
   type OpId,
@@ -30,13 +33,13 @@ import {
 } from "./outbox";
 
 /**
- * The synchronous op-apply the engine drives. It is THE scene-core op-apply
- * (Rust compiled to wasm, the same logic the server runs); the wasm instance must
- * be initialized — via {@link ensureSceneCore} — before the engine authors. The
- * seam is injectable so tests can substitute a double, but production uses the
- * wasm apply in both the browser and Node/vitest.
+ * The synchronous object op-apply the engine drives. It is THE scene-core
+ * op-apply (Rust compiled to wasm, the same logic the server runs); the wasm
+ * instance must be initialized — via {@link ensureSceneCore} — before the engine
+ * authors. The seam is injectable so tests can substitute a double, but
+ * production uses the wasm apply in both the browser and Node/vitest.
  */
-export type ApplyPatch = (scene: Scene, patch: RenderScenePatch, now: string) => RenderResult;
+export type ApplyObjectOp = (scene: ObjectScene, op: ObjectOp) => ObjectApplyResult;
 
 /** Default coalescing window: rapid ops within this many ms ride one frame. */
 export const COALESCE_MS = 33;
@@ -46,24 +49,12 @@ export const COALESCE_MS = 33;
  * supply a mock. The engine never touches the socket directly.
  */
 export interface EngineTransport {
-  /** Send a batch of opId-stamped envelopes on the reliable channel. */
+  /** Send a batch of `WireOp` envelopes on the reliable channel. */
   sendEnvelopes(entries: OutboxEntry[]): void;
 }
 
-/**
- * An applied ack/rejected the engine must reconcile. `applied` distinguishes an
- * ack (drop + commit) from a rejected (drop + the optimistic write was wrong; we
- * leave reconciliation against the next snapshot/patch to the caller).
- */
-export type ResolveResult = {
-  opIds: OpId[];
-  applied: boolean;
-  seq?: number;
-  revision?: number;
-};
-
 export type SyncEngineOptions = {
-  /** Authoring identity; stamped into every opId.clientId. */
+  /** Authoring identity; stamped into every opId.clientId + WireOp.actor. */
   clientId: string;
   /** Durable outbox; defaults to an in-memory store if omitted by the caller. */
   outbox: OutboxStore;
@@ -71,10 +62,10 @@ export type SyncEngineOptions = {
   transport: EngineTransport;
   /**
    * The synchronous op-apply; defaults to the scene-core wasm apply
-   * ({@link applyRenderPatchSync}). Injectable for tests. When the default is
-   * used, the wasm must already be initialized via `ensureSceneCore()`.
+   * ({@link applyObjectOpSync}). Injectable for tests. When the default is used,
+   * the wasm must already be initialized via `ensureSceneCore()`.
    */
-  applyPatch?: ApplyPatch;
+  applyOp?: ApplyObjectOp;
   /** Coalescing window in ms; defaults to {@link COALESCE_MS}. */
   coalesceMs?: number;
   /** Clock source for envelope `ts`; injected for deterministic tests. */
@@ -84,57 +75,63 @@ export type SyncEngineOptions = {
   clearTimer?: (handle: unknown) => void;
 };
 
+/** Result of {@link SyncEngine.author}: errors (empty on success), the minted
+ *  opId, and the captured inverse op (the undo entry, D21). */
+export type AuthorResult = {
+  errors: string[];
+  opId?: OpId;
+  inverse?: ObjectOp | null;
+};
+
 /**
  * Granularity of transient ownership: per (objectId, field).
  *
- * Ownership protects an in-flight CONTINUOUS field edit (drag/resize/reorder/
+ * Ownership protects an in-flight CONTINUOUS field edit (transform/geometry/
  * text) so a peer or self-echo can't clobber the value the user is still
- * authoring before our op is acked. A move owns `(id, "position")`; a resize
- * owns `(id, "position")` (geometry); a text edit owns `(id, <field>)`.
+ * authoring before our op is acked. A `set-transform` owns `(id, "transform")`;
+ * a `set-text` owns `(id, "text")`; `edit-geometry` owns `(id, "geometry")`.
  *
- * Structural ops (create/delete/group/tag/select/...) take NO ownership: they
- * are not property writes, so a later remote field edit on the same object is a
- * legitimate concurrent change, and create/delete conflicts are settled by the
- * server's authoritative seq ordering, not by transient client ownership. A
- * batch contributes the union of its members' field keys.
+ * Structural ops (insert/delete/reparent/reorder/tags/...) take NO ownership:
+ * they are not single-field property writes, so a later remote field edit on the
+ * same object is a legitimate concurrent change, and create/delete conflicts are
+ * settled by the server's authoritative seq ordering. A batch contributes the
+ * union of its members' field keys.
  */
-function ownedKeys(patch: RenderScenePatch): string[] {
-  switch (patch.kind) {
-    case "move-card":
-    case "resize-card":
-      return [`${patch.id}:position`];
-    case "move-group":
-    case "resize-group":
-      return [`${patch.id}:bounds`];
-    case "set-card-z-index":
-      return [`${patch.id}:zIndex`];
-    case "edit-card-text":
-      return [`${patch.id}:${patch.field}`];
+function ownedKeys(op: ObjectOp): string[] {
+  switch (op.kind) {
+    case "set-transform":
+      return [`${op.id}:transform`];
+    case "edit-geometry":
+      return [`${op.id}:geometry`];
+    case "set-text":
+      return [`${op.id}:text`];
+    case "set-style":
+      return [`${op.id}:style`];
     case "batch":
-      return patch.ops.flatMap(ownedKeys);
+      return op.ops.flatMap(ownedKeys);
     default:
       return [];
   }
 }
 
-/** Does a remote patch write any (object, field) key the client currently owns? */
-function remoteTouchesOwnedKey(patch: RenderScenePatch, owned: Set<string>): boolean {
+/** Does a remote op write any (object, field) key the client currently owns? */
+function remoteTouchesOwnedKey(op: ObjectOp, owned: Set<string>): boolean {
   if (owned.size === 0) return false;
-  return ownedKeys(patch).some((key) => owned.has(key));
+  return ownedKeys(op).some((key) => owned.has(key));
 }
 
 export class SyncEngine {
   private readonly clientId: string;
   private readonly outbox: OutboxStore;
   private readonly transport: EngineTransport;
-  private readonly applyPatch: ApplyPatch;
+  private readonly applyOp: ApplyObjectOp;
   private readonly coalesceMs: number;
   private readonly now: () => string;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
 
   /** Local optimistic scene the shell renders. */
-  private scene: Scene;
+  private scene: ObjectScene;
   /** Revision the next authored op is based on (server revision + local lead). */
   private baseRevision = 0;
 
@@ -147,15 +144,15 @@ export class SyncEngine {
   /** opId key -> the keys that op owns, so we release them on ack/reject. */
   private readonly opOwnedKeys = new Map<string, string[]>();
 
-  private sceneListeners = new Set<(scene: Scene) => void>();
+  private sceneListeners = new Set<(scene: ObjectScene) => void>();
 
-  constructor(initialScene: Scene, opts: SyncEngineOptions) {
+  constructor(initialScene: ObjectScene, opts: SyncEngineOptions) {
     this.scene = initialScene;
     this.baseRevision = initialScene.sceneVersion;
     this.clientId = opts.clientId;
     this.outbox = opts.outbox;
     this.transport = opts.transport;
-    this.applyPatch = opts.applyPatch ?? applyRenderPatchSync;
+    this.applyOp = opts.applyOp ?? applyObjectOpSync;
     this.coalesceMs = opts.coalesceMs ?? COALESCE_MS;
     this.now = opts.now ?? (() => new Date().toISOString());
     this.setTimer =
@@ -165,7 +162,7 @@ export class SyncEngine {
   }
 
   /** The current optimistic scene. */
-  getScene(): Scene {
+  getScene(): ObjectScene {
     return this.scene;
   }
 
@@ -175,45 +172,58 @@ export class SyncEngine {
   }
 
   /** Subscribe to optimistic scene updates; returns an unsubscribe. */
-  onScene(cb: (scene: Scene) => void): () => void {
+  onScene(cb: (scene: ObjectScene) => void): () => void {
     this.sceneListeners.add(cb);
     return () => this.sceneListeners.delete(cb);
   }
 
   /**
-   * Author a local op (MG4.4): apply optimistically, take transient ownership of
-   * its keys, persist it to the outbox, then schedule a coalesced send (MG4.5).
-   * Rejected-by-core ops never enter the outbox or the wire.
+   * Build the `WireOp` envelope for an `ObjectOp` authored at `localSeq`. The
+   * `propDelta` carries the full op; `objectId`/`kind` are descriptive (mirroring
+   * the server's `op_to_wire`).
    */
-  async author(patch: RenderScenePatch): Promise<{ errors: string[]; opId?: OpId }> {
-    const applied = this.applyPatch(this.scene, patch, this.now());
-    if (applied.errors.length > 0) return { errors: applied.errors };
-
-    const localSeq = await this.outbox.nextLocalSeq();
-    const opId: OpId = { clientId: this.clientId, localSeq };
-    const entry: OutboxEntry = {
-      opId,
+  private wireOp(op: ObjectOp, localSeq: number): WireOp {
+    return {
+      opId: { clientId: this.clientId, localSeq },
+      objectId: opPrimaryTargetId(op),
+      kind: op.kind,
+      propDelta: op,
       baseRevision: this.baseRevision,
-      ts: this.now(),
-      patch
+      actor: this.clientId,
+      ts: this.now()
     };
-
-    this.scene = applied.scene;
-    this.takeOwnership(opId, ownedKeys(patch));
-    await this.outbox.append(entry);
-    this.enqueue(entry);
-    this.emitScene();
-    return { errors: [], opId };
   }
 
   /**
-   * Apply a REMOTE patch (peer or self-echo) to the optimistic scene, honoring
-   * transient ownership (MG4.4): a remote write to an (object,field) key we still
-   * own is dropped until our local op is acked. Returns true if applied.
+   * Author a local op: apply optimistically, take transient ownership of its
+   * keys, persist its `WireOp` envelope to the outbox, then schedule a coalesced
+   * send. Rejected-by-core ops never enter the outbox or the wire. Returns the
+   * captured inverse op (the undo entry, D21) on success.
    */
-  applyRemote(patch: RenderScenePatch): boolean {
-    if (remoteTouchesOwnedKey(patch, this.ownedKeySet())) return false;
-    const applied = this.applyPatch(this.scene, patch, this.now());
+  async author(op: ObjectOp): Promise<AuthorResult> {
+    const applied = this.applyOp(this.scene, op);
+    if (applied.errors.length > 0) return { errors: applied.errors };
+
+    const localSeq = await this.outbox.nextLocalSeq();
+    const entry = this.wireOp(op, localSeq);
+    const opId = entry.opId;
+
+    this.scene = applied.scene;
+    this.takeOwnership(opId, ownedKeys(op));
+    await this.outbox.append(entry);
+    this.enqueue(entry);
+    this.emitScene();
+    return { errors: [], opId, inverse: applied.inverse };
+  }
+
+  /**
+   * Apply a REMOTE op (peer or self-echo) to the optimistic scene, honoring
+   * transient ownership: a remote write to an (object,field) key we still own is
+   * dropped until our local op is acked. Returns true if applied.
+   */
+  applyRemote(op: ObjectOp): boolean {
+    if (remoteTouchesOwnedKey(op, this.ownedKeySet())) return false;
+    const applied = this.applyOp(this.scene, op);
     if (applied.errors.length > 0) return false;
     this.scene = applied.scene;
     this.emitScene();
@@ -222,8 +232,7 @@ export class SyncEngine {
 
   /**
    * Reconcile an ack: drop the acked entries from the outbox, release their
-   * ownership, and advance the base revision. A duplicate ack is harmless
-   * (already-removed entries are a no-op).
+   * ownership, and advance the base revision. A duplicate ack is harmless.
    */
   async onAck(result: { opIds: OpId[]; revision?: number }): Promise<void> {
     await this.outbox.remove(result.opIds);
@@ -236,8 +245,7 @@ export class SyncEngine {
   /**
    * Reconcile a rejected op: drop it from the outbox and release its ownership so
    * subsequent remote writes for those keys apply. The optimistic write stays in
-   * the local scene until the next snapshot/patch corrects it (the caller may
-   * re-snapshot); the engine does not attempt a local rollback in MG-4.
+   * the local scene until the next snapshot/patch corrects it.
    */
   async onRejected(opIds: OpId[]): Promise<void> {
     await this.outbox.remove(opIds);
@@ -245,13 +253,12 @@ export class SyncEngine {
   }
 
   /**
-   * Reconnect reconcile (MG4.5): reset the local base to a fresh `welcome`
-   * snapshot, then REPLAY every outbox entry (re-send unacked ops). Ownership is
-   * rebuilt from the replayed entries so transient ownership survives a
-   * reconnect. The snapshot is taken as authoritative for everything NOT under a
-   * surviving unacked write.
+   * Reconnect reconcile: reset the local base to a fresh `welcome` snapshot, then
+   * REPLAY every outbox entry (re-send unacked ops). Ownership is rebuilt from the
+   * replayed entries so transient ownership survives a reconnect. The snapshot is
+   * authoritative for everything NOT under a surviving unacked write.
    */
-  async reconcileSnapshot(snapshot: Scene): Promise<void> {
+  async reconcileSnapshot(snapshot: ObjectScene): Promise<void> {
     this.scene = snapshot;
     this.baseRevision = snapshot.sceneVersion;
     this.ownership.clear();
@@ -259,10 +266,9 @@ export class SyncEngine {
 
     const entries = await this.outbox.all();
     for (const entry of entries) {
-      // Re-apply optimistically on top of the snapshot and re-take ownership.
-      const applied = this.applyPatch(this.scene, entry.patch, this.now());
+      const applied = this.applyOp(this.scene, entry.propDelta);
       if (applied.errors.length === 0) this.scene = applied.scene;
-      this.takeOwnership(entry.opId, ownedKeys(entry.patch));
+      this.takeOwnership(entry.opId, ownedKeys(entry.propDelta));
     }
     this.emitScene();
     if (entries.length > 0) this.transport.sendEnvelopes(entries);

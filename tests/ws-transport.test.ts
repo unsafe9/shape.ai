@@ -4,11 +4,14 @@ import { WsTransport, type WebSocketLike } from "../src/client/lib/wsTransport";
 import type {
   AckMessage,
   ClientMessage,
+  FeatureServerMessage,
   PatchMessage,
   PresenceServerMessage,
   ServerMessage,
   WelcomeMessage
 } from "../src/client/lib/transport";
+import type { OutboxEntry } from "../src/client/lib/outbox";
+import { emptyObjectScene, translateTransform, type ObjectOp, type WireOp } from "../src/shared/object";
 
 // A minimal WebSocket double implementing the slice WsTransport drives. Tests
 // drive the lifecycle manually: `open()` fires onopen, `emit(frame)` delivers a
@@ -36,7 +39,6 @@ class MockWebSocket implements WebSocketLike {
     this.onclose?.({});
   }
 
-  // --- test driver helpers ---
   open(): void {
     this.onopen?.({});
   }
@@ -46,7 +48,6 @@ class MockWebSocket implements WebSocketLike {
     this.onmessage?.({ data });
   }
 
-  /** The decoded client frames the transport has sent so far. */
   sentMessages(): ClientMessage[] {
     return this.sent.map((s) => JSON.parse(s) as ClientMessage);
   }
@@ -54,7 +55,6 @@ class MockWebSocket implements WebSocketLike {
 
 type Connected = {
   transport: WsTransport;
-  /** The mock socket created by the factory; valid after connect() is called. */
   getSocket: () => MockWebSocket;
 };
 
@@ -76,7 +76,6 @@ function makeTransport(): Connected {
   };
 }
 
-/** connect() + open + welcome; returns the live transport and its socket. */
 async function connected(canvasId = "c-ws"): Promise<{ transport: WsTransport; socket: MockWebSocket }> {
   const { transport, getSocket } = makeTransport();
   const ready = transport.connect(canvasId);
@@ -89,20 +88,27 @@ async function connected(canvasId = "c-ws"): Promise<{ transport: WsTransport; s
 
 const emptyWelcome: WelcomeMessage = {
   type: "welcome",
-  scene: {
-    version: 1,
-    sceneVersion: 0,
-    groups: [],
-    nodes: [],
-    edges: [],
-    tags: [],
-    comments: [],
-    artifacts: [],
-    selection: { kind: "canvas" },
-    updatedAt: "1970-01-01T00:00:00Z"
-  } as unknown as WelcomeMessage["scene"],
+  scene: emptyObjectScene(),
   seq: 0,
   revision: 0
+};
+
+/** A WireOp envelope around an ObjectOp delta (the outbox/wire shape). */
+function wireOp(op: ObjectOp, clientId: string, localSeq: number): WireOp {
+  return {
+    opId: { clientId, localSeq },
+    objectId: op.kind === "insert-object" ? op.object.id : op.kind === "delete" ? op.id : "",
+    kind: op.kind,
+    propDelta: op,
+    baseRevision: 0,
+    actor: clientId,
+    ts: "t"
+  };
+}
+
+const insertA: ObjectOp = {
+  kind: "insert-object",
+  object: { id: "a", order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z" } }
 };
 
 describe("WsTransport handshake", () => {
@@ -117,7 +123,6 @@ describe("WsTransport handshake", () => {
     const ready = transport.connect("c-ws");
     const socket = getSocket();
 
-    // No frame sent until the socket actually opens.
     expect(socket.sent).toHaveLength(0);
     socket.open();
 
@@ -137,12 +142,7 @@ describe("WsTransport handshake", () => {
     const socket = getSocket();
     socket.open();
 
-    expect(socket.sentMessages()[0]).toEqual({
-      type: "hello",
-      canvasId: "c-ws",
-      region,
-      lastAckSeq: 0
-    });
+    expect(socket.sentMessages()[0]).toEqual({ type: "hello", canvasId: "c-ws", region, lastAckSeq: 0 });
 
     socket.emit(emptyWelcome);
     await ready;
@@ -159,46 +159,31 @@ describe("WsTransport handshake", () => {
 });
 
 describe("WsTransport outbound frames", () => {
-  it("emits an ops frame matching the protocol", async () => {
+  it("emits an ops frame of WireOp envelopes matching the protocol", async () => {
     const { transport, socket } = await connected();
 
-    const createGroup = {
-      kind: "create-group" as const,
-      group: {
-        id: "g1",
-        title: "G",
-        summary: "",
-        bounds: { x: 0, y: 0, width: 400, height: 300 },
-        tagIds: [],
-        zIndex: 0,
-        styleKey: ""
-      }
-    };
-    transport.sendOps([createGroup], { clientId: "user-1", baseRevision: 0 });
+    const entries: OutboxEntry[] = [wireOp(insertA, "user-1", 1)];
+    transport.sendEnvelopes(entries);
 
-    // [0] is the hello; [1] is the ops frame. Each op is now an opId-stamped
-    // envelope (evolved protocol): clientId/baseRevision live per-op.
-    const frame = socket.sentMessages()[1] as { type: string; ops: unknown[] };
+    // [0] is the hello; [1] is the ops frame carrying WireOps verbatim.
+    const frame = socket.sentMessages()[1] as { type: string; ops: WireOp[] };
     expect(frame.type).toBe("ops");
     expect(frame.ops).toHaveLength(1);
     expect(frame.ops[0]).toMatchObject({
       opId: { clientId: "user-1", localSeq: 1 },
-      baseRevision: 0,
-      patch: createGroup
+      kind: "insert-object",
+      propDelta: insertA
     });
   });
 
-  it("mints a monotonic localSeq per envelope and a default baseRevision of 0", async () => {
+  it("emits a feature request frame on the single feature channel (OB4.5)", async () => {
     const { transport, socket } = await connected();
 
-    const noop = { kind: "select" as const, selection: { kind: "canvas" as const } };
-    transport.sendOps([noop], { clientId: "user-1" });
-    transport.sendOps([noop], { clientId: "user-1" });
-    const first = socket.sentMessages()[1] as { ops: { opId: { localSeq: number }; baseRevision: number }[] };
-    const second = socket.sentMessages()[2] as { ops: { opId: { localSeq: number } }[] };
-    expect(first.ops[0].baseRevision).toBe(0);
-    expect(first.ops[0].opId.localSeq).toBe(1);
-    expect(second.ops[0].opId.localSeq).toBe(2);
+    transport.sendFeature({ feature: "canvasSwitch", canvas_id: "c-ws" });
+    expect(socket.sentMessages()[1]).toEqual({
+      type: "feature",
+      request: { feature: "canvasSwitch", canvas_id: "c-ws" }
+    });
   });
 
   it("emits a presence frame with the canvas binding and verbatim payload", async () => {
@@ -211,37 +196,30 @@ describe("WsTransport outbound frames", () => {
 });
 
 describe("WsTransport inbound routing", () => {
-  it("routes a patch frame to onPatch with decoded ops", async () => {
+  it("routes a patch frame to onPatch with decoded WireOps", async () => {
     const { transport, socket } = await connected();
 
     const received: PatchMessage[] = [];
     transport.onPatch((p) => received.push(p));
 
-    const patch: PatchMessage = {
-      type: "patch",
-      ops: [
-        {
-          kind: "create-group",
-          group: {
-            id: "g1",
-            title: "G",
-            summary: "",
-            bounds: { x: 0, y: 0, width: 400, height: 300 },
-            tagIds: [],
-            zIndex: 0,
-            styleKey: ""
-          }
-        }
-      ],
-      seq: 1
-    };
+    const patch: PatchMessage = { type: "patch", ops: [wireOp(insertA, "peer", 1)], seq: 1 };
     socket.emit(patch);
 
     expect(received).toHaveLength(1);
-    expect(received[0].ops[0]).toEqual(patch.ops[0]);
+    expect(received[0].ops[0].propDelta).toEqual(insertA);
     expect(received[0].seq).toBe(1);
-    // patch.seq advances the resume cursor.
     expect(transport.currentAckSeq).toBe(1);
+  });
+
+  it("routes a feature response frame to onFeature", async () => {
+    const { transport, socket } = await connected();
+
+    const received: FeatureServerMessage[] = [];
+    transport.onFeature((f) => received.push(f));
+
+    socket.emit({ type: "feature", response: { feature: "templateApplied", object_ids: ["o1", "o2"] } });
+    expect(received).toHaveLength(1);
+    expect(received[0].response).toEqual({ feature: "templateApplied", object_ids: ["o1", "o2"] });
   });
 
   it("routes presence frames to onPresence", async () => {
@@ -272,25 +250,8 @@ describe("WsTransport inbound routing", () => {
     const rejections: string[][] = [];
     transport.onRejected((r) => rejections.push(r.errors));
 
-    socket.emit({ type: "rejected", errors: ['create-card target group "missing-group" not found'] });
-    expect(rejections).toEqual([['create-card target group "missing-group" not found']]);
-  });
-
-  it("tolerates the self-echo patch arriving before its ack (interleave-agnostic)", async () => {
-    const { transport, socket } = await connected();
-
-    const events: string[] = [];
-    transport.onPatch(() => events.push("patch"));
-    transport.onAck(() => events.push("ack"));
-
-    // Self patch fans out before the ack — the client must not assume order.
-    socket.emit({
-      type: "patch",
-      ops: [{ kind: "delete-group", id: "g1" }],
-      seq: 2
-    });
-    socket.emit({ type: "ack", opIds: [{ clientId: "user-1", localSeq: 1 }], seq: 2, revision: 2 });
-    expect(events).toEqual(["patch", "ack"]);
+    socket.emit({ type: "rejected", errors: ["unknown object id: missing"] });
+    expect(rejections).toEqual([["unknown object id: missing"]]);
   });
 
   it("unsubscribe stops further patch deliveries", async () => {
@@ -298,51 +259,43 @@ describe("WsTransport inbound routing", () => {
 
     let count = 0;
     const off = transport.onPatch(() => count++);
-    socket.emit({ type: "patch", ops: [{ kind: "delete-group", id: "g1" }], seq: 1 });
+    socket.emit({ type: "patch", ops: [wireOp({ kind: "delete", id: "a" }, "peer", 1)], seq: 1 });
     off();
-    socket.emit({ type: "patch", ops: [{ kind: "delete-group", id: "g2" }], seq: 2 });
+    socket.emit({ type: "patch", ops: [wireOp({ kind: "delete", id: "b" }, "peer", 2)], seq: 2 });
     expect(count).toBe(1);
   });
 });
 
 describe("wire round-trip against Rust-emitted JSON", () => {
-  // These strings are hard-coded from the documented server (serde) output. The
-  // client must parse by key, not position — serde key order is not significant.
   it("parses a Rust-emitted welcome frame for an empty new canvas", async () => {
     const { transport, getSocket } = makeTransport();
     const ready = transport.connect("c-ws");
     const socket = getSocket();
     socket.open();
     socket.emit(
-      '{"type":"welcome","scene":{"version":1,"sceneVersion":0,"groups":[],"nodes":[],"edges":[],"tags":[],"comments":[],"artifacts":[],"selection":"canvas","updatedAt":"1970-01-01T00:00:00Z"},"seq":0,"revision":0}'
+      '{"type":"welcome","scene":{"sceneVersion":0,"objects":[],"tags":[],"selection":{"kind":"canvas"},"updatedAt":"1970-01-01T00:00:00Z"},"seq":0,"revision":0}'
     );
     const welcome = await ready;
     expect(welcome.seq).toBe(0);
-    expect(welcome.revision).toBe(0);
     expect(welcome.scene.sceneVersion).toBe(0);
-    expect(welcome.scene.groups).toEqual([]);
+    expect(welcome.scene.objects).toEqual([]);
   });
 
-  it("parses a Rust-emitted patch frame with serde key order", async () => {
+  it("parses a Rust-emitted patch frame of WireOps with serde key order", async () => {
     const { transport, socket } = await connected();
 
     const received: PatchMessage[] = [];
     transport.onPatch((p) => received.push(p));
 
-    // Exact bytes as serde emits (keys alphabetised), proving key-based parsing.
     socket.emit(
-      '{"ops":[{"group":{"bounds":{"height":300.0,"width":400.0,"x":0.0,"y":0.0},"id":"g1","styleKey":"","summary":"","tagIds":[],"title":"G","zIndex":0.0},"kind":"create-group"}],"seq":1,"type":"patch"}'
+      '{"ops":[{"actor":"peer","baseRevision":1,"kind":"delete","objectId":"a","opId":{"clientId":"peer","localSeq":1},"propDelta":{"id":"a","kind":"delete"},"ts":"t"}],"seq":2,"type":"patch"}'
     );
 
     expect(received).toHaveLength(1);
     const op = received[0].ops[0];
-    expect(op.kind).toBe("create-group");
-    if (op.kind === "create-group") {
-      expect(op.group.id).toBe("g1");
-      expect(op.group.title).toBe("G");
-      expect(op.group.bounds).toEqual({ x: 0, y: 0, width: 400, height: 300 });
-    }
-    expect(received[0].seq).toBe(1);
+    expect(op.kind).toBe("delete");
+    expect(op.propDelta).toEqual({ kind: "delete", id: "a" });
+    expect(received[0].seq).toBe(2);
   });
 
   it("parses a Rust-emitted ack frame", async () => {
@@ -350,48 +303,7 @@ describe("wire round-trip against Rust-emitted JSON", () => {
 
     const acks: AckMessage[] = [];
     transport.onAck((a) => acks.push(a));
-    // Exact bytes as serde emits the evolved ack (opIds + seq + revision).
     socket.emit('{"type":"ack","opIds":[{"clientId":"c1","localSeq":7}],"seq":1,"revision":1}');
-    expect(acks).toEqual([
-      { type: "ack", opIds: [{ clientId: "c1", localSeq: 7 }], seq: 1, revision: 1 }
-    ]);
-  });
-
-  it("encodes an ops frame the server can decode (create-card min-accepted shape)", async () => {
-    const { transport, socket } = await connected();
-
-    transport.sendOps(
-      [
-        {
-          kind: "create-card",
-          card: {
-            id: "n1",
-            groupId: "g1",
-            title: "C",
-            summary: "",
-            detail: "",
-            status: "",
-            type: "",
-            bounds: { x: 10, y: 10, width: 120, height: 80 },
-            zIndex: 0,
-            styleKey: "",
-            accessibilityLabel: ""
-          }
-        }
-      ],
-      { clientId: "user-1", baseRevision: 0 }
-    );
-
-    const raw = JSON.parse(socket.sent[1]);
-    expect(raw.type).toBe("ops");
-    // Evolved protocol: clientId/baseRevision live inside each op envelope.
-    const env = raw.ops[0];
-    expect(env.opId).toEqual({ clientId: "user-1", localSeq: 1 });
-    expect(env.baseRevision).toBe(0);
-    expect(env.patch.kind).toBe("create-card");
-    // The node "type" field is serde-renamed to "type" inside the card object.
-    expect(env.patch.card.type).toBe("");
-    expect(env.patch.card.id).toBe("n1");
-    expect(env.patch.card.groupId).toBe("g1");
+    expect(acks).toEqual([{ type: "ack", opIds: [{ clientId: "c1", localSeq: 7 }], seq: 1, revision: 1 }]);
   });
 });

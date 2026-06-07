@@ -1,18 +1,25 @@
-// T6.2 §4: framework-neutral Svelte↔adapter bridge.
+// Object-native Svelte↔renderer host (OB4.3).
 //
-// This re-hosts the glue that lived in RendererCanvasHost.tsx (the three React
-// effects + refs) as a plain class with no framework dependency. The command
-// surface is the existing RendererCanvasHostHandle; the event surface is the
-// existing EngineEvent. No engine method, event variant, or batching path is
-// added, removed, or rewritten — we only own the lifecycle (load Rust core →
-// create WebGPU renderer → construct/resize/start engine) and forward events.
+// Owns the renderer lifecycle (load Rust core → create the visible WebGPU
+// renderer → construct/observe/start the input+camera engine) and bridges the
+// object scene to the renderer's object pipeline.
+//
+// The canonical scene is an `ObjectScene` (D1). `loadObjectScene` projects it to
+// the renderer-core `RenderObjectScene` JSON and builds CPU object fill/stroke
+// geometry through the crate's `buildObjectSceneGeometry`
+// (`ObjectPipeline::build_scene_geometry`), proving the object→geometry path.
+//
+// RUNTIME-DEFERRED (no GPU in CI): the live object GPU PASS — uploading the built
+// geometry through the visible renderer's frame loop — needs a renderer-crate
+// `ShapeWebGpuRenderer.drawObjects` method that does not exist yet. Until that
+// lands, the legacy `ShapeCanvasEngine` keeps the camera/input/stats loop alive
+// for navigation; the object geometry is built (and its vertex/instance counts
+// surfaced) but not yet rasterized. This is the flagged live-pixels gap.
 
 import type { CameraState } from "../../shared/renderScene";
-import type { RenderScenePatch } from "../../shared/renderPatch";
-import type { Scene, SceneSelection } from "../../shared/schema";
+import type { ObjectScene, ObjectSelection } from "../../shared/object";
 import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions } from "../renderer/engine";
-import type { FrameStats, HitResult, SceneSnapshot, WorldPoint, WorldRect } from "../renderer/scene";
-import { shapeSceneToFilteredRenderSnapshot } from "../../shared/renderPatch";
+import type { FrameStats, WorldRect } from "../renderer/scene";
 import { loadRustCore, type RustCoreStatus, type RustWebGpuRenderer } from "../renderer/wasmLoader";
 
 export type RendererStats = FrameStats;
@@ -25,20 +32,19 @@ export type RendererHealth = {
   webGpuRendererAvailable: boolean;
 };
 
+/** Result of building object geometry: the opaque crate geometry plus counts the
+ *  diagnostics can surface. `null` when the object build entry is unavailable. */
+export type ObjectGeometryBuild = {
+  fillVertexCount: number;
+  strokeInstanceCount: number;
+  raw: unknown;
+} | null;
+
 export type ShapeCanvasHostCallbacks = {
   onCameraChange: (camera: CameraState) => void;
-  // T2.2: `additive` carries the shift/meta modifier held at pick time so the
-  // shell can fold the hit into a transient `multi` selection.
-  onSelectionChange: (selection: SceneSelection, additive: boolean) => void;
-  onPatch: (patch: RenderScenePatch) => void;
-  onGestureChange: (active: boolean) => void;
   onStats: (stats: RendererStats) => void;
   onStatus: (message: string) => void;
   onHealthChange: (health: RendererHealth) => void;
-  // CC2.3: marquee drag ended; ids are node-then-group ids inside the rect.
-  onMarquee?: (ids: string[]) => void;
-  // CC4.1: right-click pick result for the context menu (selection-neutral).
-  onContextPick?: (selection: SceneSelection, screen: { x: number; y: number }) => void;
 };
 
 const initialRustStatus: RustCoreStatus = {
@@ -46,14 +52,51 @@ const initialRustStatus: RustCoreStatus = {
   backend: "detecting",
   detail: "Checking generated Rust/WASM package.",
   probeWebGpu: null,
-  createWebGpuRenderer: null
+  createWebGpuRenderer: null,
+  buildObjectSceneGeometry: null
 };
 
+// ---------------------------------------------------------------------------
+// Object scene -> renderer-core RenderObjectScene projection (the renderer feed).
+// Pure field renaming (transform / geometry.d -> geometryD); no domain op-apply.
+// ---------------------------------------------------------------------------
+
+const IDENTITY_3X3: [[number, number, number], [number, number, number], [number, number, number]] = [
+  [1, 0, 0],
+  [0, 1, 0],
+  [0, 0, 1]
+];
+
+/** Project an `ObjectScene` to the renderer-core `RenderObjectScene` JSON shape. */
+export function objectSceneToRenderObjectScene(
+  scene: ObjectScene,
+  camera: CameraState,
+  selection: ObjectSelection,
+  sceneId: string
+): Record<string, unknown> {
+  return {
+    sceneId,
+    camera,
+    selection: selection.kind === "object" ? selection.id : null,
+    multiSelect: selection.kind === "multi" ? selection.ids : [],
+    objects: scene.objects.map((object) => ({
+      id: object.id,
+      parent: object.parent ?? null,
+      order: object.order,
+      transform: object.transform ?? IDENTITY_3X3,
+      geometryD: object.geometry.d,
+      fill: object.fill ?? null,
+      stroke: object.stroke ?? null,
+      text: object.text ?? null,
+      clip: object.clip ?? false
+    }))
+  };
+}
+
 /**
- * Framework-neutral host that owns the ShapeCanvasEngine lifecycle. The Svelte
- * (or React) shell provides the three DOM nodes through mount(), and reads
- * everything else through the callbacks. Command methods mirror
- * RendererCanvasHostHandle one-to-one.
+ * Object-native renderer host. The Svelte shell provides the three DOM nodes
+ * through mount(); it reads camera/stats/health through callbacks and pushes the
+ * object scene through {@link loadObjectScene}.
  */
 export class ShapeCanvasHost {
   private callbacks: ShapeCanvasHostCallbacks;
@@ -63,24 +106,20 @@ export class ShapeCanvasHost {
   private overlayRoot: HTMLElement | null = null;
   private observer: ResizeObserver | null = null;
   private camera: CameraState = { x: 0, y: 0, zoom: 1 };
-  private selection: SceneSelection = { kind: "canvas" };
   private rustStatus: RustCoreStatus = initialRustStatus;
   private webGpuRenderer: RustWebGpuRenderer | null = null;
   private engineWebGpuAvailable: boolean | null = null;
   private engineWebGpuDetail: string | null = null;
   private webGpuDetail = "Visible Rust/wgpu renderer has not been created.";
   private disposed = false;
+  /** Latest projected object scene, so a renderer recreation can re-feed it. */
+  private lastObjectScene: ObjectScene | null = null;
+  private lastSelection: ObjectSelection = { kind: "canvas" };
 
   constructor(callbacks: ShapeCanvasHostCallbacks) {
     this.callbacks = callbacks;
   }
 
-  /**
-   * Mount against the three DOM nodes the shell owns. Replaces the three
-   * RendererCanvasHost.tsx effects: load Rust core → create the WebGPU renderer
-   * → construct/resize/start the engine. Each stage runs in order; the renderer
-   * recreation re-runs the engine construction (mirroring the effect deps).
-   */
   async mount(
     inputCanvas: HTMLCanvasElement,
     webGpuCanvas: HTMLCanvasElement,
@@ -92,17 +131,15 @@ export class ShapeCanvasHost {
     this.overlayRoot = overlayRoot;
     this.camera = initialCamera;
 
-    // Effect 1: load the generated Rust/WASM package.
     this.rustStatus = await loadRustCore();
     if (this.disposed) return;
 
-    // Effect 2: create the visible Rust/wgpu renderer.
     await this.createWebGpuRenderer();
     if (this.disposed) return;
 
-    // Effect 3: construct, observe, and start the engine.
     this.createEngine();
     this.emitHealth();
+    if (this.lastObjectScene) this.loadObjectScene(this.lastObjectScene, this.lastSelection);
   }
 
   private async createWebGpuRenderer(): Promise<void> {
@@ -177,39 +214,36 @@ export class ShapeCanvasHost {
     this.engine = null;
   }
 
-  // ----- load scene -------------------------------------------------------
+  // ----- object scene feed -------------------------------------------------
 
-  /** Build a snapshot via the EXISTING adapter fn and hand it to the engine. */
-  loadScene(scene: Scene, activeTagIds: string[], selection: SceneSelection): void {
-    if (!this.engine) return;
-    const sceneForRenderer: Scene = { ...scene, selection };
-    this.engine.loadScene(
-      shapeSceneToFilteredRenderSnapshot(sceneForRenderer, activeTagIds, {
-        camera: this.camera,
-        sceneId: `shape-scene-v${scene.sceneVersion}-production-renderer`
-      })
-    );
+  /**
+   * Push the canonical `ObjectScene` to the renderer. Projects it to the
+   * renderer-core `RenderObjectScene` and builds CPU object geometry through the
+   * crate's `buildObjectSceneGeometry`. Returns the geometry build (counts +
+   * raw), or null when the object build entry is unavailable.
+   *
+   * The live GPU object PASS is runtime-deferred (see file header): this builds
+   * and validates the geometry but does not yet rasterize it through the visible
+   * renderer's frame loop.
+   */
+  loadObjectScene(scene: ObjectScene, selection: ObjectSelection): ObjectGeometryBuild {
+    this.lastObjectScene = scene;
+    this.lastSelection = selection;
+    const build = this.rustStatus.buildObjectSceneGeometry;
+    if (!build) return null;
+    try {
+      const json = JSON.stringify(
+        objectSceneToRenderObjectScene(scene, this.camera, selection, `object-scene-v${scene.sceneVersion}`)
+      );
+      const raw = build(json);
+      return summarizeObjectGeometry(raw);
+    } catch (error) {
+      this.callbacks.onStatus(errorMessage(error, "Object geometry build failed."));
+      return null;
+    }
   }
 
-  /** Hand a pre-built snapshot straight to the engine (no adapter call). */
-  loadSnapshot(snapshot: SceneSnapshot): void {
-    this.engine?.loadScene(snapshot);
-  }
-
-  // ----- operation batch + selection -------------------------------------
-
-  applyPatch(patch: RenderScenePatch): string[] {
-    return this.engine?.applyPatch(patch) ?? ["Renderer engine is not ready"];
-  }
-
-  syncSelection(selection: SceneSelection): string[] {
-    this.selection = selection;
-    const errors = this.engine?.syncSelection(selection) ?? [];
-    if (errors.length > 0) this.callbacks.onStatus(errors.join("; "));
-    return errors;
-  }
-
-  // ----- input batch + camera --------------------------------------------
+  // ----- camera ------------------------------------------------------------
 
   setCamera(camera: CameraState): void {
     if (cameraAlmostEqual(this.camera, camera)) return;
@@ -229,36 +263,16 @@ export class ShapeCanvasHost {
     this.engine?.wheelAtScreen(screen, deltaY);
   }
 
-  // CC1.4: set the active pointer tool (Select/Hand). Switching to hand cancels
-  // any in-flight drag in the core.
+  /** CC1.4: set the active pointer tool (Select/Hand). */
   setTool(tool: ActiveTool): void {
     this.engine?.setTool(tool);
-  }
-
-  // Push the transient multi-select highlight set (marquee / shift-click). Empty
-  // clears it. The persisted single-anchor selection (syncSelection) is separate
-  // and unaffected.
-  setMultiSelect(ids: string[]): void {
-    this.engine?.setMultiSelect(ids);
-  }
-
-  // CC4.1: right-click pick. Returns the picked selection (or canvas) and emits
-  // the onContextPick callback; does not mutate selection or start a drag.
-  contextPick(screen: WorldPoint): SceneSelection {
-    return hitToSceneSelection(this.engine?.contextPick(screen) ?? null);
-  }
-
-  // ----- diagnostics ------------------------------------------------------
-
-  getSnapshot(): SceneSnapshot | null {
-    return this.engine?.getSnapshot() ?? null;
   }
 
   getCamera(): CameraState {
     return this.camera;
   }
 
-  // ----- engine event routing (mirrors RendererCanvasHost.handleEngineEvent)
+  // ----- engine event routing ---------------------------------------------
 
   private handleEngineEvent(event: EngineEvent): void {
     if (event.type === "stats") {
@@ -270,35 +284,6 @@ export class ShapeCanvasHost {
         this.callbacks.onCameraChange(nextCamera);
       }
       this.emitHealth();
-      return;
-    }
-
-    if (event.type === "selection") {
-      this.callbacks.onSelectionChange(hitToSceneSelection(event.hit), event.additive);
-      return;
-    }
-
-    if (event.type === "patch") {
-      if (event.errors.length > 0) {
-        this.callbacks.onStatus(event.errors.join("; "));
-        return;
-      }
-      this.callbacks.onPatch(event.patch);
-      return;
-    }
-
-    if (event.type === "gesture") {
-      this.callbacks.onGestureChange(event.active);
-      return;
-    }
-
-    if (event.type === "marquee") {
-      this.callbacks.onMarquee?.(event.ids);
-      return;
-    }
-
-    if (event.type === "context-pick") {
-      this.callbacks.onContextPick?.(hitToSceneSelection(event.hit), event.screen);
       return;
     }
 
@@ -329,13 +314,14 @@ export class ShapeCanvasHost {
   }
 }
 
-// Pure helpers moved from RendererCanvasHost.tsx (no React, no DOM).
-
-export function hitToSceneSelection(hit: HitResult | null): SceneSelection {
-  if (!hit) return { kind: "canvas" };
-  if (hit.kind === "group") return { kind: "group", id: hit.id };
-  if (hit.kind === "edge") return { kind: "edge", id: hit.id };
-  return { kind: "node", id: hit.id };
+/** Summarize the opaque crate geometry build into counts for diagnostics. */
+function summarizeObjectGeometry(raw: unknown): ObjectGeometryBuild {
+  const value = raw as { fillVertices?: unknown[]; strokeInstances?: unknown[] } | null;
+  return {
+    fillVertexCount: Array.isArray(value?.fillVertices) ? value!.fillVertices.length : 0,
+    strokeInstanceCount: Array.isArray(value?.strokeInstances) ? value!.strokeInstances.length : 0,
+    raw
+  };
 }
 
 export function cameraFromStats(stats: RendererStats): CameraState | null {

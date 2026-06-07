@@ -1,19 +1,19 @@
-// Transport-agnostic scene sync seam (MG3.2).
+// Transport-agnostic object scene sync seam (OB4.3).
 //
 // This is the TS mirror of the Rust WS wire protocol implemented by the server's
 // `crates/server/src/ws.rs` (`WsClientMessage`/`WsServerMessage`). One socket,
 // JSON TEXT frames, internally tagged on `type`, all keys camelCase. Two logical
 // channels (channel == message type, not a separate stream):
-//   - reliable_ordered: hello, welcome, ops, ack, rejected, patch
+//   - reliable_ordered: hello, welcome, ops, ack, rejected, patch, feature
 //   - ephemeral_besteffort: presence
 //
-// `ops`/`patch` carry WHOLE `RenderScenePatch` objects (the same union the canvas
-// actor applies). The granular per-property/opId wire shape is MG-4 and is not
-// used here. This module is the seam that replaced the HTTP scene client (MG-7).
+// `ops`/`patch` carry `WireOp[]` — each a wire envelope whose `propDelta` is the
+// `ObjectOp` delta JSON the object-native canvas actor applies. `welcome` carries
+// an `ObjectScene` snapshot. The single `feature` request/response RPC frame
+// replaces the retired bespoke REST surface (OB4.5).
 
-import type { Scene } from "../../shared/schema";
-import type { RenderScenePatch } from "../../shared/renderPatch";
-import type { OpId, OutboxEntry } from "./outbox";
+import type { ObjectScene, WireOp, FeatureRequest, FeatureResponse } from "../../shared/object";
+import type { OpId } from "./outbox";
 
 export type { OpId };
 
@@ -35,9 +35,9 @@ export type Region = {
 
 /**
  * First frame; `region` optional, `lastAckSeq` defaults 0 server-side. `userId`
- * (MG6.3) is the connection's attributed author AND its self-skip identity: the
- * server tags client-attributed ops/presence with it and never echoes them back
- * to the sender. Permissive (no auth, C13); omitted == anonymous connection.
+ * is the connection's attributed author AND its self-skip identity: the server
+ * tags client-attributed ops/presence with it and never echoes them back to the
+ * sender. Permissive (no auth, C13); omitted == anonymous connection.
  */
 export type HelloMessage = {
   type: "hello";
@@ -48,17 +48,22 @@ export type HelloMessage = {
 };
 
 /**
- * A batch of op ENVELOPES (MG-4). Each entry is an `opId`-stamped envelope around
- * a whole render patch (`OutboxEntry` shape), carrying its idempotency key, the
- * `baseRevision` it was authored against, and a client `ts`. No top-level
- * `clientId`/`baseRevision` — those moved into the per-op envelope.
+ * A batch of `WireOp`s to apply, in order. Each carries its own `opId`
+ * (`clientId` + `localSeq`) for idempotent dedup, the `baseRevision` it was
+ * authored against, and the object-op delta in `propDelta`.
  */
 export type OpsMessage = {
   type: "ops";
-  ops: OutboxEntry[];
+  ops: WireOp[];
 };
 
-/** (Re)subscribe to a region. `region` is REQUIRED here. MG-3 no-op beyond binding. */
+/** A Feature request/response RPC frame (canvas switch, comment, template apply, export). */
+export type FeatureClientMessage = {
+  type: "feature";
+  request: FeatureRequest;
+};
+
+/** (Re)subscribe to a region. `region` is REQUIRED here. */
 export type SubscribeMessage = {
   type: "subscribe";
   canvasId: string;
@@ -72,7 +77,7 @@ export type PresenceClientMessage = {
   payload: unknown;
 };
 
-/** Resume after a disconnect; MG-3 replies with a fresh welcome snapshot. */
+/** Resume after a disconnect; replies with a fresh welcome snapshot. */
 export type ResumeMessage = {
   type: "resume";
   canvasId: string;
@@ -82,6 +87,7 @@ export type ResumeMessage = {
 export type ClientMessage =
   | HelloMessage
   | OpsMessage
+  | FeatureClientMessage
   | SubscribeMessage
   | PresenceClientMessage
   | ResumeMessage;
@@ -90,19 +96,18 @@ export type ClientMessage =
 // Server -> Client messages.
 // ---------------------------------------------------------------------------
 
-/** Handshake reply: full Scene snapshot + server seq/revision. */
+/** Handshake reply: full ObjectScene snapshot + server seq/revision. */
 export type WelcomeMessage = {
   type: "welcome";
-  scene: Scene;
+  scene: ObjectScene;
   seq: number;
   revision: number;
 };
 
 /**
- * One applied op (MG-4): the `opIds` it resolved (one per op) plus the server
- * seq + revision (scene.sceneVersion) after apply. A duplicate op re-acks its
- * ORIGINAL seq/revision (idempotent), so the client can always drop the matching
- * outbox entries by `opIds`.
+ * One applied op: the `opIds` it resolved (one per op) plus the server seq +
+ * revision after apply. A duplicate op re-acks its ORIGINAL seq/revision
+ * (idempotent), so the client can always drop the matching outbox entries.
  */
 export type AckMessage = {
   type: "ack";
@@ -122,11 +127,17 @@ export type RejectedMessage = {
   errors: string[];
 };
 
-/** A peer's (or self-echo) applied patch fanned out in seq order. */
+/** A peer's (or self-echo) applied op fanned out in seq order, as `WireOp`s. */
 export type PatchMessage = {
   type: "patch";
-  ops: RenderScenePatch[];
+  ops: WireOp[];
   seq: number;
+};
+
+/** A Feature response to a `feature` request. */
+export type FeatureServerMessage = {
+  type: "feature";
+  response: FeatureResponse;
 };
 
 /** A peer's presence frame (ephemeral/best-effort). */
@@ -146,6 +157,7 @@ export type ServerMessage =
   | AckMessage
   | RejectedMessage
   | PatchMessage
+  | FeatureServerMessage
   | PresenceServerMessage
   | ErrorMessage;
 
@@ -155,15 +167,9 @@ export type ServerMessage =
 
 /** Result of a successful `connect()` handshake (decoded `welcome`). */
 export type WelcomeResult = {
-  scene: Scene;
+  scene: ObjectScene;
   seq: number;
   revision: number;
-};
-
-/** Options for an `ops` send. `baseRevision` is the revision the ops were authored against. */
-export type SendOpsOptions = {
-  clientId: string;
-  baseRevision?: number;
 };
 
 /** An applied `ack`: the resolved opIds plus the server seq/revision after apply. */
@@ -176,7 +182,7 @@ export type Ack = {
 export type Unsubscribe = () => void;
 
 /**
- * Transport-agnostic scene sync handle. A WS implementation lives in
+ * Transport-agnostic object scene sync handle. A WS implementation lives in
  * `wsTransport.ts`; a future WebTransport/gRPC impl maps onto the same channels.
  */
 export interface SceneTransport {
@@ -189,14 +195,16 @@ export interface SceneTransport {
    * whole canvas.
    */
   subscribe(region: Region): void;
-  /** Send a batch of whole render patches on the reliable channel. */
-  sendOps(ops: RenderScenePatch[], opts: SendOpsOptions): void;
+  /** Send a Feature request RPC frame on the reliable channel (OB4.5). */
+  sendFeature(request: FeatureRequest): void;
   /** Send a best-effort presence frame on the ephemeral channel. */
   sendPresence(payload: unknown): void;
   /** Subscribe to peer/self applied patches; returns an unsubscribe. */
   onPatch(cb: (patch: PatchMessage) => void): Unsubscribe;
   /** Subscribe to peer presence frames; returns an unsubscribe. */
   onPresence(cb: (presence: PresenceServerMessage) => void): Unsubscribe;
+  /** Subscribe to Feature response frames; returns an unsubscribe. */
+  onFeature(cb: (feature: FeatureServerMessage) => void): Unsubscribe;
   /** Subscribe to ack frames; returns an unsubscribe. */
   onAck(cb: (ack: AckMessage) => void): Unsubscribe;
   /** Subscribe to rejected frames; returns an unsubscribe. */

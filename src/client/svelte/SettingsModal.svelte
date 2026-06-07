@@ -1,35 +1,34 @@
 <script lang="ts">
   import { Keyboard, X } from "lucide-svelte";
-  import { commandCatalog, detectMac, formatShortcut, type CommandCategory } from "../lib/commandCatalog";
+  import { detectMac, formatShortcut } from "../lib/shortcuts";
+  import type { ObjectCommand } from "../scene/sceneCoreWasm";
 
-  // CC5.1 / O7 — settings overlay (Cmd+,). Shows the READ-ONLY shortcut list from
-  // the command catalog. CC5.2 binding/command separation: each row pairs a
-  // command (id/label) with its binding (defaultShortcut); editing is out of
-  // scope, but the data model already keeps the two distinct so a future binding
-  // editor can override the binding per command without touching the command set.
+  // CC5.1 / U4 — settings overlay (Cmd+,). Shows the READ-ONLY shortcut list from
+  // the object command catalog (the wasm core's `object_command_catalog()`, P1 —
+  // no TS mirror). Each row pairs a command (id/label) with its binding
+  // (defaultShortcut); editing is out of scope.
   type Props = {
+    catalog: ObjectCommand[];
     onClose: () => void;
   };
 
-  let { onClose }: Props = $props();
+  let { catalog, onClose }: Props = $props();
 
   const isMac = detectMac();
 
-  const categoryLabels: Record<CommandCategory, string> = {
-    tool: "Tools",
-    shape: "Shapes",
-    view: "View",
-    edit: "Edit",
-    selection: "Selection",
-    template: "Templates",
-    canvas: "Canvas"
-  };
-
-  const categoryOrder: CommandCategory[] = ["tool", "shape", "view", "edit", "selection", "template", "canvas"];
-
-  const grouped = categoryOrder
-    .map((category) => ({ category, commands: commandCatalog.filter((command) => command.category === category) }))
-    .filter((group) => group.commands.length > 0);
+  // Group by the catalog's own category strings, in first-seen order.
+  const grouped = $derived.by(() => {
+    const order: string[] = [];
+    const byCategory = new Map<string, ObjectCommand[]>();
+    for (const command of catalog) {
+      if (!byCategory.has(command.category)) {
+        byCategory.set(command.category, []);
+        order.push(command.category);
+      }
+      byCategory.get(command.category)!.push(command);
+    }
+    return order.map((category) => ({ category, commands: byCategory.get(category)! }));
+  });
 </script>
 
 <div
@@ -61,7 +60,7 @@
     <div class="settings-modal-body">
       {#each grouped as group (group.category)}
         <section class="settings-section">
-          <h3>{categoryLabels[group.category]}</h3>
+          <h3>{group.category}</h3>
           <ul>
             {#each group.commands as command (command.id)}
               <li>

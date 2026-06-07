@@ -12,17 +12,13 @@
 // callers can use plain try/catch. Domain failures (unknown id, invalid patch)
 // are NOT thrown: they ride in the `errors: string[]` field of the result.
 
-import type { Scene, SceneComment, SceneSelection, Tag } from "../../shared/schema";
-import type { RenderScenePatch } from "../../shared/renderPatch";
-import type { WorldPoint } from "../../shared/renderScene";
-import type { Command } from "../lib/commandCatalog";
 import type { Object as SceneObject, ObjectOp, ObjectScene } from "../../shared/object";
 
 /**
  * Result of `apply_object_op` (OB4.3). On success `scene` is the next object
  * scene and `inverse` is the captured inverse op (the undo entry, D21). On a
  * domain failure the scene is returned unchanged, `inverse` is null, and the
- * message rides `errors` — mirroring {@link RenderResult}'s error policy.
+ * message rides `errors`.
  */
 export type ObjectApplyResult = {
   scene: ObjectScene;
@@ -37,41 +33,13 @@ export type ObjectCommand = {
   category: string;
   defaultShortcut?: string;
   description?: string;
+  /** The ObjectOp kind this command lowers to 1:1, when applicable. */
+  opKind?: string;
   [extra: string]: unknown;
 };
 
 /** A derived outline/region for an object's geometry (OB1.3, reference stub). */
 export type DerivedRegion = Record<string, unknown>;
-
-/** Result of `apply_render_patch` / `update_group_tags`. */
-export type RenderResult = {
-  scene: Scene;
-  errors: string[];
-};
-
-/** Result of `add_comment`. `comment` is null when `errors` is non-empty. */
-export type CommentResult = {
-  scene: Scene;
-  comment: SceneComment | null;
-  errors: string[];
-};
-
-/** Insert ids for `insert_primitive_ops` (mirrors scene-core `InsertIds`). */
-export type InsertIds = {
-  primary: string;
-  secondary: string;
-  edge: string;
-};
-
-/** Primitive kind token accepted by `insert_primitive_ops`. */
-export type PrimitiveSpec = "rectangle" | "ellipse" | "connector" | "sticky" | "frame";
-
-// scene-core owns the template/recipe contract shapes; they are not yet mirrored
-// as TS types, so they are surfaced as opaque records here. Tighten when a shared
-// schema exists.
-export type TemplateContract = Record<string, unknown>;
-export type TemplateMetadata = Record<string, unknown>;
-export type AppliedTemplate = Record<string, unknown>;
 
 // Shape of the generated wasm-pack module (`shape_scene_core.js`). Declared
 // locally — matching wasmLoader.ts — so this file does not statically import the
@@ -82,33 +50,13 @@ export type AppliedTemplate = Record<string, unknown>;
 // `initSync` (init from already-loaded wasm bytes/module). The browser uses
 // `default`; Node/vitest cannot `fetch()` the module, so it reads the `.wasm`
 // from the filesystem and inits synchronously via `initSync`.
+//
+// Only the OB4.3 object-native bridges are surfaced here; the legacy
+// Group/Card/Edge wasm exports remain in the binary but are no longer bound on
+// the TS side (a follow-up removes them from the crate entirely).
 type SceneCoreModule = {
   default: (init?: unknown) => Promise<unknown>;
   initSync: (module: { module: BufferSource | WebAssembly.Module }) => unknown;
-  apply_render_patch: (sceneJson: string, patchJson: string, now: string) => string;
-  add_comment: (sceneJson: string, targetJson: string, body: string, now: string) => string;
-  update_group_tags: (
-    sceneJson: string,
-    groupId: string,
-    tagIdsJson: string,
-    now: string
-  ) => string;
-  recipe_from_selection: (sceneJson: string, idsJson: string, metadataJson: string) => string;
-  apply_template: (
-    templateJson: string,
-    anchorJson: string,
-    idPrefix: string,
-    now: string
-  ) => string;
-  insert_primitive_ops: (
-    spec: string,
-    anchorJson: string,
-    groupId: string,
-    idsJson: string,
-    now: string
-  ) => string;
-  command_catalog: () => string;
-  // OB4.3 object-native bridges (the same Rust the object-native server runs).
   apply_object_op: (sceneJson: string, opJson: string) => string;
   derive_region: (geometryJson: string, flatness: number) => string;
   object_command_catalog: () => string;
@@ -120,32 +68,9 @@ type SceneCoreModule = {
   ) => string;
 };
 
-/** Typed handle returned by {@link loadSceneCore}. */
+/** Typed handle returned by {@link loadSceneCore}. The object-native op-apply +
+ *  derived contracts run the SAME Rust the object-native server runs. */
 export type SceneCore = {
-  applyRenderPatch(scene: Scene, patch: RenderScenePatch, now: string): RenderResult;
-  addComment(scene: Scene, target: SceneSelection, body: string, now: string): CommentResult;
-  updateGroupTags(scene: Scene, groupId: string, tagIds: string[], now: string): RenderResult;
-  recipeFromSelection(
-    scene: Scene,
-    ids: string[],
-    metadata: TemplateMetadata
-  ): TemplateContract;
-  applyTemplate(
-    template: TemplateContract,
-    anchor: WorldPoint,
-    idPrefix: string,
-    now: string
-  ): AppliedTemplate;
-  insertPrimitiveOps(
-    spec: PrimitiveSpec,
-    anchor: WorldPoint,
-    groupId: string,
-    ids: InsertIds,
-    now: string
-  ): RenderScenePatch[];
-  commandCatalog(): Command[];
-  // OB4.3 object-native op-apply + derived contracts. These run the SAME Rust the
-  // object-native server runs, so an object op applies identically on both sides.
   applyObjectOp(scene: ObjectScene, op: ObjectOp): ObjectApplyResult;
   deriveRegion(geometry: SceneObject["geometry"], flatness: number): DerivedRegion;
   objectCommandCatalog(): ObjectCommand[];
@@ -161,10 +86,6 @@ let modulePromise: Promise<SceneCoreModule> | null = null;
 // Set once the wasm instance is initialized; backs the synchronous op-apply the
 // sync engine uses on its hot path (after `ensureSceneCore` has resolved).
 let readyModule: SceneCoreModule | null = null;
-
-// `Tag` is part of scene-core's serde surface (tags ride inside Scene); imported
-// to anchor the type contract even though no wrapper takes a bare Tag yet.
-export type { Tag };
 
 /** True under Node/vitest (no `fetch`-served wasm), false in the browser. */
 function isNodeRuntime(): boolean {
@@ -231,45 +152,6 @@ async function loadModule(): Promise<SceneCoreModule> {
 export async function loadSceneCore(): Promise<SceneCore> {
   const mod = await loadModule();
   return {
-    applyRenderPatch(scene, patch, now) {
-      return parseBridge<RenderResult>(
-        "apply_render_patch",
-        mod.apply_render_patch(JSON.stringify(scene), JSON.stringify(patch), now)
-      );
-    },
-    addComment(scene, target, body, now) {
-      return parseBridge<CommentResult>(
-        "add_comment",
-        mod.add_comment(JSON.stringify(scene), JSON.stringify(target), body, now)
-      );
-    },
-    updateGroupTags(scene, groupId, tagIds, now) {
-      return parseBridge<RenderResult>(
-        "update_group_tags",
-        mod.update_group_tags(JSON.stringify(scene), groupId, JSON.stringify(tagIds), now)
-      );
-    },
-    recipeFromSelection(scene, ids, metadata) {
-      return parseBridge<TemplateContract>(
-        "recipe_from_selection",
-        mod.recipe_from_selection(JSON.stringify(scene), JSON.stringify(ids), JSON.stringify(metadata))
-      );
-    },
-    applyTemplate(template, anchor, idPrefix, now) {
-      return parseBridge<AppliedTemplate>(
-        "apply_template",
-        mod.apply_template(JSON.stringify(template), JSON.stringify(anchor), idPrefix, now)
-      );
-    },
-    insertPrimitiveOps(spec, anchor, groupId, ids, now) {
-      return parseBridge<RenderScenePatch[]>(
-        "insert_primitive_ops",
-        mod.insert_primitive_ops(spec, JSON.stringify(anchor), groupId, JSON.stringify(ids), now)
-      );
-    },
-    commandCatalog() {
-      return parseBridge<Command[]>("command_catalog", mod.command_catalog());
-    },
     applyObjectOp(scene, op) {
       return parseBridge<ObjectApplyResult>(
         "apply_object_op",
@@ -299,7 +181,7 @@ export async function loadSceneCore(): Promise<SceneCore> {
 
 /**
  * Idempotently initialize the scene-core wasm instance so the synchronous
- * {@link applyRenderPatchSync} can run afterwards. The sync engine's owner awaits
+ * {@link applyObjectOpSync} can run afterwards. The sync engine's owner awaits
  * this once (e.g. before `connect`) — the same `--target web` artifact backs both
  * the browser and Node/vitest, so the engine runs the SAME op-apply everywhere.
  */
@@ -308,27 +190,12 @@ export async function ensureSceneCore(): Promise<void> {
 }
 
 /**
- * Synchronous op-apply, the sync engine's hot path. Requires {@link ensureSceneCore}
- * to have resolved first (the wasm instance must be initialized); throws if not,
- * since the engine's `author`/`applyRemote`/`reconcileSnapshot` are synchronous
- * and cannot await an init. This is THE op-apply — the same Rust the server runs.
- */
-export function applyRenderPatchSync(scene: Scene, patch: RenderScenePatch, now: string): RenderResult {
-  if (!readyModule) {
-    throw new Error("scene-core wasm is not initialized; await ensureSceneCore() before applyRenderPatchSync()");
-  }
-  return parseBridge<RenderResult>(
-    "apply_render_patch",
-    readyModule.apply_render_patch(JSON.stringify(scene), JSON.stringify(patch), now)
-  );
-}
-
-/**
- * Synchronous object op-apply (OB4.3), the object sync engine's hot path. Like
- * {@link applyRenderPatchSync} it requires {@link ensureSceneCore} to have
- * resolved; it runs THE scene-core object op-apply — the same Rust the
- * object-native server runs — and returns the next scene plus the inverse op
- * (undo entry, D21).
+ * Synchronous object op-apply (OB4.3), the object sync engine's hot path.
+ * Requires {@link ensureSceneCore} to have resolved first (the wasm instance must
+ * be initialized); throws if not, since the engine's `author`/`applyRemote`/
+ * `reconcileSnapshot` are synchronous and cannot await an init. It runs THE
+ * scene-core object op-apply — the same Rust the object-native server runs — and
+ * returns the next scene plus the inverse op (undo entry, D21).
  */
 export function applyObjectOpSync(scene: ObjectScene, op: ObjectOp): ObjectApplyResult {
   if (!readyModule) {

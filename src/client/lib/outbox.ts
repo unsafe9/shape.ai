@@ -1,4 +1,4 @@
-// Durable outbox for unacked client ops (MG4.3).
+// Durable outbox for unacked client ops (OB4.3).
 //
 // Every op the shell authors is appended here BEFORE it is sent on the wire and
 // is removed only when the server acks its `opId`. This makes the unacked tail
@@ -7,10 +7,10 @@
 // dropped) is re-sent rather than lost. Re-sending the same `opId` is safe — the
 // server dedups by it and re-acks the original seq (idempotent).
 //
-// C11: the eventual durable backing is storage-core wasm sqlite (OPFS);
-// IndexedDB is the interim impl, swap behind OutboxStore.
+// An entry is a `WireOp` (the exact wire envelope, `propDelta` carrying the
+// `ObjectOp` delta), so a row can be re-sent verbatim with no re-encoding.
 
-import type { RenderScenePatch } from "../../shared/renderPatch";
+import type { WireOp } from "../../shared/object";
 
 /** `(clientId, localSeq)` idempotency key — mirrors the server `OpId`. */
 export type OpId = {
@@ -19,16 +19,11 @@ export type OpId = {
 };
 
 /**
- * One outbox row: an opId-stamped envelope around a whole `RenderScenePatch`.
- * Field-for-field the `ops` envelope the evolved WS protocol carries, so an
- * entry can be re-sent verbatim with no re-encoding.
+ * One outbox row: an opId-stamped `WireOp` envelope around an `ObjectOp` delta.
+ * Field-for-field the `ops` envelope the WS protocol carries, so an entry can be
+ * re-sent verbatim with no re-encoding.
  */
-export type OutboxEntry = {
-  opId: OpId;
-  baseRevision: number;
-  ts: string;
-  patch: RenderScenePatch;
-};
+export type OutboxEntry = WireOp;
 
 /**
  * Durable append-only log of unacked ops, keyed by `opId`.

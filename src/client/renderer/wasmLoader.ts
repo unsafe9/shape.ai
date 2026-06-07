@@ -6,6 +6,14 @@ export type RustCoreStatus = {
   detail: string;
   probeWebGpu: RustWebGpuProbe | null;
   createWebGpuRenderer: RustCreateWebGpuRenderer | null;
+  /**
+   * OB-4 object render entry: builds CPU object fill/stroke geometry from a
+   * `RenderObjectScene` JSON via the crate's `ObjectPipeline::build_scene_geometry`.
+   * Present once the renderer wasm exports it. The live GPU object PASS (uploading
+   * this geometry through the frame loop) is a deferred renderer-crate step — this
+   * exercises the build path so the object scene round-trips through the renderer.
+   */
+  buildObjectSceneGeometry: ((sceneJson: string) => unknown) | null;
 };
 
 export type RustWebGpuFrameStats = {
@@ -172,6 +180,7 @@ type RustCoreModule = {
   renderer_backend?: () => string;
   probeWebGpu?: RustWebGpuProbe;
   ShapeWebGpuRenderer?: RustWebGpuRendererClass;
+  buildObjectSceneGeometry?: (sceneJson: string) => unknown;
 };
 
 export async function loadRustCore(): Promise<RustCoreStatus> {
@@ -191,7 +200,9 @@ export async function loadRustCore(): Promise<RustCoreStatus> {
       backend,
       detail: "Rust/WASM package loaded with WebGPU renderer export.",
       probeWebGpu: typeof wasmModule.probeWebGpu === "function" ? wasmModule.probeWebGpu : null,
-      createWebGpuRenderer: wasmModule.ShapeWebGpuRenderer.create.bind(wasmModule.ShapeWebGpuRenderer)
+      createWebGpuRenderer: wasmModule.ShapeWebGpuRenderer.create.bind(wasmModule.ShapeWebGpuRenderer),
+      buildObjectSceneGeometry:
+        typeof wasmModule.buildObjectSceneGeometry === "function" ? wasmModule.buildObjectSceneGeometry : null
     };
   } catch (error) {
     return {
@@ -199,7 +210,8 @@ export async function loadRustCore(): Promise<RustCoreStatus> {
       backend: "webgpu-wasm-unavailable",
       detail: error instanceof Error ? error.message : "Rust/WASM package has not been built yet.",
       probeWebGpu: null,
-      createWebGpuRenderer: null
+      createWebGpuRenderer: null,
+      buildObjectSceneGeometry: null
     };
   }
 }

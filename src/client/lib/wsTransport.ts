@@ -1,28 +1,28 @@
-// WebSocket implementation of `SceneTransport` (MG3.2).
+// WebSocket implementation of `SceneTransport` (OB4.3).
 //
-// Mirrors the server WS endpoint (`crates/server/src/ws.rs`): one socket at
-// `/ws`, JSON TEXT frames, `hello` first, `welcome` resolves `connect()`. Two
-// logical channels share the socket — ops/ack/patch are the reliable path,
-// presence is fire-and-forget. The WebSocket constructor is injected so tests
-// can drive a mock without a browser global.
+// Mirrors the object-native server WS endpoint (`crates/server/src/ws.rs`): one
+// socket at `/ws`, JSON TEXT frames, `hello` first, `welcome` resolves
+// `connect()`. Two logical channels share the socket — ops/ack/patch + feature
+// are the reliable path, presence is fire-and-forget. The WebSocket constructor
+// is injected so tests can drive a mock without a browser global.
 
 import type {
   Ack,
   AckMessage,
   ClientMessage,
   ErrorMessage,
+  FeatureServerMessage,
   HelloMessage,
   PatchMessage,
   PresenceServerMessage,
   Region,
   RejectedMessage,
   SceneTransport,
-  SendOpsOptions,
   ServerMessage,
   Unsubscribe,
   WelcomeResult
 } from "./transport";
-import type { RenderScenePatch } from "../../shared/renderPatch";
+import type { FeatureRequest } from "../../shared/object";
 import type { OutboxEntry } from "./outbox";
 import type { EngineTransport } from "./syncEngine";
 
@@ -45,7 +45,7 @@ export type WsTransportOptions = {
   /** Socket factory; defaults to the browser `WebSocket` global. */
   createSocket?: WebSocketFactory;
   /**
-   * Stable author/self-skip identity sent in `hello.userId` (MG6.3). The server
+   * Stable author/self-skip identity sent in `hello.userId`. The server
    * attributes this client's ops/presence to it and never echoes them back, so
    * the client treats every inbound `patch`/`presence` as a peer's.
    */
@@ -97,7 +97,7 @@ function defaultFactory(url: string): WebSocketLike {
 export class WsTransport implements SceneTransport, EngineTransport {
   private readonly url: string;
   private readonly createSocket: WebSocketFactory;
-  /** Stable author/self-skip identity sent in `hello.userId` (MG6.3). */
+  /** Stable author/self-skip identity sent in `hello.userId`. */
   private readonly userId: string | undefined;
   private socket: WebSocketLike | null = null;
 
@@ -122,15 +122,9 @@ export class WsTransport implements SceneTransport, EngineTransport {
   private status: ConnectionStatus = "offline";
   private readonly statusListeners = new Set<Listener<ConnectionStatus>>();
 
-  /**
-   * Fallback monotonic localSeq for the bare {@link sendOps} path (no engine).
-   * The engine owns its own durable counter via the outbox; this is only used
-   * when ops are sent directly through {@link SceneTransport.sendOps}.
-   */
-  private fallbackLocalSeq = 0;
-
   private readonly patchListeners = new Set<Listener<PatchMessage>>();
   private readonly presenceListeners = new Set<Listener<PresenceServerMessage>>();
+  private readonly featureListeners = new Set<Listener<FeatureServerMessage>>();
   private readonly ackListeners = new Set<Listener<AckMessage>>();
   private readonly rejectedListeners = new Set<Listener<RejectedMessage>>();
   private readonly errorListeners = new Set<Listener<ErrorMessage>>();
@@ -253,37 +247,23 @@ export class WsTransport implements SceneTransport, EngineTransport {
   }
 
   /**
-   * Send a batch of whole render patches as opId-stamped envelopes (evolved
-   * protocol). Each patch is wrapped with a freshly-minted `opId`
-   * (`clientId` + monotonic localSeq), the supplied `baseRevision`, and a `ts`.
-   * The engine path uses {@link sendEnvelopes} directly with durable opIds; this
-   * bare path is for callers that don't run the sync engine.
-   */
-  sendOps(ops: RenderScenePatch[], opts: SendOpsOptions): void {
-    const baseRevision = opts.baseRevision ?? 0;
-    const ts = new Date().toISOString();
-    const entries: OutboxEntry[] = ops.map((patch) => ({
-      opId: { clientId: opts.clientId, localSeq: ++this.fallbackLocalSeq },
-      baseRevision,
-      ts,
-      patch
-    }));
-    this.sendEnvelopes(entries);
-  }
-
-  /**
-   * Send pre-built opId-stamped envelopes on the reliable channel
+   * Send pre-built `WireOp` envelopes on the reliable channel
    * ({@link EngineTransport}). The sync engine drives this with entries minted
    * from its durable outbox so opIds survive reloads.
    *
    * Offline-safe (MG8.4): with no live socket the send is a no-op — the entries
    * are already durable in the engine's outbox, so the reconnect welcome's
-   * reconcile replays them. This is what lets the shell keep authoring while
-   * disconnected (optimistic apply + outbox) without a throw on every op.
+   * reconcile replays them.
    */
   sendEnvelopes(entries: OutboxEntry[]): void {
     if (!this.socket) return;
     this.sendRaw({ type: "ops", ops: entries });
+  }
+
+  /** Send a Feature request RPC frame on the reliable channel (OB4.5). */
+  sendFeature(request: FeatureRequest): void {
+    if (!this.socket) throw new Error("sendFeature before connect");
+    this.sendRaw({ type: "feature", request });
   }
 
   sendPresence(payload: unknown): void {
@@ -311,6 +291,10 @@ export class WsTransport implements SceneTransport, EngineTransport {
     return this.subscribeListener(this.presenceListeners, cb);
   }
 
+  onFeature(cb: Listener<FeatureServerMessage>): Unsubscribe {
+    return this.subscribeListener(this.featureListeners, cb);
+  }
+
   onAck(cb: Listener<AckMessage>): Unsubscribe {
     return this.subscribeListener(this.ackListeners, cb);
   }
@@ -330,20 +314,20 @@ export class WsTransport implements SceneTransport, EngineTransport {
 
   /**
    * Wire a {@link SyncEngine} onto this socket: ack/rejected drop outbox entries,
-   * remote patches feed the optimistic/discard path, and every welcome (initial
-   * + reconnect) reconciles the snapshot and replays the outbox. Returns a
-   * detach that drops all four subscriptions.
+   * remote patches feed the optimistic/discard path (each `WireOp.propDelta` is
+   * the `ObjectOp` to re-apply), and every welcome reconciles the snapshot and
+   * replays the outbox. Returns a detach that drops all four subscriptions.
    */
   attachEngine(engine: {
     onAck(r: { opIds: AckMessage["opIds"]; revision?: number }): void | Promise<void>;
     onRejected(opIds: NonNullable<RejectedMessage["opIds"]>): void | Promise<void>;
-    applyRemote(patch: PatchMessage["ops"][number]): boolean;
+    applyRemote(op: PatchMessage["ops"][number]["propDelta"]): boolean;
     reconcileSnapshot(scene: WelcomeResult["scene"]): void | Promise<void>;
   }): Unsubscribe {
     const offAck = this.onAck((m) => void engine.onAck({ opIds: m.opIds, revision: m.revision }));
     const offRej = this.onRejected((m) => void engine.onRejected(m.opIds ?? []));
     const offPatch = this.onPatch((m) => {
-      for (const op of m.ops) engine.applyRemote(op);
+      for (const wire of m.ops) engine.applyRemote(wire.propDelta);
     });
     const offWelcome = this.onWelcome((w) => void engine.reconcileSnapshot(w.scene));
     return () => {
@@ -428,6 +412,10 @@ export class WsTransport implements SceneTransport, EngineTransport {
       case "patch": {
         this.lastAckSeq = Math.max(this.lastAckSeq, msg.seq);
         this.patchListeners.forEach((cb) => cb(msg));
+        return;
+      }
+      case "feature": {
+        this.featureListeners.forEach((cb) => cb(msg));
         return;
       }
       case "presence": {
