@@ -15,27 +15,36 @@
 //! * [`format`] — the one portable bundle format: a sharded directory written
 //!   and read incrementally (streaming, bounded buffers) and in parallel via
 //!   rayon, with per-shard CRCs for stability.
-//! * [`MemoryAdapter`] / [`FileAdapter`] — real, fully-tested adapters living
-//!   under [`adapters`].
-//! * [`SqliteAdapter`] / [`PostgresAdapter`] / [`S3Adapter`] /
-//!   [`RemoteServerAdapter`] — clearly-marked stubs (drivers unavailable
-//!   offline) that still keep the portability contract.
+//! * [`MemoryAdapter`] / [`FileAdapter`] / [`SqliteAdapter`] — real,
+//!   fully-tested adapters living under [`adapters`]. (`SqliteAdapter` is
+//!   native-only and behind the default `sqlite` feature.)
+//! * [`PostgresAdapter`] / [`S3Adapter`] / [`RemoteServerAdapter`] —
+//!   clearly-marked stubs (drivers unavailable offline) that still keep the
+//!   portability contract.
 
 mod adapter;
 mod adapters;
 mod error;
+// The portable bundle format depends on std::fs + rayon, so it is native-only;
+// wasm32 keeps the data model + trait + MemoryAdapter and no on-disk format.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod format;
 mod record;
+mod spatial;
 
 pub use adapter::{AdapterKind, RecordCursor, StorageAdapter};
-pub use adapters::{
-    FileAdapter, MemoryAdapter, PostgresAdapter, RemoteServerAdapter, S3Adapter, SqliteAdapter,
-};
+pub use adapters::MemoryAdapter;
+#[cfg(not(target_arch = "wasm32"))]
+pub use adapters::{FileAdapter, PostgresAdapter, RemoteServerAdapter, S3Adapter};
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+pub use adapters::SqliteAdapter;
 pub use error::{Result, StorageError};
+#[cfg(not(target_arch = "wasm32"))]
 pub use format::{Manifest, ShardEntry, DEFAULT_SHARD_COUNT, FORMAT_VERSION};
 pub use record::{Record, StoreSnapshot};
+pub use spatial::{RegionKey, SpatialStore};
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use std::env;
@@ -220,7 +229,7 @@ mod tests {
 /// across a full streaming export/import of a large dataset and assert it stays
 /// far below the dataset's total size — the regression guard against the old
 /// "snapshot the whole store, then write" pattern.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod alloc_probe {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -277,14 +286,14 @@ mod alloc_probe {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[global_allocator]
 static GLOBAL: alloc_probe::CountingAlloc = alloc_probe::CountingAlloc;
 
 /// Detailed integrity + memory-safety tests, run against BOTH the in-memory and
 /// the on-disk adapters via a shared harness. These enforce the integrity
 /// contract documented in `src/adapters/CLAUDE.md`.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod integrity {
     use super::*;
     use crate::format::{import_stream, shard_index_of};
@@ -536,6 +545,106 @@ mod integrity {
         let mut mem2 = MemoryAdapter::new();
         mem2.import(&b2).unwrap();
         assert_imports_match(&expected, &mem2);
+    }
+
+    /// The capstone byte-stability proof: the SAME logical dataset exported from
+    /// every real adapter — Memory (RAM), File (bundle dir), and Sqlite (native
+    /// rusqlite) — must produce byte-identical bundles (manifest + every shard),
+    /// and each bundle must re-import into a fresh MemoryAdapter reproducing the
+    /// source snapshot exactly. This proves the sqlite adapter is a first-class
+    /// participant in the one portable, byte-stable bundle format.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn all_adapters_export_byte_identical_and_reimport() {
+        let tmp = TempDir::new("alladapters");
+
+        // Same dataset into all three adapter kinds.
+        let (mem, expected) = loaded(MemoryAdapter::new());
+        let (file, _) = loaded(open_file(&tmp, "store.shapestore"));
+        let mut sqlite = SqliteAdapter::open_in_memory().unwrap();
+        for r in &expected {
+            sqlite.save(r.clone()).unwrap();
+        }
+
+        let mem_bundle = tmp.path().join("mem.shapestore");
+        let file_bundle = tmp.path().join("file.shapestore");
+        let sqlite_bundle = tmp.path().join("sqlite.shapestore");
+        let man_mem = mem.export(&mem_bundle).unwrap();
+        let man_file = file.export(&file_bundle).unwrap();
+        let man_sqlite = sqlite.export(&sqlite_bundle).unwrap();
+
+        // Manifests identical across all three adapter kinds.
+        assert_eq!(man_mem, man_file, "memory vs file manifest");
+        assert_eq!(man_mem, man_sqlite, "memory vs sqlite manifest");
+
+        // And the full on-disk bundle bytes (manifest + every shard) identical.
+        let bytes_mem = read_bundle_bytes(&mem_bundle);
+        assert_eq!(bytes_mem, read_bundle_bytes(&file_bundle), "memory vs file bytes");
+        assert_eq!(bytes_mem, read_bundle_bytes(&sqlite_bundle), "memory vs sqlite bytes");
+
+        // Every bundle re-imports into a fresh MemoryAdapter reproducing the snapshot.
+        let source_snapshot = mem.snapshot().unwrap();
+        for bundle in [&mem_bundle, &file_bundle, &sqlite_bundle] {
+            let mut into = MemoryAdapter::new();
+            into.import(bundle).unwrap();
+            assert_eq!(
+                into.snapshot().unwrap(),
+                source_snapshot,
+                "snapshot mismatch reimporting {}",
+                bundle.display()
+            );
+        }
+    }
+
+    // ---- BUNDLE ATOMICITY (MG1.4) ----------------------------------------
+
+    /// A FileAdapter import that fails partway (corrupt incoming bundle) must
+    /// leave the existing on-disk bundle fully intact — the swap-in-place write
+    /// goes through a sibling temp dir and only renames on success, so a failed
+    /// import never corrupts or truncates the live store.
+    #[test]
+    fn file_import_failure_leaves_existing_bundle_intact() {
+        let tmp = TempDir::new("atomic");
+
+        // A populated, healthy file store; capture its exact on-disk bytes.
+        let (file_seed, expected) = loaded(open_file(&tmp, "live.shapestore"));
+        let live_root = file_seed.root().to_path_buf();
+        let before = read_bundle_bytes(&live_root);
+        assert!(!before.is_empty(), "seed store must have content");
+
+        // Build a valid bundle, then corrupt one shard so import fails midway.
+        let incoming = tmp.path().join("incoming.shapestore");
+        let (donor, _) = loaded(MemoryAdapter::new());
+        let man = donor.export(&incoming).unwrap();
+        let victim = man
+            .shards
+            .iter()
+            .find(|s| s.records > 0)
+            .expect("a non-empty shard");
+        let shard_path = incoming.join(format!("shard-{:05}.bin", victim.index));
+        let mut shard_bytes = std::fs::read(&shard_path).unwrap();
+        let last = shard_bytes.len() - 1;
+        shard_bytes[last] ^= 0xff;
+        std::fs::write(&shard_path, &shard_bytes).unwrap();
+
+        // Import must fail on the corrupt shard's CRC.
+        let mut live = FileAdapter::open(&live_root).unwrap();
+        let err = live.import(&incoming).unwrap_err();
+        assert!(matches!(err, StorageError::Format(_)), "got {err:?}");
+
+        // The live bundle's bytes are unchanged, and it still serves every record.
+        assert_eq!(read_bundle_bytes(&live_root), before, "live bundle bytes changed");
+        let reopened = FileAdapter::open(&live_root).unwrap();
+        assert_imports_match(&expected, &reopened);
+
+        // No orphan temp bundle leaked next to the live store.
+        let leaked: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leaked.is_empty(), "leaked temp bundle(s): {leaked:?}");
     }
 
     // ---- LARGE-DATA / BOUNDED-MEMORY -------------------------------------

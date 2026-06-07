@@ -1,0 +1,52 @@
+[package]
+name = "shape_server"
+version = "0.1.0"
+edition = "2021"
+description = "Native (tokio/axum) server for shape.ai: transport, persistence, and fan-out orchestration around the pure scene-core. Canvas logic stays in scene-core; this crate is the platform seam."
+
+[lib]
+name = "shape_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shape_server"
+path = "src/main.rs"
+
+[dependencies]
+# `ws` feature: the MG-3 WebSocket transport (axum::extract::ws). It pulls in
+# axum's own tokio-tungstenite (0.24); the dev-dep client below pins the same
+# major so the test shares one tungstenite/http stack.
+axum = { version = "0.7", features = ["ws"] }
+# Stream/sink combinators for splitting the WS socket and draining the actor
+# broadcast in the per-connection forwarder task.
+futures-util = "0.3"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+# MG2.3 (Phase 3): official MCP rust-sdk. Server + the streamable-HTTP transport
+# (a tower::Service mounted at /mcp) + schemars-derived tool input schemas.
+rmcp = { version = "1.7", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+] }
+schemars = "1"
+
+shape_scene_core = { path = "../scene-core" }
+shape_storage_core = { path = "../../src/storage/core" }
+# MG-8 scale-out: single-writer canvas leases + routing + presence/pubsub seam.
+shape_coordination = { path = "../coordination" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# MG-3 WS integration test: a real WebSocket client against the bound router.
+# Pinned to 0.24 to match axum 0.7's bundled tungstenite (no duplicate stack).
+tokio-tungstenite = "0.24"

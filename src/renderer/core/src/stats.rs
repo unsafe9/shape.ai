@@ -115,6 +115,17 @@ pub struct CoreOverlayRequest {
     pub style: CoreOverlayStyle,
 }
 
+/// Result of a completed drag marquee (C1 / CC2.x). The shell merges `ids` into
+/// its transient `multiSelectIds` set; `rect` is the final world-space marquee
+/// rectangle. Emitted only on the pointer-up that ends a marquee drag.
+#[cfg(feature = "wgpu-probe")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreMarqueeResult {
+    pub rect: WorldRect,
+    pub ids: Vec<String>,
+}
+
 #[cfg(feature = "wgpu-probe")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,6 +135,7 @@ pub struct CoreInputBatchResult {
     pub selection: SceneSelection,
     pub patches: Vec<RenderScenePatch>,
     pub overlay: Option<CoreOverlayRequest>,
+    pub marquee: Option<CoreMarqueeResult>,
 }
 
 #[cfg(feature = "wgpu-probe")]

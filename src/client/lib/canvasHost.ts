@@ -10,8 +10,8 @@
 import type { CameraState } from "../../shared/renderScene";
 import type { RenderScenePatch } from "../../shared/renderPatch";
 import type { Scene, SceneSelection } from "../../shared/schema";
-import { ShapeCanvasEngine, type EngineEvent, type FocusBoundsOptions } from "../renderer/engine";
-import type { FrameStats, HitResult, SceneSnapshot, WorldRect } from "../renderer/scene";
+import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions } from "../renderer/engine";
+import type { FrameStats, HitResult, SceneSnapshot, WorldPoint, WorldRect } from "../renderer/scene";
 import { shapeSceneToFilteredRenderSnapshot } from "../../shared/renderPatch";
 import { loadRustCore, type RustCoreStatus, type RustWebGpuRenderer } from "../renderer/wasmLoader";
 
@@ -35,6 +35,10 @@ export type ShapeCanvasHostCallbacks = {
   onStats: (stats: RendererStats) => void;
   onStatus: (message: string) => void;
   onHealthChange: (health: RendererHealth) => void;
+  // CC2.3: marquee drag ended; ids are node-then-group ids inside the rect.
+  onMarquee?: (ids: string[]) => void;
+  // CC4.1: right-click pick result for the context menu (selection-neutral).
+  onContextPick?: (selection: SceneSelection, screen: { x: number; y: number }) => void;
 };
 
 const initialRustStatus: RustCoreStatus = {
@@ -225,6 +229,18 @@ export class ShapeCanvasHost {
     this.engine?.wheelAtScreen(screen, deltaY);
   }
 
+  // CC1.4: set the active pointer tool (Select/Hand). Switching to hand cancels
+  // any in-flight drag in the core.
+  setTool(tool: ActiveTool): void {
+    this.engine?.setTool(tool);
+  }
+
+  // CC4.1: right-click pick. Returns the picked selection (or canvas) and emits
+  // the onContextPick callback; does not mutate selection or start a drag.
+  contextPick(screen: WorldPoint): SceneSelection {
+    return hitToSceneSelection(this.engine?.contextPick(screen) ?? null);
+  }
+
   // ----- diagnostics ------------------------------------------------------
 
   getSnapshot(): SceneSnapshot | null {
@@ -266,6 +282,16 @@ export class ShapeCanvasHost {
 
     if (event.type === "gesture") {
       this.callbacks.onGestureChange(event.active);
+      return;
+    }
+
+    if (event.type === "marquee") {
+      this.callbacks.onMarquee?.(event.ids);
+      return;
+    }
+
+    if (event.type === "context-pick") {
+      this.callbacks.onContextPick?.(hitToSceneSelection(event.hit), event.screen);
       return;
     }
 

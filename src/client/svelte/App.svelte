@@ -1,6 +1,22 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { Activity, BrainCircuit, History, Layers, Loader2, Maximize2, Minus, Ellipsis, PanelLeft, Plus, X } from "lucide-svelte";
+  import {
+    Clipboard,
+    Copy,
+    Layers as LayersIcon,
+    MessageSquarePlus,
+    Pencil,
+    Tag as TagIcon,
+    Trash2,
+    Ungroup,
+    Activity,
+    BrainCircuit,
+    History,
+    Loader2,
+    Ellipsis,
+    PanelLeft,
+    X
+  } from "lucide-svelte";
   import {
     createComment,
     createGroup,
@@ -15,6 +31,7 @@
   } from "../lib/api";
   import { boundsIntersect, expandedBounds, nodeBounds } from "../../shared/graph";
   import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../../shared/renderPatch";
+  import { loadSceneCore, type RenderResult, type SceneCore } from "../scene/sceneCoreWasm";
   import type { CameraState, RenderCard, RenderGroup, WorldRect } from "../../shared/renderScene";
   import { screenToWorld } from "../renderer/scene";
   import { primarySelection } from "../../shared/schema";
@@ -29,6 +46,7 @@
     SceneGroup,
     SceneNode,
     SceneSelection,
+    ScenePatch,
     Tag
   } from "../../shared/schema";
   import { cloneNodeForPaste, formatNodeMarkdown } from "../lib/nodeClipboard";
@@ -48,15 +66,32 @@
   } from "../lib/followController";
   import { ShapeCanvasHost, type RendererHealth, type RendererStats, type ShapeCanvasHostCallbacks } from "../lib/canvasHost";
   import { createPatchSaver, isContinuousRendererPatch } from "../lib/patchSaver";
-  import { buildTemplateInsertion, templateCatalog } from "../lib/templates";
+  import { SceneClient, type CanvasSummary } from "../lib/sceneClient";
+  import type { PeerPresence } from "../lib/peers";
+  import type { ConnectionStatus } from "../lib/wsTransport";
+  import type { ActiveTool } from "../renderer/engine";
+  import { applyTemplate, type TemplateContract } from "../../shared/templates/contract";
+  import { createShortcutDispatcher } from "../lib/shortcuts";
+  import { primitiveForCommand, type PrimitiveKindId } from "../lib/cockpitCommands";
+  import {
+    createTemplate as apiCreateTemplate,
+    deleteTemplate as apiDeleteTemplate,
+    listTemplates as apiListTemplates,
+    recipeFromSelection
+  } from "../lib/templatesApi";
   import Sidebar from "./Sidebar.svelte";
-  import ShapePalette, { type PrimitiveKindId } from "./ShapePalette.svelte";
+  import CanvasSwitcher from "./CanvasSwitcher.svelte";
+  import CockpitRemote from "./CockpitRemote.svelte";
+  import TemplateLibrary from "./TemplateLibrary.svelte";
+  import SettingsModal from "./SettingsModal.svelte";
   import CanvasHost from "./ShapeCanvasHost.svelte";
   import CanvasEditingToolbar from "./CanvasEditingToolbar.svelte";
   import SelectedNodeInspector from "./node/SelectedNodeInspector.svelte";
   import NodeContextMenu from "./NodeContextMenu.svelte";
+  import ContextMenu, { type ContextMenuItem } from "./ContextMenu.svelte";
   import CompanionDock from "./CompanionDock.svelte";
   import CompanionTrace from "./CompanionTrace.svelte";
+  import PeerCursors from "./PeerCursors.svelte";
   import RendererDiagnosticsDrawer from "./RendererDiagnosticsDrawer.svelte";
   import ExportDrawer, { type ExportPreview } from "./ExportDrawer.svelte";
 
@@ -72,6 +107,15 @@
     nodeId: string;
     x: number;
     y: number;
+  };
+
+  // CC4.2 right-click context menu over any target kind (node/edge/group/canvas).
+  type ContextMenuState = {
+    selection: SceneSelection;
+    x: number;
+    y: number;
+    // World point of the right-click, used for "paste here" / "insert here".
+    world: { x: number; y: number };
   };
 
   // ----- document projection (read of server scene) -----
@@ -96,8 +140,18 @@
   // ----- node editing slice -----
   let editingNodeId = $state<string | null>(null);
   let nodeMenu = $state<NodeMenuState | null>(null);
+  let contextMenu = $state<ContextMenuState | null>(null);
   let copiedNode = $state<SceneNode | null>(null);
   let commentValue = $state("");
+
+  // ----- cockpit slice (CC1.4/CC2.4/CC3.3/CC5.1) -----
+  // active tool is ephemeral shell state (CC0.1) — never persisted.
+  let activeTool = $state<ActiveTool>("select");
+  // Space-hold temporarily activates Hand; the prior tool is restored on release.
+  let spaceToolBeforeHold: ActiveTool | null = null;
+  let templateLibraryOpen = $state(false);
+  let settingsOpen = $state(false);
+  let userTemplates = $state<TemplateContract[]>([]);
 
   // ----- export drawer slice -----
   let exportPreview = $state<ExportPreview | null>(null);
@@ -106,6 +160,11 @@
   // ----- MCP companions + follow mode -----
   let mcpClients = $state<McpClientInfo[]>([]);
   let followState = $state<FollowState>(initialFollowState);
+
+  // ----- realtime peers (MG6.2): live peer cursors over the canvas -----
+  let peers = $state<PeerPresence[]>([]);
+  // Throttle gate for outbound cursor presence frames (MG6.2).
+  let lastCursorSentAt = 0;
 
   // ----- ephemeral renderer readout -----
   let rendererStats = $state<RendererStats | null>(null);
@@ -118,9 +177,57 @@
   let sceneRequest = 0;
   let gestureActive = false;
   let selectionRef: SceneSelection = { kind: "canvas" };
+
+  // MG5.3: transport-backed scene data layer. Renderer-op SAVE and the INITIAL
+  // scene LOAD flow through this WS client; CRUD/templates/tags/comments/export
+  // and tag-filtered reloads still use api.ts until MG-7. The connection is
+  // best-effort: when the WS server is unreachable the shell falls back to the
+  // existing HTTP path (patchSaver + fetchScene), so dev stays usable mid-cutover.
+  let canvasId = $state("default");
+  let sceneClient: SceneClient | null = null;
+  let sceneClientReady = false;
+  // MG-7a: scene-core compiled to wasm is the single op-apply implementation. The
+  // shell routes its optimistic document apply (and template apply / recipe /
+  // insert-primitive where practical) through this handle once loaded; until the
+  // async init resolves the shell falls back to the golden-equivalent TS apply so
+  // the first interactions stay correct and the build/tests stay green.
+  let sceneCore: SceneCore | null = null;
+  // MG9.2 multi-canvas + MG8.4 connectivity: the switcher chrome reads these.
+  let canvases = $state<CanvasSummary[]>([]);
+  let connectionStatus = $state<ConnectionStatus>("offline");
+  let canvasBusy = $state(false);
   // Mirror the follow state for the poll-driven effect so it can read the latest
   // machine without subscribing (matching App.tsx's followStateRef).
   let followStateRef: FollowState = initialFollowState;
+
+  // MG6.2 follow integration: a realtime peer is followable just like an MCP
+  // companion. Project each live peer cursor into an McpClientInfo-shaped chip
+  // whose lastTarget is the peer's viewport (so following re-frames to what the
+  // peer is looking at) — falling back to its cursor point. This reuses the whole
+  // followController (decideFollowCommand/followTarget) + CompanionDock unchanged.
+  const peerCompanions = $derived<McpClientInfo[]>(
+    peers.map((peer) => ({
+      clientId: peer.userId,
+      actorType: "mcp",
+      label: peer.userId,
+      name: peer.userId,
+      version: "live",
+      color: peer.color,
+      iconRef: null,
+      transport: "http",
+      dockState: "active",
+      lastTarget: peer.viewport
+        ? { kind: "viewport", rect: peer.viewport }
+        : peer.cursor
+          ? { kind: "viewport", rect: { x: peer.cursor.x - 200, y: peer.cursor.y - 150, width: 400, height: 300 } }
+          : { kind: "canvas" },
+      connectedAt: 0,
+      lastActivityAt: peer.lastSeen,
+      muted: false
+    }))
+  );
+  // The dock + follow machinery operate over MCP companions and live peers alike.
+  const companions = $derived<McpClientInfo[]>([...mcpClients, ...peerCompanions]);
 
   const activeGroupId = $derived(activeGroupIdForSelection(scene, selection) ?? currentGroupId ?? scene?.groups[0]?.id);
   const activeGroup = $derived(scene?.groups.find((group) => group.id === activeGroupId) ?? null);
@@ -139,6 +246,9 @@
           ? `multi:${selection.ids.length} objects`
           : `${selection.kind}:${selection.id}`
   );
+  // CC3.3: "save selection as template" only makes sense for object selections
+  // (single node, multi-select, or a group), not canvas/edge.
+  const canSaveSelection = $derived(selection.kind === "node" || selection.kind === "multi" || selection.kind === "group");
 
   // T6.2 §1: debounced, gesture-gated renderer-patch save lives in the
   // framework-neutral patchSaver module; the shell only feeds it.
@@ -179,13 +289,77 @@
     onHealthChange: (health) => {
       rendererHealth = health;
       if (health.state === "ready" && isDiagnosticsOnlyRendererStatus(status)) status = "Ready";
-    }
+    },
+    onMarquee: handleMarquee,
+    onContextPick: handleContextPick
   };
 
-  // Initial fetch + reactive reload-on-filter, mirroring the App.tsx
-  // batched/debounced load. Document writes flow ONLY through patchSaver, so the
-  // scene store is never re-derived per keystroke (T6.2 §1 batch-aware wiring).
-  void refreshScene().catch((error) => (status = error instanceof Error ? error.message : "Scene load failed"));
+  // MG5.3: initial LOAD through the transport client. We open the WS session and
+  // adopt its welcome snapshot as the initial scene; renderer-op saves then flow
+  // through the client. If the WS server is unreachable we fall back to the HTTP
+  // fetchScene path so the shell still loads against the legacy Node server.
+  // MG-7a: the renderer wasm boots inside ShapeCanvasHost.mount; here we boot the
+  // scene-core wasm op-apply alongside the transport so both halves of the new
+  // stack are live by the time the user interacts. Both inits are async +
+  // best-effort: the shell stays usable (TS apply / HTTP load) until they resolve.
+  void bootstrapSceneCore();
+  void connectSceneClient();
+
+  // MG-7a: lazy-init the scene-core wasm bridge. Idempotent in the loader; a load
+  // failure leaves sceneCore null so op-apply transparently uses the TS fallback.
+  async function bootstrapSceneCore(): Promise<void> {
+    try {
+      sceneCore = await loadSceneCore();
+    } catch {
+      sceneCore = null;
+    }
+  }
+
+  // MG-7a: ONE op-apply implementation. Prefer the scene-core wasm bridge (the
+  // same Rust the server runs); fall back to the golden-equivalent TS apply only
+  // until the wasm finishes loading. Returns {scene, errors} — the wasm shape; the
+  // TS path's appPatch is no longer needed on the WS save path (the raw op is sent
+  // over the wire and the server re-applies authoritatively).
+  function applyOptimistic(currentScene: Scene, patch: RenderScenePatch, now: string): RenderResult {
+    if (sceneCore) return sceneCore.applyRenderPatch(currentScene, patch, now);
+    const applied = applyRenderPatchToShapeScene(currentScene, patch, now);
+    return { scene: applied.scene, errors: applied.errors };
+  }
+
+  // MG-7a: persist a shell CRUD document patch. When the transport client owns the
+  // scene the patch flows over WS (decomposed to ops + durable outbox + coalesced
+  // send); the shell already applied the change optimistically and the client's
+  // onScene callback reconciles the acked/server scene. A selection field rides
+  // presence (no revision bump). When the WS server is unreachable mid-cutover the
+  // legacy HTTP saveScenePatch path runs and its response scene is adopted.
+  function persistScenePatch(patch: ScenePatch): void {
+    if (sceneClientReady && sceneClient) {
+      void sceneClient.applyScenePatch(patch).then((result) => {
+        if (result.errors.length > 0) status = result.errors.join("; ");
+      });
+      sceneClient.flush();
+      return;
+    }
+    void saveScenePatch(patch).catch((error) => {
+      status = error instanceof Error ? error.message : "Save failed";
+    });
+  }
+
+  // MG-7a: persist a selection-only change. Selection is presence, not a document
+  // op (it never bumps the revision), so the WS path broadcasts it on the presence
+  // channel; the HTTP fallback PATCHes the legacy scene endpoint.
+  async function persistSelection(nextSelection: SceneSelection): Promise<void> {
+    if (sceneClientReady && sceneClient) {
+      sceneClient.saveSelection(nextSelection);
+      return;
+    }
+    await saveScenePatch({ selection: nextSelection });
+  }
+
+  // Reactive reload-on-filter, mirroring the App.tsx batched/debounced load.
+  // Tag-filtered loads stay on the HTTP path until MG-7 (the WS welcome has no
+  // server-side tag filter). Document writes flow through patchSaver / sceneClient,
+  // so the scene store is never re-derived per keystroke (T6.2 §1 batch-aware wiring).
 
   $effect(() => {
     const tagIds = activeTagIds;
@@ -195,7 +369,10 @@
     return () => window.clearTimeout(id);
   });
 
-  // T5.1 MCP companion poll (best-effort; dock shows last known state).
+  // T5.1 MCP companion poll (best-effort; dock shows last known state). MG6.2: the
+  // same tick re-reads the peer cursor set so a peer that has gone fully silent
+  // (no new presence frames to drive ingest-time expiry) drops within one poll
+  // interval — peerCursors expires stale peers lazily on read.
   $effect(() => {
     let cancelled = false;
     function poll() {
@@ -206,6 +383,7 @@
         .catch(() => {
           /* best-effort */
         });
+      if (!cancelled && sceneClientReady && sceneClient) peers = sceneClient.peerCursors;
     }
     poll();
     const id = window.setInterval(poll, 4_000);
@@ -219,7 +397,7 @@
   // a new lastTarget for the pinned followee — and no user gesture is active (§8) —
   // re-frame the camera through the existing focus path.
   $effect(() => {
-    const clients = mcpClients;
+    const clients = companions;
     const reconciled = reconcileFollowee(followStateRef, clients);
     if (reconciled !== followStateRef) {
       followState = reconciled;
@@ -259,60 +437,190 @@
     host?.syncSelection(primarySelection(selection));
   });
 
-  // Global keyboard shortcuts (Esc handoff, copy/paste/edit) — mirrors App.tsx.
+  // CC1.4: push the active tool to the renderer whenever it changes (and once the
+  // host is ready). The CSS cursor is bound on the canvas wrap below.
+  $effect(() => {
+    const tool = activeTool;
+    host?.setTool(tool);
+  });
+
+  // MG9.4 windowed replica: re-aim the data-layer subscription window at the
+  // current camera viewport (world space) whenever the camera moves. The client
+  // debounces + margin-grows it, so a small pan keeps nearby off-screen objects
+  // loaded. This is the DATA window (which objects the client holds), distinct
+  // from the renderer's own culling (which held objects it draws each frame).
+  $effect(() => {
+    const cam = camera;
+    if (!sceneClientReady || !sceneClient) return;
+    const rect = canvasWrap?.getBoundingClientRect();
+    if (!rect || rect.width === 0 || rect.height === 0) return;
+    const topLeft = screenToWorld({ x: 0, y: 0 }, cam);
+    const bottomRight = screenToWorld({ x: rect.width, y: rect.height }, cam);
+    sceneClient.setViewport({
+      x: topLeft.x,
+      y: topLeft.y,
+      width: bottomRight.x - topLeft.x,
+      height: bottomRight.y - topLeft.y
+    });
+  });
+
+  // CC0.4/CC6.1 central shortcut dispatch. The catalog-driven dispatcher handles
+  // tools, shapes, zoom, edit, selection, template, settings; Escape and Space
+  // keep bespoke handling (priority Esc handoff + Space-hold pan) that does not
+  // map onto a single command.
+  const dispatchShortcut = createShortcutDispatcher({ handlers: shortcutHandlers() });
+
   $effect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
+      const typing = target ? ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName) || target.isContentEditable : false;
+
       if (event.key === "Escape") {
         event.preventDefault();
-        // T5.3 §7 hard handoff: Esc stops following first; camera stays put.
-        if (followStateRef.mode !== "off") {
-          followState = stopFollow(followStateRef);
-          return;
-        }
-        if (traceOpen) {
-          traceOpen = false;
-          return;
-        }
-        if (diagnosticsOpen) {
-          diagnosticsOpen = false;
-          return;
-        }
-        if (nodeMenu) {
-          nodeMenu = null;
-          return;
-        }
-        if (editingNodeId) {
-          editingNodeId = null;
-          return;
-        }
-        void selectSceneItem({ kind: "canvas" });
+        handleEscape();
         return;
       }
-      if (target && ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName)) return;
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v") {
+
+      // CC2.4 Space-hold temporarily activates Hand (pan); restore on keyup.
+      if (event.code === "Space" && !typing && !event.repeat) {
         event.preventDefault();
-        pasteCopiedNode(selection.kind === "node" ? selection.id : undefined);
+        if (spaceToolBeforeHold === null) {
+          spaceToolBeforeHold = activeTool;
+          setActiveTool("hand");
+        }
         return;
       }
-      if (selection.kind !== "node") return;
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "c") {
+
+      // Everything else routes through the catalog dispatcher (focus-aware).
+      dispatchShortcut(event);
+    }
+    function handleKeyUp(event: KeyboardEvent) {
+      if (event.code === "Space" && spaceToolBeforeHold !== null) {
         event.preventDefault();
-        void copyNode(selection.id);
-        return;
-      }
-      if (event.key.toLowerCase() === "e" && !event.metaKey && !event.ctrlKey) {
-        event.preventDefault();
-        editingNodeId = selection.id;
+        setActiveTool(spaceToolBeforeHold);
+        spaceToolBeforeHold = null;
       }
     }
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
   });
 
-  onDestroy(() => patchSaver.dispose());
+  onDestroy(() => {
+    patchSaver.dispose();
+    sceneClient?.close();
+  });
+
+  // MG5.3: open the transport session and adopt its welcome snapshot. Renderer-op
+  // saves route through the client once ready; on failure the shell falls back to
+  // the HTTP fetchScene path so it still loads against the legacy Node server.
+  async function connectSceneClient(): Promise<void> {
+    const client = new SceneClient({ url: wsBaseUrl(), clientId: clientIdentity(), userId: userIdentity() });
+    try {
+      const welcome = await client.connect(canvasId);
+      sceneClient = client;
+      sceneClientReady = true;
+      connectionStatus = client.connectionStatus;
+      // Keep the shell's reactive scene in lockstep with the engine's optimistic
+      // scene so acked/remote changes (and renderer-op authoring) are reflected.
+      client.onScene((next) => commitClientScene(next));
+      // MG8.4: surface online/offline so the switcher chrome shows connectivity.
+      client.onStatus((next) => (connectionStatus = next));
+      // MG6.2: surface live peer cursors for the overlay (latest-wins per userId,
+      // stale peers expired by the client's sweep).
+      client.onPeers((next) => (peers = next));
+      const requestId = ++sceneRequest;
+      if (requestId !== sceneRequest) return;
+      scene = welcome;
+      selection = validSelection(welcome, welcome.selection);
+      void loadCanvases();
+    } catch {
+      // WS server unreachable mid-cutover: fall back to the HTTP load path.
+      client.close();
+      await refreshScene().catch((error) => (status = error instanceof Error ? error.message : "Scene load failed"));
+    }
+  }
+
+  // MG9.2: refresh the canvas list for the switcher chrome (best-effort).
+  async function loadCanvases(): Promise<void> {
+    if (!sceneClient) return;
+    try {
+      canvases = await sceneClient.listCanvases();
+    } catch {
+      /* best-effort; the switcher just shows the active canvas */
+    }
+  }
+
+  // MG9.2: switch the active canvas. The data layer reconnects + re-subscribes
+  // the current window for the new canvasId; we adopt its welcome snapshot.
+  async function switchToCanvas(nextCanvasId: string): Promise<void> {
+    if (!sceneClient || nextCanvasId === canvasId) return;
+    canvasBusy = true;
+    try {
+      const welcome = await sceneClient.switchCanvas(nextCanvasId);
+      canvasId = nextCanvasId;
+      sceneRequest += 1;
+      scene = welcome;
+      selection = validSelection(welcome, welcome.selection);
+      currentGroupId = undefined;
+      activeTagIds = [];
+    } catch (error) {
+      status = error instanceof Error ? error.message : "Canvas switch failed";
+    } finally {
+      canvasBusy = false;
+    }
+  }
+
+  async function createCanvas(title: string): Promise<void> {
+    if (!sceneClient) return;
+    canvasBusy = true;
+    try {
+      const summary = await sceneClient.createCanvas(title);
+      await loadCanvases();
+      await switchToCanvas(summary.id);
+    } catch (error) {
+      status = error instanceof Error ? error.message : "Canvas create failed";
+    } finally {
+      canvasBusy = false;
+    }
+  }
+
+  async function deleteCanvas(targetCanvasId: string): Promise<void> {
+    if (!sceneClient || targetCanvasId === canvasId) return;
+    canvasBusy = true;
+    try {
+      await sceneClient.deleteCanvas(targetCanvasId);
+      await loadCanvases();
+    } catch (error) {
+      status = error instanceof Error ? error.message : "Canvas delete failed";
+    } finally {
+      canvasBusy = false;
+    }
+  }
+
+  // Apply an engine-driven scene update without re-triggering a save. Honors the
+  // existing gesture gate (no clobber while dragging) and keeps the selection /
+  // multi-set / active-group invariants the renderer path relies on.
+  function commitClientScene(next: Scene): void {
+    if (gestureActive) return;
+    const valid = validSelection(next, selection);
+    sceneRequest += 1;
+    selectionRef = valid;
+    scene = next;
+    selection = valid;
+    multiSelectIds = valid.kind === "multi" ? valid.ids : [];
+    const nextGroupId = activeGroupIdForSelection(next, valid);
+    if (nextGroupId) currentGroupId = nextGroupId;
+  }
 
   async function refreshScene(tagIds = activeTagIds): Promise<void> {
+    // When the transport client owns the full (unfiltered) scene, skip the HTTP
+    // reload so the WS-authoritative scene is not clobbered. Tag-filtered loads
+    // still use HTTP until MG-7.
+    if (sceneClientReady && tagIds.length === 0) return;
     const requestId = ++sceneRequest;
     const nextScene = await fetchScene({ tagIds });
     if (requestId !== sceneRequest) return;
@@ -322,10 +630,43 @@
     selection = serverSelection.kind === "canvas" && localSelection.kind !== "canvas" ? localSelection : serverSelection;
   }
 
+  // The WS base for the transport client. In dev the vite proxy forwards /api to
+  // the API port; the WS server shares that host, so we derive ws(s):// from the
+  // current page origin. The transport appends /ws.
+  function wsBaseUrl(): string {
+    const loc = window.location;
+    const protocol = loc.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${loc.host}`;
+  }
+
+  // A stable-enough authoring identity for this tab/session. opIds are namespaced
+  // by this clientId so re-sends dedup on the server.
+  function clientIdentity(): string {
+    return `shell-${crypto.randomUUID().slice(0, 8)}`;
+  }
+
+  // MG6.3: a stable user identity for the session, persisted in localStorage so a
+  // reload keeps the same peer lane (cursor color / follow target). It is the
+  // hello.userId self-skip identity and the tag on every presence frame.
+  function userIdentity(): string {
+    const key = "shape-ai-user-id";
+    try {
+      const existing = window.localStorage.getItem(key);
+      if (existing) return existing;
+      const fresh = `user-${crypto.randomUUID().slice(0, 8)}`;
+      window.localStorage.setItem(key, fresh);
+      return fresh;
+    } catch {
+      // Private mode / storage disabled: fall back to an ephemeral id.
+      return `user-${crypto.randomUUID().slice(0, 8)}`;
+    }
+  }
+
   function handleHost(next: ShapeCanvasHost): void {
     host = next;
     if (scene) host.loadScene(scene, activeTagIds, selection);
     host.syncSelection(primarySelection(selection));
+    host.setTool(activeTool);
   }
 
   function handleRendererSelection(next: SceneSelection, additive = false): void {
@@ -342,7 +683,7 @@
     selection = valid;
     // The canonical persisted selection stays single-anchor so the renderer/Rust
     // core can restore it; the multi-set itself is shell-only ephemeral state.
-    void saveScenePatch({ selection: primarySelection(valid) }).catch((error) => {
+    void persistSelection(primarySelection(valid)).catch((error) => {
       status = error instanceof Error ? error.message : "Selection save failed";
     });
   }
@@ -351,13 +692,42 @@
     if (!scene) return;
     const previousScene = scene;
     const previousSelection = selection;
-    const applied = applyRenderPatchToShapeScene(scene, patch, new Date().toISOString());
+    const now = new Date().toISOString();
+
+    // MG-7a: when the transport client owns the scene, the renderer-op SAVE flows
+    // through it (optimistic engine apply + durable outbox + coalesced send) and
+    // the optimistic document apply runs through the scene-core wasm bridge — the
+    // ONE op-apply implementation. The shell still commits its local optimistic
+    // scene for immediate feedback; the client's onScene callback keeps it in
+    // lockstep once the op is acked.
+    if (sceneClientReady && sceneClient) {
+      const applied = applyOptimistic(scene, patch, now);
+      if (applied.errors.length > 0) {
+        status = applied.errors.join("; ");
+        return;
+      }
+      const optimisticSelection = validSelection(applied.scene, applied.scene.selection);
+      sceneRequest += 1;
+      commitScene(applied.scene, optimisticSelection);
+      void sceneClient.applyRenderPatch(patch).then((result) => {
+        if (result.errors.length > 0) status = result.errors.join("; ");
+      });
+      // Continuous gestures rely on the engine's coalescing window; a discrete op
+      // flushes immediately so it isn't held behind the coalesce timer.
+      if (!isContinuousRendererPatch(patch)) sceneClient.flush();
+      return;
+    }
+
+    // HTTP fallback (WS server unreachable mid-cutover): the legacy patchSaver
+    // path needs the TS apply's appPatch, so keep the TS apply here.
+    const applied = applyRenderPatchToShapeScene(scene, patch, now);
     if (applied.errors.length > 0) {
       status = applied.errors.join("; ");
       return;
     }
     const optimisticSelection = validSelection(applied.scene, applied.scene.selection);
     sceneRequest += 1;
+
     if (isContinuousRendererPatch(patch)) {
       if (!gestureActive) commitScene(applied.scene, optimisticSelection);
       patchSaver.queue(applied.appPatch, previousScene, previousSelection, patch.kind, gestureActive);
@@ -379,6 +749,8 @@
     }
     if (scene) commitScene(scene, selection);
     patchSaver.flush();
+    // MG5.3: flush the engine's coalesced gesture buffer at gesture end too.
+    sceneClient?.flush();
   }
 
   function commitScene(nextScene: Scene, nextSelection: SceneSelection): void {
@@ -399,10 +771,303 @@
     status = message;
   }
 
+  // CC4.2: right-click anywhere — ask the renderer to pick the target (pure hit
+  // test, no selection change) then open a context-appropriate menu. The
+  // onContextPick callback fires from the host and opens the menu in handleContextPick.
   function handleContextMenuRequest(point: { x: number; y: number }): void {
-    if (selectionRef.kind !== "node") return;
+    if (!host || !canvasWrap) {
+      contextMenu = null;
+      return;
+    }
+    const rect = canvasWrap.getBoundingClientRect();
+    pendingContextScreen = { clientX: point.x, clientY: point.y };
+    host.contextPick({ x: point.x - rect.left, y: point.y - rect.top });
+  }
+
+  // The clientX/clientY of the right-click awaiting the renderer pick result.
+  let pendingContextScreen: { clientX: number; clientY: number } | null = null;
+
+  // MG6.2: broadcast the local pointer as a presence cursor frame on pointer move,
+  // throttled so a fast move rides ~one frame per CURSOR_THROTTLE_MS. Coordinates
+  // are WORLD space (camera-projected) plus the current viewport, so a peer with a
+  // different camera frames the same canvas point and follow can re-aim to it.
+  const CURSOR_THROTTLE_MS = 40;
+  function handlePointerMove(event: PointerEvent): void {
+    if (!sceneClientReady || !sceneClient || !canvasWrap) return;
+    const now = Date.now();
+    if (now - lastCursorSentAt < CURSOR_THROTTLE_MS) return;
+    lastCursorSentAt = now;
+    const rect = canvasWrap.getBoundingClientRect();
+    const cursor = screenToWorld({ x: event.clientX - rect.left, y: event.clientY - rect.top }, camera);
+    const topLeft = screenToWorld({ x: 0, y: 0 }, camera);
+    const bottomRight = screenToWorld({ x: rect.width, y: rect.height }, camera);
+    sceneClient.sendCursor(cursor, {
+      x: topLeft.x,
+      y: topLeft.y,
+      width: bottomRight.x - topLeft.x,
+      height: bottomRight.y - topLeft.y
+    });
+  }
+
+  // CC4.1/4.2: the renderer returned a pick for the right-click. Build the menu.
+  function handleContextPick(picked: SceneSelection, screen: { x: number; y: number }): void {
+    const anchor = pendingContextScreen;
+    pendingContextScreen = null;
+    if (!anchor || !canvasWrap) return;
     editingNodeId = null;
-    nodeMenu = { nodeId: selectionRef.id, x: point.x, y: point.y };
+    nodeMenu = null;
+    const rect = canvasWrap.getBoundingClientRect();
+    const world = screenToWorld({ x: anchor.clientX - rect.left, y: anchor.clientY - rect.top }, camera);
+    contextMenu = { selection: picked, x: anchor.clientX, y: anchor.clientY, world };
+  }
+
+  // CC4.2: close the context menu on any pointer-down outside it (the menu stops
+  // propagation on its own pointerdown, so this only fires for click-away).
+  $effect(() => {
+    if (!contextMenu) return;
+    function dismiss() {
+      contextMenu = null;
+    }
+    window.addEventListener("pointerdown", dismiss);
+    return () => window.removeEventListener("pointerdown", dismiss);
+  });
+
+  function contextMenuTitle(picked: SceneSelection): string {
+    if (picked.kind === "node") return scene?.nodes.find((node) => node.id === picked.id)?.title ?? "Node";
+    if (picked.kind === "group") return scene?.groups.find((group) => group.id === picked.id)?.title ?? "Frame";
+    if (picked.kind === "edge") return "Connector";
+    return "Canvas";
+  }
+
+  // CC4.3: context-appropriate actions per target kind. node: edit/duplicate/
+  // delete/comment/tag; edge: delete; group: ungroup/tag; canvas: paste/insert/
+  // select-all.
+  function contextMenuItems(menu: ContextMenuState): (ContextMenuItem | null)[] {
+    const picked = menu.selection;
+    if (picked.kind === "node") {
+      const nodeId = picked.id;
+      return [
+        { label: "Edit", icon: Pencil, onSelect: () => closeContextThen(() => startEditingNode(nodeId)) },
+        { label: "Duplicate", icon: Copy, onSelect: () => closeContextThen(() => duplicateNode(nodeId)) },
+        { label: "Copy as Markdown", icon: Copy, onSelect: () => closeContextThen(() => void copyNode(nodeId)) },
+        { label: "Add comment", icon: MessageSquarePlus, onSelect: () => closeContextThen(() => openCommentForNode(nodeId)) },
+        { label: "Bring to front", icon: LayersIcon, onSelect: () => closeContextThen(() => moveNodeLayer(nodeId, "front")) },
+        { label: "Send to back", icon: LayersIcon, onSelect: () => closeContextThen(() => moveNodeLayer(nodeId, "back")) },
+        null,
+        { label: "Delete", icon: Trash2, danger: true, onSelect: () => closeContextThen(() => deleteNode(nodeId)) }
+      ];
+    }
+    if (picked.kind === "edge") {
+      const edgeId = picked.id;
+      return [{ label: "Delete connector", icon: Trash2, danger: true, onSelect: () => closeContextThen(() => handleRendererPatch({ kind: "delete-edge", id: edgeId })) }];
+    }
+    if (picked.kind === "group") {
+      const groupId = picked.id;
+      return [
+        { label: "Ungroup", icon: Ungroup, onSelect: () => closeContextThen(() => handleRendererPatch({ kind: "ungroup", id: groupId })) },
+        { label: "Tags", icon: TagIcon, onSelect: () => closeContextThen(() => selectGroupForTags(groupId)) },
+        null,
+        { label: "Delete frame", icon: Trash2, danger: true, onSelect: () => closeContextThen(() => handleRendererPatch({ kind: "delete-group", id: groupId })) }
+      ];
+    }
+    // canvas
+    const world = menu.world;
+    return [
+      { label: "Paste node", icon: Clipboard, disabled: copiedNode === null, onSelect: () => closeContextThen(() => pasteCopiedNode()) },
+      { label: "Insert rectangle", icon: Pencil, onSelect: () => closeContextThen(() => insertPrimitiveAt("rectangle", world)) },
+      { label: "Insert sticky", icon: Pencil, onSelect: () => closeContextThen(() => insertPrimitiveAt("sticky", world)) },
+      null,
+      { label: "Select all", icon: LayersIcon, onSelect: () => closeContextThen(() => selectAll()) }
+    ];
+  }
+
+  function closeContextThen(action: () => void): void {
+    contextMenu = null;
+    action();
+  }
+
+  // Open the comment composer for a node by selecting it (the inspector shows the
+  // comment field). The right-click menu reuses the existing inspector path.
+  function openCommentForNode(nodeId: string): void {
+    void selectSceneItem({ kind: "node", id: nodeId });
+    commentValue = "";
+  }
+
+  function selectGroupForTags(groupId: string): void {
+    void selectSceneItem({ kind: "group", id: groupId });
+    groupPanelOpen = true;
+  }
+
+  // CC2.3: the marquee drag ended; merge the returned ids into the transient
+  // multiSelectIds set, preserving the single-anchor persisted-selection invariant.
+  function handleMarquee(ids: string[]): void {
+    if (!scene) return;
+    if (ids.length === 0) {
+      // Empty marquee acts as a click-away: clear selection.
+      multiSelectIds = [];
+      void selectSceneItem({ kind: "canvas" });
+      return;
+    }
+    const merged = Array.from(new Set([...multiSelectIds, ...ids]));
+    const nodeIds = merged.filter((id) => scene!.nodes.some((node) => node.id === id));
+    if (nodeIds.length >= 2) {
+      const next: SceneSelection = { kind: "multi", ids: nodeIds };
+      multiSelectIds = nodeIds;
+      handleRendererSelection(next);
+      return;
+    }
+    if (nodeIds.length === 1) {
+      handleRendererSelection({ kind: "node", id: nodeIds[0] });
+      return;
+    }
+    // Only group ids in the marquee — select the first group (single anchor).
+    const groupId = merged.find((id) => scene!.groups.some((group) => group.id === id));
+    if (groupId) handleRendererSelection({ kind: "group", id: groupId });
+  }
+
+  // CC1.4: switch the active tool (ephemeral). The renderer is updated via the
+  // activeTool $effect; the canvas cursor follows toolCursor below.
+  function setActiveTool(tool: ActiveTool): void {
+    activeTool = tool;
+  }
+
+  // Esc priority handoff: follow → trace → diagnostics → settings → template
+  // library → context menu → node menu → editing → clear selection.
+  function handleEscape(): void {
+    if (followStateRef.mode !== "off") {
+      followState = stopFollow(followStateRef);
+      return;
+    }
+    if (settingsOpen) {
+      settingsOpen = false;
+      return;
+    }
+    if (templateLibraryOpen) {
+      templateLibraryOpen = false;
+      return;
+    }
+    if (traceOpen) {
+      traceOpen = false;
+      return;
+    }
+    if (diagnosticsOpen) {
+      diagnosticsOpen = false;
+      return;
+    }
+    if (contextMenu) {
+      contextMenu = null;
+      return;
+    }
+    if (nodeMenu) {
+      nodeMenu = null;
+      return;
+    }
+    if (editingNodeId) {
+      editingNodeId = null;
+      return;
+    }
+    multiSelectIds = [];
+    void selectSceneItem({ kind: "canvas" });
+  }
+
+  // CC0.4/CC6.1: command-id → handler map for the catalog dispatcher. Handlers
+  // reuse the existing shell paths (insertPrimitive, zoom, editing-toolbar ops,
+  // copy/paste, selection) so a key and a remote/menu click share one path.
+  function shortcutHandlers() {
+    return {
+      "select-move": () => setActiveTool("select"),
+      "hand-pan": () => setActiveTool("hand"),
+      "insert-rectangle": () => insertPrimitive("rectangle"),
+      "insert-ellipse": () => insertPrimitive("ellipse"),
+      "insert-connector": () => insertPrimitive("connector"),
+      "insert-sticky": () => insertPrimitive("sticky"),
+      "insert-frame": () => insertPrimitive("frame"),
+      "zoom-in": () => zoomAtCenter(-160),
+      "zoom-out": () => zoomAtCenter(160),
+      "zoom-fit": () => fitScene(),
+      "toggle-fullscreen": () => void toggleFullscreen(),
+      delete: () => deleteSelection(),
+      duplicate: () => duplicateSelection(),
+      copy: () => {
+        if (selection.kind === "node") void copyNode(selection.id);
+      },
+      paste: () => pasteCopiedNode(selection.kind === "node" ? selection.id : undefined),
+      group: () => groupSelection(),
+      ungroup: () => ungroupSelection(),
+      "bring-to-front": () => moveSelectionLayer("front"),
+      "send-to-back": () => moveSelectionLayer("back"),
+      "select-all": () => selectAll(),
+      "open-template-library": () => (templateLibraryOpen = !templateLibraryOpen),
+      "new-canvas": () => {
+        if (sceneClient) void createCanvas("New canvas");
+      },
+      "open-settings": () => (settingsOpen = !settingsOpen)
+    };
+  }
+
+  // ----- shortcut-driven selection ops (CC6.1) -----------------------------
+
+  function currentSelectionIds(): string[] {
+    if (selection.kind === "multi") return selection.ids;
+    if (selection.kind === "node" || selection.kind === "group" || selection.kind === "edge") return [selection.id];
+    return [];
+  }
+
+  function deleteSelection(): void {
+    if (!scene) return;
+    const ids = currentSelectionIds();
+    if (ids.length === 0) return;
+    if (ids.length === 1) {
+      const id = ids[0];
+      if (scene.nodes.some((node) => node.id === id)) handleRendererPatch({ kind: "delete-card", id });
+      else if (scene.groups.some((group) => group.id === id)) handleRendererPatch({ kind: "delete-group", id });
+      else if (scene.edges.some((edge) => edge.id === id)) handleRendererPatch({ kind: "delete-edge", id });
+      return;
+    }
+    const ops: RenderScenePatch[] = [];
+    for (const id of ids) {
+      if (scene.nodes.some((node) => node.id === id)) ops.push({ kind: "delete-card", id });
+      else if (scene.groups.some((group) => group.id === id)) ops.push({ kind: "delete-group", id });
+      else if (scene.edges.some((edge) => edge.id === id)) ops.push({ kind: "delete-edge", id });
+    }
+    if (ops.length > 0) handleRendererPatch({ kind: "batch", ops });
+  }
+
+  function duplicateSelection(): void {
+    if (!scene) return;
+    const nodeIds = currentSelectionIds().filter((id) => scene!.nodes.some((node) => node.id === id));
+    if (nodeIds.length === 0) return;
+    handleRendererPatch({ kind: "duplicate-objects", ids: nodeIds, delta: { x: 40, y: 40 } });
+  }
+
+  function groupSelection(): void {
+    if (!scene) return;
+    const ids = currentSelectionIds().filter((id) => scene!.nodes.some((node) => node.id === id) || scene!.groups.some((group) => group.id === id));
+    if (ids.length < 2) return;
+    const frameId = `frame-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 4)}`;
+    handleRendererPatch({ kind: "group-objects", ids, frameId });
+  }
+
+  function ungroupSelection(): void {
+    if (selection.kind !== "group") return;
+    handleRendererPatch({ kind: "ungroup", id: selection.id });
+  }
+
+  function moveSelectionLayer(direction: "front" | "back"): void {
+    const ids = currentSelectionIds().filter((id) => scene?.nodes.some((node) => node.id === id));
+    for (const id of ids) moveNodeLayer(id, direction);
+  }
+
+  function selectAll(): void {
+    if (!scene) return;
+    const nodeIds = scene.nodes.map((node) => node.id);
+    if (nodeIds.length === 0) return;
+    if (nodeIds.length === 1) {
+      handleRendererSelection({ kind: "node", id: nodeIds[0] });
+      return;
+    }
+    multiSelectIds = nodeIds;
+    handleRendererSelection({ kind: "multi", ids: nodeIds });
   }
 
   function openSelectedNodeMenu(event: MouseEvent & { currentTarget: HTMLButtonElement }): void {
@@ -420,9 +1085,7 @@
     if (!current) return;
     const nextNode = { ...current, ...node };
     scene = { ...scene, nodes: scene.nodes.map((candidate) => (candidate.id === node.id ? nextNode : candidate)) };
-    void saveScenePatch({ nodes: [nextNode] })
-      .then((response) => (scene = response.scene))
-      .catch((error) => (status = error instanceof Error ? error.message : "Save failed"));
+    persistScenePatch({ nodes: [nextNode] });
   }
 
   function startEditingNode(nodeId: string): void {
@@ -443,7 +1106,7 @@
     selection = { kind: "canvas" };
     editingNodeId = null;
     multiSelectIds = [];
-    void saveScenePatch({ removeNodeIds: [nodeId], selection: { kind: "canvas" } });
+    persistScenePatch({ removeNodeIds: [nodeId], selection: { kind: "canvas" } });
   }
 
   function addLinkedNode(type: NodeType): void {
@@ -486,7 +1149,7 @@
       : null;
     const nextScene = { ...scene, nodes: [...scene.nodes, node], edges: edge ? [...scene.edges, edge] : scene.edges };
     scene = nextScene;
-    void saveScenePatch({ nodes: [node], edges: edge ? [edge] : [], selection: { kind: "node", id } }).then((response) => (scene = response.scene));
+    persistScenePatch({ nodes: [node], edges: edge ? [edge] : [], selection: { kind: "node", id } });
     void selectSceneItem({ kind: "node", id }, nextScene);
   }
 
@@ -528,7 +1191,7 @@
       updatedAt: new Date().toISOString()
     };
     scene = { ...scene, nodes: [...scene.nodes, node] };
-    void saveScenePatch({ nodes: [node], selection: { kind: "node", id } }).then((response) => (scene = response.scene));
+    persistScenePatch({ nodes: [node], selection: { kind: "node", id } });
     status = "Pasted copied node";
   }
 
@@ -541,7 +1204,7 @@
     const zIndex = direction === "front" ? Math.max(...values, 0) + 1 : Math.min(...values, 0) - 1;
     const updated = { ...node, zIndex, updatedAt: new Date().toISOString() };
     scene = { ...scene, nodes: scene.nodes.map((candidate) => (candidate.id === nodeId ? updated : candidate)) };
-    void saveScenePatch({ nodes: [updated] });
+    persistScenePatch({ nodes: [updated] });
     status = direction === "front" ? "Brought node to front" : "Sent node to back";
   }
 
@@ -635,7 +1298,11 @@
 
   function handleFocusTarget(target: unknown): void {
     if (!scene || !target || typeof target !== "object") return;
-    const t = target as { kind?: string; id?: string; groupId?: string; ids?: { kind: string; id: string }[] };
+    const t = target as { kind?: string; id?: string; groupId?: string; ids?: { kind: string; id: string }[]; rect?: WorldRect };
+    if (t.kind === "viewport" && t.rect) {
+      focusBounds(t.rect);
+      return;
+    }
     if (t.kind === "group" && t.id) {
       const group = scene.groups.find((g) => g.id === t.id);
       if (group) {
@@ -680,7 +1347,13 @@
     // edit keystroke) re-trigger the effect and snap the camera back.
     const currentScene = untrack(() => scene);
     if (!currentScene || !target || typeof target !== "object") return;
-    const t = target as { kind?: string; id?: string; groupId?: string; ids?: { kind: string; id: string }[] };
+    const t = target as { kind?: string; id?: string; groupId?: string; ids?: { kind: string; id: string }[]; rect?: WorldRect };
+    // MG6.2: a peer/companion viewport target re-frames the camera to the rect the
+    // peer is looking at (the follow camera command for a live peer).
+    if (t.kind === "viewport" && t.rect) {
+      focusBounds(t.rect);
+      return;
+    }
     if (t.kind === "group" && t.id) {
       const group = currentScene.groups.find((g) => g.id === t.id);
       if (group) focusGroup(group, { fit: true });
@@ -721,7 +1394,7 @@
     }
     if (current.mode === "paused") {
       const resumed = resumeFollow(current);
-      const followee = resolveFollowee(resumed, mcpClients);
+      const followee = resolveFollowee(resumed, companions);
       if (followee && targetKey(followee.lastTarget) !== null) {
         followState = { ...resumed, lastFramedKey: targetKey(followee.lastTarget) };
         followTarget(followee.lastTarget);
@@ -732,7 +1405,7 @@
   }
 
   function handleJumpToCurrent(): void {
-    const followee = resolveFollowee(followStateRef, mcpClients);
+    const followee = resolveFollowee(followStateRef, companions);
     const target = jumpToCurrentTarget(followee);
     if (target !== null) followTarget(target);
   }
@@ -748,7 +1421,7 @@
     if (valid.kind === "canvas") multiSelectIds = [];
     selection = valid;
     try {
-      await saveScenePatch({ selection: valid });
+      await persistSelection(valid);
     } catch (error) {
       status = error instanceof Error ? error.message : "Selection save failed";
     }
@@ -774,23 +1447,109 @@
     });
   }
 
-  async function applyTemplateById(templateId: string): Promise<void> {
+  // ----- template library (CC3.3) -----------------------------------------
+
+  // Refresh the registered template list (builtins seeded on the server + user
+  // templates). Best-effort; the library just shows what it can load.
+  async function loadTemplates(): Promise<void> {
+    try {
+      userTemplates = await apiListTemplates();
+    } catch (error) {
+      status = error instanceof Error ? error.message : "Template load failed";
+    }
+  }
+
+  function toggleTemplateLibrary(): void {
+    templateLibraryOpen = !templateLibraryOpen;
+    if (templateLibraryOpen) void loadTemplates();
+  }
+
+  // Lower a registered TemplateContract to canvas objects in an open area and
+  // persist via the scene-patch path (mirrors applyTemplate semantics). MG-7a:
+  // the lowered groups/nodes/edges are applied optimistically to the local scene
+  // and persisted through persistScenePatch (WS ops when connected, HTTP fallback
+  // otherwise); the focus/select then read the local optimistic scene rather than
+  // a server response. The template lowering itself stays on the TS applyTemplate
+  // until the wasm template contract types are mirrored (see notes_for_next).
+  async function applyTemplateContract(templateId: string): Promise<void> {
+    if (!scene) return;
+    const contract = userTemplates.find((candidate) => candidate.metadata.id === templateId);
+    if (!contract) return;
     await withBusy("Inserting template", async () => {
-      const built = buildTemplateInsertion(scene, templateId);
-      if (!built) return;
+      const anchor = templateAnchor();
+      const idPrefix = `tpl-${crypto.randomUUID().slice(0, 8)}`;
+      const applied = applyTemplate(contract, anchor, idPrefix, new Date().toISOString());
+      if (applied.errors.length > 0) {
+        status = applied.errors.join("; ");
+        return;
+      }
       sceneRequest += 1;
-      const response = await saveScenePatch(built.patch);
-      scene = response.scene;
+      const selectionForGroup: SceneSelection | undefined = applied.group ? { kind: "group", id: applied.group.id } : undefined;
+      const nextScene: Scene = {
+        ...scene!,
+        groups: [...scene!.groups, ...applied.groups],
+        nodes: [...scene!.nodes, ...applied.nodes],
+        edges: [...scene!.edges, ...applied.edges]
+      };
+      scene = nextScene;
+      persistScenePatch({
+        groups: applied.groups,
+        nodes: applied.nodes,
+        edges: applied.edges,
+        selection: selectionForGroup
+      });
       exportPreview = null;
       exportPreviewCopied = false;
-      if (built.group) {
-        const created = response.scene.groups.find((group) => group.id === built.group!.id) ?? built.group;
-        currentGroupId = created.id;
-        focusGroup(created, { fit: true });
-        await selectSceneItem({ kind: "group", id: created.id }, response.scene);
+      if (applied.group) {
+        currentGroupId = applied.group.id;
+        focusGroup(applied.group, { fit: true });
+        await selectSceneItem({ kind: "group", id: applied.group.id }, nextScene);
       }
-      status = `Inserted ${built.title}`;
+      status = `Inserted ${contract.metadata.title}`;
     });
+  }
+
+  // CC3.1/CC3.3: build a TemplateContract from the current selection (single
+  // object / multi-select / single group) and POST it to the server.
+  async function saveSelectionAsTemplate(title: string): Promise<void> {
+    if (!scene) return;
+    const metadata = {
+      id: `user-${crypto.randomUUID().slice(0, 8)}`,
+      title,
+      description: `Saved from selection (${title})`,
+      category: "general" as const,
+      templateKind: "user"
+    };
+    const contract = recipeFromSelection(scene, selection, metadata);
+    if (!contract) {
+      status = "Select objects to save as a template";
+      return;
+    }
+    await withBusy("Saving template", async () => {
+      await apiCreateTemplate(contract);
+      await loadTemplates();
+      status = `Saved template ${title}`;
+    });
+  }
+
+  async function deleteTemplateById(templateId: string): Promise<void> {
+    await withBusy("Deleting template", async () => {
+      await apiDeleteTemplate(templateId);
+      await loadTemplates();
+      status = "Template deleted";
+    });
+  }
+
+  // Place an applied template to the right of existing content so it lands in view.
+  function templateAnchor(): { x: number; y: number } {
+    if (!scene || scene.groups.length === 0) return viewportCenterWorld();
+    let maxRight = -Infinity;
+    let top = Infinity;
+    for (const group of scene.groups) {
+      maxRight = Math.max(maxRight, group.bounds.x + group.bounds.width);
+      top = Math.min(top, group.bounds.y);
+    }
+    return { x: maxRight + 240, y: Number.isFinite(top) ? top : 120 };
   }
 
   // ----- primitive palette --------------------------------------------------
@@ -808,9 +1567,15 @@
   // canvas near the viewport. Everything flows through the existing renderPatch
   // create-card/create-group/create-edge ops + handleRendererPatch, which
   // persists discrete patches through saveScenePatch (patchSaver.saveNow).
-  function insertPrimitive(kind: PrimitiveKindId): void {
+  // CC4.3: drop a primitive at an explicit world point (used by the canvas
+  // right-click menu "insert here"). Delegates to insertPrimitive.
+  function insertPrimitiveAt(kind: PrimitiveKindId, world: { x: number; y: number }): void {
+    insertPrimitive(kind, world);
+  }
+
+  function insertPrimitive(kind: PrimitiveKindId, anchor?: { x: number; y: number }): void {
     if (!scene) return;
-    const center = viewportCenterWorld();
+    const center = anchor ?? viewportCenterWorld();
 
     if (kind === "frame") {
       const frame: RenderGroup = {
@@ -993,6 +1758,18 @@
     });
   }
 
+  // Frame the camera to an arbitrary world rect (a peer/companion viewport in
+  // follow mode). Centers the rect with a small fit padding, reusing the host's
+  // imperative focus surface so no camera math is duplicated here.
+  function focusBounds(rect: WorldRect): void {
+    const view = canvasWrap?.getBoundingClientRect();
+    if (!view || !host) return;
+    host.focusBounds(rect, {
+      screen: { x: view.width / 2, y: view.height / 2 },
+      padding: { x: 80, y: 80 }
+    });
+  }
+
   function focusNode(node: SceneNode, targetZoom?: number): void {
     const rect = canvasWrap?.getBoundingClientRect();
     if (!rect || !host) return;
@@ -1149,7 +1926,7 @@
   <main class="studio-stage">
     <section class={`canvas-panel ${selection.kind === "node" ? "has-card-focus" : ""}`}>
       <CompanionDock
-        clients={mcpClients}
+        clients={companions}
         onFocusTarget={handleFocusTarget}
         follow={{
           followeeClientId: followState.followeeClientId,
@@ -1159,10 +1936,22 @@
           onJumpToCurrent: handleJumpToCurrent
         }}
       />
-      <div class="flow-wrap renderer-scene-surface" bind:this={canvasWrap}>
+      <div class="flow-wrap renderer-scene-surface" data-tool={activeTool} bind:this={canvasWrap} onpointermove={handlePointerMove}>
         <div class="canvas-watermark" aria-hidden="true">
           <BrainCircuit size={28} />
           <span>shape.ai</span>
+        </div>
+        <PeerCursors {peers} {camera} />
+        <div class="canvas-switcher-chrome">
+          <CanvasSwitcher
+            {canvases}
+            activeCanvasId={canvasId}
+            status={connectionStatus}
+            busy={canvasBusy}
+            onSelect={(id) => void switchToCanvas(id)}
+            onCreate={(title) => void createCanvas(title)}
+            onDelete={(id) => void deleteCanvas(id)}
+          />
         </div>
         <div class="scene-controls" aria-label="Canvas controls">
           <button
@@ -1185,25 +1974,30 @@
           >
             <History size={15} />
           </button>
-          <button class="icon-button" onclick={() => zoomAtCenter(160)} aria-label="Zoom out" title="Zoom out">
-            <Minus size={15} />
-          </button>
-          <button class="icon-button" onclick={() => zoomAtCenter(-160)} aria-label="Zoom in" title="Zoom in">
-            <Plus size={15} />
-          </button>
-          <button class="icon-button" onclick={fitScene} aria-label="Fit scene" title="Fit scene">
-            <Layers size={15} />
-          </button>
-          <button class="icon-button" onclick={() => void toggleFullscreen()} aria-label="Fullscreen" title="Fullscreen">
-            <Maximize2 size={15} />
-          </button>
         </div>
-        <ShapePalette
-          templates={templateCatalog.map(({ id, title, description }) => ({ id, title, description }))}
+        <CockpitRemote
+          {activeTool}
           {busy}
+          templateOpen={templateLibraryOpen}
+          onSetTool={setActiveTool}
           onInsertPrimitive={insertPrimitive}
-          onApplyTemplate={(templateId) => void applyTemplateById(templateId)}
+          onToggleTemplates={toggleTemplateLibrary}
+          onZoomIn={() => zoomAtCenter(-160)}
+          onZoomOut={() => zoomAtCenter(160)}
+          onFit={fitScene}
+          onFullscreen={() => void toggleFullscreen()}
         />
+        {#if templateLibraryOpen}
+          <TemplateLibrary
+            templates={userTemplates}
+            {busy}
+            {canSaveSelection}
+            onApply={(templateId) => void applyTemplateContract(templateId)}
+            onSaveSelection={(title) => void saveSelectionAsTemplate(title)}
+            onDelete={(templateId) => void deleteTemplateById(templateId)}
+            onClose={() => (templateLibraryOpen = false)}
+          />
+        {/if}
         <RendererDiagnosticsDrawer
           open={diagnosticsOpen}
           stats={rendererStats}
@@ -1323,6 +2117,14 @@
             nodeMenu = null;
           }}
         />
+      {/if}
+
+      {#if contextMenu}
+        <ContextMenu x={contextMenu.x} y={contextMenu.y} title={contextMenuTitle(contextMenu.selection)} items={contextMenuItems(contextMenu)} />
+      {/if}
+
+      {#if settingsOpen}
+        <SettingsModal onClose={() => (settingsOpen = false)} />
       {/if}
 
       {#if busy || status !== "Ready"}

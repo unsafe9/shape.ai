@@ -1,10 +1,11 @@
 //! Adapter stubs for backends whose drivers are not available offline.
 //!
-//! sqlite / postgres / s3 / remote-server are part of the [`AdapterKind`]
-//! vocabulary but require external crates or services that cannot be fetched
-//! in this environment. Each is a real `StorageAdapter` *shape* so callers can
-//! name and route to it, but the per-record I/O returns
-//! [`StorageError::Unsupported`] until a backend is wired in.
+//! postgres / s3 / remote-server are part of the [`AdapterKind`] vocabulary but
+//! require external crates or services that cannot be fetched in this
+//! environment. Each is a real `StorageAdapter` *shape* so callers can name and
+//! route to it, but the per-record I/O returns [`StorageError::Unsupported`]
+//! until a backend is wired in. (The `sqlite` kind has a real adapter now; see
+//! [`crate::adapters::SqliteAdapter`].)
 //!
 //! Crucially, the portability surface is *not* faked: a real backend just needs
 //! to implement the streaming pair (`records`/`ingest`) plus `snapshot`/
@@ -84,7 +85,6 @@ macro_rules! unsupported_adapter {
     };
 }
 
-unsupported_adapter!(SqliteAdapter, AdapterKind::Sqlite, "sqlite");
 unsupported_adapter!(PostgresAdapter, AdapterKind::Postgres, "postgres");
 unsupported_adapter!(S3Adapter, AdapterKind::S3, "s3");
 unsupported_adapter!(RemoteServerAdapter, AdapterKind::RemoteServer, "remote-server");
@@ -95,13 +95,12 @@ mod tests {
 
     #[test]
     fn stubs_report_kind_and_unsupported() {
-        let mut s = SqliteAdapter::new();
-        assert_eq!(s.kind(), AdapterKind::Sqlite);
+        let mut s = PostgresAdapter::new();
+        assert_eq!(s.kind(), AdapterKind::Postgres);
         assert!(matches!(
             s.save(Record::new("a", "k", b"x".to_vec())),
-            Err(StorageError::Unsupported { kind: "sqlite", op: "save" })
+            Err(StorageError::Unsupported { kind: "postgres", op: "save" })
         ));
-        assert_eq!(PostgresAdapter::new().kind(), AdapterKind::Postgres);
         assert_eq!(S3Adapter::new().kind(), AdapterKind::S3);
         assert_eq!(RemoteServerAdapter::new().kind(), AdapterKind::RemoteServer);
     }

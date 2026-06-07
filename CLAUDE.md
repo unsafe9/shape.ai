@@ -30,3 +30,79 @@ reaching into its internals. The web shell is **Svelte** (the project has fully
 cut over from React); a future macOS shell would be SwiftUI, changing only the
 language and the adapter.
 
+## Stack and Layout
+
+The project has decommissioned its original Node/Fastify/sql.js server: there is
+no Node backend, no `tsx`/`concurrency` toolchain, and no `src/server/*.ts`
+runtime beyond `local.ts` (a TS export helper still imported by surviving
+renderer/export tests). Everything server-side is now one Rust workspace; the
+client is a Svelte shell over WASM.
+
+Rust workspace (`Cargo.toml` members):
+
+- `crates/scene-core` (`shape_scene_core`) — the pure canvas core: model, op
+  enum, op-apply, per-property LWW, fractional index, templates, wire serde,
+  command catalog. Native + `wasm32`, no time/rng/thread/IO. The web client
+  builds it to WASM (`--features wasm`) and uses it as the client op-apply.
+- `src/storage/core` (`shape_storage_core`) — store-neutral persistence:
+  `StorageAdapter` trait, spatial region index, portable sharded bundle format,
+  Memory/File/SQLite adapters. SQLite + the on-disk format are native-only;
+  `wasm32` keeps model + trait + `MemoryAdapter`.
+- `crates/coordination` (`shape_coordination`) — scale-out seam: `Coordinator`
+  trait for single-writer canvas leases, pub/sub, and presence; in-memory
+  (single-process) and file (single-host multi-process) impls. No canvas logic.
+- `crates/server` (`shape_server`) — the native tokio/axum platform layer. It
+  orchestrates transport, persistence, and fan-out only and never reimplements
+  canvas logic. Key files: `app.rs` (router: `/api/*`, `/ws`, `/mcp`, static
+  SPA), `canvas_actor.rs` (one actor per canvas), `sync.rs` (dedup + LWW +
+  fractional keys), `scene_store.rs` (per-object region-indexed records),
+  `registry.rs` (canvasId→actor, leases, eviction, routing, graceful shutdown),
+  `ws.rs` (two-channel WS transport), `mcp.rs` (rmcp Streamable HTTP tools),
+  `local_export.rs`/`group_seed.rs`/`scene_api.rs` (ported legacy scene routes).
+
+The renderer core `src/renderer/core` (`shape_canvas_core`) is `exclude`d from
+the workspace (its pinned wgpu lock would pollute the workspace lock) and builds
+standalone to WASM for the web canvas.
+
+Client (`src/client`) is the Svelte shell: it owns product UI and orchestration
+and reaches the canvas through the imperative handle + event stream, the server
+over `/ws` and `/api/*`, and uses scene-core-WASM for optimistic op-apply.
+
+## Conventions
+
+- **Pointer-width-agnostic core.** No 32-bit address assumptions: never truncate a
+  pointer to an integer, serialize wire/storage offsets/lengths as explicit-width
+  types (`u32`/`u64`) not `usize`. Keeps a future Wasm 3.0 Memory64 (64-bit wasm)
+  port a target-triple flip, not a rewrite.
+
+## Running
+
+Build the client (Rust → WASM, then Vite), then run the native server:
+
+```bash
+npm install
+npm run build              # scene:wasm:build + renderer:wasm:build + vite build -> dist/client
+cargo run -p shape_server # serves dist/client + /ws + /mcp on :8787
+```
+
+For iterative client work, run Vite (`npm run dev`, :5173) against a running
+`cargo run -p shape_server` (:8787). There is no `npm start`/`npm run dev:server`
+anymore. Scene data persists per-object in `.local/shape.sqlite`; exports under
+`.local/exports/`. `.local/` is gitignored.
+
+Always invoke cargo/wasm-pack through `scripts/renderer-toolchain.sh` so the
+pinned renderer toolchain is on `PATH`.
+
+## Operating Notes
+
+- The client TS op-apply (`src/shared/renderPatch.ts` →
+  `applyRenderPatchToShapeScene`, used by `syncEngine.ts`) is kept deliberately:
+  scene-core WASM is `--target web` and cannot `fetch()` its module under
+  Node/vitest, so the node-tested sync engine and the WS path still need the TS
+  op-apply. scene-core-WASM is the op-apply in the browser, not the only one.
+- Template lowering still runs through TS `applyTemplate` in the shell; the WASM
+  template contract is mirrored but not yet routed through.
+- Verification gates: `cargo test --workspace`, the two `wasm32` `cargo check`s
+  (scene-core, storage-core), both wasm-pack builds, `npm run test:unit`
+  (vitest), and `npm run build` (vite).
+

@@ -1,79 +1,134 @@
 # shape.ai
 
-Visual group canvas for humans and AI agents.
+Visual group canvas for humans and AI agents — an infinite, local-first canvas
+that agents can review and extend through MCP.
 
-shape.ai stores one infinite `Scene` in SQLite. The only organization unit is a `Group`; nodes and edges live inside groups, and registered tags are attached to groups for filtering, overview tinting, and MCP queries. The same Fastify process serves the Web UI and remote Streamable HTTP MCP at `/mcp`.
+shape.ai keeps every canvas behind a single native Rust server. The server owns
+one running actor per canvas, persists scene objects per-object in SQLite, and
+serves the Web UI, a WebSocket sync transport, and a remote Streamable HTTP MCP
+endpoint from the same process. The web client is a Svelte shell over a
+Rust/WASM/WebGPU canvas; canvas logic (op-apply, layout, hit testing, LWW,
+fractional indexing, templates) lives in the shared `scene-core` crate and is
+never reimplemented in TypeScript or in the server.
 
 ## What It Does
 
 - Creates a group from a proposition, architecture concern, or implementation plan.
-- Stores scene objects as `Group`, `Node`, and `Edge` records with scene-space bounds and z-index ordering.
-- Supports a Rust/WASM/WebGPU canvas UI with smooth pan/zoom, pinch zoom, renderer-owned culling, inline note editing, copy/paste, comments, and z-order actions.
-- Keeps group tags in a global registry with create, rename, recolor, delete-unused, attach, detach, and filter flows.
-- Exports group, node, edge, or selection scope as MADR Markdown, YADR YAML, Mermaid, and image-generation prompts.
-- Exposes MCP tools so AI agents can query the scene, inspect groups, update group tags, patch scene objects, add comments, and export group content.
+- Stores scene objects as `Group`, `Node`, and `Edge` records with scene-space
+  bounds and z-index ordering.
+- Drives a Rust/WASM/WebGPU canvas with smooth pan/zoom, pinch zoom,
+  renderer-owned culling, inline note editing, copy/paste, comments, and z-order
+  actions.
+- Keeps group tags in a global registry with create, rename, recolor,
+  delete-unused, attach, detach, and filter flows.
+- Exports group, node, edge, or selection scope as MADR Markdown, YADR YAML,
+  Mermaid, and image-generation prompts.
+- Exposes MCP tools so AI agents can query the scene, inspect groups, update
+  group tags, patch scene objects, add comments, and export group content.
+
+## Architecture
+
+The stack is one Rust workspace plus a thin Svelte shell:
+
+- `crates/scene-core` (`shape_scene_core`) — the pure canvas core: scene model,
+  op enum, op-apply, per-property LWW, fractional index, templates, wire serde,
+  and the command catalog. Compiles for native and `wasm32`; no time/rng/thread/IO.
+  The web client builds it to WASM (`--features wasm`) and uses it as the
+  client-side op-apply.
+- `src/storage/core` (`shape_storage_core`) — store-neutral persistence: a
+  `StorageAdapter` trait, a spatial region index, a portable sharded bundle
+  format, and Memory/File/SQLite adapters. SQLite is native-only; `wasm32` keeps
+  the model, the trait, and the in-memory adapter.
+- `crates/coordination` (`shape_coordination`) — the scale-out seam: a
+  `Coordinator` trait giving single-writer canvas leases, pub/sub, and presence.
+  Ships an in-memory impl (single-process dev) and a file impl (single-host
+  multi-process). No canvas logic lives here.
+- `crates/server` (`shape_server`) — the native (tokio/axum) platform layer. It
+  orchestrates transport, persistence, and fan-out only:
+  - **Canvas actor.** One tokio task per canvas serializes every edit through an
+    mpsc channel, calls scene-core for op-apply, persists a per-object checkpoint
+    plus a durable journal entry per op, and fans applied patches out over a
+    broadcast channel.
+  - **WebSocket transport (`/ws`).** Two logical channels over one socket
+    (sync + presence). A client `hello` yields a windowed `welcome`, then ops are
+    acked with monotonic server seqs; opId dedup makes re-apply idempotent.
+  - **Sync engine.** Server-authoritative: opId dedup, journal-tail recovery past
+    the last checkpoint, a per-property LWW store for concurrent property writes,
+    and additive fractional order keys stamped into created objects.
+  - **Per-object storage + windowing.** Each object is its own region-indexed
+    SQLite record. Region reads answer a windowed subscriber from the actor's live
+    in-memory scene filtered by bbox.
+  - **Registry / leases.** The registry maps `canvasId` to its actor, acquires a
+    single-writer lease before spawning, renews it on an interval, evicts idle
+    canvases (flush + checkpoint), and releases leases on graceful shutdown so a
+    successor recovers with no data loss.
+  - **MCP (`/mcp`).** Streamable HTTP MCP (rmcp) mounted on the same router, plus
+    a companion dock (`/api/mcp/clients`, `/api/mcp/trace`).
+- `src/renderer/core` (`shape_canvas_core`) — the standalone WGPU renderer core,
+  built to WASM for the web canvas. Stays out of the workspace until it is wired
+  to scene-core.
+- `src/client` — the Svelte shell. It owns product UI and orchestration and
+  talks to the canvas only through a narrow imperative handle plus an event
+  stream. The client uses scene-core-WASM for optimistic op-apply and reaches the
+  server over `/ws` and the `/api/*` routes.
 
 ## Local Development
 
+Build the client (Rust → WASM for scene-core and the renderer, then the Vite
+bundle), then run the native server:
+
 ```bash
 npm install
-npm start
+npm run build
+cargo run -p shape_server
 ```
 
-`npm start` builds the client, starts the Fastify server, and opens `http://127.0.0.1:8787`.
+`npm run build` runs `scene:wasm:build` + `renderer:wasm:build` + `vite build`,
+emitting the SPA to `dist/client/`. The server serves that directory statically
+and listens on `http://127.0.0.1:8787`.
 
-For iterative frontend/backend development, use:
+For iterative frontend work, run the Vite dev server against a running backend:
 
 ```bash
-npm run dev
+cargo run -p shape_server   # backend on :8787
+npm run dev                 # Vite client on :5173
 ```
 
-The Fastify backend listens on `http://127.0.0.1:8787` by default. Canonical scene data is stored in `.local/shape.sqlite`, and exported artifacts are stored under `.local/exports/`. Legacy snapshots are migrated into top-level groups when an old local database is detected. The `.local/` directory is intentionally ignored by git.
+Canonical scene data is stored per-object in `.local/shape.sqlite`, and exported
+artifacts under `.local/exports/`. The `.local/` directory is ignored by git.
 
 Useful environment variables:
 
-- `SHAPE_AI_HOST`: backend host, default `127.0.0.1`
-- `SHAPE_AI_PORT`: backend port, default `8787`
-- `SHAPE_AI_CLIENT_PORT`: Vite client port, default `5173`
+- `SHAPE_AI_HOST`: server host, default `127.0.0.1`
+- `SHAPE_AI_PORT`: server port, default `8787`
 - `SHAPE_AI_DATA_DIR`: local storage root, default `.local`
-- `SHAPE_AI_REPO_ROOT`: repository root used when validating local export paths
-- `SHAPE_AI_OPEN_BROWSER`: set to `1` to open the browser when running the server directly
+- `SHAPE_AI_CLIENT_DIR`: pre-built client assets to serve, default `dist/client`
 
 ## API
 
-Primary HTTP routes:
+Primary HTTP routes (served by `shape_server` alongside `/ws` and `/mcp`):
 
-- `GET /api/scene?tags`: query canonical scene objects with an optional tag filter. Viewport and zoom culling are renderer-owned.
+- `GET /api/health`, `GET /api/ready`: liveness and readiness probes.
+- `GET /api/scene?tags`: query canonical scene objects with an optional tag
+  filter. Viewport and zoom culling are renderer-owned.
 - `PATCH /api/scene`: patch groups, nodes, edges, or the current selection.
 - `POST /api/groups`: create a group with seeded nodes and optional tags.
-- `GET /api/groups/:id`: read a group subgraph.
 - `PATCH /api/groups/:id/tags`: replace the tag IDs attached to a group.
-- `POST /api/tags`, `PATCH /api/tags/:id`, `DELETE /api/tags/:id`: manage the tag registry.
 - `POST /api/groups/:id/export`: export group content with optional `scope`.
-- `POST /api/comments`, `PATCH /api/comments/:commentId`: add or resolve comments.
+- `POST /api/tags`, `PATCH /api/tags/:id`, `DELETE /api/tags/:id`: manage the
+  tag registry.
+- `POST /api/comments`, `PATCH /api/comments/:id`: add or resolve comments.
+- `GET /api/canvases`, `POST /api/canvases`, `DELETE /api/canvases/:id`:
+  multi-canvas CRUD.
+- `GET /api/templates`, `POST /api/templates`, `DELETE /api/templates/:id`:
+  template library.
 
 ## MCP Usage
 
-Remote Streamable HTTP MCP is served by the main server:
+Remote Streamable HTTP MCP is served by the same server:
 
 ```text
 http://127.0.0.1:8787/mcp
-```
-
-The stdio MCP server is also available for hosts that need process-based MCP:
-
-```bash
-npm run mcp
-```
-
-Example MCP host command:
-
-```json
-{
-  "command": "npm",
-  "args": ["run", "mcp"],
-  "cwd": "/absolute/path/to/shape.ai"
-}
 ```
 
 Available tools:
@@ -89,40 +144,39 @@ Available tools:
 - `add_comment`
 - `export_group`
 
-`export_group` accepts either `type` for one format or `types` for several formats, and returns generated content in preview fields alongside persisted artifact metadata. MCP clients can pass `markdown` as an alias for `madr`.
+`export_group` accepts either `type` for one format or `types` for several
+formats, and returns generated content in preview fields alongside persisted
+artifact metadata. MCP clients can pass `markdown` as an alias for `madr`.
 
 ## Exports
 
-Exports are generated locally and deterministically from the stored group subgraph:
+Exports are generated deterministically from the stored group subgraph:
 
-- `madr`: Markdown Architectural Decision Record, based on the `adr/madr` template.
-- `yadr`: YAML Architectural Decision Record, based on the `adr/yadr` template.
+- `madr`: Markdown Architectural Decision Record (`adr/madr` template).
+- `yadr`: YAML Architectural Decision Record (`adr/yadr` template).
 - `mermaid`: Mermaid flowchart text.
-- `image_prompt`: Prompt text for an MCP client with its own image-generation capability.
+- `image_prompt`: prompt text for an MCP client with its own image generation.
 
 Exports can target `group`, `node`, `edge`, or `selection` scope.
 
-## Performance Model
-
-- The server returns canonical scene data with business filters; viewport and zoom culling happen in the Rust/WASM/WebGPU renderer.
-- The client mounts a renderer host and delegates retained scene rendering, camera updates, culling, hit testing, text layout, and GPU buffer/cache work to the Rust/WASM/WebGPU renderer.
-- DOM remains for product panels, floating controls, diagnostics, and the active native input overlay while editing.
-- Generated WASM glue is built into `src/client/renderer/wasm/` before production builds and copied into the client bundle.
-
 ## Constraints
 
-- SQLite is the canonical store.
+- SQLite is the canonical store; every object is its own region-indexed record.
 - `Scene`, `Group`, `Node`, `Edge`, and `Tag` are the canonical model.
-- The Web UI does not embed an OpenAI client, AI chat, shell execution, or code-editing tool.
-- AI integration is via MCP, with remote Streamable HTTP at `/mcp` and stdio as a compatibility transport.
-- Runtime data and exports under `.local/` should stay out of git.
+- Canvas logic stays in `shape_scene_core`. The server and the client shell are
+  thin platform layers.
+- The Web UI does not embed an OpenAI client, AI chat, shell execution, or
+  code-editing tool. AI integration is via MCP.
+- Identity is `userId`-only with no auth yet.
+- Runtime data and exports under `.local/` stay out of git.
 
 ## Verification
 
 ```bash
+scripts/renderer-toolchain.sh cargo test --workspace
+scripts/renderer-toolchain.sh cargo check -p shape_scene_core --target wasm32-unknown-unknown
+scripts/renderer-toolchain.sh cargo check -p shape_storage_core --target wasm32-unknown-unknown
 npm run typecheck
 npm run test:unit
-npm run renderer:test
-npm run renderer:rust:test
 npm run build
 ```

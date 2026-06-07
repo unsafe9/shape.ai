@@ -4,14 +4,14 @@ use std::{collections::HashMap, f32::consts::PI};
 
 use crate::lod::{apparent_px, lod_tier, LodTier};
 use crate::model::{
-    CameraState, CanvasInputEvent, CubicRoute, RenderCard, RenderEdge, RenderGroup,
+    ActiveTool, CameraState, CanvasInputEvent, CubicRoute, RenderCard, RenderEdge, RenderGroup,
     RenderScenePatch, SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken,
     WorldPoint, WorldRect,
 };
 use crate::serde_wasm;
 use crate::stats::{
-    CoreHitResult, CoreInputBatchResult, CoreOverlayRequest, CoreOverlayStyle, CoreOverlayTarget,
-    WebGpuDebugSnapshot, WebGpuFrameStats, WebGpuProbeReport,
+    CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreOverlayRequest, CoreOverlayStyle,
+    CoreOverlayTarget, WebGpuDebugSnapshot, WebGpuFrameStats, WebGpuProbeReport,
 };
 use crate::text::{
     CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_HEIGHT,
@@ -476,6 +476,11 @@ enum InputDragState {
         pointer_id: i32,
         source_id: String,
     },
+    Marquee {
+        pointer_id: i32,
+        start: WorldPoint,
+        current: WorldPoint,
+    },
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -483,6 +488,7 @@ struct RendererRollbackState {
     scene: Option<SceneSnapshot>,
     camera: CameraState,
     input_drag: Option<InputDragState>,
+    active_tool: ActiveTool,
     last_hit: Option<CoreHitResult>,
     text_layout_cache: TextLayoutCache,
     counters: MutationCounters,
@@ -508,6 +514,7 @@ pub struct ShapeWebGpuRenderer {
     _text_view: wgpu::TextureView,
     _text_sampler: wgpu::Sampler,
     vertex_buffer: wgpu::Buffer,
+    overlay_vertex_buffer: wgpu::Buffer,
     vertex_ranges: VertexRanges,
     text_engine: TextEngine,
     text_layout_cache: TextLayoutCache,
@@ -531,6 +538,7 @@ pub struct ShapeWebGpuRenderer {
     group_capacity_grow_count: usize,
     group_compaction_count: usize,
     input_drag: Option<InputDragState>,
+    active_tool: ActiveTool,
     last_hit: Option<CoreHitResult>,
     last_lod_tiers: HashMap<String, LodTier>,
 }
@@ -596,6 +604,12 @@ impl ShapeWebGpuRenderer {
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shape.ai WebGPU primitive vertices"),
             size: 4,
+            usage: webgpu_vertex_buffer_usage(),
+            mapped_at_creation: false,
+        });
+        let overlay_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shape.ai WebGPU overlay vertices"),
+            size: (MARQUEE_OVERLAY_VERTEX_CAPACITY * std::mem::size_of::<GpuVertex>()) as u64,
             usage: webgpu_vertex_buffer_usage(),
             mapped_at_creation: false,
         });
@@ -730,6 +744,7 @@ impl ShapeWebGpuRenderer {
             _text_view: text_view,
             _text_sampler: text_sampler,
             vertex_buffer,
+            overlay_vertex_buffer,
             vertex_ranges: VertexRanges::default(),
             text_engine,
             text_layout_cache: TextLayoutCache::default(),
@@ -753,6 +768,7 @@ impl ShapeWebGpuRenderer {
             group_capacity_grow_count: 0,
             group_compaction_count: 0,
             input_drag: None,
+            active_tool: ActiveTool::default(),
             last_hit: None,
             last_lod_tiers: HashMap::new(),
         };
@@ -808,6 +824,7 @@ impl ShapeWebGpuRenderer {
             scene: self.scene.clone(),
             camera: self.camera.clone(),
             input_drag: self.input_drag.clone(),
+            active_tool: self.active_tool,
             last_hit: self.last_hit.clone(),
             text_layout_cache: self.text_layout_cache.clone(),
             counters: self.mutation_counters(),
@@ -818,6 +835,7 @@ impl ShapeWebGpuRenderer {
         self.scene = state.scene;
         self.camera = state.camera;
         self.input_drag = state.input_drag;
+        self.active_tool = state.active_tool;
         self.last_hit = state.last_hit;
         self.text_layout_cache = state.text_layout_cache.clone();
         self.rebuild_vertex_buffer();
@@ -1205,6 +1223,7 @@ impl ShapeWebGpuRenderer {
     pub fn render_frame(&mut self) -> Result<JsValue, JsValue> {
         self.write_uniform();
         self.flush_text_atlas();
+        let overlay_vertex_count = self.write_marquee_overlay();
         let mut draw_list = self.build_draw_list();
         // Carry this frame's per-object tiers forward so the next frame's
         // hysteresis resolves against them (T3.1 §3). Tiers are diagnostics; they
@@ -1257,6 +1276,14 @@ impl ShapeWebGpuRenderer {
                 for range in &draw_list.ranges {
                     pass.draw(range.start..range.end, 0..1);
                 }
+            }
+            // Draw the drag marquee on top of the scene using the same world-space
+            // pipeline and bind group, from a separate dynamic vertex buffer.
+            if overlay_vertex_count > 0 {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.overlay_vertex_buffer.slice(..));
+                pass.draw(0..overlay_vertex_count as u32, 0..1);
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -1333,9 +1360,11 @@ impl ShapeWebGpuRenderer {
         let mut patches = Vec::new();
         let mut hit = None;
         let mut overlay = None;
+        let mut marquee = None;
         let rollback = self.rollback_state();
         for event in events {
-            if let Err(error) = self.apply_input_event(event, &mut patches, &mut hit, &mut overlay)
+            if let Err(error) =
+                self.apply_input_event(event, &mut patches, &mut hit, &mut overlay, &mut marquee)
             {
                 self.restore_rollback_state(rollback);
                 return Err(error);
@@ -1353,12 +1382,40 @@ impl ShapeWebGpuRenderer {
             selection,
             patches,
             overlay,
+            marquee,
         })
     }
 
     #[wasm_bindgen(js_name = overlayRequest)]
     pub fn overlay_request(&self, card_id: &str, field: &str) -> Result<JsValue, JsValue> {
         serde_wasm(self.overlay_request_for_card(card_id, field))
+    }
+
+    /// Set the active pointer tool ("select" | "hand"). Equivalent to a
+    /// `set-tool` inputBatch event but callable as a one-off (tool toggles in the
+    /// shell rarely coincide with a pointer batch). Unknown values are ignored.
+    #[wasm_bindgen(js_name = setTool)]
+    pub fn set_tool(&mut self, tool: &str) {
+        match tool {
+            "select" => self.active_tool = ActiveTool::Select,
+            "hand" => {
+                self.active_tool = ActiveTool::Hand;
+                self.input_drag = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Hit-test a screen-space point without mutating selection or camera (CC4.1).
+    /// Returns the picked object (or null) so the shell can show a right-click
+    /// context menu. Mirrors `hitTest` in coreContract.ts.
+    #[wasm_bindgen(js_name = hitTest)]
+    pub fn hit_test(&self, screen_x: f64, screen_y: f64) -> Result<JsValue, JsValue> {
+        let hit = self.hit_at_screen(WorldPoint {
+            x: screen_x,
+            y: screen_y,
+        });
+        serde_wasm(hit)
     }
 
     #[wasm_bindgen(js_name = debugSnapshot)]
@@ -1403,26 +1460,48 @@ impl ShapeWebGpuRenderer {
         patches: &mut Vec<RenderScenePatch>,
         hit: &mut Option<CoreHitResult>,
         overlay: &mut Option<CoreOverlayRequest>,
+        marquee: &mut Option<CoreMarqueeResult>,
     ) -> Result<(), JsValue> {
         match event {
             CanvasInputEvent::PointerDown { pointer_id, screen } => {
+                // Hand tool always pans; it never hit-tests or mutates selection.
+                if self.active_tool == ActiveTool::Hand {
+                    self.input_drag = Some(InputDragState::Pan {
+                        pointer_id,
+                        start: screen,
+                        camera: self.camera.clone(),
+                    });
+                    return Ok(());
+                }
                 let next_hit = self.hit_at_screen(screen);
                 self.last_hit = next_hit.clone();
                 *hit = next_hit.clone();
+                // Empty hit under the Select tool starts a marquee instead of
+                // clearing selection. The shell decides whether/how to clear its
+                // own selection from the resulting marquee ids (C1).
+                let Some(hit_object) = next_hit.clone() else {
+                    let world = screen_to_world(screen, &self.camera);
+                    self.input_drag = Some(InputDragState::Marquee {
+                        pointer_id,
+                        start: world,
+                        current: world,
+                    });
+                    return Ok(());
+                };
                 self.push_input_patch(
                     RenderScenePatch::Select {
-                        selection: selection_from_hit(next_hit.as_ref()),
+                        selection: selection_from_hit(Some(&hit_object)),
                     },
                     patches,
                 )?;
-                self.input_drag = match next_hit.as_ref() {
-                    Some(hit) if hit.kind == "port" && hit.port.as_deref() == Some("source") => {
+                self.input_drag = match &hit_object {
+                    hit if hit.kind == "port" && hit.port.as_deref() == Some("source") => {
                         Some(InputDragState::Edge {
                             pointer_id,
                             source_id: hit.id.clone(),
                         })
                     }
-                    Some(hit) if hit.kind == "card" || hit.kind == "text" => self
+                    hit if hit.kind == "card" || hit.kind == "text" => self
                         .scene
                         .as_ref()
                         .and_then(|scene| scene.cards.iter().find(|card| card.id == hit.id))
@@ -1435,7 +1514,7 @@ impl ShapeWebGpuRenderer {
                             },
                             start_bounds: card.bounds.clone(),
                         }),
-                    Some(hit) if hit.kind == "group" => Some(InputDragState::Group {
+                    hit if hit.kind == "group" => Some(InputDragState::Group {
                         pointer_id,
                         group_id: hit.id.clone(),
                         start: WorldPoint {
@@ -1510,6 +1589,17 @@ impl ShapeWebGpuRenderer {
                         pointer_id: drag_pointer_id,
                         ..
                     } if drag_pointer_id == pointer_id => {}
+                    InputDragState::Marquee {
+                        pointer_id: drag_pointer_id,
+                        start,
+                        ..
+                    } if drag_pointer_id == pointer_id => {
+                        self.input_drag = Some(InputDragState::Marquee {
+                            pointer_id,
+                            start,
+                            current: screen_to_world(screen, &self.camera),
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -1555,6 +1645,22 @@ impl ShapeWebGpuRenderer {
                                 }
                             }
                         }
+                    }
+                } else if let Some(InputDragState::Marquee {
+                    pointer_id: drag_pointer_id,
+                    start,
+                    ..
+                }) = self.input_drag.clone()
+                {
+                    if drag_pointer_id == pointer_id {
+                        let current = screen_to_world(screen, &self.camera);
+                        let rect = marquee_rect(start, current);
+                        let ids = self
+                            .scene
+                            .as_ref()
+                            .map(|scene| marquee_intersecting_ids(scene, &rect))
+                            .unwrap_or_default();
+                        *marquee = Some(CoreMarqueeResult { rect, ids });
                     }
                 }
                 self.input_drag = None;
@@ -1606,6 +1712,19 @@ impl ShapeWebGpuRenderer {
             CanvasInputEvent::SetCamera { camera } => {
                 self.camera = clamp_camera(camera);
             }
+            CanvasInputEvent::SetTool { tool } => {
+                self.active_tool = tool;
+                // Switching tools mid-gesture abandons any in-flight drag so the
+                // new tool starts from a clean pointer state.
+                self.input_drag = None;
+            }
+            CanvasInputEvent::ContextPick { screen } => {
+                // Right-click pick: report the hit without mutating selection or
+                // starting a drag, so the shell can open a context menu (CC4.1).
+                let next_hit = self.hit_at_screen(screen);
+                self.last_hit = next_hit.clone();
+                *hit = next_hit;
+            }
         }
         Ok(())
     }
@@ -1649,6 +1768,26 @@ impl ShapeWebGpuRenderer {
             world_rect,
             style: overlay_style(&self.camera, &style, field, selected),
         })
+    }
+
+    /// Write the marquee overlay quads for the active drag (if any) into the
+    /// dedicated overlay vertex buffer, returning the vertex count to draw. Zero
+    /// when no marquee is in flight.
+    fn write_marquee_overlay(&mut self) -> usize {
+        let Some(InputDragState::Marquee { start, current, .. }) = self.input_drag.clone() else {
+            return 0;
+        };
+        let rect = marquee_rect(start, current);
+        let vertices = build_marquee_overlay_vertices(&rect, self.camera.zoom);
+        if vertices.is_empty() {
+            return 0;
+        }
+        self.queue.write_buffer(
+            &self.overlay_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&vertices),
+        );
+        vertices.len()
     }
 
     fn build_draw_list(&self) -> FrameDrawList {
@@ -3260,6 +3399,13 @@ fn collect_selection_dirty_ids(
         SceneSelection::Group { id } => push_unique(groups, id),
         SceneSelection::Node { id } => push_unique(cards, id),
         SceneSelection::Edge { id } => push_unique(edges, id),
+        // Multi is a transient shell-side set; the persisted core selection never
+        // holds it, but dirty any node ids it carries to be safe.
+        SceneSelection::Multi { ids } => {
+            for id in ids {
+                push_unique(cards, id);
+            }
+        }
     }
 }
 
@@ -4326,6 +4472,94 @@ mod tests {
         assert_eq!(held.compact_tier_count, 1);
         assert_eq!(held.lod_tiers.get("card"), Some(&LodTier::Compact));
     }
+
+    fn marquee_group(id: &str, x: f64, y: f64, width: f64, height: f64) -> RenderGroup {
+        RenderGroup {
+            id: id.to_string(),
+            title: id.to_string(),
+            summary: String::new(),
+            bounds: WorldRect {
+                x,
+                y,
+                width,
+                height,
+            },
+            tag_ids: Vec::new(),
+            z_index: 0.0,
+            style_key: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn marquee_rect_normalizes_drag_corners() {
+        // Drag from bottom-right to top-left still yields a positive-extent rect.
+        let rect = marquee_rect(
+            WorldPoint { x: 300.0, y: 200.0 },
+            WorldPoint { x: 100.0, y: 50.0 },
+        );
+        assert_eq!(rect.x, 100.0);
+        assert_eq!(rect.y, 50.0);
+        assert_eq!(rect.width, 200.0);
+        assert_eq!(rect.height, 150.0);
+    }
+
+    #[test]
+    fn marquee_collects_intersecting_cards_and_groups() {
+        let scene = SceneSnapshot {
+            scene_id: "marquee-test".to_string(),
+            camera: CameraState {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+            // inside (60..300) overlaps the marquee; far (900+) does not.
+            groups: vec![
+                marquee_group("group-in", 40.0, 40.0, 120.0, 120.0),
+                marquee_group("group-out", 900.0, 900.0, 80.0, 80.0),
+            ],
+            cards: vec![
+                text_path_card("card-in", 100.0, 100.0),
+                text_path_card("card-out", 1000.0, 1000.0),
+            ],
+            edges: Vec::new(),
+            styles: vec![minimal_style_token("default")],
+            selection: SceneSelection::Canvas,
+        };
+
+        let rect = marquee_rect(
+            WorldPoint { x: 60.0, y: 60.0 },
+            WorldPoint { x: 320.0, y: 320.0 },
+        );
+        let ids = marquee_intersecting_ids(&scene, &rect);
+
+        // Cards first, then groups; only the intersecting ones.
+        assert_eq!(ids, vec!["card-in".to_string(), "group-in".to_string()]);
+    }
+
+    #[test]
+    fn marquee_overlay_builds_fill_and_stroke_geometry() {
+        let rect = WorldRect {
+            x: 10.0,
+            y: 20.0,
+            width: 120.0,
+            height: 80.0,
+        };
+        let vertices = build_marquee_overlay_vertices(&rect, 1.0);
+        // 1 fill quad + 4 stroke quads = 30 vertices, within the buffer capacity.
+        assert_eq!(vertices.len(), MARQUEE_OVERLAY_VERTEX_CAPACITY);
+        assert!(vertices.len() <= MARQUEE_OVERLAY_VERTEX_CAPACITY);
+    }
+
+    #[test]
+    fn multi_selection_round_trips_camel_case_kind() {
+        let selection = SceneSelection::Multi {
+            ids: vec!["card-a".to_string(), "group-b".to_string()],
+        };
+        let json = serde_json::to_string(&selection).unwrap();
+        assert_eq!(json, r#"{"kind":"multi","ids":["card-a","group-b"]}"#);
+        let parsed: SceneSelection = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, SceneSelection::Multi { ids } if ids.len() == 2));
+    }
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -4841,6 +5075,69 @@ fn rects_intersect(a: &WorldRect, b: &WorldRect) -> bool {
     a.x <= b.x + b.width && a.x + a.width >= b.x && a.y <= b.y + b.height && a.y + a.height >= b.y
 }
 
+/// Normalize two world-space drag corners into a non-negative-extent rect.
+#[cfg(feature = "wgpu-probe")]
+fn marquee_rect(start: WorldPoint, current: WorldPoint) -> WorldRect {
+    let x = start.x.min(current.x);
+    let y = start.y.min(current.y);
+    WorldRect {
+        x,
+        y,
+        width: (start.x - current.x).abs(),
+        height: (start.y - current.y).abs(),
+    }
+}
+
+/// Build the marquee overlay quads (translucent fill + 1.5px-equivalent stroke)
+/// in world space for `rect`. `zoom` keeps the stroke a constant screen width.
+/// Returns up to MARQUEE_OVERLAY_VERTEX_CAPACITY vertices.
+#[cfg(feature = "wgpu-probe")]
+fn build_marquee_overlay_vertices(rect: &WorldRect, zoom: f64) -> Vec<GpuVertex> {
+    let mut vertices = Vec::with_capacity(MARQUEE_OVERLAY_VERTEX_CAPACITY);
+    add_rect(&mut vertices, rect, MARQUEE_FILL_COLOR);
+    let thickness = (1.5 / zoom.max(0.025)) as f32;
+    let x = rect.x as f32;
+    let y = rect.y as f32;
+    let w = rect.width as f32;
+    let h = rect.height as f32;
+    add_line(&mut vertices, [x, y], [x + w, y], thickness, MARQUEE_STROKE_COLOR);
+    add_line(
+        &mut vertices,
+        [x + w, y],
+        [x + w, y + h],
+        thickness,
+        MARQUEE_STROKE_COLOR,
+    );
+    add_line(
+        &mut vertices,
+        [x + w, y + h],
+        [x, y + h],
+        thickness,
+        MARQUEE_STROKE_COLOR,
+    );
+    add_line(&mut vertices, [x, y + h], [x, y], thickness, MARQUEE_STROKE_COLOR);
+    vertices
+}
+
+/// Node ids AND group ids whose world bounds intersect the marquee rect (AABB).
+/// Cards come first (selection-anchor friendly), then groups; both deduped by the
+/// scene's natural order.
+#[cfg(feature = "wgpu-probe")]
+fn marquee_intersecting_ids(scene: &SceneSnapshot, rect: &WorldRect) -> Vec<String> {
+    let mut ids = Vec::new();
+    for card in &scene.cards {
+        if rects_intersect(&card.bounds, rect) {
+            ids.push(card.id.clone());
+        }
+    }
+    for group in &scene.groups {
+        if rects_intersect(&group.bounds, rect) {
+            ids.push(group.id.clone());
+        }
+    }
+    ids
+}
+
 #[cfg(feature = "wgpu-probe")]
 fn screen_to_world(point: WorldPoint, camera: &CameraState) -> WorldPoint {
     let zoom = camera.zoom.max(0.025);
@@ -4985,6 +5282,9 @@ fn selection_world_rect(scene: &SceneSnapshot, selection: &SceneSelection) -> Op
                     Some(edge_visible_bounds(source, target))
                 })
         }
+        // A transient multi-select has no single persisted bounds; the shell owns
+        // any multi-selection framing.
+        SceneSelection::Multi { .. } => None,
     }
 }
 
@@ -5262,7 +5562,8 @@ fn drag_pointer_id(drag: Option<&InputDragState>) -> Option<i32> {
         Some(InputDragState::Pan { pointer_id, .. })
         | Some(InputDragState::Group { pointer_id, .. })
         | Some(InputDragState::Card { pointer_id, .. })
-        | Some(InputDragState::Edge { pointer_id, .. }) => Some(*pointer_id),
+        | Some(InputDragState::Edge { pointer_id, .. })
+        | Some(InputDragState::Marquee { pointer_id, .. }) => Some(*pointer_id),
         None => None,
     }
 }
@@ -5578,6 +5879,15 @@ const EDGE_VERTEX_SLOT: usize = 768;
 const CARD_VERTEX_SLOT: usize = 1536;
 #[cfg(feature = "wgpu-probe")]
 const VIEWPORT_CULL_PADDING: f64 = 400.0;
+// Marquee overlay = 1 fill quad (6 verts) + 4 stroke edge quads (24 verts) = 30.
+#[cfg(feature = "wgpu-probe")]
+const MARQUEE_OVERLAY_VERTEX_CAPACITY: usize = 30;
+// Marquee fill/stroke colors (accent blue, translucent). Drawn in world space so
+// the existing camera-transform pipeline renders them in place.
+#[cfg(feature = "wgpu-probe")]
+const MARQUEE_FILL_COLOR: [f32; 4] = [0.231, 0.510, 0.965, 0.12];
+#[cfg(feature = "wgpu-probe")]
+const MARQUEE_STROKE_COLOR: [f32; 4] = [0.231, 0.510, 0.965, 0.9];
 
 #[cfg(feature = "wgpu-probe")]
 fn webgpu_vertex_buffer_usage() -> wgpu::BufferUsages {

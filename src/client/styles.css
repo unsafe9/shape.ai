@@ -187,11 +187,16 @@ p {
 }
 
 .renderer-scene-surface {
-  cursor: grab;
+  cursor: default;
   touch-action: none;
 }
 
-.renderer-scene-surface:active {
+/* CC2.4 tool cursors: hand pans (grab/grabbing), select shows the default. */
+.renderer-scene-surface[data-tool="hand"] {
+  cursor: grab;
+}
+
+.renderer-scene-surface[data-tool="hand"]:active {
   cursor: grabbing;
 }
 
@@ -390,6 +395,15 @@ p {
   border-radius: 11px;
 }
 
+/* MG9.2 canvas switch chrome: pinned top-centre, above the canvas surface. */
+.canvas-switcher-chrome {
+  position: absolute;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 12;
+}
+
 .canvas-watermark {
   position: absolute;
   top: 30px;
@@ -542,121 +556,6 @@ p {
 .template-picker-desc {
   color: var(--muted);
   font-size: 11px;
-  font-weight: 560;
-  line-height: 1.3;
-}
-
-/* Figma-like left palette: basic primitives + templates. */
-.shape-palette {
-  position: absolute;
-  top: 50%;
-  left: 34px;
-  z-index: 13;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  width: 178px;
-  max-height: min(660px, calc(100vh - 120px));
-  overflow-y: auto;
-  padding: 10px;
-  border: 1px solid rgb(255 255 255 / 0.74);
-  border-radius: 16px;
-  background: rgb(255 255 255 / 0.88);
-  box-shadow: var(--shadow-deep);
-  backdrop-filter: var(--glass-blur);
-  transform: translateY(-50%);
-}
-
-.palette-section {
-  display: grid;
-  gap: 6px;
-}
-
-.palette-section-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 4px;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-}
-
-.palette-section-title svg {
-  flex: 0 0 auto;
-}
-
-.palette-primitive-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 6px;
-}
-
-.palette-primitive {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  min-height: 56px;
-  border: 1px solid var(--line);
-  border-radius: 11px;
-  background: rgb(255 255 255 / 0.7);
-  color: var(--text);
-  font-size: 10.5px;
-  font-weight: 700;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(25 36 48 / 0.04);
-  transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
-}
-
-.palette-primitive:hover:not(:disabled),
-.palette-primitive:focus-visible {
-  border-color: rgb(47 126 230 / 0.28);
-  background: rgb(255 255 255 / 0.94);
-  transform: translateY(-1px);
-}
-
-.palette-primitive:disabled {
-  opacity: 0.46;
-  cursor: not-allowed;
-}
-
-.palette-template-list {
-  display: grid;
-  gap: 3px;
-}
-
-.palette-template-item {
-  display: grid;
-  gap: 2px;
-  border: 0;
-  border-radius: 10px;
-  background: transparent;
-  padding: 7px 9px;
-  text-align: left;
-}
-
-.palette-template-item:hover:not(:disabled),
-.palette-template-item:focus-visible {
-  background: rgb(235 243 251 / 0.92);
-}
-
-.palette-template-item:disabled {
-  opacity: 0.42;
-  cursor: default;
-}
-
-.palette-template-title {
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 760;
-}
-
-.palette-template-desc {
-  color: var(--muted);
-  font-size: 10.5px;
   font-weight: 560;
   line-height: 1.3;
 }
@@ -2006,4 +1905,249 @@ p {
 .canvas-editing-toolbar-delete:hover {
   border-color: rgb(214 75 69 / 0.28);
   background: rgb(255 240 240 / 0.92);
+}
+
+/* ---------------------------------------------------------------------------
+ * CC1.1 CockpitRemote — bottom-center remote control
+ * --------------------------------------------------------------------------- */
+
+.cockpit-remote {
+  position: absolute;
+  left: 50%;
+  bottom: 28px;
+  z-index: 13;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid rgb(255 255 255 / 0.72);
+  border-radius: 18px;
+  background: rgb(255 255 255 / 0.78);
+  box-shadow: var(--shadow-float);
+  backdrop-filter: var(--glass-blur);
+}
+
+.cockpit-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.cockpit-sep {
+  width: 1px;
+  height: 22px;
+  background: var(--line);
+  margin: 0 4px;
+}
+
+/* ---------------------------------------------------------------------------
+ * CC3.3 TemplateLibrary — popover above the cockpit remote
+ * --------------------------------------------------------------------------- */
+
+.template-library {
+  position: absolute;
+  left: 50%;
+  bottom: 92px;
+  z-index: 14;
+  width: 320px;
+  max-height: min(520px, calc(100vh - 160px));
+  display: flex;
+  flex-direction: column;
+  transform: translateX(-50%);
+  padding: 12px;
+  border: 1px solid rgb(255 255 255 / 0.74);
+  border-radius: 16px;
+  background: rgb(255 255 255 / 0.92);
+  box-shadow: var(--shadow-deep);
+  backdrop-filter: var(--glass-blur);
+}
+
+.template-library-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.template-library-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 750;
+  font-size: 13px;
+}
+
+.template-library-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.template-library-empty {
+  margin: 8px 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.template-library-item {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.template-library-apply {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgb(255 255 255 / 0.7);
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+.template-library-apply:hover:not(:disabled),
+.template-library-apply:focus-visible {
+  border-color: rgb(47 126 230 / 0.28);
+  background: rgb(255 255 255 / 0.95);
+  transform: translateY(-1px);
+}
+
+.template-library-apply:disabled {
+  opacity: 0.55;
+}
+
+.template-library-item-title {
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.template-library-item-desc {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.template-library-delete {
+  color: var(--bad);
+}
+
+.template-library-save {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.template-library-save input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgb(255 255 255 / 0.86);
+  font-size: 13px;
+}
+
+/* ---------------------------------------------------------------------------
+ * CC5.1 SettingsModal — read-only shortcut reference
+ * --------------------------------------------------------------------------- */
+
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(20 28 38 / 0.32);
+  backdrop-filter: blur(3px);
+}
+
+.settings-modal {
+  width: min(560px, calc(100vw - 48px));
+  max-height: calc(100vh - 96px);
+  display: flex;
+  flex-direction: column;
+  padding: 18px;
+  border: 1px solid rgb(255 255 255 / 0.74);
+  border-radius: 18px;
+  background: rgb(255 255 255 / 0.96);
+  box-shadow: var(--shadow-deep);
+}
+
+.settings-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.settings-modal-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 800;
+  font-size: 15px;
+}
+
+.settings-modal-note {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 20px;
+}
+
+.settings-section h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 750;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.settings-section ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-section li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.settings-command-binding {
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgb(244 247 250 / 0.9);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.settings-command-unbound {
+  color: var(--muted);
 }

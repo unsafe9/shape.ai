@@ -1,0 +1,22 @@
+[package]
+name = "shape_coordination"
+version = "0.1.0"
+edition = "2021"
+description = "Coordination seam for shape.ai scale-out (MG8): single-writer canvas leases, presence, and pub/sub behind an async Coordinator trait. InMemory impl for single-process dev; File impl for single-host multi-process dev. No canvas logic lives here."
+
+[lib]
+name = "shape_coordination"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time", "fs", "rt", "macros"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# Cross-process advisory file locking for the FileCoordinator lease (MG8.6).
+fs2 = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"

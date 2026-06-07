@@ -54,7 +54,13 @@ export type CanvasInputEvent =
   | { kind: "key"; code: string; modifiers: string[] }
   | { kind: "set-camera"; camera: CameraState }
   | { kind: "fit-scene" }
-  | { kind: "focus-bounds"; bounds: WorldRect };
+  | { kind: "focus-bounds"; bounds: WorldRect }
+  // CC1.4: switch the active pointer tool. Switching to hand cancels any
+  // in-flight drag. `tool` is the camelCase ActiveTool ("select" | "hand").
+  | { kind: "set-tool"; tool: "select" | "hand" }
+  // CC4.1: right-click pick — populates the result `hit` with the picked object
+  // (or null) without changing selection or starting a drag.
+  | { kind: "context-pick"; screen: WorldPoint };
 
 // ---------------------------------------------------------------------------
 // Hit-test contract
@@ -285,6 +291,16 @@ export interface ShapeCanvasCoreContract {
   hitTest(screenPoint: WorldPoint): CoreHitResult | null;
 
   /**
+   * Set the active pointer tool ("select" | "hand"). Switching to hand cancels
+   * any in-flight drag. Equivalent to a `set-tool` inputBatch event but callable
+   * as a one-off (tool toggles in the shell rarely coincide with a pointer batch).
+   * Unknown values are ignored.
+   *
+   * Mirrors `setTool` / `webgpu.rs`.
+   */
+  setTool(tool: "select" | "hand"): void;
+
+  /**
    * Compute the bounding rect (world space) of the current selection.
    *
    * Returns `null` when nothing is selected. The result is the seed for multi-select
@@ -369,10 +385,25 @@ export interface ShapeCanvasCoreContract {
  * Mirrors `CoreInputBatchResult` in `stats.rs` (`#[cfg(feature = "wgpu-probe")]`).
  */
 export type CoreInputBatchResult = {
+  /** Camera state after the batch was applied. */
+  camera: CameraState;
   /** Hit result for the final pointer event in the batch, if any. */
   hit: CoreHitResult | null;
-  /** Selection state after the batch was applied. */
+  /**
+   * Selection state after the batch was applied. Can be the `multi` variant
+   * (`{ kind: "multi", ids }`) — the core never persists it; the shell merges the
+   * ids into its transient multiSelectIds set.
+   */
   selection: SceneSelection;
+  /** Render-op patches the batch produced (applied in order). */
+  patches: RenderScenePatch[];
   /** Overlay requests triggered by gestures in the batch (e.g. text field activation). */
   overlayRequests: CoreOverlayRequest[];
+  /**
+   * CC2.3: non-null ONLY on the pointer-up that ends a marquee drag. `rect` is
+   * the final world-space marquee rect; `ids` are node ids first then group ids
+   * whose world bounds AABB-intersect the rect. The shell merges `ids` into its
+   * transient multiSelectIds set.
+   */
+  marquee: { rect: WorldRect; ids: string[] } | null;
 };

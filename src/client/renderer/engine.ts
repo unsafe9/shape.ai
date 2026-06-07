@@ -15,9 +15,13 @@ import type {
   RustDebugSnapshot,
   RustHitResult,
   RustInputBatchResult,
+  RustMarqueeResult,
   RustWebGpuFrameStats,
   RustWebGpuRenderer
 } from "./wasmLoader";
+
+/** CC1.4: the active pointer tool. "select" picks/drags, "hand" pans. */
+export type ActiveTool = "select" | "hand";
 
 export type EngineEvent =
   | { type: "stats"; stats: FrameStats }
@@ -27,6 +31,12 @@ export type EngineEvent =
   | { type: "patch"; patch: ScenePatch; errors: string[] }
   | { type: "overlay"; request: DomOverlayRequest | null }
   | { type: "gesture"; active: boolean }
+  // CC2.3: emitted on the pointer-up that ends a marquee drag. ids = node ids
+  // first, then group ids, whose world AABB intersects the final rect. The shell
+  // merges them into its transient multiSelectIds set.
+  | { type: "marquee"; rect: WorldRect; ids: string[] }
+  // CC4.1: right-click pick result, for the context menu. Does not change selection.
+  | { type: "context-pick"; hit: HitResult | null; screen: WorldPoint }
   | { type: "status"; message: string };
 
 export type ShapeCanvasEngineOptions = {
@@ -148,6 +158,51 @@ export class ShapeCanvasEngine {
   fitScene() {
     this.sendInputBatch([{ kind: "fit-scene" }]);
     this.updateOverlayPosition();
+  }
+
+  // CC1.4: set the active pointer tool. Prefer the direct wasm method (a tool
+  // toggle rarely coincides with a pointer batch); fall back to a set-tool input
+  // event if the build predates the direct method.
+  setTool(tool: ActiveTool) {
+    if (!this.webGpuRenderer) return;
+    if (typeof this.webGpuRenderer.setTool === "function") {
+      try {
+        this.webGpuRenderer.setTool(tool);
+        this.rustBoundaryCalls += 1;
+      } catch (error) {
+        this.onEvent({
+          type: "status",
+          message: error instanceof Error ? `Rust setTool failed: ${error.message}` : "Rust setTool failed"
+        });
+      }
+      return;
+    }
+    this.sendInputBatch([{ kind: "set-tool", tool }]);
+  }
+
+  // CC4.1: pure hit-test for the right-click context menu. Prefers the direct
+  // wasm hitTest (no mutation); falls back to a context-pick input event whose
+  // result.hit is surfaced without changing selection.
+  contextPick(screen: WorldPoint): HitResult | null {
+    if (!this.webGpuRenderer) return null;
+    let hit: HitResult | null = null;
+    if (typeof this.webGpuRenderer.hitTest === "function") {
+      try {
+        hit = rustHitToEngineHit(this.webGpuRenderer.hitTest(screen.x, screen.y));
+        this.rustBoundaryCalls += 1;
+      } catch (error) {
+        this.onEvent({
+          type: "status",
+          message: error instanceof Error ? `Rust hitTest failed: ${error.message}` : "Rust hitTest failed"
+        });
+        hit = null;
+      }
+    } else {
+      const result = this.sendInputBatch([{ kind: "context-pick", screen }]);
+      hit = rustHitToEngineHit(result?.hit ?? null);
+    }
+    this.onEvent({ type: "context-pick", hit, screen });
+    return hit;
   }
 
   wheelAtScreen(screen: WorldPoint, deltaY: number) {
@@ -658,6 +713,10 @@ export class ShapeCanvasEngine {
       this.mountOverlay(result.overlay);
       this.onEvent({ type: "overlay", request: result.overlay });
     }
+    // CC2.3: a marquee result rides the pointer-up that ends the drag. Forward
+    // the intersected ids so the shell merges them into multiSelectIds.
+    const marquee = marqueeFromResult(result);
+    if (marquee) this.onEvent({ type: "marquee", rect: marquee.rect, ids: marquee.ids });
   }
 
   private mirrorAcceptedPatches(patches: ScenePatch[], emitPatchEvents: boolean) {
@@ -698,6 +757,14 @@ export class ShapeCanvasEngine {
       return null;
     }
   }
+}
+
+// CC2.3: read the marquee result defensively — a wasm build that predates the
+// field returns it as undefined, which must behave like "no marquee".
+function marqueeFromResult(result: RustInputBatchResult): RustMarqueeResult | null {
+  const marquee = result.marquee;
+  if (!marquee) return null;
+  return { rect: marquee.rect, ids: marquee.ids };
 }
 
 function rustHitToEngineHit(hit: RustHitResult | null): HitResult | null {

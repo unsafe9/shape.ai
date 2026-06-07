@@ -96,9 +96,9 @@ impl FileAdapter {
         let cursor = crate::format::stream_bundle(&self.root)?;
         // Write to a sibling temp bundle, then swap in place.
         let tmp = sibling_tmp(&self.root);
-        export_stream(cursor, &tmp, shard_count)?;
-        replace_bundle(&self.root, &tmp)?;
-        Ok(())
+        write_then_swap(&self.root, &tmp, |dst| {
+            export_stream(cursor, dst, shard_count).map(|_| ())
+        })
     }
 }
 
@@ -178,9 +178,9 @@ impl StorageAdapter for FileAdapter {
         let merged = MergeById::new(Box::new(existing), Box::new(incoming));
 
         let tmp = sibling_tmp(&self.root);
-        export_stream(merged, &tmp, self.shard_count)?;
-        replace_bundle(&self.root, &tmp)?;
-        Ok(())
+        write_then_swap(&self.root, &tmp, |dst| {
+            export_stream(merged, dst, self.shard_count).map(|_| ())
+        })
     }
 }
 
@@ -259,6 +259,23 @@ fn sibling_tmp(root: &Path) -> PathBuf {
     match root.parent() {
         Some(parent) => parent.join(name),
         None => PathBuf::from(name),
+    }
+}
+
+/// Write a fresh bundle into the sibling temp path `tmp` via `write`, then swap
+/// it into place at `dst`. The swap-in-place keeps the live bundle byte-intact
+/// until the new one is fully written. On any failure the partial temp bundle is
+/// removed so a failed run never leaks an orphan bundle beside the live store.
+fn write_then_swap<F>(dst: &Path, tmp: &Path, write: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    match write(tmp).and_then(|()| replace_bundle(dst, tmp)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(tmp);
+            Err(e)
+        }
     }
 }
 

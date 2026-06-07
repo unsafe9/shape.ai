@@ -12,11 +12,18 @@
 use crate::adapter::{AdapterKind, RecordCursor, StorageAdapter};
 use crate::error::{Result, StorageError};
 use crate::record::{Record, StoreSnapshot};
+use crate::spatial::{bbox_overlaps, RegionKey, SpatialStore};
+use std::collections::BTreeMap;
 
 /// In-process store holding records in a sorted map.
+///
+/// `regions` is the optional spatial side index keyed by record id (see
+/// [`SpatialStore`]); it stays empty unless [`save_indexed`](SpatialStore::save_indexed)
+/// is used, so the plain [`StorageAdapter`] path is unaffected.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryAdapter {
     snapshot: StoreSnapshot,
+    regions: BTreeMap<String, RegionKey>,
 }
 
 impl MemoryAdapter {
@@ -27,7 +34,10 @@ impl MemoryAdapter {
 
     /// Build directly from an existing snapshot.
     pub fn from_snapshot(snapshot: StoreSnapshot) -> Self {
-        MemoryAdapter { snapshot }
+        MemoryAdapter {
+            snapshot,
+            regions: BTreeMap::new(),
+        }
     }
 
     /// Number of records held.
@@ -59,6 +69,7 @@ impl StorageAdapter for MemoryAdapter {
     }
 
     fn delete(&mut self, id: &str) -> Result<bool> {
+        self.regions.remove(id);
         Ok(self.snapshot.remove(id).is_some())
     }
 
@@ -77,7 +88,48 @@ impl StorageAdapter for MemoryAdapter {
 
     fn restore(&mut self, snapshot: StoreSnapshot) -> Result<()> {
         self.snapshot = snapshot;
+        // The region index pointed at the previous contents; drop it so no stale
+        // rows survive a replace.
+        self.regions.clear();
         Ok(())
+    }
+}
+
+impl SpatialStore for MemoryAdapter {
+    fn save_indexed(&mut self, record: Record, key: Option<RegionKey>) -> Result<()> {
+        match key {
+            Some(key) => {
+                self.regions.insert(record.id.clone(), key);
+            }
+            None => {
+                self.regions.remove(&record.id);
+            }
+        }
+        self.snapshot.insert(record);
+        Ok(())
+    }
+
+    fn query_region(
+        &self,
+        canvas_id: &str,
+        bbox: Option<(f64, f64, f64, f64)>,
+    ) -> Result<RecordCursor<'_>> {
+        let canvas_id = canvas_id.to_string();
+        // `regions` is a BTreeMap, so iterating it gives id-sorted order, and the
+        // snapshot is keyed by the same ids. We clone matched records lazily.
+        let cursor = self
+            .regions
+            .iter()
+            .filter(move |(_, key)| key.canvas_id == canvas_id)
+            .filter(move |(_, key)| match bbox {
+                None => true,
+                Some((qminx, qminy, qmaxx, qmaxy)) => bbox_overlaps(
+                    key.min_x, key.min_y, key.max_x, key.max_y, qminx, qminy, qmaxx, qmaxy,
+                ),
+            })
+            .filter_map(|(id, _)| self.snapshot.get(id).cloned())
+            .map(Ok);
+        Ok(Box::new(cursor))
     }
 }
 

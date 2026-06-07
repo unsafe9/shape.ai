@@ -346,6 +346,13 @@ pub enum SceneSelection {
     Edge {
         id: String,
     },
+    // Transient multi-select set produced by a drag marquee. The shell merges
+    // these ids into its own `multiSelectIds` set; the single-anchor persisted
+    // selection invariant lives in the shell, not here. Matches scene-core/TS
+    // `{ kind: "multi", ids: string[] }`.
+    Multi {
+        ids: Vec<String>,
+    },
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -400,6 +407,20 @@ pub(crate) enum RenderScenePatch {
     },
 }
 
+// Active pointer tool. Select is the default: pointer-down on an object starts a
+// drag, pointer-down on empty space starts a marquee. Hand always pans. Insert
+// tools are handled shell-side via insert-primitive ops; the core only needs to
+// distinguish Select vs Hand for pointer routing.
+#[cfg(feature = "wgpu-probe")]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ActiveTool {
+    #[default]
+    Select,
+    Hand,
+}
+
 #[cfg(feature = "wgpu-probe")]
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize)]
@@ -447,6 +468,15 @@ pub(crate) enum CanvasInputEvent {
     },
     SetCamera {
         camera: CameraState,
+    },
+    SetTool {
+        tool: ActiveTool,
+    },
+    // Right-click pick: returns the hit for `screen` in CoreInputBatchResult
+    // without mutating selection or starting a drag, so the shell can show a
+    // context menu for the picked object (CC4.1).
+    ContextPick {
+        screen: WorldPoint,
     },
 }
 

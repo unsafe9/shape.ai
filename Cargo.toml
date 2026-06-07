@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "src/storage/core",
+    "crates/scene-core",
+    "crates/server",
+    "crates/coordination",
+]
+# renderer/core stays standalone until MG0.3 wires it to scene-core; member-izing
+# it here would fold its pinned wgpu lockfile into the workspace lock prematurely.
+exclude = [
+    "src/renderer/core",
+]

@@ -12,10 +12,22 @@
 //! See [`CLAUDE.md`](./CLAUDE.md) for the memory-discipline rules, the integrity
 //! test contract, and how to add a new adapter.
 
-mod file;
 mod memory;
+// FileAdapter and the driver stubs lean on the std::fs + rayon bundle format,
+// so they are native-only. wasm32 keeps just the in-memory adapter.
+#[cfg(not(target_arch = "wasm32"))]
+mod file;
+// The sqlite adapter is native-only (rusqlite is a native-only optional dep)
+// and behind the default `sqlite` feature.
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+mod sqlite;
+#[cfg(not(target_arch = "wasm32"))]
 mod stubs;
 
-pub use file::FileAdapter;
 pub use memory::MemoryAdapter;
-pub use stubs::{PostgresAdapter, RemoteServerAdapter, S3Adapter, SqliteAdapter};
+#[cfg(not(target_arch = "wasm32"))]
+pub use file::FileAdapter;
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+pub use sqlite::SqliteAdapter;
+#[cfg(not(target_arch = "wasm32"))]
+pub use stubs::{PostgresAdapter, RemoteServerAdapter, S3Adapter};

@@ -1,0 +1,22 @@
+[package]
+name = "shape_scene_core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared pure-logic scene core for shape.ai: model, op enum, op-apply, per-property LWW, fractional index, templates, wire serde, command catalog. Compiles for wasm32 + native; no time/rng/thread/IO."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `wasm` pulls in wasm-bindgen and compiles the JS bridge in `wasm_api.rs`. It is
+# off by default so native test/build (and a bare `wasm32` check) never touch
+# wasm-bindgen; the web client builds it on with `wasm-pack --features wasm`.
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = { version = "0.2", optional = true }
+
+[dev-dependencies]
+serde_json = "1"

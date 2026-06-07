@@ -1,8 +1,10 @@
 //! The `StorageAdapter` trait every backend implements.
 
 use crate::error::Result;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::format::{export_stream, import_stream, Manifest, DEFAULT_SHARD_COUNT};
 use crate::record::{Record, StoreSnapshot};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 /// The named store kinds the adapter layer abstracts over. Mirrors the
@@ -100,6 +102,10 @@ pub trait StorageAdapter {
 
     /// Export the entire store to the one portable bundle format at `root`,
     /// using the default shard count. Implemented once for all adapters.
+    ///
+    /// Native-only: the bundle format depends on `std::fs` + rayon, neither of
+    /// which exists on wasm32.
+    #[cfg(not(target_arch = "wasm32"))]
     fn export(&self, root: &Path) -> Result<Manifest> {
         self.export_with_shards(root, DEFAULT_SHARD_COUNT)
     }
@@ -108,6 +114,9 @@ pub trait StorageAdapter {
     ///
     /// Streams the [`records`](StorageAdapter::records) cursor straight to the
     /// bundle in bounded memory — it never builds a full snapshot.
+    ///
+    /// Native-only: see [`export`](StorageAdapter::export).
+    #[cfg(not(target_arch = "wasm32"))]
     fn export_with_shards(&self, root: &Path, shard_count: u32) -> Result<Manifest> {
         export_stream(self.records()?, root, shard_count)
     }
@@ -117,6 +126,9 @@ pub trait StorageAdapter {
     /// Streams the bundle shard-by-shard into [`ingest`](StorageAdapter::ingest)
     /// in bounded memory — it never builds a full snapshot. Implementors that
     /// need replace-not-merge semantics should clear first.
+    ///
+    /// Native-only: see [`export`](StorageAdapter::export).
+    #[cfg(not(target_arch = "wasm32"))]
     fn import(&mut self, root: &Path) -> Result<()> {
         import_stream(root, |record| self.ingest(record))?;
         Ok(())

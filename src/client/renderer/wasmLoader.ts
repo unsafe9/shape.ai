@@ -72,7 +72,19 @@ export type RustCanvasInputEvent =
   | { kind: "double-click"; screen: WorldPoint }
   | { kind: "fit-scene" }
   | { kind: "focus-bounds"; bounds: WorldRect; screen?: WorldPoint; zoom?: number; padding?: WorldPoint; minZoom?: number; maxZoom?: number }
-  | { kind: "set-camera"; camera: CameraState };
+  | { kind: "set-camera"; camera: CameraState }
+  // CC1.4: active tool toggle (Select/Hand). tool is camelCase ActiveTool.
+  | { kind: "set-tool"; tool: "select" | "hand" }
+  // CC4.1: right-click pick — populates result.hit without mutating selection.
+  | { kind: "context-pick"; screen: WorldPoint };
+
+// CC2.3: a marquee result is non-null only on the pointer-up that ends a
+// marquee drag. ids = node ids first, then group ids, whose world AABB
+// intersects the final rect; the shell merges them into multiSelectIds.
+export type RustMarqueeResult = {
+  rect: WorldRect;
+  ids: string[];
+};
 
 export type RustInputBatchResult = {
   camera: CameraState;
@@ -80,6 +92,9 @@ export type RustInputBatchResult = {
   selection: SceneSelection;
   patches: ScenePatch[];
   overlay: DomOverlayRequest | null;
+  // CC2.3: optional so a wasm build (or test mock) predating the field still
+  // typechecks; the engine reads it defensively as "no marquee".
+  marquee?: RustMarqueeResult | null;
 };
 
 export type RustDebugSnapshot = {
@@ -134,6 +149,12 @@ export type RustWebGpuRenderer = {
   inputBatch(eventsJson: string): RustInputBatchResult;
   overlayRequest(cardId: string, field: string): DomOverlayRequest | null;
   debugSnapshot(): RustDebugSnapshot;
+  // CC1.4/CC4.1: optional so a wasm build (or test mock) predating these methods
+  // still satisfies the type; the engine feature-detects before calling.
+  // setTool sets the active pointer tool ("select" | "hand"; unknown ignored);
+  // hitTest is a pure pick (no mutation) for the right-click context menu.
+  setTool?(tool: string): void;
+  hitTest?(screenX: number, screenY: number): RustHitResult | null;
 };
 
 type RustWebGpuRendererClass = {

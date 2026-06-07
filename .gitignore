@@ -5,6 +5,11 @@ node_modules
 .claude/
 bun.lock
 src/client/renderer/wasm
+src/client/scene/wasm
 src/renderer/core/target/
 src/storage/core/target/
 .renderer-toolchains/
+
+# Workspace + crate build artifacts
+/target/
+crates/*/target/
