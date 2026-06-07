@@ -20,13 +20,23 @@
 // mock socket and the real `WsTransport` wires onto the same calls.
 
 import type { Scene } from "../../shared/schema";
-import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../../shared/renderPatch";
+import type { RenderScenePatch } from "../../shared/renderPatch";
+import { applyRenderPatchSync, type RenderResult } from "../scene/sceneCoreWasm";
 import {
   opIdKey,
   type OpId,
   type OutboxEntry,
   type OutboxStore
 } from "./outbox";
+
+/**
+ * The synchronous op-apply the engine drives. It is THE scene-core op-apply
+ * (Rust compiled to wasm, the same logic the server runs); the wasm instance must
+ * be initialized — via {@link ensureSceneCore} — before the engine authors. The
+ * seam is injectable so tests can substitute a double, but production uses the
+ * wasm apply in both the browser and Node/vitest.
+ */
+export type ApplyPatch = (scene: Scene, patch: RenderScenePatch, now: string) => RenderResult;
 
 /** Default coalescing window: rapid ops within this many ms ride one frame. */
 export const COALESCE_MS = 33;
@@ -59,6 +69,12 @@ export type SyncEngineOptions = {
   outbox: OutboxStore;
   /** Where coalesced frames are flushed. */
   transport: EngineTransport;
+  /**
+   * The synchronous op-apply; defaults to the scene-core wasm apply
+   * ({@link applyRenderPatchSync}). Injectable for tests. When the default is
+   * used, the wasm must already be initialized via `ensureSceneCore()`.
+   */
+  applyPatch?: ApplyPatch;
   /** Coalescing window in ms; defaults to {@link COALESCE_MS}. */
   coalesceMs?: number;
   /** Clock source for envelope `ts`; injected for deterministic tests. */
@@ -111,6 +127,7 @@ export class SyncEngine {
   private readonly clientId: string;
   private readonly outbox: OutboxStore;
   private readonly transport: EngineTransport;
+  private readonly applyPatch: ApplyPatch;
   private readonly coalesceMs: number;
   private readonly now: () => string;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
@@ -138,6 +155,7 @@ export class SyncEngine {
     this.clientId = opts.clientId;
     this.outbox = opts.outbox;
     this.transport = opts.transport;
+    this.applyPatch = opts.applyPatch ?? applyRenderPatchSync;
     this.coalesceMs = opts.coalesceMs ?? COALESCE_MS;
     this.now = opts.now ?? (() => new Date().toISOString());
     this.setTimer =
@@ -168,7 +186,7 @@ export class SyncEngine {
    * Rejected-by-core ops never enter the outbox or the wire.
    */
   async author(patch: RenderScenePatch): Promise<{ errors: string[]; opId?: OpId }> {
-    const applied = applyRenderPatchToShapeScene(this.scene, patch, this.now());
+    const applied = this.applyPatch(this.scene, patch, this.now());
     if (applied.errors.length > 0) return { errors: applied.errors };
 
     const localSeq = await this.outbox.nextLocalSeq();
@@ -195,7 +213,7 @@ export class SyncEngine {
    */
   applyRemote(patch: RenderScenePatch): boolean {
     if (remoteTouchesOwnedKey(patch, this.ownedKeySet())) return false;
-    const applied = applyRenderPatchToShapeScene(this.scene, patch, this.now());
+    const applied = this.applyPatch(this.scene, patch, this.now());
     if (applied.errors.length > 0) return false;
     this.scene = applied.scene;
     this.emitScene();
@@ -242,7 +260,7 @@ export class SyncEngine {
     const entries = await this.outbox.all();
     for (const entry of entries) {
       // Re-apply optimistically on top of the snapshot and re-take ownership.
-      const applied = applyRenderPatchToShapeScene(this.scene, entry.patch, this.now());
+      const applied = this.applyPatch(this.scene, entry.patch, this.now());
       if (applied.errors.length === 0) this.scene = applied.scene;
       this.takeOwnership(entry.opId, ownedKeys(entry.patch));
     }

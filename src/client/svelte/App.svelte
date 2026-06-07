@@ -30,8 +30,9 @@
     type McpClientInfo
   } from "../lib/api";
   import { boundsIntersect, expandedBounds, nodeBounds } from "../../shared/graph";
-  import { applyRenderPatchToShapeScene, type RenderScenePatch } from "../../shared/renderPatch";
-  import { loadSceneCore, type RenderResult, type SceneCore } from "../scene/sceneCoreWasm";
+  import type { RenderScenePatch } from "../../shared/renderPatch";
+  import { applyRenderPatchSync, loadSceneCore, type RenderResult, type SceneCore } from "../scene/sceneCoreWasm";
+  import { scenePatchFromScenes } from "../scene/sceneDiff";
   import type { CameraState, RenderCard, RenderGroup, WorldRect } from "../../shared/renderScene";
   import { screenToWorld } from "../renderer/scene";
   import { primarySelection } from "../../shared/schema";
@@ -305,8 +306,10 @@
   void bootstrapSceneCore();
   void connectSceneClient();
 
-  // MG-7a: lazy-init the scene-core wasm bridge. Idempotent in the loader; a load
-  // failure leaves sceneCore null so op-apply transparently uses the TS fallback.
+  // Lazy-init the scene-core wasm bridge. Idempotent in the loader; a load failure
+  // leaves the async handle null so applyOptimistic falls back to the synchronous
+  // wasm apply (applyRenderPatchSync) against the same shared, already-init'd
+  // instance. There is no longer a TS op-apply fallback.
   async function bootstrapSceneCore(): Promise<void> {
     try {
       sceneCore = await loadSceneCore();
@@ -315,15 +318,15 @@
     }
   }
 
-  // MG-7a: ONE op-apply implementation. Prefer the scene-core wasm bridge (the
-  // same Rust the server runs); fall back to the golden-equivalent TS apply only
-  // until the wasm finishes loading. Returns {scene, errors} — the wasm shape; the
-  // TS path's appPatch is no longer needed on the WS save path (the raw op is sent
-  // over the wire and the server re-applies authoritatively).
+  // ONE op-apply implementation: the scene-core wasm bridge (the same Rust the
+  // server runs). The async handle is preferred once resolved; otherwise the
+  // synchronous wasm apply runs against the shared, already-initialized instance
+  // (SceneClient.connect awaits ensureSceneCore before any save is possible).
+  // Returns {scene, errors} — the wasm shape; the WS save path sends the raw op
+  // over the wire and the server re-applies authoritatively.
   function applyOptimistic(currentScene: Scene, patch: RenderScenePatch, now: string): RenderResult {
     if (sceneCore) return sceneCore.applyRenderPatch(currentScene, patch, now);
-    const applied = applyRenderPatchToShapeScene(currentScene, patch, now);
-    return { scene: applied.scene, errors: applied.errors };
+    return applyRenderPatchSync(currentScene, patch, now);
   }
 
   // MG-7a: persist a shell CRUD document patch. When the transport client owns the
@@ -718,24 +721,27 @@
       return;
     }
 
-    // HTTP fallback (WS server unreachable mid-cutover): the legacy patchSaver
-    // path needs the TS apply's appPatch, so keep the TS apply here.
-    const applied = applyRenderPatchToShapeScene(scene, patch, now);
+    // HTTP fallback (WS server unreachable mid-cutover): still ONE op-apply (the
+    // scene-core wasm). The legacy patchSaver wants a ScenePatch appPatch, derived
+    // here by diffing the previous scene against the wasm-applied scene; the server
+    // re-applies it authoritatively over /api/scene.
+    const applied = applyOptimistic(scene, patch, now);
     if (applied.errors.length > 0) {
       status = applied.errors.join("; ");
       return;
     }
     const optimisticSelection = validSelection(applied.scene, applied.scene.selection);
+    const appPatch = scenePatchFromScenes(scene, applied.scene);
     sceneRequest += 1;
 
     if (isContinuousRendererPatch(patch)) {
       if (!gestureActive) commitScene(applied.scene, optimisticSelection);
-      patchSaver.queue(applied.appPatch, previousScene, previousSelection, patch.kind, gestureActive);
+      patchSaver.queue(appPatch, previousScene, previousSelection, patch.kind, gestureActive);
       return;
     }
     commitScene(applied.scene, optimisticSelection);
     patchSaver.flush();
-    patchSaver.saveNow(applied.appPatch, previousScene, previousSelection, patch.kind);
+    patchSaver.saveNow(appPatch, previousScene, previousSelection, patch.kind);
   }
 
   function handleRendererGesture(active: boolean): void {

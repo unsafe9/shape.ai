@@ -6,7 +6,7 @@
 // drives the real WsTransport.attachEngine wiring through a MockWebSocket to
 // prove the integration end to end.
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   COALESCE_MS,
@@ -20,9 +20,18 @@ import {
   type OutboxEntry
 } from "../src/client/lib/outbox";
 import { WsTransport, type WebSocketLike } from "../src/client/lib/wsTransport";
+import { ensureSceneCore } from "../src/client/scene/sceneCoreWasm";
 import type { RenderScenePatch } from "../src/shared/renderPatch";
 import type { Scene } from "../src/shared/schema";
 import type { ClientMessage, ServerMessage, WelcomeMessage } from "../src/client/lib/transport";
+
+// The engine's default op-apply is the scene-core wasm (the same Rust the server
+// runs); it must be initialized before any `author`. Under Node/vitest the loader
+// reads the prebuilt `--target web` `.wasm` from disk and inits synchronously, so
+// these tests exercise the WASM op-apply — not the TS one — under Node.
+beforeAll(async () => {
+  await ensureSceneCore();
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures.

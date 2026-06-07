@@ -95,13 +95,30 @@ pinned renderer toolchain is on `PATH`.
 
 ## Operating Notes
 
-- The client TS op-apply (`src/shared/renderPatch.ts` →
-  `applyRenderPatchToShapeScene`, used by `syncEngine.ts`) is kept deliberately:
-  scene-core WASM is `--target web` and cannot `fetch()` its module under
-  Node/vitest, so the node-tested sync engine and the WS path still need the TS
-  op-apply. scene-core-WASM is the op-apply in the browser, not the only one.
-- Template lowering still runs through TS `applyTemplate` in the shell; the WASM
-  template contract is mirrored but not yet routed through.
+- scene-core WASM is the SINGLE runtime op-apply in both the browser and
+  Node/vitest. The loader (`src/client/scene/sceneCoreWasm.ts`) keeps one
+  `--target web` artifact and picks its init per environment: the browser awaits
+  the async `default` (which fetches the `.wasm`), while Node/vitest reads the
+  sibling `.wasm` from disk and inits synchronously via `initSync` (no `fetch`).
+  `applyRenderPatchSync` is the synchronous op-apply the sync engine drives;
+  `ensureSceneCore()` must resolve first (the wasm instance must be initialized),
+  which `SceneClient.connect` awaits before the engine can author. `syncEngine.ts`
+  and the shell (`App.svelte`) call only the WASM apply; there is no runtime TS
+  op-apply. Because vitest now drives the WASM op-apply, `pretest:unit` builds the
+  scene wasm before the suite runs.
+- `src/shared/renderPatch.ts` (`applyRenderPatchToShapeScene`,
+  `updateShapeSceneGroupTags`, `addShapeSceneComment`) and its `operation.ts`
+  envelope helper are retained as TEST-ONLY golden-oracle tooling: the golden
+  generator (`crates/scene-core/tests/golden/generate.ts`) and the equivalence/
+  unit suites import them to prove the Rust port matches the canonical TS. The
+  oracle must stay independent — do NOT regenerate goldens from the Rust-derived
+  WASM. These files are no longer in the client op-apply runtime path; only their
+  `RenderScenePatch` TYPE and the render projection
+  `shapeSceneToFilteredRenderSnapshot` are still imported by the client.
+- Template lowering still runs through TS `applyTemplate` in the shell
+  (`src/shared/templates/contract.ts` uses `applyRenderPatchToShapeScene`); the
+  WASM template contract is mirrored but not yet routed through. This is a
+  separate, deliberate deviation from the op-apply cutover above.
 - Verification gates: `cargo test --workspace`, the two `wasm32` `cargo check`s
   (scene-core, storage-core), both wasm-pack builds, `npm run test:unit`
   (vitest), and `npm run build` (vite).

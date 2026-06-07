@@ -5,12 +5,16 @@ import { defaultStyles, excludedBusinessFields, shapeSceneToRenderSnapshot } fro
 import { generateLocalExport } from "../src/server/local";
 import { ShapeCanvasEngine, type EngineEvent } from "../src/client/renderer/engine";
 import {
+  createShapeSceneFixture,
+  shapeSceneToFilteredRenderSnapshot
+} from "../src/client/renderer/adapter";
+// Op-apply is the golden-oracle TS (test-only); imported directly from its module
+// rather than re-exported through the client-runtime adapter.
+import {
   addShapeSceneComment,
   applyRenderPatchToShapeScene,
-  createShapeSceneFixture,
-  shapeSceneToFilteredRenderSnapshot,
   updateShapeSceneGroupTags
-} from "../src/client/renderer/adapter";
+} from "../src/shared/renderPatch";
 import { createBenchmarkFixture } from "../src/client/renderer/fixtures";
 import {
   applyScenePatch,

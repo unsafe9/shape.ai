@@ -243,8 +243,8 @@ export function applyScenePatch(snapshot: SceneSnapshot, patch: ScenePatch): Sce
   if (patch.kind === "select") {
     return { ...snapshot, selection: patch.selection };
   }
-  // T2.2 ops are applied server-side via applyRenderPatchToShapeScene;
-  // the client snapshot is refreshed from the authoritative scene response.
+  // T2.2 ops are applied via the scene-core op-apply (wasm in the shell, the same
+  // Rust on the server); the client snapshot is refreshed from the resulting scene.
   return snapshot;
 }
 

@@ -34,6 +34,7 @@ import type { RenderScenePatch } from "../../shared/renderPatch";
 import type { WorldPoint, WorldRect } from "../../shared/renderScene";
 import { WsTransport, type ConnectionStatus, type ReconnectOptions, type WebSocketFactory } from "./wsTransport";
 import { SyncEngine } from "./syncEngine";
+import { ensureSceneCore } from "../scene/sceneCoreWasm";
 import { InMemoryOutboxStore, type OpId, type OutboxStore } from "./outbox";
 import { PeerRegistry, type PeerPresence } from "./peers";
 import type { Bbox, PatchMessage, Region } from "./transport";
@@ -215,7 +216,14 @@ export class SceneClient {
     });
     this.transport = transport;
 
+    // The SyncEngine's optimistic op-apply is the scene-core wasm (the same Rust
+    // the server runs); init it before the engine can author. Idempotent + shared
+    // with the shell's loadSceneCore, so the wasm instance is initialized once.
+    // Started here (after the socket is created synchronously, so callers can drive
+    // the socket) and awaited alongside the welcome below.
+    const sceneCoreReady = ensureSceneCore();
     const welcome = await transport.connect(canvasId, this.regionFor(this.window));
+    await sceneCoreReady;
 
     const engine = new SyncEngine(welcome.scene, {
       clientId: this.clientId,
