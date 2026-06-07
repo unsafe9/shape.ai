@@ -22,6 +22,7 @@ wgpu-probe = ["dep:wasm-bindgen-futures", "dep:wgpu"]
 js-sys = "0.3"
 bytemuck = { version = "1.25", features = ["derive"] }
 fontdue = { version = "0.9.3", default-features = false, features = ["std"] }
+lyon_tessellation = "1.0"
 rustybuzz = "0.20.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

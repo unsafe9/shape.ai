@@ -6,6 +6,27 @@ mod render_cache;
 mod stats;
 mod text;
 
+// OB-3 object render-model groundwork (additive). These modules are pure-CPU
+// object-pipeline pieces wired into the GPU draw path at the OB-4 cutover; until
+// then they are unused by the live 2D pipeline, so they carry module-local
+// `#[allow(dead_code)]` to avoid tripping warnings before they are consumed.
+#[allow(dead_code)]
+mod curve_lod;
+#[allow(dead_code)]
+mod hit_test_object;
+#[allow(dead_code)]
+mod outline;
+#[allow(dead_code)]
+mod render_object;
+#[allow(dead_code)]
+mod shaders;
+#[allow(dead_code)]
+mod stroke_expand;
+#[allow(dead_code)]
+mod tessellate;
+#[allow(dead_code)]
+mod text_layout;
+
 #[cfg(feature = "wgpu-probe")]
 mod webgpu;
 
@@ -21,6 +42,40 @@ pub use model::{
 pub use stats::{CoreHitResult, WebGpuFrameStats, WebGpuProbeReport};
 #[cfg(feature = "wgpu-probe")]
 pub use webgpu::ShapeWebGpuRenderer;
+
+// OB-3 object render-model surface (additive; consumed at the OB-4 cutover).
+#[allow(unused_imports)]
+pub use curve_lod::{
+    bucket_anchor_zoom, flatness_for_bucket, flatten_cubic, zoom_bucket, FlattenCache,
+};
+#[allow(unused_imports)]
+pub use hit_test_object::{
+    apply_3x3, hit_test_object, invert_3x3, point_in_polygon, world_to_local, PathSeg,
+};
+#[allow(unused_imports)]
+pub use outline::{derive_region, parse_path_string, Region, RegionCache};
+#[allow(unused_imports)]
+pub use render_object::{
+    default_fill, default_stroke, parse_path_d, resolve_visual, FocusRing, RFill, RGradientStop,
+    RHandle, RNode, RPaint, RStroke, RStrokeCap, RStrokeJoin, RSubPath, RText, RTextAlign,
+    RTextRun, RTextValign, RenderObject, RenderObjectScene, ResolvedStyle, VisualState,
+};
+#[allow(unused_imports)]
+pub use shaders::{CLIP_WGSL, MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_STROKE_WGSL};
+#[allow(unused_imports)]
+pub use stroke_expand::{
+    dash_segments, expand_stroke, Cap, Join, Mesh as StrokeMesh,
+};
+#[allow(unused_imports)]
+pub use tessellate::{
+    parse_path, quantized_to_px, tessellate_fill, DrawRange, FillRuleKind, MegaBuffer, Mesh,
+    ParsedSubpath, PathCommand, TessCache,
+};
+#[allow(unused_imports)]
+pub use text_layout::{
+    layout_runs, GlyphPlacement, MsdfAtlasPlan, MsdfGlyphEntry, MsdfGlyphKey, TextAlign,
+    TextRunInput, TextVAlign,
+};
 
 #[wasm_bindgen]
 pub fn renderer_backend() -> String {
