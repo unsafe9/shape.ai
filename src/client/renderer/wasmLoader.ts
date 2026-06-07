@@ -75,6 +75,9 @@ export type RustCanvasInputEvent =
   | { kind: "set-camera"; camera: CameraState }
   // CC1.4: active tool toggle (Select/Hand). tool is camelCase ActiveTool.
   | { kind: "set-tool"; tool: "select" | "hand" }
+  // Transient multi-select highlight set (marquee / shift-click). Empty clears it;
+  // the persisted single-anchor selection is untouched.
+  | { kind: "set-multi-select"; ids: string[] }
   // CC4.1: right-click pick — populates result.hit without mutating selection.
   | { kind: "context-pick"; screen: WorldPoint };
 
@@ -155,6 +158,9 @@ export type RustWebGpuRenderer = {
   // hitTest is a pure pick (no mutation) for the right-click context menu.
   setTool?(tool: string): void;
   hitTest?(screenX: number, screenY: number): RustHitResult | null;
+  // Replace the transient multi-select highlight set (JSON array of ids). Optional
+  // so a wasm build predating it is treated as a no-op by the engine.
+  setMultiSelect?(idsJson: string): void;
 };
 
 type RustWebGpuRendererClass = {

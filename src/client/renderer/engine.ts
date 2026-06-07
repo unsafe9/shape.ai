@@ -180,6 +180,27 @@ export class ShapeCanvasEngine {
     this.sendInputBatch([{ kind: "set-tool", tool }]);
   }
 
+  // Push the transient multi-select highlight set to the renderer (marquee /
+  // shift-click). Prefers the direct wasm method; falls back to a set-multi-select
+  // input event. A wasm build predating either is a no-op (the multi highlight is
+  // additive over the single anchor, so older builds just lose it). Empty clears.
+  setMultiSelect(ids: string[]) {
+    if (!this.webGpuRenderer) return;
+    if (typeof this.webGpuRenderer.setMultiSelect === "function") {
+      try {
+        this.webGpuRenderer.setMultiSelect(JSON.stringify(ids));
+        this.rustBoundaryCalls += 1;
+      } catch (error) {
+        this.onEvent({
+          type: "status",
+          message: error instanceof Error ? `Rust setMultiSelect failed: ${error.message}` : "Rust setMultiSelect failed"
+        });
+      }
+      return;
+    }
+    this.sendInputBatch([{ kind: "set-multi-select", ids }]);
+  }
+
   // CC4.1: pure hit-test for the right-click context menu. Prefers the direct
   // wasm hitTest (no mutation); falls back to a context-pick input event whose
   // result.hit is surfaced without changing selection.

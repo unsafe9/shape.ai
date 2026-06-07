@@ -447,6 +447,16 @@
     host?.setTool(tool);
   });
 
+  // Push the transient multi-select set to the renderer so every marquee /
+  // shift-click member is highlighted, not just the single anchor. This is
+  // additive over the single-anchor `syncSelection` above: the core stores the
+  // set separately from the persisted selection, so a `select` op no longer wipes
+  // the multi highlight. An empty set clears it.
+  $effect(() => {
+    const ids = multiSelectIds;
+    host?.setMultiSelect(ids);
+  });
+
   // MG9.4 windowed replica: re-aim the data-layer subscription window at the
   // current camera viewport (world space) whenever the camera moves. The client
   // debounces + margin-grows it, so a small pan keeps nearby off-screen objects
@@ -670,6 +680,7 @@
     if (scene) host.loadScene(scene, activeTagIds, selection);
     host.syncSelection(primarySelection(selection));
     host.setTool(activeTool);
+    host.setMultiSelect(multiSelectIds);
   }
 
   function handleRendererSelection(next: SceneSelection, additive = false): void {

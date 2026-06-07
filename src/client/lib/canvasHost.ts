@@ -235,6 +235,13 @@ export class ShapeCanvasHost {
     this.engine?.setTool(tool);
   }
 
+  // Push the transient multi-select highlight set (marquee / shift-click). Empty
+  // clears it. The persisted single-anchor selection (syncSelection) is separate
+  // and unaffected.
+  setMultiSelect(ids: string[]): void {
+    this.engine?.setMultiSelect(ids);
+  }
+
   // CC4.1: right-click pick. Returns the picked selection (or canvas) and emits
   // the onContextPick callback; does not mutate selection or start a drag.
   contextPick(screen: WorldPoint): SceneSelection {

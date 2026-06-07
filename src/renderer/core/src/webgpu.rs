@@ -489,6 +489,7 @@ struct RendererRollbackState {
     camera: CameraState,
     input_drag: Option<InputDragState>,
     active_tool: ActiveTool,
+    multi_select: Vec<String>,
     last_hit: Option<CoreHitResult>,
     text_layout_cache: TextLayoutCache,
     counters: MutationCounters,
@@ -539,6 +540,10 @@ pub struct ShapeWebGpuRenderer {
     group_compaction_count: usize,
     input_drag: Option<InputDragState>,
     active_tool: ActiveTool,
+    // Transient multi-select highlight set. Held on the renderer (like
+    // `active_tool`) so it survives a `load_scene` rebuild, then mirrored into the
+    // scene snapshot the draw path reads. Never part of the serialized snapshot.
+    multi_select: Vec<String>,
     last_hit: Option<CoreHitResult>,
     last_lod_tiers: HashMap<String, LodTier>,
 }
@@ -769,6 +774,7 @@ impl ShapeWebGpuRenderer {
             group_compaction_count: 0,
             input_drag: None,
             active_tool: ActiveTool::default(),
+            multi_select: Vec::new(),
             last_hit: None,
             last_lod_tiers: HashMap::new(),
         };
@@ -790,8 +796,12 @@ impl ShapeWebGpuRenderer {
 
     #[wasm_bindgen(js_name = loadScene)]
     pub fn load_scene(&mut self, scene_json: &str) -> Result<(), JsValue> {
-        let scene = serde_json::from_str::<SceneSnapshot>(scene_json)
+        let mut scene = serde_json::from_str::<SceneSnapshot>(scene_json)
             .map_err(|error| JsValue::from_str(&format!("Invalid scene snapshot: {error}")))?;
+        // The transient multi-select set is shell-owned and not in the wire format,
+        // so a reload would otherwise drop it. Re-apply the renderer-held set so the
+        // highlight survives scene reloads, mirroring how `active_tool` persists.
+        scene.multi_select = self.multi_select.clone();
         self.camera = CameraState {
             x: scene.camera.x,
             y: scene.camera.y,
@@ -825,6 +835,7 @@ impl ShapeWebGpuRenderer {
             camera: self.camera.clone(),
             input_drag: self.input_drag.clone(),
             active_tool: self.active_tool,
+            multi_select: self.multi_select.clone(),
             last_hit: self.last_hit.clone(),
             text_layout_cache: self.text_layout_cache.clone(),
             counters: self.mutation_counters(),
@@ -836,6 +847,7 @@ impl ShapeWebGpuRenderer {
         self.camera = state.camera;
         self.input_drag = state.input_drag;
         self.active_tool = state.active_tool;
+        self.multi_select = state.multi_select;
         self.last_hit = state.last_hit;
         self.text_layout_cache = state.text_layout_cache.clone();
         self.rebuild_vertex_buffer();
@@ -1406,6 +1418,37 @@ impl ShapeWebGpuRenderer {
         }
     }
 
+    /// Replace the transient multi-select highlight set with `ids` (JSON array of
+    /// strings); an empty array clears it. Equivalent to a `set-multi-select`
+    /// inputBatch event but callable as a one-off, mirroring `setTool`. The
+    /// persisted single-anchor selection is untouched.
+    #[wasm_bindgen(js_name = setMultiSelect)]
+    pub fn set_multi_select(&mut self, ids_json: &str) -> Result<(), JsValue> {
+        let ids = serde_json::from_str::<Vec<String>>(ids_json)
+            .map_err(|error| JsValue::from_str(&format!("Invalid multi-select ids: {error}")))?;
+        self.set_multi_select_ids(ids);
+        Ok(())
+    }
+
+    // Store the transient multi-select set (renderer-held so it survives reloads),
+    // mirror it into the scene the draw path reads, and rebuild geometry so every
+    // member draws with selection styling. Multi-select changes are discrete user
+    // actions (marquee completion, shift-click), so a full rebuild — the same
+    // fallback the patch path uses — is acceptable and avoids per-kind slot
+    // bookkeeping for a kind-agnostic id set.
+    fn set_multi_select_ids(&mut self, ids: Vec<String>) {
+        if self.multi_select == ids {
+            return;
+        }
+        self.multi_select = ids;
+        let multi_select = self.multi_select.clone();
+        let Some(scene) = &mut self.scene else {
+            return;
+        };
+        scene.multi_select = multi_select;
+        self.rebuild_vertex_buffer();
+    }
+
     /// Hit-test a screen-space point without mutating selection or camera (CC4.1).
     /// Returns the picked object (or null) so the shell can show a right-click
     /// context menu. Mirrors `hitTest` in coreContract.ts.
@@ -1717,6 +1760,9 @@ impl ShapeWebGpuRenderer {
                 // Switching tools mid-gesture abandons any in-flight drag so the
                 // new tool starts from a clean pointer state.
                 self.input_drag = None;
+            }
+            CanvasInputEvent::SetMultiSelect { ids } => {
+                self.set_multi_select_ids(ids);
             }
             CanvasInputEvent::ContextPick { screen } => {
                 // Right-click pick: report the hit without mutating selection or
@@ -2984,7 +3030,8 @@ fn build_group_vertices(
 ) -> (Vec<GpuVertex>, TextBuildStats) {
     let mut vertices = Vec::new();
     let style = resolve_shape_style(&scene.styles, &group.style_key);
-    let selected = selection_is_group(&scene.selection, &group.id);
+    let selected =
+        selection_is_group(&scene.selection, &group.id) || multi_selected(scene, &group.id);
     let radius = if selected {
         style.radius.group_selected
     } else {
@@ -3104,7 +3151,8 @@ fn build_edge_vertices(
         return (vertices, TextBuildStats::default());
     };
     let route = edge_route(source, target);
-    let selected = selection_is_edge(&scene.selection, &edge.id);
+    let selected =
+        selection_is_edge(&scene.selection, &edge.id) || multi_selected(scene, &edge.id);
     let style = resolve_shape_style(&scene.styles, &edge.style_key);
     let compact = edge.label.trim().is_empty();
     let stroke_width = if selected {
@@ -3190,7 +3238,8 @@ fn build_card_vertices(
     let mut vertices = Vec::new();
     let mut text_stats = TextBuildStats::default();
     let style = resolve_shape_style(&scene.styles, &card.style_key);
-    let selected = selection_is_node(&scene.selection, &card.id);
+    let selected =
+        selection_is_node(&scene.selection, &card.id) || multi_selected(scene, &card.id);
     let text_layout = card_text_layout(&card.bounds, &style, selected);
     let radius = if selected {
         style.radius.card_selected
@@ -3429,6 +3478,15 @@ fn selection_is_node(selection: &SceneSelection, id: &str) -> bool {
 #[cfg(feature = "wgpu-probe")]
 fn selection_is_edge(selection: &SceneSelection, id: &str) -> bool {
     matches!(selection, SceneSelection::Edge { id: selected } if selected == id)
+}
+
+// True when `id` should draw with selection styling: it is the single anchor of
+// the matching kind, or a member of the transient multi-select set. The set is
+// kind-agnostic (groups/cards/edges all live in `multi_select`), so each draw
+// path OR-s its single-anchor check with this membership test.
+#[cfg(feature = "wgpu-probe")]
+fn multi_selected(scene: &SceneSnapshot, id: &str) -> bool {
+    scene.multi_select.iter().any(|candidate| candidate == id)
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -3972,6 +4030,7 @@ mod tests {
             selection: SceneSelection::Node {
                 id: card.id.clone(),
             },
+            multi_select: Vec::new(),
         };
         let mut cache = TextLayoutCache::default();
         let mut text_engine = TextEngine::new().unwrap();
@@ -4014,6 +4073,7 @@ mod tests {
             selection: SceneSelection::Edge {
                 id: edge.id.clone(),
             },
+            multi_select: Vec::new(),
         };
         let mut cache = TextLayoutCache::default();
         let mut text_engine = TextEngine::new().unwrap();
@@ -4145,6 +4205,7 @@ mod tests {
             selection: SceneSelection::Node {
                 id: card.id.clone(),
             },
+            multi_select: Vec::new(),
         };
         let mut cache = TextLayoutCache::default();
         let mut text_engine = TextEngine::new().unwrap();
@@ -4317,6 +4378,7 @@ mod tests {
             edges: Vec::new(),
             styles: vec![minimal_style_token("default")],
             selection: SceneSelection::Canvas,
+            multi_select: Vec::new(),
         };
         let mut cache = TextLayoutCache::default();
         let mut text_engine = TextEngine::new().unwrap();
@@ -4524,6 +4586,7 @@ mod tests {
             edges: Vec::new(),
             styles: vec![minimal_style_token("default")],
             selection: SceneSelection::Canvas,
+            multi_select: Vec::new(),
         };
 
         let rect = marquee_rect(
@@ -4559,6 +4622,111 @@ mod tests {
         assert_eq!(json, r#"{"kind":"multi","ids":["card-a","group-b"]}"#);
         let parsed: SceneSelection = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, SceneSelection::Multi { ids } if ids.len() == 2));
+    }
+
+    // The transient multi-select set is never serialized, so its presence cannot
+    // leak into the persisted snapshot wire format.
+    #[test]
+    fn multi_select_set_is_not_serialized() {
+        let scene = SceneSnapshot {
+            scene_id: "skip-test".to_string(),
+            camera: CameraState {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+            groups: Vec::new(),
+            cards: Vec::new(),
+            edges: Vec::new(),
+            styles: Vec::new(),
+            selection: SceneSelection::Canvas,
+            multi_select: vec!["card-a".to_string()],
+        };
+        let json = serde_json::to_string(&scene).unwrap();
+        assert!(!json.contains("multiSelect"));
+        assert!(!json.contains("multi_select"));
+        assert!(!json.contains("card-a"));
+        let parsed: SceneSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(parsed.multi_select.is_empty());
+    }
+
+    // A card listed in the transient multi-select set draws with the same selection
+    // styling as the single anchor, and differently from an unselected card —
+    // proving the highlight path covers multi-select ids.
+    #[test]
+    fn multi_select_highlights_card_like_single_anchor() {
+        let card = text_path_card("card-a", 100.0, 100.0);
+        let make_scene = |selection: SceneSelection, multi_select: Vec<String>| SceneSnapshot {
+            scene_id: "multi-highlight-test".to_string(),
+            camera: CameraState {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+            groups: Vec::new(),
+            cards: vec![card.clone()],
+            edges: Vec::new(),
+            styles: vec![minimal_style_token("default")],
+            selection,
+            multi_select,
+        };
+        let mut cache = TextLayoutCache::default();
+        let mut text_engine = TextEngine::new().unwrap();
+
+        let unselected = make_scene(SceneSelection::Canvas, Vec::new());
+        let single = make_scene(
+            SceneSelection::Node {
+                id: card.id.clone(),
+            },
+            Vec::new(),
+        );
+        let multi = make_scene(SceneSelection::Canvas, vec![card.id.clone()]);
+
+        let (unselected_v, _) =
+            build_card_vertices(&unselected, &card, &mut cache, &mut text_engine);
+        let (single_v, _) = build_card_vertices(&single, &card, &mut cache, &mut text_engine);
+        let (multi_v, _) = build_card_vertices(&multi, &card, &mut cache, &mut text_engine);
+
+        // Selection styling changes the geometry, so a highlighted card never
+        // matches the unselected one...
+        assert_ne!(unselected_v.len(), single_v.len());
+        // ...and a multi-selected card matches the single-anchor highlight exactly.
+        assert_eq!(single_v.len(), multi_v.len());
+        assert_ne!(unselected_v.len(), multi_v.len());
+    }
+
+    // The wasm-facing `setMultiSelect` (via its inner helper) stores the set on the
+    // scene without disturbing the persisted single-anchor selection.
+    #[test]
+    fn set_multi_select_ids_keeps_single_anchor_selection() {
+        let card_a = text_path_card("card-a", 100.0, 100.0);
+        let card_b = text_path_card("card-b", 400.0, 100.0);
+        let mut scene = SceneSnapshot {
+            scene_id: "set-multi-test".to_string(),
+            camera: CameraState {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+            groups: Vec::new(),
+            cards: vec![card_a.clone(), card_b.clone()],
+            edges: Vec::new(),
+            styles: vec![minimal_style_token("default")],
+            selection: SceneSelection::Node {
+                id: card_a.id.clone(),
+            },
+            multi_select: Vec::new(),
+        };
+
+        // Mirrors set_multi_select_ids's scene mutation (the renderer wrapper also
+        // rebuilds GPU buffers, which a probe-less test cannot exercise).
+        scene.multi_select = vec![card_a.id.clone(), card_b.id.clone()];
+
+        assert!(matches!(
+            &scene.selection,
+            SceneSelection::Node { id } if id == &card_a.id
+        ));
+        assert_eq!(scene.multi_select, vec![card_a.id, card_b.id]);
     }
 }
 
