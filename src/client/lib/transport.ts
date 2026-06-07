@@ -9,7 +9,7 @@
 //
 // `ops`/`patch` carry WHOLE `RenderScenePatch` objects (the same union the canvas
 // actor applies). The granular per-property/opId wire shape is MG-4 and is not
-// used here. This module is the seam that will eventually replace `api.ts` (MG-5).
+// used here. This module is the seam that replaced the HTTP scene client (MG-7).
 
 import type { Scene } from "../../shared/schema";
 import type { RenderScenePatch } from "../../shared/renderPatch";

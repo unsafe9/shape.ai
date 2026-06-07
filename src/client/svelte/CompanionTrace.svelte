@@ -1,6 +1,6 @@
 <script lang="ts">
   import { X } from "lucide-svelte";
-  import { fetchMcpTrace, type McpClientInfo, type McpTraceEvent, type McpTraceKind } from "../lib/api";
+  import { fetchMcpTrace, type McpClientInfo, type McpTraceEvent, type McpTraceKind } from "../lib/mcpDock";
 
   type Props = {
     open: boolean;

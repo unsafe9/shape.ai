@@ -24,10 +24,11 @@
  *    as a source of truth.  It reads them as {@link EngineEvent} / `FrameStats`
  *    and commands via the handle.
  *
- * 2. **Canvas never calls product I/O.**  The adapter/core never call HTTP, never
- *    know MCP/export/proposal semantics.  Persistence stays in
- *    `src/server/storage.ts` + `src/client/lib/api.ts`; business semantics stay in
- *    the TS app/Svelte shell + server.
+ * 2. **Canvas never calls product I/O.**  The adapter/core never call HTTP/WS,
+ *    never know MCP/export/proposal semantics.  Persistence stays in the WS
+ *    transport client (`src/client/lib/sceneClient.ts`) plus the residual
+ *    server-side ops (`src/client/lib/sceneServerApi.ts`); business semantics
+ *    stay in the Svelte shell + server.
  *
  * 3. **One bridge, two directions.**  All shell→canvas traffic goes through the
  *    {@link RendererCanvasHostHandle}-shaped methods; all canvas→shell traffic
@@ -160,8 +161,8 @@ export interface ShapeCanvasHost {
    *
    * The shell routes each {@link EngineEvent} variant as follows:
    *   - `stats`     → update `rendererStats` / `camera` mirror (derived, not authoritative).
-   *   - `selection` → call `handleRendererSelection`, persist via `lib/api.ts`.
-   *   - `patch`     → call `handleRendererPatch`, debounce-save via `lib/api.ts`.
+   *   - `selection` → call `handleRendererSelection`, persist via the WS client.
+   *   - `patch`     → call `handleRendererPatch`, save via the WS client (coalesced).
    *   - `overlay`   → mount/unmount the DOM `<textarea>` at coordinates the
    *                   engine computed (IME/clipboard seam — shell mounts the
    *                   DOM node, adapter computes target + coordinates).
@@ -183,9 +184,9 @@ export interface ShapeCanvasHost {
  * survive a shell swap (React → Svelte) or a page reload.
  *
  * These fields flow through the op model (T2.5) and/or the persistence path
- * (`lib/api.ts` → `PATCH /api/scene` → `src/server/storage.ts`).  They must
- * NOT be inlined into Rust core or the canvas adapter; they live in the TS
- * app/Svelte shell + server.
+ * (the WS transport client → `ops` envelope → per-canvas actor).  They must
+ * NOT be inlined into Rust core or the canvas adapter; they live in the
+ * Svelte shell + server.
  *
  * Derived from `App.tsx` state at T1.4 time; extended by downstream tasks
  * (P4 template, P5 MCP/companion) as their fields become document state.
@@ -193,24 +194,24 @@ export interface ShapeCanvasHost {
 export interface DocumentShellState {
   /**
    * The full scene graph — groups, nodes, edges, tags, artifacts, comments,
-   * and the persisted selection.  Fetched via `lib/api.ts#fetchScene` and
-   * patched via `lib/api.ts#saveScenePatch`.
+   * and the persisted selection.  Loaded from the WS welcome snapshot and
+   * mutated through the WS transport client (`sceneClient.ts`).
    *
    * @see src/shared/schema.ts `Scene`
    */
-  scene: unknown; // typed as Scene in App.tsx — kept `unknown` here to avoid a circular dep
+  scene: unknown; // typed as Scene in the shell — kept `unknown` here to avoid a circular dep
 
   /**
-   * Active tag filter.  Passed to `fetchScene` and to
-   * `shapeSceneToFilteredRenderSnapshot`; affects which nodes are visible on
-   * canvas.  Persisted implicitly through the filtered snapshot, not as a
-   * top-level scene field.
+   * Active tag filter.  Passed to `shapeSceneToFilteredRenderSnapshot`; affects
+   * which nodes are visible on canvas.  Applied client-side over the
+   * WS-held scene, not as a top-level scene field.
    */
   activeTagIds: string[];
 
   /**
    * Which scene item (canvas / group / node / edge) is currently selected.
-   * Written to the server on every change via `saveScenePatch({ selection })`.
+   * Broadcast as presence on every change via the WS client (selection is not
+   * a document op).
    *
    * @see src/shared/schema.ts `SceneSelection`
    */

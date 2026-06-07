@@ -13,7 +13,7 @@ import {
   toggleFollow,
   type FollowState
 } from "../src/client/lib/followController";
-import type { McpClientInfo } from "../src/client/lib/api";
+import type { McpClientInfo } from "../src/client/lib/mcpDock";
 
 function makeClient(overrides: Partial<McpClientInfo> = {}): McpClientInfo {
   return {

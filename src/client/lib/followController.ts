@@ -11,7 +11,7 @@
 // machine, §2 click-to-follow, §3 pinned follow, §4 pause/resume, §5 jump-to-current,
 // §7 handoff, §8 "never steal control" guard).
 
-import type { McpClientInfo } from "./api";
+import type { McpClientInfo } from "./mcpDock";
 
 export type FollowMode =
   // no followee; camera is fully user-owned

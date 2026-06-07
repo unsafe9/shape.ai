@@ -1,7 +1,8 @@
-//! MG-7 Phase A integration tests: drive the ported Node `/api/*` scene routes
-//! through the assembled axum router (`build_router_with_mcp`) via
-//! `tower::ServiceExt::oneshot`. These assert the response shapes the web client
-//! (src/client/lib/api.ts) expects.
+//! Integration tests for the residual server-side scene routes (`/api/groups`
+//! seed + export + artifact download, `/api/comments`) that survive the MG-7
+//! client cutover because they have no scene-core op. Driven through the assembled
+//! axum router (`build_router_with_mcp`) via `tower::ServiceExt::oneshot`; these
+//! assert the response shapes the Svelte shell consumes.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -22,18 +23,6 @@ fn router() -> axum::Router {
     let canvases = CanvasRegistry::open_in_memory().unwrap();
     let clients = ClientRegistry::new();
     build_router_with_mcp(&test_config(), canvases, clients)
-}
-
-async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
-    let resp = app
-        .clone()
-        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
 }
 
 async fn send_json(app: &axum::Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -110,92 +99,6 @@ async fn second_group_is_offset_so_it_does_not_overlap() {
 }
 
 #[tokio::test]
-async fn get_scene_filters_by_and_tags() {
-    let app = router();
-    let (_b, group_id) = create_group(&app, "Tagged group").await;
-
-    // Two tags.
-    let (_s, t1) = send_json(&app, "POST", "/api/tags", json!({ "name": "Backend", "color": "#111" })).await;
-    let tag1 = t1["tag"]["id"].as_str().unwrap().to_string();
-    let (_s2, t2) = send_json(&app, "POST", "/api/tags", json!({ "name": "Infra", "color": "#222" })).await;
-    let tag2 = t2["tag"]["id"].as_str().unwrap().to_string();
-
-    // Attach only tag1 to the group.
-    let (status, _b) = send_json(
-        &app,
-        "PATCH",
-        &format!("/api/groups/{group_id}/tags"),
-        json!({ "tagIds": [tag1] }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    // Filtering on tag1 keeps the group + its nodes/edges.
-    let (status, body) = get_json(&app, &format!("/api/scene?tags={tag1}")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["scene"]["groups"].as_array().unwrap().len(), 1);
-    assert_eq!(body["scene"]["nodes"].as_array().unwrap().len(), 10);
-
-    // Filtering on tag2 (not attached) drops the group + cascades nodes/edges.
-    let (_status, body) = get_json(&app, &format!("/api/scene?tags={tag2}")).await;
-    assert_eq!(body["scene"]["groups"].as_array().unwrap().len(), 0);
-    assert_eq!(body["scene"]["nodes"].as_array().unwrap().len(), 0);
-    assert_eq!(body["scene"]["edges"].as_array().unwrap().len(), 0);
-
-    // AND semantics: requiring both tags (only tag1 attached) drops the group.
-    let (_status, body) = get_json(&app, &format!("/api/scene?tags={tag1},{tag2}")).await;
-    assert_eq!(body["scene"]["groups"].as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn tag_crud_create_update_delete() {
-    let app = router();
-
-    // Create.
-    let (status, body) =
-        send_json(&app, "POST", "/api/tags", json!({ "name": "Security", "color": "#abc" })).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let tag_id = body["tag"]["id"].as_str().unwrap().to_string();
-    assert!(tag_id.starts_with("tag-security-"));
-    assert_eq!(body["tag"]["color"], "#abc");
-
-    // Update name + color.
-    let (status, body) = send_json(
-        &app,
-        "PATCH",
-        &format!("/api/tags/{tag_id}"),
-        json!({ "name": "Sec", "color": "#def" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["tag"]["name"], "Sec");
-    assert_eq!(body["tag"]["color"], "#def");
-
-    // Delete an unused tag succeeds and removes it from the scene.
-    let (status, body) = send_json(&app, "DELETE", &format!("/api/tags/{tag_id}"), json!({})).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["scene"]["tags"].as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn delete_tag_attached_to_group_is_refused() {
-    let app = router();
-    let (_b, group_id) = create_group(&app, "G").await;
-    let (_s, t) = send_json(&app, "POST", "/api/tags", json!({ "name": "Used", "color": "#000" })).await;
-    let tag_id = t["tag"]["id"].as_str().unwrap().to_string();
-    send_json(
-        &app,
-        "PATCH",
-        &format!("/api/groups/{group_id}/tags"),
-        json!({ "tagIds": [tag_id.clone()] }),
-    )
-    .await;
-
-    let (status, _body) = send_json(&app, "DELETE", &format!("/api/tags/{tag_id}"), json!({})).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
 async fn comment_add_and_update() {
     let app = router();
     let (_b, group_id) = create_group(&app, "Commentable").await;
@@ -225,25 +128,6 @@ async fn comment_add_and_update() {
     assert_eq!(body["comment"]["body"], "resolved now");
     assert_eq!(body["comment"]["resolved"], true);
     assert_eq!(body["scene"]["comments"].as_array().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn patch_scene_bulk_upsert_and_remove() {
-    let app = router();
-    let (_b, group_id) = create_group(&app, "Bulk").await;
-
-    // Remove the whole group via a bulk ScenePatch -> nodes/edges cascade away.
-    let (status, body) = send_json(
-        &app,
-        "PATCH",
-        "/api/scene",
-        json!({ "removeGroupIds": [group_id] }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["scene"]["groups"].as_array().unwrap().len(), 0);
-    assert_eq!(body["scene"]["nodes"].as_array().unwrap().len(), 0);
-    assert_eq!(body["scene"]["edges"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

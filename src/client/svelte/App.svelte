@@ -17,22 +17,11 @@
     PanelLeft,
     X
   } from "lucide-svelte";
-  import {
-    createComment,
-    createGroup,
-    createTag,
-    exportGroup,
-    fetchMcpClients,
-    fetchScene,
-    saveScenePatch,
-    updateComment,
-    updateGroupTags,
-    type McpClientInfo
-  } from "../lib/api";
+  import { createComment, createGroup, exportGroup, updateComment } from "../lib/sceneServerApi";
+  import { fetchMcpClients, type McpClientInfo } from "../lib/mcpDock";
   import { boundsIntersect, expandedBounds, nodeBounds } from "../../shared/graph";
   import type { RenderScenePatch } from "../../shared/renderPatch";
   import { applyRenderPatchSync, loadSceneCore, type RenderResult, type SceneCore } from "../scene/sceneCoreWasm";
-  import { scenePatchFromScenes } from "../scene/sceneDiff";
   import type { CameraState, RenderCard, RenderGroup, WorldRect } from "../../shared/renderScene";
   import { screenToWorld } from "../renderer/scene";
   import { primarySelection } from "../../shared/schema";
@@ -66,7 +55,6 @@
     type FollowState
   } from "../lib/followController";
   import { ShapeCanvasHost, type RendererHealth, type RendererStats, type ShapeCanvasHostCallbacks } from "../lib/canvasHost";
-  import { createPatchSaver, isContinuousRendererPatch } from "../lib/patchSaver";
   import { SceneClient, type CanvasSummary } from "../lib/sceneClient";
   import type { PeerPresence } from "../lib/peers";
   import type { ConnectionStatus } from "../lib/wsTransport";
@@ -179,11 +167,12 @@
   let gestureActive = false;
   let selectionRef: SceneSelection = { kind: "canvas" };
 
-  // MG5.3: transport-backed scene data layer. Renderer-op SAVE and the INITIAL
-  // scene LOAD flow through this WS client; CRUD/templates/tags/comments/export
-  // and tag-filtered reloads still use api.ts until MG-7. The connection is
-  // best-effort: when the WS server is unreachable the shell falls back to the
-  // existing HTTP path (patchSaver + fetchScene), so dev stays usable mid-cutover.
+  // MG-7: transport-backed scene data layer is the SINGLE data path. Scene LOAD,
+  // renderer-op SAVE, shell CRUD, tags, and selection all flow through this WS
+  // client; the tag filter is applied client-side by the renderer over the full
+  // WS-held scene. Only the genuinely server-computed operations that have no
+  // scene-core op (group seed, export, comments) still ride HTTP via
+  // `sceneServerApi.ts` — see that module for the rationale.
   let canvasId = $state("default");
   let sceneClient: SceneClient | null = null;
   let sceneClientReady = false;
@@ -251,34 +240,12 @@
   // (single node, multi-select, or a group), not canvas/edge.
   const canSaveSelection = $derived(selection.kind === "node" || selection.kind === "multi" || selection.kind === "group");
 
-  // T6.2 §1: debounced, gesture-gated renderer-patch save lives in the
-  // framework-neutral patchSaver module; the shell only feeds it.
-  const patchSaver = createPatchSaver({
-    isGestureActive: () => gestureActive,
-    onSaved: (savedScene, savedSelection) => {
-      const validated = validSelection(savedScene, savedSelection);
-      sceneRequest += 1;
-      // Update selectionRef BEFORE scene so the scene-push $effect (which reads
-      // selectionRef non-reactively) loads the new scene with the correct anchor
-      // in the same frame instead of one frame behind.
-      selectionRef = validated;
-      scene = savedScene;
-      selection = validated;
-      multiSelectIds = validated.kind === "multi" ? validated.ids : [];
-      const savedGroupId = activeGroupIdForSelection(savedScene, validated);
-      if (savedGroupId) currentGroupId = savedGroupId;
-    },
-    onError: (rollbackScene, rollbackSelection, message) => {
-      const restored = validSelection(rollbackScene, rollbackSelection);
-      scene = rollbackScene;
-      selection = restored;
-      const restoredGroupId = activeGroupIdForSelection(rollbackScene, restored);
-      if (restoredGroupId) currentGroupId = restoredGroupId;
-      if (restored.kind !== "node") editingNodeId = null;
-      status = message;
-      void refreshScene().catch((error) => (status = error instanceof Error ? error.message : "Scene refresh failed"));
-    }
-  });
+  // Renderer ops coalesce on the WS engine's window; a discrete op flushes
+  // immediately so it is not held behind the coalesce timer. Continuous gestures
+  // (move-group / move-card) ride the coalesce window and flush at gesture end.
+  function isContinuousRendererPatch(patch: RenderScenePatch): boolean {
+    return patch.kind === "move-group" || patch.kind === "move-card";
+  }
 
   const hostCallbacks: ShapeCanvasHostCallbacks = {
     onCameraChange: (next) => (camera = next),
@@ -295,14 +262,13 @@
     onContextPick: handleContextPick
   };
 
-  // MG5.3: initial LOAD through the transport client. We open the WS session and
-  // adopt its welcome snapshot as the initial scene; renderer-op saves then flow
-  // through the client. If the WS server is unreachable we fall back to the HTTP
-  // fetchScene path so the shell still loads against the legacy Node server.
-  // MG-7a: the renderer wasm boots inside ShapeCanvasHost.mount; here we boot the
-  // scene-core wasm op-apply alongside the transport so both halves of the new
-  // stack are live by the time the user interacts. Both inits are async +
-  // best-effort: the shell stays usable (TS apply / HTTP load) until they resolve.
+  // MG-7: initial LOAD through the transport client (the single data path). We open
+  // the WS session and adopt its welcome snapshot as the initial scene; renderer-op
+  // saves and shell CRUD then flow through the client.
+  // The renderer wasm boots inside ShapeCanvasHost.mount; here we boot the
+  // scene-core wasm op-apply alongside the transport so both halves of the stack
+  // are live by the time the user interacts. Both inits are async + best-effort:
+  // the shell stays usable (synchronous wasm apply) until they resolve.
   void bootstrapSceneCore();
   void connectSceneClient();
 
@@ -329,48 +295,27 @@
     return applyRenderPatchSync(currentScene, patch, now);
   }
 
-  // MG-7a: persist a shell CRUD document patch. When the transport client owns the
-  // scene the patch flows over WS (decomposed to ops + durable outbox + coalesced
-  // send); the shell already applied the change optimistically and the client's
-  // onScene callback reconciles the acked/server scene. A selection field rides
-  // presence (no revision bump). When the WS server is unreachable mid-cutover the
-  // legacy HTTP saveScenePatch path runs and its response scene is adopted.
+  // MG-7: persist a shell CRUD document patch through the WS transport client (the
+  // single data path). The patch is decomposed to scene-core ops + durable outbox
+  // + coalesced send; the shell already applied the change optimistically and the
+  // client's onScene callback reconciles the acked/server scene. A selection field
+  // rides presence (no revision bump). A write before the client is connected is
+  // dropped on the wire but kept optimistically; the WS welcome reconciles state.
   function persistScenePatch(patch: ScenePatch): void {
-    if (sceneClientReady && sceneClient) {
-      void sceneClient.applyScenePatch(patch).then((result) => {
-        if (result.errors.length > 0) status = result.errors.join("; ");
-      });
-      sceneClient.flush();
-      return;
-    }
-    void saveScenePatch(patch).catch((error) => {
-      status = error instanceof Error ? error.message : "Save failed";
+    if (!sceneClientReady || !sceneClient) return;
+    void sceneClient.applyScenePatch(patch).then((result) => {
+      if (result.errors.length > 0) status = result.errors.join("; ");
     });
+    sceneClient.flush();
   }
 
-  // MG-7a: persist a selection-only change. Selection is presence, not a document
-  // op (it never bumps the revision), so the WS path broadcasts it on the presence
-  // channel; the HTTP fallback PATCHes the legacy scene endpoint.
-  async function persistSelection(nextSelection: SceneSelection): Promise<void> {
-    if (sceneClientReady && sceneClient) {
-      sceneClient.saveSelection(nextSelection);
-      return;
-    }
-    await saveScenePatch({ selection: nextSelection });
+  // MG-7: persist a selection-only change. Selection is presence, not a document
+  // op (it never bumps the revision), so the WS client broadcasts it on the
+  // presence channel.
+  function persistSelection(nextSelection: SceneSelection): void {
+    if (!sceneClientReady || !sceneClient) return;
+    sceneClient.saveSelection(nextSelection);
   }
-
-  // Reactive reload-on-filter, mirroring the App.tsx batched/debounced load.
-  // Tag-filtered loads stay on the HTTP path until MG-7 (the WS welcome has no
-  // server-side tag filter). Document writes flow through patchSaver / sceneClient,
-  // so the scene store is never re-derived per keystroke (T6.2 §1 batch-aware wiring).
-
-  $effect(() => {
-    const tagIds = activeTagIds;
-    const id = window.setTimeout(() => {
-      void refreshScene(tagIds).catch((error) => (status = error instanceof Error ? error.message : "Scene load failed"));
-    }, 120);
-    return () => window.clearTimeout(id);
-  });
 
   // T5.1 MCP companion poll (best-effort; dock shows last known state). MG6.2: the
   // same tick re-reads the peer cursor set so a peer that has gone fully silent
@@ -513,13 +458,13 @@
   });
 
   onDestroy(() => {
-    patchSaver.dispose();
     sceneClient?.close();
   });
 
-  // MG5.3: open the transport session and adopt its welcome snapshot. Renderer-op
-  // saves route through the client once ready; on failure the shell falls back to
-  // the HTTP fetchScene path so it still loads against the legacy Node server.
+  // MG-7: open the transport session and adopt its welcome snapshot as the initial
+  // scene. The WS client is the single data path; a connect failure leaves the
+  // shell empty with a status (the same Rust process serves /ws and /api/*, so a
+  // dead socket means a dead server — there is no separate HTTP load to fall to).
   async function connectSceneClient(): Promise<void> {
     const client = new SceneClient({ url: wsBaseUrl(), clientId: clientIdentity(), userId: userIdentity() });
     try {
@@ -540,10 +485,9 @@
       scene = welcome;
       selection = validSelection(welcome, welcome.selection);
       void loadCanvases();
-    } catch {
-      // WS server unreachable mid-cutover: fall back to the HTTP load path.
+    } catch (error) {
       client.close();
-      await refreshScene().catch((error) => (status = error instanceof Error ? error.message : "Scene load failed"));
+      status = error instanceof Error ? error.message : "Scene load failed";
     }
   }
 
@@ -619,20 +563,6 @@
     if (nextGroupId) currentGroupId = nextGroupId;
   }
 
-  async function refreshScene(tagIds = activeTagIds): Promise<void> {
-    // When the transport client owns the full (unfiltered) scene, skip the HTTP
-    // reload so the WS-authoritative scene is not clobbered. Tag-filtered loads
-    // still use HTTP until MG-7.
-    if (sceneClientReady && tagIds.length === 0) return;
-    const requestId = ++sceneRequest;
-    const nextScene = await fetchScene({ tagIds });
-    if (requestId !== sceneRequest) return;
-    scene = nextScene;
-    const serverSelection = validSelection(nextScene, nextScene.selection);
-    const localSelection = validSelection(nextScene, selection);
-    selection = serverSelection.kind === "canvas" && localSelection.kind !== "canvas" ? localSelection : serverSelection;
-  }
-
   // The WS base for the transport client. In dev the vite proxy forwards /api to
   // the API port; the WS server shares that host, so we derive ws(s):// from the
   // current page origin. The transport appends /ws.
@@ -686,62 +616,37 @@
     selection = valid;
     // The canonical persisted selection stays single-anchor so the renderer/Rust
     // core can restore it; the multi-set itself is shell-only ephemeral state.
-    void persistSelection(primarySelection(valid)).catch((error) => {
-      status = error instanceof Error ? error.message : "Selection save failed";
-    });
+    persistSelection(primarySelection(valid));
   }
 
   function handleRendererPatch(patch: RenderScenePatch): void {
     if (!scene) return;
-    const previousScene = scene;
-    const previousSelection = selection;
     const now = new Date().toISOString();
 
-    // MG-7a: when the transport client owns the scene, the renderer-op SAVE flows
-    // through it (optimistic engine apply + durable outbox + coalesced send) and
-    // the optimistic document apply runs through the scene-core wasm bridge — the
-    // ONE op-apply implementation. The shell still commits its local optimistic
-    // scene for immediate feedback; the client's onScene callback keeps it in
-    // lockstep once the op is acked.
-    if (sceneClientReady && sceneClient) {
-      const applied = applyOptimistic(scene, patch, now);
-      if (applied.errors.length > 0) {
-        status = applied.errors.join("; ");
-        return;
-      }
-      const optimisticSelection = validSelection(applied.scene, applied.scene.selection);
-      sceneRequest += 1;
-      commitScene(applied.scene, optimisticSelection);
-      void sceneClient.applyRenderPatch(patch).then((result) => {
-        if (result.errors.length > 0) status = result.errors.join("; ");
-      });
-      // Continuous gestures rely on the engine's coalescing window; a discrete op
-      // flushes immediately so it isn't held behind the coalesce timer.
-      if (!isContinuousRendererPatch(patch)) sceneClient.flush();
-      return;
-    }
-
-    // HTTP fallback (WS server unreachable mid-cutover): still ONE op-apply (the
-    // scene-core wasm). The legacy patchSaver wants a ScenePatch appPatch, derived
-    // here by diffing the previous scene against the wasm-applied scene; the server
-    // re-applies it authoritatively over /api/scene.
+    // MG-7: the renderer-op SAVE flows through the WS transport client (optimistic
+    // engine apply + durable outbox + coalesced send) and the optimistic document
+    // apply runs through the scene-core wasm bridge — the ONE op-apply
+    // implementation. The shell commits its local optimistic scene for immediate
+    // feedback; the client's onScene callback keeps it in lockstep once acked.
     const applied = applyOptimistic(scene, patch, now);
     if (applied.errors.length > 0) {
       status = applied.errors.join("; ");
       return;
     }
     const optimisticSelection = validSelection(applied.scene, applied.scene.selection);
-    const appPatch = scenePatchFromScenes(scene, applied.scene);
     sceneRequest += 1;
-
-    if (isContinuousRendererPatch(patch)) {
-      if (!gestureActive) commitScene(applied.scene, optimisticSelection);
-      patchSaver.queue(appPatch, previousScene, previousSelection, patch.kind, gestureActive);
-      return;
+    // During a continuous gesture the renderer drives the optimistic frame; only
+    // commit the scene between gestures so a drag is not clobbered mid-flight.
+    if (!isContinuousRendererPatch(patch) || !gestureActive) {
+      commitScene(applied.scene, optimisticSelection);
     }
-    commitScene(applied.scene, optimisticSelection);
-    patchSaver.flush();
-    patchSaver.saveNow(appPatch, previousScene, previousSelection, patch.kind);
+    if (!sceneClientReady || !sceneClient) return;
+    void sceneClient.applyRenderPatch(patch).then((result) => {
+      if (result.errors.length > 0) status = result.errors.join("; ");
+    });
+    // Continuous gestures rely on the engine's coalescing window; a discrete op
+    // flushes immediately so it isn't held behind the coalesce timer.
+    if (!isContinuousRendererPatch(patch)) sceneClient.flush();
   }
 
   function handleRendererGesture(active: boolean): void {
@@ -754,8 +659,7 @@
       return;
     }
     if (scene) commitScene(scene, selection);
-    patchSaver.flush();
-    // MG5.3: flush the engine's coalesced gesture buffer at gesture end too.
+    // MG-7: flush the engine's coalesced gesture buffer at gesture end.
     sceneClient?.flush();
   }
 
@@ -1426,11 +1330,7 @@
     if (valid.kind !== "node") editingNodeId = null;
     if (valid.kind === "canvas") multiSelectIds = [];
     selection = valid;
-    try {
-      await persistSelection(valid);
-    } catch (error) {
-      status = error instanceof Error ? error.message : "Selection save failed";
-    }
+    persistSelection(valid);
   }
 
   async function runCreateGroup(): Promise<void> {
@@ -1571,8 +1471,8 @@
 
   // Insert a basic primitive (rectangle/ellipse/connector/sticky/frame) onto the
   // canvas near the viewport. Everything flows through the existing renderPatch
-  // create-card/create-group/create-edge ops + handleRendererPatch, which
-  // persists discrete patches through saveScenePatch (patchSaver.saveNow).
+  // create-card/create-group/create-edge ops + handleRendererPatch, which persists
+  // discrete ops through the WS transport client (immediate flush).
   // CC4.3: drop a primitive at an explicit world point (used by the canvas
   // right-click menu "insert here"). Delegates to insertPrimitive.
   function insertPrimitiveAt(kind: PrimitiveKindId, world: { x: number; y: number }): void {
@@ -1711,31 +1611,37 @@
     return labels[kind];
   }
 
-  async function runCreateTag(): Promise<void> {
-    if (!tagName.trim()) return;
-    await withBusy("Creating tag", async () => {
-      const color = tagColors[(scene?.tags.length ?? 0) % tagColors.length];
-      const response = await createTag(tagName.trim(), color);
-      scene = response.scene;
-      tagName = "";
-      status = `Tag created: ${response.tag.name}`;
-    });
+  // MG-7: tag create is a scene-core `create-tag` op. The shell mints the tag id
+  // (scene-core stays randomness-free) and routes it through the renderer-op path,
+  // so the optimistic apply + WS save share the single op pipeline.
+  function runCreateTag(): void {
+    const name = tagName.trim();
+    if (!name) return;
+    const color = tagColors[(scene?.tags.length ?? 0) % tagColors.length];
+    const now = new Date().toISOString();
+    const tag: Tag = {
+      id: `tag-${crypto.randomUUID().slice(0, 8)}`,
+      name,
+      color,
+      description: "",
+      createdAt: now,
+      updatedAt: now
+    };
+    handleRendererPatch({ kind: "create-tag", tag });
+    tagName = "";
+    status = `Tag created: ${name}`;
   }
 
-  async function toggleGroupTag(tag: Tag): Promise<void> {
-    if (!activeGroup || !scene) return;
+  // MG-7: group-tag toggle is a scene-core `set-object-tags` op (frame target),
+  // routed through the renderer-op path like every other document mutation.
+  function toggleGroupTag(tag: Tag): void {
+    if (!activeGroup) return;
     const group = activeGroup;
     const nextTagIds = group.tagIds.includes(tag.id)
       ? group.tagIds.filter((tagId) => tagId !== tag.id)
       : [...group.tagIds, tag.id];
-    scene = { ...scene, groups: scene.groups.map((candidate) => (candidate.id === group.id ? { ...group, tagIds: nextTagIds } : candidate)) };
-    try {
-      const response = await updateGroupTags(group.id, nextTagIds);
-      scene = response.scene;
-      status = "Group tags updated";
-    } catch (error) {
-      status = error instanceof Error ? error.message : "Tag update failed";
-    }
+    handleRendererPatch({ kind: "set-object-tags", targetKind: "frame", id: group.id, tagIds: nextTagIds });
+    status = "Group tags updated";
   }
 
   function onSelectGroupFromSidebar(group: SceneGroup): void {
@@ -2087,7 +1993,7 @@
             onSelectGroup={onSelectGroupFromSidebar}
             onToggleGroupTag={(tag) => void toggleGroupTag(tag)}
             onToggleTagFilter={toggleTagFilter}
-            onRefresh={() => void refreshScene().catch((error) => (status = error instanceof Error ? error.message : "Scene refresh failed"))}
+            onRefresh={() => sceneClient?.resync()}
           />
         </div>
       </div>
