@@ -70,10 +70,10 @@ over `/ws` and `/api/*`, and uses scene-core-WASM for optimistic op-apply.
 
 ## Conventions
 
-- **Pointer-width-agnostic core.** No 32-bit address assumptions: never truncate a
-  pointer to an integer, serialize wire/storage offsets/lengths as explicit-width
-  types (`u32`/`u64`) not `usize`. Keeps a future Wasm 3.0 Memory64 (64-bit wasm)
-  port a target-triple flip, not a rewrite.
+- **Pointer-width-agnostic core.** scene-core/storage-core deny width-narrowing
+  and raw-pointer casts (the workspace lint table in root `Cargo.toml`); use
+  checked `try_from`, or a reasoned `#[allow]` for intentional truncation. Intent:
+  a future Wasm 3.0 Memory64 port stays a target-triple flip, not a rewrite.
 
 ## Running
 
