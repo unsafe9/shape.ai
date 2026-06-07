@@ -726,6 +726,111 @@ mod tests {
         assert_eq!(cache.hits, 0);
     }
 
+    /// OB5.1 zero-lag perf gate (DONE: "1만 object 드래그 = 재tessellation 0").
+    ///
+    /// Bake 10_000 distinct object meshes once (the initial tessellation = 10_000
+    /// misses), then simulate a sustained DRAG: re-request every object many
+    /// frames at the SAME geometry revision (a transform-only edit does not bump
+    /// the revision). The gate is that the drag adds ZERO further misses — every
+    /// request is a cache hit, so the dragged frames re-tessellate nothing (P4).
+    /// Finally a single real geometry edit (one revision bump) re-bakes exactly
+    /// that one object and nothing else.
+    #[test]
+    fn perf_gate_drag_10k_objects_zero_retessellation() {
+        const N: usize = 10_000;
+        const DRAG_FRAMES: usize = 60;
+
+        // Capacity must hold the whole working set: at the default 8192 cap the
+        // LRU would evict during the initial bake, and an evicted object would
+        // re-bake on the next drag frame and falsely count as a miss. Size the
+        // cache to the full set so 0-rebake measures the cache, not eviction.
+        let mut cache = TessCache::with_capacity(N);
+
+        // Each object gets a unique id and a unique geometry. A shared bake-call
+        // counter (the ground-truth tessellation count) lets us assert the bake
+        // closure ran exactly N times across the whole scenario.
+        let ids: Vec<String> = (0..N).map(|i| format!("obj-{i}")).collect();
+        let mut bake_calls = 0usize;
+        let bake_one = |calls: &mut usize, i: usize| {
+            *calls += 1;
+            let f = i as f32;
+            tessellate_fill(
+                &[(
+                    true,
+                    vec![(f, f), (f + 10.0, f), (f + 10.0, f + 10.0), (f, f + 10.0)],
+                )],
+                FillRuleKind::NonZero,
+            )
+        };
+
+        // --- Initial bake: 10_000 distinct (id, rev=1) -> 10_000 misses. -------
+        cache.begin_frame();
+        for (i, id) in ids.iter().enumerate() {
+            cache.get_or_insert(id, 1, || bake_one(&mut bake_calls, i));
+        }
+        assert_eq!(cache.misses, N, "initial bake is one miss per distinct object");
+        assert_eq!(cache.hits, 0, "nothing cached before the initial bake");
+        assert_eq!(cache.evictions, 0, "capacity holds the whole set, no eviction");
+        assert_eq!(bake_calls, N, "tessellated each object exactly once");
+        let misses_after_bake = cache.misses;
+
+        // --- Drag: re-request all 10_000 at the SAME rev for many frames. ------
+        // A transform-only edit (drag) does not bump the geometry revision, so
+        // every one of these N * DRAG_FRAMES requests must be a cache hit.
+        for _frame in 0..DRAG_FRAMES {
+            cache.begin_frame();
+            for (i, id) in ids.iter().enumerate() {
+                // The bake closure must NEVER run during the drag; if it does, the
+                // shared counter moves past N and the final assert fails. The
+                // additional-misses assert below is the primary 0-rebake gate.
+                cache.get_or_insert(id, 1, || bake_one(&mut bake_calls, i));
+            }
+        }
+
+        // THE 0-REBAKE GATE: the drag added zero misses. Every re-request at the
+        // unchanged revision was a hit, so re-tessellation during the drag == 0.
+        assert_eq!(
+            cache.misses - misses_after_bake,
+            0,
+            "1만 object 드래그 = 재tessellation 0: a transform-only drag must not re-tessellate (P4)"
+        );
+        assert_eq!(
+            bake_calls, N,
+            "the bake closure never ran during the drag — still exactly N total bakes"
+        );
+        assert_eq!(
+            cache.hits,
+            N * DRAG_FRAMES,
+            "every dragged request across every frame was a cache hit"
+        );
+        assert_eq!(cache.evictions, 0, "no eviction perturbed the resident set");
+
+        // --- One real geometry edit: bump ONE object's revision -> exactly 1 ---
+        // additional miss (only that object rebakes, P4), the other 9_999 stay
+        // hits.
+        let misses_before_edit = cache.misses;
+        let hits_before_edit = cache.hits;
+        cache.begin_frame();
+        for (i, id) in ids.iter().enumerate() {
+            // Object 0 gets a bumped revision (a genuine geometry edit); the rest
+            // stay at rev 1.
+            let rev = if i == 0 { 2 } else { 1 };
+            cache.get_or_insert(id, rev, || bake_one(&mut bake_calls, i));
+        }
+        assert_eq!(
+            cache.misses - misses_before_edit,
+            1,
+            "a single geometry edit re-bakes exactly one object, not the scene"
+        );
+        assert_eq!(
+            cache.hits - hits_before_edit,
+            N - 1,
+            "the other 9_999 unchanged objects are still hits"
+        );
+        assert_eq!(bake_calls, N + 1, "exactly one extra bake for the one edited object");
+        assert_eq!(cache.cached_revision("obj-0"), Some(2), "edited object cached at new rev");
+    }
+
     /// Explicit dirty-id invalidation re-bakes even at the same revision.
     #[test]
     fn invalidate_forces_rebake_at_same_revision() {

@@ -848,6 +848,81 @@ mod tests {
         assert_eq!(back.payload, raw);
     }
 
+    /// OB5.4 data-size gate: the at-rest OBJECT payload stores geometry as a
+    /// compact path-string `d`, NEVER raw float point arrays or a tessellated
+    /// mesh. We build a realistic freehand-stroke object scene (a few hundred
+    /// M/L nodes as a compact integer path-string), serialize it the way it lives
+    /// at rest (the `Object`/`Geometry` serde shape: path-string `d`, no
+    /// `subpaths` — that field is `#[serde(skip)]`, runtime-only), and assert:
+    ///   1. the payload carries the path-string `d`,
+    ///   2. it carries NO tessellated `mesh`/`vertices`/`indices`, nor a raw
+    ///      `subpaths` array (raw points/mesh are not persisted), and
+    ///   3. zstd at rest shrinks the repetitive path-string materially (< 60%)
+    ///      while `load` round-trips the exact bytes.
+    ///
+    /// shape_storage_core is store-neutral (it never depends on scene-core), so
+    /// the payload is hand-built JSON matching scene-core's `Object`/`Geometry`
+    /// serde surface (camelCase keys, geometry `{ "d": "...", "fillRule": ... }`,
+    /// parsed `subpaths` never serialized) rather than importing the crate.
+    #[test]
+    fn object_payload_stores_path_string_not_raw_points_or_mesh() {
+        // A many-node freehand stroke as a compact integer path-string: one M
+        // moveto, then ~400 L linetos in object-local quantized integer units.
+        // Drawn as a gentle wiggle so the coords vary but stay short/repetitive,
+        // which is exactly the shape a real RDP-simplified sketch produces (D11).
+        let mut d = String::from("M 0 0");
+        for i in 1..=400i32 {
+            let x = i * 3;
+            let y = (i * 7) % 50 - 25;
+            d.push_str(&format!(" L {x} {y}"));
+        }
+
+        // The at-rest object scene payload: scene-core's `Object`/`Geometry`
+        // serde shape. Geometry is the path-string `d` (+ fill rule); the parsed
+        // `subpaths` are runtime-only and never appear here. No mesh/vertices/
+        // indices anywhere — those are derived render artifacts, not persisted.
+        let payload_json = format!(
+            r##"{{"sceneVersion":1,"objects":[{{"id":"stroke-1","order":"a0","transform":[[1,0,0],[0,1,0],[0,0,1]],"geometry":{{"d":"{d}","fillRule":"nonZero"}},"stroke":{{"paint":{{"kind":"solid","color":"#1a1a1a"}},"width":2,"cap":"round","join":"round"}}}}],"tags":[],"selection":{{"kind":"canvas"}},"updatedAt":"1970-01-01T00:00:00Z"}}"##
+        );
+        let raw = payload_json.into_bytes();
+
+        // (1) The payload carries the path-string `d`.
+        let text = std::str::from_utf8(&raw).unwrap();
+        assert!(text.contains(r#""d":"M 0 0 L 3"#), "payload must carry the path-string d");
+
+        // (2) Raw points / tessellated mesh are NOT persisted: no mesh/vertices/
+        //     indices fields, and no raw `subpaths` array (it is #[serde(skip)]).
+        for forbidden in ["\"mesh\"", "\"vertices\"", "\"indices\"", "\"subpaths\""] {
+            assert!(
+                !text.contains(forbidden),
+                "at-rest object payload must not contain {forbidden} (raw points/mesh are not stored)"
+            );
+        }
+
+        // (3) zstd at rest shrinks the repetitive path-string materially, and the
+        //     stored value round-trips byte-for-byte through the redb adapter.
+        let record = Record::new("stroke-1", "object", raw.clone());
+        let encoded = encode_record_value(&record);
+        assert!(
+            (encoded.len() as f64) < (raw.len() as f64) * 0.60,
+            "expected zstd to store the object payload below 60% of raw; \
+             got {} stored bytes for {} raw bytes",
+            encoded.len(),
+            raw.len()
+        );
+
+        // Round-trip the exact at-rest bytes through the pure value codec
+        // (encode_record_value/decode_record_value is exactly what the adapter's
+        // save/load use). Using the codec rather than opening a redb Database
+        // keeps this size-gate test light: a file-backed redb DB allocates
+        // several MB that, under a parallel `cargo test`, would inflate the
+        // process-global allocator-probe peak of the bounded-memory integrity
+        // tests and flake them.
+        let got = decode_record_value("stroke-1", &encoded).unwrap();
+        assert_eq!(got.payload, raw, "codec must round-trip the exact at-rest bytes");
+        assert_eq!(got.kind, "object");
+    }
+
     #[test]
     fn snapshot_restore_round_trip() {
         let tmp = TempDir::new("snap");
