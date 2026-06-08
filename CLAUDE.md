@@ -25,6 +25,11 @@ parallelism and future scale-out.
 
 ## Conventions
 
+Performance is the top-priority target in every change: never ship a known-slow
+"just make it work first" implementation — redesign until it can hit the bar
+(transform-only updates, zero per-frame re-tessellation, no avoidable allocations
+on the hot path).
+
 The pure cores stay pointer-width-agnostic: no 32-bit address assumptions, so a
 future 64-bit wasm (Memory64) port is a target-triple flip, not a rewrite.
 
