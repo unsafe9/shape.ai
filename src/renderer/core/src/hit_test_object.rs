@@ -334,6 +334,33 @@ pub fn rotate_delta_matrix(
     rotate_about_3x3(a_now - a_start, center.0, center.1)
 }
 
+/// Round `theta` (radians) to the nearest multiple of `snap_deg` (degrees). The
+/// coarse-rotate gesture (C2 `coarse-rotate-shift`, 15°) passes `snap_deg = 15`.
+pub fn snap_angle(theta: f64, snap_deg: f64) -> f64 {
+    let step = snap_deg.to_radians();
+    (theta / step).round() * step
+}
+
+/// D5 coarse-rotate variant of [`rotate_delta_matrix`]: when `snap_deg` is
+/// `Some`, the swept delta theta is snapped to the nearest `snap_deg` increment
+/// before building the rotation; when `None`, behaves identically to
+/// [`rotate_delta_matrix`].
+pub fn rotate_delta_matrix_snapped(
+    center: (f64, f64),
+    world_now: (f64, f64),
+    world_start: (f64, f64),
+    snap_deg: Option<f64>,
+) -> [[f64; 3]; 3] {
+    let a_now = (world_now.1 - center.1).atan2(world_now.0 - center.0);
+    let a_start = (world_start.1 - center.1).atan2(world_start.0 - center.0);
+    let theta = a_now - a_start;
+    let theta = match snap_deg {
+        Some(deg) => snap_angle(theta, deg),
+        None => theta,
+    };
+    rotate_about_3x3(theta, center.0, center.1)
+}
+
 /// The row-major 3×3 identity.
 pub fn identity_3x3() -> [[f64; 3]; 3] {
     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
@@ -759,6 +786,36 @@ mod tests {
         assert!(
             approx_eq_mat(&m, &expected, 1e-9),
             "90deg pointer sweep should rotate by pi/2, got {m:?}"
+        );
+    }
+
+    #[test]
+    fn coarse_rotate_snaps_swept_delta_to_15deg_increments() {
+        // Center (0,0); start at angle 0 (1,0). `now` at angle `d` degrees gives a
+        // swept delta of exactly `d`. Expected matrix = rotation by the snapped (or
+        // raw) angle about the center.
+        let center = (0.0, 0.0);
+        let start = (1.0, 0.0);
+        let point_at = |deg: f64| (deg.to_radians().cos(), deg.to_radians().sin());
+        let expect = |deg: f64| rotate_about_3x3(deg.to_radians(), center.0, center.1);
+
+        // snap ON: 47->45, 7->0, 83->90.
+        for (raw, snapped) in [(47.0, 45.0), (7.0, 0.0), (83.0, 90.0)] {
+            let m =
+                rotate_delta_matrix_snapped(center, point_at(raw), start, Some(15.0));
+            assert!(
+                approx_eq_mat(&m, &expect(snapped), 1e-9),
+                "{raw}deg swept w/ 15deg snap should rotate by {snapped}deg, got {m:?}"
+            );
+        }
+
+        // snap OFF: 47 stays 47, identical to the unsnapped fn.
+        let m = rotate_delta_matrix_snapped(center, point_at(47.0), start, None);
+        assert!(approx_eq_mat(&m, &expect(47.0), 1e-9), "no snap -> raw 47deg");
+        let unsnapped = rotate_delta_matrix(center, point_at(47.0), start);
+        assert!(
+            approx_eq_mat(&m, &unsnapped, 1e-12),
+            "None snap must equal rotate_delta_matrix exactly"
         );
     }
 
