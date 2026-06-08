@@ -508,18 +508,11 @@ impl CanvasActor {
             .clone();
         let seq_snapshot = self.seq;
         let revision_snapshot = self.revision();
-        let mut alloc_counter = 0u64;
-        let mut alloc = || {
-            let id = format!("artifact-{seq_snapshot}-{alloc_counter}");
-            alloc_counter += 1;
-            id
-        };
         let now_fn = now;
         let mut ctx = FeatureCtx {
             now: &now_fn,
             seq: u64::try_from(seq_snapshot).unwrap_or(u64::MAX),
             revision: u64::try_from(revision_snapshot).unwrap_or(u64::MAX),
-            alloc_id: &mut alloc,
         };
         let (ops, response) = handle_feature(request, &mut scratch, &mut ctx);
 

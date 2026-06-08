@@ -39,8 +39,6 @@ pub struct FeatureCtx<'a> {
     pub seq: u64,
     /// The canvas's current scene revision (`scene_version`), echoed on switch.
     pub revision: u64,
-    /// Fresh-id allocator (e.g. export request artifact refs). Injected, no rng.
-    pub alloc_id: &'a mut dyn FnMut() -> String,
 }
 
 /// Lower a [`FeatureRequest`] to [`ObjectOp`]s and apply them through the single
@@ -57,9 +55,10 @@ pub struct FeatureCtx<'a> {
 ///   `TemplateApplied` with the inserted ids.
 /// - `CanvasSwitch` → no op (read/subscribe); reply `CanvasSwitched` with the
 ///   injected `seq`/`revision`.
-/// - `ExportRequest` → no op; reply `ExportReady` with a stub artifact ref
-///   (the real export is `local_export`, cutover-wired) or `FeatureError` for an
-///   unsupported `export_type`.
+/// - `ExportRequest` → no op; reply `ExportReady` carrying the rendered export
+///   text in `artifact_ref` (the AI-readable digest of the scoped objects + their
+///   anchor connections, via [`crate::object_mcp::export`]), or `FeatureError`
+///   for an unsupported `export_type`.
 pub fn handle_feature(
     req: FeatureRequest,
     scene: &mut ObjectScene,
@@ -117,13 +116,14 @@ pub fn handle_feature(
         }
 
         FeatureRequest::ExportRequest {
+            scope_ids,
             export_type,
             request_id,
             ..
         } => {
-            // Stub: the real artifact is produced by `local_export` at the
-            // cutover. Only the formats local_export supports are accepted here;
-            // anything else is a clean FeatureError carrying the request_id.
+            // Read-only: render the scoped objects + their anchor connections into
+            // the AI-readable digest (P6) and return the text as the artifact.
+            // Unknown formats are a clean FeatureError carrying the request_id.
             if !is_supported_export(&export_type) {
                 return (
                     Vec::new(),
@@ -133,7 +133,7 @@ pub fn handle_feature(
                     },
                 );
             }
-            let artifact_ref = (ctx.alloc_id)();
+            let artifact_ref = crate::object_mcp::export(scene, &scope_ids, &export_type);
             (
                 Vec::new(),
                 FeatureResponse::ExportReady {
@@ -162,18 +162,18 @@ fn apply_lowered(scene: &mut ObjectScene, ops: Vec<ObjectOp>) -> Result<Vec<Obje
     Ok(applied)
 }
 
-/// The export formats `local_export` can satisfy. Kept narrow on purpose: an
-/// unknown format is rejected rather than silently stubbed.
+/// The export formats [`crate::object_mcp::export`] renders. Kept narrow on
+/// purpose: an unknown format is rejected rather than silently rendered.
 fn is_supported_export(export_type: &str) -> bool {
-    matches!(export_type, "svg" | "png" | "json")
+    matches!(export_type, "mermaid" | "digest")
 }
 
 fn export_content_type(export_type: &str) -> &'static str {
     match export_type {
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "json" => "application/json",
-        _ => "application/octet-stream",
+        // A mermaid flowchart is markdown-embeddable text; the plain digest is
+        // a node/edge listing.
+        "mermaid" => "text/markdown",
+        _ => "text/plain",
     }
 }
 
@@ -206,8 +206,47 @@ pub fn encode_feature_response(resp: &FeatureResponse) -> String {
 mod tests {
     use super::*;
     use shape_scene_core::object::{
-        Comment, FillRule, Geometry, Object, PathNode, SubPath,
+        Anchor, Comment, FillRule, Geometry, LocalPoint, Object, PathNode, SubPath, Text, TextAlign,
+        TextRun, TextVAlign,
     };
+
+    /// A labeled closed rect object at the origin, carrying a single text run.
+    fn labeled_rect(id: &str, order: &str, label: &str) -> Object {
+        let mut obj = Object::new(id, order, rect_geometry());
+        obj.text = Some(Text {
+            runs: vec![TextRun {
+                text: label.to_string(),
+                color: None,
+                size: None,
+                bold: false,
+                italic: false,
+                font: None,
+            }],
+            align: TextAlign::default(),
+            valign: TextVAlign::default(),
+        });
+        obj
+    }
+
+    /// An open 2-node connector anchored from `a` (node 0) to `b` (node 1).
+    fn connector(id: &str, order: &str, a: &str, b: &str) -> Object {
+        let mut obj = Object::new(
+            id,
+            order,
+            Geometry::from_subpaths(
+                vec![SubPath {
+                    closed: false,
+                    nodes: vec![PathNode::corner(0, 0), PathNode::corner(320, 0)],
+                }],
+                FillRule::NonZero,
+            ),
+        );
+        obj.anchors = vec![
+            Anchor { node_index: 0, target: a.to_string(), at: LocalPoint { x: 0, y: 0 } },
+            Anchor { node_index: 1, target: b.to_string(), at: LocalPoint { x: 0, y: 0 } },
+        ];
+        obj
+    }
 
     /// A closed unit rect at (0,0)-(80,40) in quantized units.
     fn rect_geometry() -> Geometry {
@@ -230,16 +269,6 @@ mod tests {
         || "1970-01-01T00:00:00Z".to_string()
     }
 
-    /// A counting id allocator returning "artifact-0", "artifact-1", ... .
-    fn counting_alloc() -> impl FnMut() -> String {
-        let mut n = 0u64;
-        move || {
-            let id = format!("artifact-{n}");
-            n += 1;
-            id
-        }
-    }
-
     fn scene_with_one_object() -> ObjectScene {
         let mut scene = ObjectScene::default();
         apply_object_op(
@@ -256,12 +285,10 @@ mod tests {
     fn comment_upsert_appends_and_responds() {
         let mut scene = scene_with_one_object();
         let clock = fixed_clock();
-        let mut alloc = counting_alloc();
         let mut ctx = FeatureCtx {
             now: &clock,
             seq: 7,
             revision: 42,
-            alloc_id: &mut alloc,
         };
         let comment = Comment {
             id: "c-1".into(),
@@ -299,12 +326,10 @@ mod tests {
     fn comment_upsert_on_missing_object_errors_without_mutation() {
         let mut scene = ObjectScene::default();
         let clock = fixed_clock();
-        let mut alloc = counting_alloc();
         let mut ctx = FeatureCtx {
             now: &clock,
             seq: 7,
             revision: 42,
-            alloc_id: &mut alloc,
         };
         let req = FeatureRequest::CommentUpsert {
             canvas_id: "cv-1".into(),
@@ -328,12 +353,10 @@ mod tests {
     fn template_apply_inserts_recipe_and_returns_ids() {
         let mut scene = ObjectScene::default();
         let clock = fixed_clock();
-        let mut alloc = counting_alloc();
         let mut ctx = FeatureCtx {
             now: &clock,
             seq: 7,
             revision: 42,
-            alloc_id: &mut alloc,
         };
         // A 2-object recipe carrying its own ids/orders (as build_template mints).
         let recipe = vec![
@@ -371,12 +394,10 @@ mod tests {
         let mut scene = scene_with_one_object();
         let before = scene.clone();
         let clock = fixed_clock();
-        let mut alloc = counting_alloc();
         let mut ctx = FeatureCtx {
             now: &clock,
             seq: 7,
             revision: 42,
-            alloc_id: &mut alloc,
         };
         let req = FeatureRequest::CanvasSwitch {
             canvas_id: "cv-2".into(),
@@ -398,46 +419,95 @@ mod tests {
     }
 
     #[test]
-    fn export_request_supported_yields_ready_stub() {
+    fn export_request_renders_connected_scope_into_artifact() {
+        // A 2-object scene wired by a connector: src -> dst.
         let mut scene = ObjectScene::default();
+        for op in [
+            ObjectOp::InsertObject { object: labeled_rect("src", "a0", "Source") },
+            ObjectOp::InsertObject { object: labeled_rect("dst", "a1", "Dest") },
+            ObjectOp::InsertObject { object: connector("edge", "a2", "src", "dst") },
+        ] {
+            apply_object_op(&mut scene, op).expect("seed insert");
+        }
         let clock = fixed_clock();
-        let mut alloc = counting_alloc();
         let mut ctx = FeatureCtx {
             now: &clock,
             seq: 7,
             revision: 42,
-            alloc_id: &mut alloc,
         };
         let req = FeatureRequest::ExportRequest {
             canvas_id: "cv-1".into(),
-            scope_ids: vec!["rect-1".into()],
-            export_type: "svg".into(),
+            scope_ids: vec![],
+            export_type: "digest".into(),
             request_id: "req-9".into(),
         };
 
         let (applied, resp) = handle_feature(req, &mut scene, &mut ctx);
 
+        // Read-only: no op applied, scene untouched.
         assert!(applied.is_empty());
-        assert_eq!(
-            resp,
+        match resp {
             FeatureResponse::ExportReady {
-                request_id: "req-9".into(),
-                artifact_ref: "artifact-0".into(),
-                content_type: "image/svg+xml".into(),
+                request_id,
+                artifact_ref,
+                content_type,
+            } => {
+                assert_eq!(request_id, "req-9");
+                assert_eq!(content_type, "text/plain");
+                // Non-empty content mentioning both connected objects + the edge.
+                assert!(!artifact_ref.is_empty(), "export content is non-empty");
+                assert!(artifact_ref.contains("Source"), "mentions src label: {artifact_ref}");
+                assert!(artifact_ref.contains("Dest"), "mentions dst label: {artifact_ref}");
+                assert!(artifact_ref.contains("src -> dst"), "has the edge: {artifact_ref}");
             }
-        );
+            other => panic!("expected ExportReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_request_mermaid_is_markdown() {
+        let mut scene = ObjectScene::default();
+        for op in [
+            ObjectOp::InsertObject { object: labeled_rect("src", "a0", "Source") },
+            ObjectOp::InsertObject { object: labeled_rect("dst", "a1", "Dest") },
+            ObjectOp::InsertObject { object: connector("edge", "a2", "src", "dst") },
+        ] {
+            apply_object_op(&mut scene, op).expect("seed insert");
+        }
+        let clock = fixed_clock();
+        let mut ctx = FeatureCtx {
+            now: &clock,
+            seq: 7,
+            revision: 42,
+        };
+        let req = FeatureRequest::ExportRequest {
+            canvas_id: "cv-1".into(),
+            scope_ids: vec![],
+            export_type: "mermaid".into(),
+            request_id: "req-m".into(),
+        };
+
+        let (applied, resp) = handle_feature(req, &mut scene, &mut ctx);
+
+        assert!(applied.is_empty());
+        match resp {
+            FeatureResponse::ExportReady { artifact_ref, content_type, .. } => {
+                assert_eq!(content_type, "text/markdown");
+                assert!(artifact_ref.starts_with("flowchart LR"));
+                assert!(artifact_ref.contains("src --> dst"));
+            }
+            other => panic!("expected ExportReady, got {other:?}"),
+        }
     }
 
     #[test]
     fn export_request_unsupported_yields_feature_error() {
         let mut scene = ObjectScene::default();
         let clock = fixed_clock();
-        let mut alloc = counting_alloc();
         let mut ctx = FeatureCtx {
             now: &clock,
             seq: 7,
             revision: 42,
-            alloc_id: &mut alloc,
         };
         let req = FeatureRequest::ExportRequest {
             canvas_id: "cv-1".into(),
