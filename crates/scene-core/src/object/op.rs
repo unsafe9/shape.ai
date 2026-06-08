@@ -24,6 +24,16 @@ pub enum FieldEdit<T> {
 }
 
 impl<T> FieldEdit<T> {
+    /// Build the edit that reproduces an optional value: `Some(v)` -> `Set{v}`,
+    /// `None` -> `Clear`. The inverse of [`resolve`](Self::resolve); used to
+    /// capture the inverse of a style edit from the prior value.
+    pub fn from_option(value: Option<T>) -> Self {
+        match value {
+            Some(value) => FieldEdit::Set { value },
+            None => FieldEdit::Clear,
+        }
+    }
+
     /// Resolve this edit against a current optional value, returning the new one.
     pub fn resolve(self, _current: Option<T>) -> Option<T> {
         match self {

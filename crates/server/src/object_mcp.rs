@@ -372,8 +372,8 @@ pub fn patch_object(spec: PatchObjectSpec) -> Result<Vec<ObjectOp>, String> {
         let (fill, stroke, _text_color) = semantic_preset_style(preset);
         ops.push(ObjectOp::SetStyle {
             id: spec.id.clone(),
-            fill: Some(field_edit(fill)),
-            stroke: Some(field_edit(stroke)),
+            fill: Some(FieldEdit::from_option(fill)),
+            stroke: Some(FieldEdit::from_option(stroke)),
         });
     }
 
@@ -390,14 +390,6 @@ pub fn patch_object(spec: PatchObjectSpec) -> Result<Vec<ObjectOp>, String> {
         return Err("patch is empty (no fields set)".to_string());
     }
     Ok(ops)
-}
-
-/// `Some(v) -> Set{v}`, `None -> Clear` — the three-state field edit (D-op).
-fn field_edit<T>(value: Option<T>) -> FieldEdit<T> {
-    match value {
-        Some(v) => FieldEdit::Set { value: v },
-        None => FieldEdit::Clear,
-    }
 }
 
 // ---------------------------------------------------------------------------

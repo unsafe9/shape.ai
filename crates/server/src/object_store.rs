@@ -382,10 +382,7 @@ impl<A: StorageAdapter + SpatialStore> ObjectStore<A> {
         // absent (a Delete) -> remove the Record (which drops its region row too).
         for (id, object) in persist {
             match object {
-                Some(object) => {
-                    let (record, region) = object_to_record(canvas_id, &object, seq);
-                    self.adapter.save_indexed(record, region)?;
-                }
+                Some(object) => self.save_object(canvas_id, &object, seq)?,
                 None => {
                     self.adapter.delete(&object_record_id(canvas_id, &id))?;
                 }

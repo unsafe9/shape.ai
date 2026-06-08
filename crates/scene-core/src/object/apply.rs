@@ -13,7 +13,7 @@
 use crate::fractional::generate_key_between;
 
 use super::model::{
-    Anchor, Comment, Fill, Geometry, Layout, Object, ObjectId, ObjectScene, Stroke, SubPath,
+    Anchor, Comment, Geometry, Layout, Object, ObjectId, ObjectScene, SubPath,
 };
 use super::op::{FieldEdit, ObjectOp};
 use super::validate::{validate_geometry, ValidationError};
@@ -132,12 +132,12 @@ fn apply_inner(scene: &mut ObjectScene, op: ObjectOp) -> Result<ObjectOp, ApplyE
             let inv_fill = fill.map(|edit| {
                 let old = scene.objects[idx].fill.clone();
                 scene.objects[idx].fill = edit.resolve(old.clone());
-                field_edit_from_old::<Fill>(old)
+                FieldEdit::from_option(old)
             });
             let inv_stroke = stroke.map(|edit| {
                 let old = scene.objects[idx].stroke.clone();
                 scene.objects[idx].stroke = edit.resolve(old.clone());
-                field_edit_from_old::<Stroke>(old)
+                FieldEdit::from_option(old)
             });
             Ok(ObjectOp::SetStyle { id, fill: inv_fill, stroke: inv_stroke })
         }
@@ -233,15 +233,6 @@ fn apply_inner(scene: &mut ObjectScene, op: ObjectOp) -> Result<ObjectOp, ApplyE
             *scene = working;
             Ok(ObjectOp::Batch { ops: inverses })
         }
-    }
-}
-
-/// Build the inverse `FieldEdit` from a captured old optional value: `Some` ->
-/// `Set{old}`, `None` -> `Clear`.
-fn field_edit_from_old<T>(old: Option<T>) -> FieldEdit<T> {
-    match old {
-        Some(value) => FieldEdit::Set { value },
-        None => FieldEdit::Clear,
     }
 }
 
