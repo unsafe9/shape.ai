@@ -52,6 +52,10 @@
 /// `fwidth`-based edge anti-aliasing (OB3.R3 / D7 / OB3.R8).
 pub const OBJECT_FILL_WGSL: &str = include_str!("shaders/object_fill.wgsl");
 
+/// Object drop-shadow VS/FS: a feathered quad beneath each object, tinted by the
+/// theme `shadow` token, with a per-vertex blur falloff (RB3 #11 / D2 / D7).
+pub const OBJECT_SHADOW_WGSL: &str = include_str!("shaders/object_shadow.wgsl");
+
 /// Object stroke VS/FS: per-vertex ribbon expansion along the normal with
 /// per-node width, dash gating, and analytic ribbon-edge AA (OB3.R2 / OB3.R8).
 pub const OBJECT_STROKE_WGSL: &str = include_str!("shaders/object_stroke.wgsl");
@@ -76,6 +80,7 @@ mod tests {
     fn object_pipeline_shaders_are_present() {
         for (name, src) in [
             ("object_fill", OBJECT_FILL_WGSL),
+            ("object_shadow", OBJECT_SHADOW_WGSL),
             ("object_stroke", OBJECT_STROKE_WGSL),
             ("msdf_text", MSDF_TEXT_WGSL),
             ("clip", CLIP_WGSL),

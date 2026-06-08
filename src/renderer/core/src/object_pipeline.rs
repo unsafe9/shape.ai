@@ -46,7 +46,7 @@ use crate::text_layout::{layout_runs, TextAlign, TextRunInput, TextVAlign};
 #[cfg(feature = "wgpu-probe")]
 use crate::model::CameraState;
 #[cfg(feature = "wgpu-probe")]
-use crate::shaders::{MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_STROKE_WGSL};
+use crate::shaders::{MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_SHADOW_WGSL, OBJECT_STROKE_WGSL};
 #[cfg(feature = "wgpu-probe")]
 use crate::text_layout::MsdfAtlasPlan;
 use crate::stroke_expand::{dash_segments, expand_stroke, Cap, Join};
@@ -111,6 +111,31 @@ pub struct FillInstance {
     pub m1: [f32; 3],
     pub m2: [f32; 3],
     pub fill: [f32; 4],
+}
+
+/// Per-vertex drop-shadow attributes matching `object_shadow.wgsl`'s `VertexIn`
+/// (`position` @0, `feather` @1). Positions are object-local **pixels** (the
+/// region bbox expanded by the blur radius and offset by the drop-shadow offset);
+/// `feather` is the per-vertex 0..1 blur falloff (0 at the shadow core, 1 at the
+/// soft outer edge) the FS turns into the soft Gaussian-ish tail.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShadowVertex {
+    pub position: [f32; 2],
+    pub feather: f32,
+}
+
+/// Per-object instance attributes for the drop-shadow pipeline matching
+/// `object_shadow.wgsl` (`m0`/`m1`/`m2` @2..4, `shadow` @5). The 3x3 projective
+/// matrix is the same one the fill/stroke instances carry; `shadow` is the theme
+/// `shadow` token color (translucent), re-resolved on a theme flip.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShadowInstance {
+    pub m0: [f32; 3],
+    pub m1: [f32; 3],
+    pub m2: [f32; 3],
+    pub shadow: [f32; 4],
 }
 
 /// Per-vertex stroke attributes matching `object_stroke.wgsl`'s `VertexIn`
@@ -205,6 +230,7 @@ pub struct ObjectPipeline {
     pub stroke_bind_group_layout: wgpu::BindGroupLayout,
     pub text_bind_group_layout: wgpu::BindGroupLayout,
     pub fill_pipeline: wgpu::RenderPipeline,
+    pub shadow_pipeline: wgpu::RenderPipeline,
     pub stroke_pipeline: wgpu::RenderPipeline,
     pub text_pipeline: wgpu::RenderPipeline,
 }
@@ -223,6 +249,10 @@ impl ObjectPipeline {
         let fill_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shape.ai object fill shader"),
             source: wgpu::ShaderSource::Wgsl(OBJECT_FILL_WGSL.into()),
+        });
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shape.ai object shadow shader"),
+            source: wgpu::ShaderSource::Wgsl(OBJECT_SHADOW_WGSL.into()),
         });
         let stroke_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shape.ai object stroke shader"),
@@ -386,6 +416,64 @@ impl ObjectPipeline {
             cache: None,
         });
 
+        // ---- Shadow pipeline ----------------------------------------------
+        // slot0: ShadowVertex (position @0, feather @1); slot1: instance-step
+        // matrix columns m0/m1/m2 @2..4 + shadow color @5. Matches
+        // `object_shadow.wgsl`'s VertexIn.
+        let shadow_vertex_attrs = [
+            // @location(0) position: vec2<f32>
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            // @location(1) feather: f32
+            wgpu::VertexAttribute {
+                offset: std::mem::size_of::<[f32; 2]>() as u64,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32,
+            },
+        ];
+        let shadow_instance_attrs = fill_instance_attributes();
+        let shadow_buffers = [
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<ShadowVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &shadow_vertex_attrs,
+            },
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<ShadowInstance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &shadow_instance_attrs,
+            },
+        ];
+        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shape.ai object shadow pipeline layout"),
+            bind_group_layouts: &[Some(&camera_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shape.ai object shadow pipeline"),
+            layout: Some(&shadow_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &shadow_buffers,
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shadow_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &color_targets,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // ---- Stroke pipeline ----------------------------------------------
         let stroke_vertex_attrs = [
             // @location(0) position: vec2<f32>
@@ -528,6 +616,7 @@ impl ObjectPipeline {
             stroke_bind_group_layout,
             text_bind_group_layout,
             fill_pipeline,
+            shadow_pipeline,
             stroke_pipeline,
             text_pipeline,
         }
@@ -633,6 +722,11 @@ pub struct ObjectDraw {
     /// range when the object has no fillable region.
     pub fill_range: DrawRange,
     pub fill_instance: FillInstance,
+    /// RB3 drop-shadow quad vertex range into the shared `shadow_vertices` buffer.
+    /// Empty when the object has no boundable region (nothing to cast a shadow).
+    /// Drawn BEFORE fill (beneath the object).
+    pub shadow_range: DrawRange,
+    pub shadow_instance: ShadowInstance,
     /// Stroke ribbon vertices for this object (own buffer slice via `stroke_range`).
     pub stroke_range: DrawRange,
     pub stroke_instance: StrokeInstance,
@@ -651,6 +745,19 @@ pub struct ObjectDraw {
     pub stroke_token: Option<String>,
 }
 
+/// RB3: the renderer-default drop-shadow color is the theme `shadow` token. This
+/// is the ONLY tie of the shadow pass to the C1 token table — it is wired, never
+/// hardcoded, so the shadow flips dark-translucent (light mode) <-> light-
+/// translucent (dark mode) with the theme bit (zero-rebake color refresh, P4).
+const SHADOW_TOKEN: &str = "shadow";
+
+/// RB3 drop-shadow geometry constants (object-local px). The shadow is the region
+/// bbox offset down-right by [`SHADOW_OFFSET_PX`] and expanded by
+/// [`SHADOW_BLUR_PX`] on every side; the expanded margin carries the per-vertex
+/// `feather` blur falloff (0 at the core rect, 1 at the outer edge).
+const SHADOW_OFFSET_PX: f32 = 2.0;
+const SHADOW_BLUR_PX: f32 = 6.0;
+
 /// Owns the CPU-built object draw data and the GPU buffers it uploads to, and
 /// records the object render pass.
 #[cfg(feature = "wgpu-probe")]
@@ -662,6 +769,8 @@ pub struct ObjectRenderer {
     pub fill_vertex_buffer: wgpu::Buffer,
     pub fill_index_buffer: wgpu::Buffer,
     pub fill_instance_buffer: wgpu::Buffer,
+    pub shadow_vertex_buffer: wgpu::Buffer,
+    pub shadow_instance_buffer: wgpu::Buffer,
     pub stroke_vertex_buffer: wgpu::Buffer,
     pub stroke_instance_buffer: wgpu::Buffer,
     pub text_vertex_buffer: wgpu::Buffer,
@@ -671,6 +780,7 @@ pub struct ObjectRenderer {
     pub text_bind_group: wgpu::BindGroup,
     draws: Vec<ObjectDraw>,
     fill_index_count: u32,
+    shadow_vertex_count: u32,
     stroke_vertex_count: u32,
     text_vertex_count: u32,
     /// RB1: the active light/dark theme. Sources the canvas clear color and is
@@ -762,6 +872,10 @@ impl ObjectRenderer {
         let fill_index_buffer = create_index_buffer(device, "object fill indices", &build.fill.indices);
         let fill_instance_buffer =
             create_vertex_buffer(device, "object fill instances", &build.fill_instances);
+        let shadow_vertex_buffer =
+            create_vertex_buffer(device, "object shadow vertices", &build.shadow_vertices);
+        let shadow_instance_buffer =
+            create_vertex_buffer(device, "object shadow instances", &build.shadow_instances);
         let stroke_vertex_buffer =
             create_vertex_buffer(device, "object stroke vertices", &build.stroke_vertices);
         let stroke_instance_buffer =
@@ -786,6 +900,20 @@ impl ObjectRenderer {
                 &fill_instance_buffer,
                 0,
                 bytemuck::cast_slice(&build.fill_instances),
+            );
+        }
+        if !build.shadow_vertices.is_empty() {
+            queue.write_buffer(
+                &shadow_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&build.shadow_vertices),
+            );
+        }
+        if !build.shadow_instances.is_empty() {
+            queue.write_buffer(
+                &shadow_instance_buffer,
+                0,
+                bytemuck::cast_slice(&build.shadow_instances),
             );
         }
         if !build.stroke_vertices.is_empty() {
@@ -909,6 +1037,8 @@ impl ObjectRenderer {
             fill_vertex_buffer,
             fill_index_buffer,
             fill_instance_buffer,
+            shadow_vertex_buffer,
+            shadow_instance_buffer,
             stroke_vertex_buffer,
             stroke_instance_buffer,
             text_vertex_buffer,
@@ -917,6 +1047,7 @@ impl ObjectRenderer {
             msdf_atlas_texture,
             text_bind_group,
             fill_index_count: build.fill.indices.len() as u32,
+            shadow_vertex_count: build.shadow_vertices.len() as u32,
             stroke_vertex_count: build.stroke_vertices.len() as u32,
             text_vertex_count: build.text_vertices.len() as u32,
             draws: build.draws,
@@ -970,7 +1101,22 @@ impl ObjectRenderer {
             return self.theme;
         }
         self.theme = Theme { dark };
+        // RB3: the default drop-shadow color is the `shadow` token, so it flips with
+        // the bit too — re-resolve every object's shadow instance color (zero rebake,
+        // the geometry is untouched). Sourced from the same token table, never hard-
+        // coded.
+        let shadow_color = self.theme.shadow();
         for (i, draw) in self.draws.iter_mut().enumerate() {
+            if !draw.shadow_range.is_empty() {
+                draw.shadow_instance.shadow = shadow_color;
+                let offset = (i * std::mem::size_of::<ShadowInstance>()
+                    + std::mem::offset_of!(ShadowInstance, shadow)) as u64;
+                queue.write_buffer(
+                    &self.shadow_instance_buffer,
+                    offset,
+                    bytemuck::cast_slice(&shadow_color),
+                );
+            }
             if let Some(name) = draw.fill_token.as_deref() {
                 let color = resolve_token_f32(name, dark).unwrap_or([1.0, 1.0, 1.0, 1.0]);
                 draw.fill_instance.fill = color;
@@ -1096,6 +1242,27 @@ impl ObjectRenderer {
             multiview_mask: None,
         });
 
+        // Shadow pass: one instanced draw per object over its feathered shadow quad,
+        // recorded FIRST so it sits beneath the fill+stroke. Each object's shadow
+        // rides its own per-object matrix instance (index `i`), index-aligned with
+        // `draws` exactly like the fill/stroke loops.
+        if self.shadow_vertex_count > 0 {
+            pass.set_pipeline(&pipeline.shadow_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.shadow_vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.shadow_instance_buffer.slice(..));
+            for (instance, draw) in self.draws.iter().enumerate() {
+                if draw.shadow_range.is_empty() {
+                    continue;
+                }
+                let instance = instance as u32;
+                pass.draw(
+                    draw.shadow_range.start..draw.shadow_range.end,
+                    instance..instance + 1,
+                );
+            }
+        }
+
         // Fill pass: one indexed instanced draw per object, all sharing the merged
         // megabuffer vertex/index buffers and the per-object instance buffer.
         if self.fill_index_count > 0 {
@@ -1162,6 +1329,11 @@ impl ObjectRenderer {
         self.fill_index_count
     }
 
+    /// Number of drop-shadow quad vertices uploaded for the loaded scene (diagnostics).
+    pub fn shadow_vertex_count(&self) -> u32 {
+        self.shadow_vertex_count
+    }
+
     /// Number of stroke ribbon vertices uploaded for the loaded scene (diagnostics).
     pub fn stroke_vertex_count(&self) -> u32 {
         self.stroke_vertex_count
@@ -1210,6 +1382,13 @@ fn create_index_buffer(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu
 pub struct SceneGeometry {
     pub fill: MegaBuffer,
     pub fill_instances: Vec<FillInstance>,
+    /// RB3 drop-shadow quad vertices (6 per object with a boundable region,
+    /// tri-list), object-local px + per-vertex feather. Per-object slices via
+    /// `draws[i].shadow_range`.
+    pub shadow_vertices: Vec<ShadowVertex>,
+    /// Per-object shadow instances (matrix columns + theme `shadow` color),
+    /// index-aligned with `draws`.
+    pub shadow_instances: Vec<ShadowInstance>,
     pub stroke_vertices: Vec<StrokeVertex>,
     pub stroke_instances: Vec<StrokeInstance>,
     /// Positioned glyph-quad vertices (6 per visible glyph, tri-list), object-local
@@ -1285,6 +1464,23 @@ pub fn build_scene_geometry_themed_with_measure(
             fill: paint_color(&resolved.fill.paint, resolved.fill.opacity as f32, theme),
         });
 
+        // ---- Shadow: a feathered quad beneath the object (RB3 #11) ---------
+        // The shadow rect is the object's region bbox (same flattened pixel subpaths
+        // as fill/stroke) offset + expanded by the blur radius. Its color is the
+        // theme `shadow` token, NEVER hardcoded — so a theme flip is a per-instance
+        // color refresh, the geometry stays put (zero rebake, P4).
+        let shadow_start = geometry.shadow_vertices.len() as u32;
+        append_shadow_quad(&mut geometry.shadow_vertices, &subpaths, scene.camera.zoom);
+        let shadow_end = geometry.shadow_vertices.len() as u32;
+        geometry.shadow_instances.push(ShadowInstance {
+            m0: matrix_col(&obj.transform, 0),
+            m1: matrix_col(&obj.transform, 1),
+            m2: matrix_col(&obj.transform, 2),
+            // The drop-shadow color is the `shadow` token resolved against the
+            // active theme — wired through the token table, never a hardcoded RGBA.
+            shadow: resolve_token_f32(SHADOW_TOKEN, theme.dark).unwrap_or([0.0, 0.0, 0.0, 0.25]),
+        });
+
         // ---- Stroke: expand each (dashed) subpath into a ribbon ------------
         let stroke_start = geometry.stroke_vertices.len() as u32;
         let cap = match resolved.stroke.cap {
@@ -1338,6 +1534,14 @@ pub fn build_scene_geometry_themed_with_measure(
                 .fill_instances
                 .last()
                 .expect("fill instance just pushed"),
+            shadow_range: DrawRange {
+                start: shadow_start,
+                end: shadow_end,
+            },
+            shadow_instance: *geometry
+                .shadow_instances
+                .last()
+                .expect("shadow instance just pushed"),
             stroke_range: DrawRange {
                 start: stroke_start,
                 end: stroke_end,
@@ -1418,6 +1622,74 @@ fn flatten_object_subpaths(obj: &RenderObject, zoom: f64) -> Vec<(bool, Vec<(f32
         out.push((sub.closed, pts));
     }
     out
+}
+
+/// Append one object's drop-shadow geometry (RB3 #11) to `out`: a soft macOS-
+/// style blurred silhouette beneath the object. The shadow is the object's region
+/// bbox (derived from the SAME flattened pixel `subpaths` as fill/stroke/text, via
+/// [`crate::outline::derive_region`] — single pixel space, no re-parse) offset
+/// down-right by [`SHADOW_OFFSET_PX`], built as a 9-patch: a solid core rect (all
+/// corners `feather = 0` -> full shadow alpha) plus an outer ring expanded by
+/// [`SHADOW_BLUR_PX`] whose outer corners `feather = 1` (-> the FS fades the alpha
+/// to 0). That gives a real per-side soft falloff — the blurred-silhouette
+/// approximation the card calls for — baked once with the geometry (zero per-frame
+/// re-tessellation; theme flip only refreshes the instance color). Objects with no
+/// boundable region (degenerate geometry) emit nothing, so their `shadow_range`
+/// stays empty.
+fn append_shadow_quad(
+    out: &mut Vec<ShadowVertex>,
+    subpaths: &[(bool, Vec<(f32, f32)>)],
+    zoom: f64,
+) {
+    let bucket = crate::curve_lod::zoom_bucket(zoom);
+    let flatness = crate::curve_lod::flatness_for_bucket(bucket);
+    let Some(region) = crate::outline::derive_region(subpaths, flatness) else {
+        return;
+    };
+
+    // Core rect: the region bbox shifted by the drop-shadow offset.
+    let cx0 = region.min_x + SHADOW_OFFSET_PX;
+    let cy0 = region.min_y + SHADOW_OFFSET_PX;
+    let cx1 = region.max_x + SHADOW_OFFSET_PX;
+    let cy1 = region.max_y + SHADOW_OFFSET_PX;
+    // Outer rect: the core expanded by the blur radius on every side.
+    let ox0 = cx0 - SHADOW_BLUR_PX;
+    let oy0 = cy0 - SHADOW_BLUR_PX;
+    let ox1 = cx1 + SHADOW_BLUR_PX;
+    let oy1 = cy1 + SHADOW_BLUR_PX;
+
+    // A 3x3 grid of corners: rows [oy0, cy0, cy1, oy1] x cols [ox0, cx0, cx1, ox1].
+    // The inner 2x2 (core) carries feather 0; the outer band ramps to feather 1.
+    let xs = [ox0, cx0, cx1, ox1];
+    let ys = [oy0, cy0, cy1, oy1];
+    // feather per grid line: 1 at the outer edge, 0 across the solid core span.
+    let fx = [1.0f32, 0.0, 0.0, 1.0];
+    let fy = [1.0f32, 0.0, 0.0, 1.0];
+
+    // Emit each of the 9 cells as two triangles. A corner's feather is the max of
+    // its row/col feather, so the four outer corners reach 1 while the core stays 0.
+    for r in 0..3 {
+        for c in 0..3 {
+            let x0 = xs[c];
+            let x1 = xs[c + 1];
+            let y0 = ys[r];
+            let y1 = ys[r + 1];
+            let f00 = fx[c].max(fy[r]);
+            let f10 = fx[c + 1].max(fy[r]);
+            let f11 = fx[c + 1].max(fy[r + 1]);
+            let f01 = fx[c].max(fy[r + 1]);
+            let tl = ShadowVertex { position: [x0, y0], feather: f00 };
+            let tr = ShadowVertex { position: [x1, y0], feather: f10 };
+            let br = ShadowVertex { position: [x1, y1], feather: f11 };
+            let bl = ShadowVertex { position: [x0, y1], feather: f01 };
+            out.push(tl);
+            out.push(tr);
+            out.push(br);
+            out.push(tl);
+            out.push(br);
+            out.push(bl);
+        }
+    }
 }
 
 /// Append a stroke ribbon `mesh` (triangle-list of `[x,y]` positions) as
@@ -2311,6 +2583,118 @@ mod tests {
         // overlaps the matrix the drag preview writes at offset 0.
         assert_eq!(std::mem::offset_of!(FillInstance, m0), 0);
         assert!(std::mem::offset_of!(FillInstance, fill) >= 3 * std::mem::size_of::<[f32; 3]>());
+    }
+
+    // ---- RB3 default drop-shadow pass --------------------------------------
+
+    /// PRIMARY GOLDEN (RB3 #11): EVERY object emits a drop-shadow primitive
+    /// beneath its fill, and the shadow RGBA is the theme `shadow` token —
+    /// translucent, and DIFFERENT light vs dark. Fails if any object lacks a
+    /// shadow quad, if the shadow range is empty, or if the color is hardcoded
+    /// (does not flip with the theme bit).
+    #[test]
+    fn every_object_emits_a_themed_translucent_shadow() {
+        let scene = scene_with(vec![rect_object("a"), rect_object("b")], None);
+        let light = build_scene_geometry_themed(&scene, Theme::light());
+        let dark = build_scene_geometry_themed(&scene, Theme::dark());
+
+        assert_eq!(light.draws.len(), 2);
+        assert_eq!(light.shadow_instances.len(), 2);
+        // (1) Every object emits a non-empty shadow primitive (the 9-patch quad).
+        for draw in &light.draws {
+            assert!(
+                !draw.shadow_range.is_empty(),
+                "object {} must cast a drop shadow",
+                draw.id
+            );
+        }
+        // The shadow vertex ranges tile the shared buffer contiguously.
+        assert_eq!(light.draws[0].shadow_range.start, 0);
+        assert_eq!(
+            light.draws[0].shadow_range.end,
+            light.draws[1].shadow_range.start
+        );
+        assert_eq!(
+            light.draws[1].shadow_range.end,
+            light.shadow_vertices.len() as u32
+        );
+
+        // (2) The shadow color is the `shadow` token, so it FLIPS with the theme
+        // bit and is NEVER hardcoded.
+        let light_shadow = light.shadow_instances[0].shadow;
+        let dark_shadow = dark.shadow_instances[0].shadow;
+        assert_eq!(light_shadow, Theme::light().shadow(), "shadow sourced from token, not hardcoded");
+        assert_eq!(dark_shadow, Theme::dark().shadow());
+        assert_ne!(light_shadow, dark_shadow, "shadow RGBA flips light vs dark");
+        // (3) Translucent in both modes (a drop shadow, not an opaque block).
+        assert!(light_shadow[3] < 1.0, "light shadow is translucent");
+        assert!(dark_shadow[3] < 1.0, "dark shadow is translucent");
+        assert!(light_shadow[3] > 0.0 && dark_shadow[3] > 0.0, "shadow is visible");
+    }
+
+    /// ZERO-REBAKE (P4): flipping the theme leaves the shadow GEOMETRY byte-
+    /// identical — only the shadow instance COLOR moves. A theme flip is a per-
+    /// instance color refresh, not a re-tessellation of the shadow quads.
+    #[test]
+    fn shadow_geometry_is_theme_invariant_only_color_flips() {
+        let scene = scene_with(vec![rect_object("a"), rect_object("b")], None);
+        let light = build_scene_geometry_themed(&scene, Theme::light());
+        let dark = build_scene_geometry_themed(&scene, Theme::dark());
+
+        // Quad vertices (positions + feather) never move with the theme bit.
+        assert_eq!(
+            light.shadow_vertices, dark.shadow_vertices,
+            "shadow quad geometry is theme-invariant (zero rebake)"
+        );
+        for (l, d) in light.draws.iter().zip(dark.draws.iter()) {
+            assert_eq!(l.shadow_range, d.shadow_range, "shadow range stable across theme");
+            assert_eq!(l.shadow_instance.m0, d.shadow_instance.m0);
+            assert_eq!(l.shadow_instance.m1, d.shadow_instance.m1);
+            assert_eq!(l.shadow_instance.m2, d.shadow_instance.m2);
+            // The color is the ONLY thing that moves.
+            assert_ne!(l.shadow_instance.shadow, d.shadow_instance.shadow);
+        }
+    }
+
+    /// The 9-patch shadow has a SOLID core (feather 0) AND a soft outer edge
+    /// (feather 1): a real blurred silhouette, not a flat block. Fails if the
+    /// feather collapses to a single value (no falloff to approximate the blur).
+    #[test]
+    fn shadow_quad_has_solid_core_and_feathered_edge() {
+        let scene = scene_with(vec![rect_object("o1")], None);
+        let geo = build_scene_geometry(&scene);
+        let verts = &geo.shadow_vertices;
+        assert!(!verts.is_empty());
+        // 9 cells * 2 tris * 3 verts = 54 vertices.
+        assert_eq!(verts.len(), 54, "9-patch shadow = 54 tri-list verts");
+
+        let min_f = verts.iter().map(|v| v.feather).fold(f32::INFINITY, f32::min);
+        let max_f = verts.iter().map(|v| v.feather).fold(f32::NEG_INFINITY, f32::max);
+        assert!((min_f - 0.0).abs() < 1e-6, "core corners feather to 0 (solid)");
+        assert!((max_f - 1.0).abs() < 1e-6, "outer corners feather to 1 (soft)");
+    }
+
+    /// Shadow packing matches `object_shadow.wgsl`: `ShadowVertex` is 12 bytes
+    /// (position + feather) and `ShadowInstance` is 52 bytes (3 matrix columns +
+    /// color), with the color slot at offset 36 (past the 36-byte matrix) so the
+    /// theme color write never clobbers the matrix.
+    #[test]
+    fn shadow_vertex_and_instance_sizes_match_shader_contract() {
+        // ShadowVertex: vec2 position + f32 feather = 3 floats = 12 bytes.
+        assert_eq!(std::mem::size_of::<ShadowVertex>(), 12);
+        // ShadowInstance: 3 vec3 columns + vec4 color = 13 floats = 52 bytes.
+        assert_eq!(std::mem::size_of::<ShadowInstance>(), 52);
+        assert_eq!(std::mem::offset_of!(ShadowInstance, m0), 0);
+        assert_eq!(std::mem::offset_of!(ShadowInstance, shadow), 36);
+    }
+
+    /// The shadow uses the same `shadow` token RB1 exposes as `Theme::shadow()`,
+    /// pinning the wiring: a wrong token (or a hardcoded color) breaks the link.
+    #[test]
+    fn shadow_token_constant_matches_theme_shadow_accessor() {
+        assert_eq!(SHADOW_TOKEN, crate::object_theme::ThemeToken::Shadow.name());
+        let light = paint_color(&RPaint::Token { name: SHADOW_TOKEN.to_string() }, 1.0, Theme::light());
+        assert_eq!(light, Theme::light().shadow());
     }
 
     /// A token paint's per-paint `opacity` multiplies the token's own alpha
