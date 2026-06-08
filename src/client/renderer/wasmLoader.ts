@@ -218,6 +218,16 @@ export type RustWebGpuRenderer = {
   // the top-most object under the screen point (no mutation). Optional so a wasm
   // build predating it is treated as "no object" by the engine.
   hitTestObject?(screenX: number, screenY: number): string | null;
+  // W2-06: nearest point on any object outline to a WORLD query point, for shape
+  // drag-create anchor snapping (W2-07 consumes this). `tolPx` is a screen-pixel
+  // radius converted to world via `zoom` internally; the inputs are WORLD coords
+  // (not screen). Optional + feature-detected, same pattern as hitTestObject.
+  nearestOutlinePoint?(
+    worldX: number,
+    worldY: number,
+    tolPx: number,
+    zoom: number
+  ): { snapped: boolean; x: number; y: number; targetId: string | null };
   // Replace the transient multi-select highlight set (JSON array of ids). Optional
   // so a wasm build predating it is treated as a no-op by the engine.
   setMultiSelect?(idsJson: string): void;

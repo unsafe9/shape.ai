@@ -606,7 +606,7 @@ fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
 
 /// Parametric position `t` of `p`'s projection onto the infinite line `a->b`,
 /// clamped to `[0, 1]` for a finite segment. Degenerate (`a == b`) yields 0.
-fn project_t(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+pub fn project_t(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let abx = b.0 - a.0;
     let aby = b.1 - a.1;
     let len2 = abx * abx + aby * aby;
@@ -619,10 +619,51 @@ fn project_t(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 }
 
 /// Shortest distance from point `p` to the finite segment `a->b`.
-fn point_segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+pub fn point_segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let t = project_t(p, a, b);
     let proj = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
     dist(p, proj)
+}
+
+/// Nearest point on a polyline outline to `(px, py)`, returning the projected
+/// point and its SQUARED distance (W2-06, anchor snapping).
+///
+/// `outline` is an ordered vertex list (no repeated closing vertex). Each
+/// consecutive pair `[i, i+1]` is a segment; when `closed` is `true` the implicit
+/// closing edge `[last, 0]` is included too — so rect/ellipse silhouettes snap to
+/// their full boundary, while an open line/freehand polyline never snaps to an
+/// edge it does not draw. Reuses [`project_t`] for the clamped per-segment
+/// projection. Allocation-free; O(outline.len()). A single-vertex outline returns
+/// that vertex; an empty outline returns `None`.
+pub fn nearest_point_on_polyline(
+    outline: &[(f32, f32)],
+    closed: bool,
+    px: f32,
+    py: f32,
+) -> Option<((f32, f32), f32)> {
+    let n = outline.len();
+    if n == 0 {
+        return None;
+    }
+    if n == 1 {
+        return Some((outline[0], dist2((px, py), outline[0])));
+    }
+    let p = (px, py);
+    let mut best_pt = outline[0];
+    let mut best_d2 = f32::INFINITY;
+    let last = if closed { n } else { n - 1 };
+    for i in 0..last {
+        let a = outline[i];
+        let b = outline[(i + 1) % n];
+        let t = project_t(p, a, b);
+        let proj = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+        let d2 = dist2(p, proj);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best_pt = proj;
+        }
+    }
+    Some((best_pt, best_d2))
 }
 
 /// A small revision-keyed LRU of derived regions, mirroring
@@ -1004,6 +1045,44 @@ mod tests {
         assert_eq!(cache.cached_revision("b"), None, "LRU victim evicted");
         assert_eq!(cache.cached_revision("a"), Some(1));
         assert_eq!(cache.cached_revision("c"), Some(1));
+    }
+
+    #[test]
+    fn nearest_point_on_polyline_closing_edge_only_when_closed() {
+        // An open square-ish polyline: 3 sides of a unit square, missing the
+        // closing edge from (0,1) back to (0,0). A query just left of that missing
+        // edge's midpoint (-0.1, 0.5) is nearest the implicit closing edge.
+        let outline = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let q = (-0.1_f32, 0.5_f32);
+
+        // Open: the closing edge does not exist, so the nearest point is an
+        // endpoint of the drawn polyline ((0,0) or (0,1)), not (0, 0.5).
+        let (open_pt, _open_d2) =
+            nearest_point_on_polyline(&outline, false, q.0, q.1).expect("open nearest");
+        assert!(
+            (open_pt.0 - 0.0).abs() < 1e-4 && (open_pt.1 - 0.0).abs() < 1e-4
+                || (open_pt.0 - 0.0).abs() < 1e-4 && (open_pt.1 - 1.0).abs() < 1e-4,
+            "open polyline snaps to a drawn endpoint, got {open_pt:?}"
+        );
+
+        // Closed: the implicit edge [last, 0] is included, so the nearest point is
+        // its projection (0, 0.5).
+        let (closed_pt, closed_d2) =
+            nearest_point_on_polyline(&outline, true, q.0, q.1).expect("closed nearest");
+        assert!(
+            (closed_pt.0 - 0.0).abs() < 1e-4 && (closed_pt.1 - 0.5).abs() < 1e-4,
+            "closed polyline snaps to the closing edge, got {closed_pt:?}"
+        );
+        assert!((closed_d2 - 0.01).abs() < 1e-4, "d2 = 0.1^2, got {closed_d2}");
+    }
+
+    #[test]
+    fn nearest_point_on_polyline_handles_degenerate_outlines() {
+        assert!(nearest_point_on_polyline(&[], false, 0.0, 0.0).is_none());
+        let (pt, d2) =
+            nearest_point_on_polyline(&[(3.0, 4.0)], false, 0.0, 0.0).expect("single vertex");
+        assert_eq!(pt, (3.0, 4.0));
+        assert!((d2 - 25.0).abs() < 1e-4);
     }
 
     #[test]

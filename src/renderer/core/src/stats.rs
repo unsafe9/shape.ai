@@ -148,6 +148,20 @@ pub struct ObjectTransformDelta {
     pub kind: &'static str,
 }
 
+/// W2-06: result of the nearest-outline-point query (anchor snapping for shape
+/// drag-create). The flat `{ snapped, x, y, targetId }` contract W2-07 consumes:
+/// on a hit, `snapped = true`, `(x, y)` is the nearest WORLD point and `target_id`
+/// the object id; on a miss, `snapped = false`, `x = y = 0`, `target_id = None`.
+#[cfg(feature = "wgpu-probe")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreNearestOutlinePoint {
+    pub snapped: bool,
+    pub x: f64,
+    pub y: f64,
+    pub target_id: Option<String>,
+}
+
 #[cfg(feature = "wgpu-probe")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

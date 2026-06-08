@@ -1939,6 +1939,7 @@ pub(crate) fn derive_object_regions(scene: &RenderObjectScene) -> Vec<ObjectRegi
         regions.push(ObjectRegion {
             id: obj.id.clone(),
             transform: obj.transform,
+            closed: region.closed,
             outline: region.outline,
         });
     }
@@ -2285,6 +2286,76 @@ pub(crate) fn region_world_bounds(region: &ObjectRegion) -> Option<WorldRect> {
     } else {
         None
     }
+}
+
+/// W2-06: nearest point on ANY object outline to a WORLD query point, within
+/// `tol_world`. Returns `(id, world_x, world_y)` of the global minimum, or `None`
+/// when no outline is within tolerance. Used by shape drag-create anchor snapping
+/// (W2-07).
+///
+/// Design (per the task's reuse mandate + simplicity-first): the renderer holds no
+/// ellipse metadata — ellipses arrive as 4 cubic Béziers already flattened into
+/// `Region.outline` at load (REGION_FLATNESS = 0.5px chord error, the same
+/// tolerance that governs hit-test). So nearest-point is a uniform min over all
+/// outline segments via [`nearest_point_on_polyline`]: straight segments and the
+/// ellipse's dense segment set are the same kind of query, and snap precision is
+/// bounded by the flatten tolerance the user already clicks against. No Newton /
+/// ellipse-equation path (it would be infeasible AND contradict the reuse rule).
+///
+/// Performance (P0, runs live during drag): AABB broad-phase first
+/// ([`region_world_bounds`] expanded by `tol_world`, cheap point-in-rect reject)
+/// before any per-outline work; the query point is inverse-transformed into each
+/// surviving region's LOCAL space ONCE (D8) instead of transforming outlines, so
+/// the inner loop is allocation-free. Distances are compared in WORLD space
+/// (`tol_world` is a world quantity): the local nearest candidate is mapped back
+/// to world via the projective transform, because local distances are wrong under
+/// scale/shear/perspective.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn nearest_outline_point(
+    regions: &[ObjectRegion],
+    world: WorldPoint,
+    tol_world: f64,
+) -> Option<(String, f64, f64)> {
+    use crate::hit_test_object::{apply_3x3, world_to_local};
+    use crate::outline::nearest_point_on_polyline;
+
+    let tol2 = tol_world * tol_world;
+    let mut best: Option<(&str, f64, f64, f64)> = None; // (id, world_x, world_y, d2)
+    for region in regions {
+        // Broad-phase: skip when the query point is outside the region's world AABB
+        // expanded by the tolerance.
+        let Some(bounds) = region_world_bounds(region) else {
+            continue;
+        };
+        if world.x < bounds.x - tol_world
+            || world.x > bounds.x + bounds.width + tol_world
+            || world.y < bounds.y - tol_world
+            || world.y > bounds.y + bounds.height + tol_world
+        {
+            continue;
+        }
+        // Query in object-LOCAL space (D8): inverse-transform the world point once.
+        let Some((lx, ly)) = world_to_local(&region.transform, world.x, world.y) else {
+            continue;
+        };
+        let Some((local_pt, _local_d2)) =
+            nearest_point_on_polyline(&region.outline, region.closed, lx as f32, ly as f32)
+        else {
+            continue;
+        };
+        // Map the local nearest candidate back to WORLD and measure there.
+        let (wx, wy) = apply_3x3(&region.transform, local_pt.0 as f64, local_pt.1 as f64);
+        if !wx.is_finite() || !wy.is_finite() {
+            continue;
+        }
+        let dx = wx - world.x;
+        let dy = wy - world.y;
+        let d2 = dx * dx + dy * dy;
+        if d2 <= tol2 && best.map(|(_, _, _, bd2)| d2 < bd2).unwrap_or(true) {
+            best = Some((region.id.as_str(), wx, wy, d2));
+        }
+    }
+    best.map(|(id, wx, wy, _)| (id.to_string(), wx, wy))
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -3570,6 +3641,61 @@ mod tests {
         }
     }
 
+    /// An object at world `(tx, ty)` whose local geometry is a `w`px×`h`px ellipse
+    /// (4 cubic arcs, the same kappa string the shell's `ellipsePath` emits, D2 8
+    /// units/px). Used to exercise the curve nearest-point path.
+    fn ellipse_object(id: &str, tx: f64, ty: f64, w: i32, h: i32) -> RenderObject {
+        let q = |px: i32| px * 8; // px -> quantized units
+        let qw = q(w);
+        let qh = q(h);
+        let cx = q(w / 2);
+        let cy = q(h / 2);
+        let rx = w * 8 / 2;
+        let ry = h * 8 / 2;
+        let kx = (rx as f32 * 0.5523).round() as i32;
+        let ky = (ry as f32 * 0.5523).round() as i32;
+        let d = format!(
+            "M 0 {cy} C 0 {} {} 0 {cx} 0 C {} 0 {qw} {} {qw} {cy} \
+             C {qw} {} {} {qh} {cx} {qh} C {} {qh} 0 {} 0 {cy} Z",
+            cy - ky,
+            cx - kx,
+            cx + kx,
+            cy - ky,
+            cy + ky,
+            cx + kx,
+            cx - kx,
+            cy + ky,
+        );
+        RenderObject {
+            id: id.to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]],
+            geometry_d: d,
+            fill: None,
+            stroke: None,
+            text: None,
+            clip: false,
+        }
+    }
+
+    /// An object at world `(tx, ty)` whose local geometry is an OPEN horizontal
+    /// line of `len`px (no closing edge — `M 0 0 L len*8 0`).
+    fn line_object(id: &str, tx: f64, ty: f64, len: i32) -> RenderObject {
+        let u = len * 8;
+        RenderObject {
+            id: id.to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]],
+            geometry_d: format!("M 0 0 L {u} 0"),
+            fill: None,
+            stroke: None,
+            text: None,
+            clip: false,
+        }
+    }
+
     fn object_scene(objects: Vec<RenderObject>) -> RenderObjectScene {
         RenderObjectScene {
             scene_id: "fc-object".to_string(),
@@ -3616,6 +3742,77 @@ mod tests {
         // Outside both.
         let id = hit_object_in_regions(&regions, &camera, WorldPoint { x: 100.0, y: 100.0 });
         assert_eq!(id, None);
+    }
+
+    #[test]
+    fn nearest_outline_rect_edge_and_corner() {
+        // A 20px rect at world (0,0): local outline 0..20 in both axes.
+        let scene = object_scene(vec![rect_object("r", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+
+        // Just outside the right edge at mid-height -> snaps to (20, 10).
+        let (id, x, y) =
+            nearest_outline_point(&regions, WorldPoint { x: 22.0, y: 10.0 }, 5.0).expect("snap");
+        assert_eq!(id, "r");
+        assert!((x - 20.0).abs() < 1e-3 && (y - 10.0).abs() < 1e-3, "({x}, {y})");
+
+        // Near a corner (outside both edges) -> clamps to the corner (20, 20).
+        let (_, cx, cy) =
+            nearest_outline_point(&regions, WorldPoint { x: 23.0, y: 23.0 }, 6.0).expect("corner");
+        assert!((cx - 20.0).abs() < 1e-3 && (cy - 20.0).abs() < 1e-3, "({cx}, {cy})");
+    }
+
+    #[test]
+    fn nearest_outline_ellipse_accuracy_within_flatten_tolerance() {
+        // A 200px ellipse at world (0,0): center (100,100), rx = ry = 100. The
+        // analytic +x extremum is (200, 100). A query just outside it must snap to
+        // within the 0.5px flatten tolerance of that analytic point.
+        let scene = object_scene(vec![ellipse_object("e", 0.0, 0.0, 200, 200)]);
+        let regions = derive_object_regions(&scene);
+        assert_eq!(regions.len(), 1, "ellipse derives a region");
+
+        let (id, x, y) =
+            nearest_outline_point(&regions, WorldPoint { x: 203.0, y: 100.0 }, 6.0).expect("snap");
+        assert_eq!(id, "e");
+        // Within the flatten tolerance (0.5px chord error) of the analytic point.
+        assert!((x - 200.0).abs() < 0.6, "x {x} ~ 200");
+        assert!((y - 100.0).abs() < 0.6, "y {y} ~ 100");
+    }
+
+    #[test]
+    fn nearest_outline_open_line_ignores_implicit_closing_edge() {
+        // An open horizontal line from (0,0) to (40,0) at world (0,0). A query above
+        // the midpoint snaps onto the drawn segment at (20, 0).
+        let scene = object_scene(vec![line_object("l", 0.0, 0.0, 40)]);
+        let regions = derive_object_regions(&scene);
+
+        let (id, x, y) =
+            nearest_outline_point(&regions, WorldPoint { x: 20.0, y: 3.0 }, 5.0).expect("snap");
+        assert_eq!(id, "l");
+        assert!((x - 20.0).abs() < 1e-3 && (y - 0.0).abs() < 1e-3, "({x}, {y})");
+
+        // The line is a 2-vertex outline (no closing edge); a query is never nearer
+        // a non-existent edge than the drawn segment. The endpoints are (0,0) and
+        // (40,0), so the whole snap surface is the single segment itself.
+        let (_, x2, y2) =
+            nearest_outline_point(&regions, WorldPoint { x: -3.0, y: 0.0 }, 5.0).expect("endpoint");
+        assert!((x2 - 0.0).abs() < 1e-3 && (y2 - 0.0).abs() < 1e-3, "({x2}, {y2})");
+    }
+
+    #[test]
+    fn nearest_outline_tolerance_boundary() {
+        // A 20px rect at world (0,0). The right edge is at x=20; a query at x=24 is
+        // 4px away from the nearest outline point (20, 10).
+        let scene = object_scene(vec![rect_object("r", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+
+        // Just inside tolerance (4px away, tol 5) -> snaps.
+        let inside = nearest_outline_point(&regions, WorldPoint { x: 24.0, y: 10.0 }, 5.0);
+        assert!(matches!(inside, Some((ref id, _, _)) if id == "r"), "{inside:?}");
+
+        // Just beyond tolerance (4px away, tol 3) -> no snap.
+        let beyond = nearest_outline_point(&regions, WorldPoint { x: 24.0, y: 10.0 }, 3.0);
+        assert!(beyond.is_none(), "{beyond:?}");
     }
 
     #[test]

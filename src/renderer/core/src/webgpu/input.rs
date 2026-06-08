@@ -10,8 +10,8 @@ use crate::model::{
 };
 use crate::serde_wasm;
 use crate::stats::{
-    CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreOverlayRequest, CoreOverlayTarget,
-    WebGpuDebugSnapshot,
+    CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreNearestOutlinePoint,
+    CoreOverlayRequest, CoreOverlayTarget, WebGpuDebugSnapshot,
 };
 use wasm_bindgen::prelude::*;
 
@@ -126,6 +126,49 @@ impl ShapeWebGpuRenderer {
                 y: screen_y,
             },
         )
+    }
+
+    /// W2-06: nearest point on any object outline to a WORLD query point, for shape
+    /// drag-create anchor snapping (W2-07).
+    ///
+    /// COORD SPACE: `world_x`/`world_y` are WORLD coordinates (NOT screen) — W2-07
+    /// already has the world point under the cursor. `tol_px` is a screen-pixel
+    /// tolerance radius, converted to world via `tol_px / zoom.max(0.025)` (the same
+    /// zoom floor `screen_to_world` uses). Returns `{ snapped, x, y, targetId }`:
+    /// on a hit, `snapped = true` with the nearest WORLD point and the object id;
+    /// otherwise `snapped = false`, `x = y = 0`, `targetId = null`.
+    #[wasm_bindgen(js_name = nearestOutlinePoint)]
+    pub fn nearest_outline_point(
+        &self,
+        world_x: f64,
+        world_y: f64,
+        tol_px: f64,
+        zoom: f64,
+    ) -> Result<JsValue, JsValue> {
+        let tol_world = tol_px / zoom.max(0.025);
+        let result = nearest_outline_point(
+            &self.object_regions,
+            WorldPoint {
+                x: world_x,
+                y: world_y,
+            },
+            tol_world,
+        );
+        let payload = match result {
+            Some((id, x, y)) => CoreNearestOutlinePoint {
+                snapped: true,
+                x,
+                y,
+                target_id: Some(id),
+            },
+            None => CoreNearestOutlinePoint {
+                snapped: false,
+                x: 0.0,
+                y: 0.0,
+                target_id: None,
+            },
+        };
+        serde_wasm(payload)
     }
 
     #[wasm_bindgen(js_name = debugSnapshot)]

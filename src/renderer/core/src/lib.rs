@@ -37,6 +37,8 @@ pub use model::{
 };
 pub use stats::{CoreHitResult, WebGpuFrameStats, WebGpuProbeReport};
 #[cfg(feature = "wgpu-probe")]
+pub use stats::CoreNearestOutlinePoint;
+#[cfg(feature = "wgpu-probe")]
 pub use webgpu::ShapeWebGpuRenderer;
 
 // OB-4 object CPU geometry build (device-independent; builds for every target,

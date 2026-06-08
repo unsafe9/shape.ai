@@ -73,6 +73,10 @@ pub(crate) struct ObjectRegion {
     id: String,
     transform: [[f64; 3]; 3],
     outline: Vec<(f32, f32)>,
+    /// W2-06: whether the source contour was closed (rect/ellipse fill) vs open
+    /// (line/freehand stroke). The nearest-point query (anchor snapping) includes
+    /// the implicit closing edge only for closed shapes; hit-test/marquee ignore it.
+    closed: bool,
 }
 
 /// FC-07: per-batch accumulator for the object-path input results, threaded through
