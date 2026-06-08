@@ -13,7 +13,7 @@ use crate::model::{
     ActiveTool, CameraState, CanvasInputEvent, CubicRoute, RenderCard, RenderEdge, RenderGroup,
     SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken, WorldPoint, WorldRect,
 };
-use crate::hit_test_object::hit_test_object;
+use crate::hit_test_object::{hit_test_object, HoverAffordance, ScreenRect, SelectionHandles};
 use crate::outline::{derive_region, parse_path_string};
 use crate::render_object::RenderObjectScene;
 use crate::stats::{CoreHitResult, CoreOverlayStyle, ObjectTransformDelta};
@@ -1914,6 +1914,43 @@ pub(crate) fn hit_object_in_regions(
         .map(|region| region.id.clone())
 }
 
+/// W2-02: compute the hover affordance under `screen` for the shell's cursor.
+/// Runs only on a no-button move (the caller gates this on "no active drag").
+///
+/// Priority, top-down: when an object is selected, its resize/rotate handles
+/// (laid out by the SHARED [`SelectionHandles`] helper, in screen space, so the
+/// hover test matches exactly what W2-04 renders and pointer-down hit-tests) win
+/// over everything; then a body hit against any object's region; otherwise empty.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn hover_affordance_at(
+    regions: &[ObjectRegion],
+    camera: &CameraState,
+    selection: Option<&str>,
+    screen: WorldPoint,
+) -> HoverAffordance {
+    if let Some(id) = selection {
+        if let Some(region) = regions.iter().find(|region| region.id == id) {
+            if let Some(world_bbox) = region_world_bounds(region) {
+                let screen_rect = world_rect_to_screen_rect(&world_bbox, camera);
+                let handles = SelectionHandles::from_screen_bbox(&ScreenRect {
+                    x: screen_rect.x,
+                    y: screen_rect.y,
+                    width: screen_rect.width,
+                    height: screen_rect.height,
+                });
+                if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
+                    return affordance;
+                }
+            }
+        }
+    }
+    if hit_object_in_regions(regions, camera, screen).is_some() {
+        HoverAffordance::Body
+    } else {
+        HoverAffordance::Empty
+    }
+}
+
 /// FC-07: the pure object pointer-input state machine. Operates only on the
 /// pieces of renderer state it touches (camera, drag, the region list) so it is
 /// unit-testable without a GPU device. Mutates `camera`/`input_drag` and writes
@@ -1933,6 +1970,7 @@ pub(crate) fn step_object_pointer(
     event: &CanvasInputEvent,
     regions: &[ObjectRegion],
     active_tool: ActiveTool,
+    selection: Option<&str>,
     camera: &mut CameraState,
     input_drag: &mut Option<InputDragState>,
     object_out: &mut ObjectInputOut,
@@ -1972,7 +2010,12 @@ pub(crate) fn step_object_pointer(
         CanvasInputEvent::PointerMove { pointer_id, screen } => {
             let pointer_id = *pointer_id;
             let screen = *screen;
+            // No active drag => no button is held: this is a hover move, so report
+            // the affordance the shell uses to pick a cursor (W2-02). Computed
+            // per-move with no hover state of its own.
             let Some(drag) = input_drag.clone() else {
+                object_out.hover_affordance =
+                    Some(hover_affordance_at(regions, camera, selection, screen));
                 return;
             };
             match drag {
@@ -3446,6 +3489,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            None,
             &mut camera,
             &mut drag,
             &mut out,
@@ -3464,6 +3508,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            None,
             &mut camera,
             &mut drag,
             &mut out,
@@ -3485,6 +3530,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            None,
             &mut camera,
             &mut drag,
             &mut out,
@@ -3512,6 +3558,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            None,
             &mut camera,
             &mut drag,
             &mut out,
@@ -3528,11 +3575,109 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            None,
             &mut camera,
             &mut drag,
             &mut out,
         );
         assert_eq!(out.marquee_ids, Some(vec!["near".to_string()]));
+    }
+
+    #[test]
+    fn hover_move_reports_affordance_per_priority() {
+        // Single 20px object at world origin; identity camera => screen == world.
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+        let camera = identity_camera();
+
+        // With "o1" selected, hovering its NW corner hits the resize handle.
+        let nw = hover_affordance_at(
+            &regions,
+            &camera,
+            Some("o1"),
+            WorldPoint { x: 0.0, y: 0.0 },
+        );
+        assert_eq!(nw, HoverAffordance::ResizeNw);
+
+        // The rotate zone sits above the top-edge midpoint (x=10).
+        let rotate = hover_affordance_at(
+            &regions,
+            &camera,
+            Some("o1"),
+            WorldPoint {
+                x: 10.0,
+                y: 0.0 - crate::hit_test_object::ROTATE_ZONE_OFFSET_PX,
+            },
+        );
+        assert_eq!(rotate, HoverAffordance::Rotate);
+
+        // Interior of the selected object (off every handle) => body.
+        let body = hover_affordance_at(
+            &regions,
+            &camera,
+            Some("o1"),
+            WorldPoint { x: 10.0, y: 10.0 },
+        );
+        assert_eq!(body, HoverAffordance::Body);
+
+        // Far from everything => empty.
+        let empty = hover_affordance_at(
+            &regions,
+            &camera,
+            Some("o1"),
+            WorldPoint { x: 200.0, y: 200.0 },
+        );
+        assert_eq!(empty, HoverAffordance::Empty);
+
+        // No selection => no handles, so the same NW corner reads as body.
+        let no_sel = hover_affordance_at(&regions, &camera, None, WorldPoint { x: 0.0, y: 0.0 });
+        assert_eq!(no_sel, HoverAffordance::Body);
+    }
+
+    #[test]
+    fn step_object_pointer_hover_sets_affordance_only_without_drag() {
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        // No active drag => the move is a hover and reports an affordance.
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove {
+                pointer_id: 1,
+                screen: WorldPoint { x: 10.0, y: 10.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            Some("o1"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert_eq!(out.hover_affordance, Some(HoverAffordance::Body));
+
+        // Start an Object drag, then a move during the drag must NOT set hover.
+        out.hover_affordance = None;
+        drag = Some(InputDragState::Object {
+            pointer_id: 1,
+            object_id: "o1".to_string(),
+            start: WorldPoint { x: 10.0, y: 10.0 },
+        });
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove {
+                pointer_id: 1,
+                screen: WorldPoint { x: 14.0, y: 12.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            Some("o1"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert_eq!(out.hover_affordance, None);
+        assert!(out.transform_delta.is_some());
     }
 
     #[test]
@@ -3551,6 +3696,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Hand,
+            None,
             &mut camera,
             &mut drag,
             &mut out,
@@ -3565,6 +3711,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Hand,
+            None,
             &mut camera,
             &mut drag,
             &mut out,

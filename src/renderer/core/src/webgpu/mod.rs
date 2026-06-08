@@ -27,7 +27,7 @@ use crate::model::{
     RenderScenePatch, SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken,
     WorldPoint, WorldRect,
 };
-use crate::hit_test_object::hit_test_object;
+use crate::hit_test_object::{hit_test_object, HoverAffordance};
 use crate::object_pipeline::{ObjectPipeline, ObjectRenderer};
 use crate::outline::{derive_region, parse_path_string};
 use crate::render_object::RenderObjectScene;
@@ -84,6 +84,9 @@ pub(crate) struct ObjectInputOut {
     selection: Option<String>,
     transform_delta: Option<ObjectTransformDelta>,
     marquee_ids: Option<Vec<String>>,
+    // W2-02: hover affordance for the shell's cursor, set on a no-button move.
+    // `None` outside object mode / when no hover move occurred in the batch.
+    hover_affordance: Option<HoverAffordance>,
 }
 
 #[cfg(feature = "wgpu-probe")]

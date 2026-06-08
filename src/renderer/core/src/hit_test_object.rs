@@ -23,6 +23,154 @@
 /// pixel (D2). A quantized `i32` coordinate becomes `f64` px by dividing by this.
 pub const UNITS_PER_PX: f64 = 8.0;
 
+/// Selection-handle side length in SCREEN pixels (W2-02/W2-04). Handles are a
+/// fixed on-screen size regardless of zoom — the layout helper consumes an
+/// already-camera-transformed (screen-space) selection bbox, so this constant is
+/// the literal square size the shell draws and the pointer hit-tests against.
+pub const HANDLE_SIZE_PX: f64 = 8.0;
+
+/// Distance in SCREEN pixels from the selection's top edge up to the center of
+/// the rotate zone (W2-02/W2-04). The rotate zone is a handle-sized square
+/// centered above the top edge, used to detect the "rotate" affordance.
+pub const ROTATE_ZONE_OFFSET_PX: f64 = 20.0;
+
+/// A hover affordance: what the pointer is currently over, used by the shell to
+/// pick a cursor (W2-02). Stable string forms (via [`HoverAffordance::as_str`])
+/// are the wire contract the shell reads off the input-batch result; do not
+/// rename them without updating the shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoverAffordance {
+    /// Blank canvas — nothing under the pointer.
+    Empty,
+    /// Over an object's interior/fill.
+    Body,
+    ResizeNw,
+    ResizeN,
+    ResizeNe,
+    ResizeE,
+    ResizeSe,
+    ResizeS,
+    ResizeSw,
+    ResizeW,
+    /// Over the rotate zone above the selection's top edge.
+    Rotate,
+}
+
+impl HoverAffordance {
+    /// The stable wire string the shell maps to a cursor. Keep in sync with the
+    /// shell's affordance->cursor table (W2-03).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HoverAffordance::Empty => "empty",
+            HoverAffordance::Body => "body",
+            HoverAffordance::ResizeNw => "resize-nw",
+            HoverAffordance::ResizeN => "resize-n",
+            HoverAffordance::ResizeNe => "resize-ne",
+            HoverAffordance::ResizeE => "resize-e",
+            HoverAffordance::ResizeSe => "resize-se",
+            HoverAffordance::ResizeS => "resize-s",
+            HoverAffordance::ResizeSw => "resize-sw",
+            HoverAffordance::ResizeW => "resize-w",
+            HoverAffordance::Rotate => "rotate",
+        }
+    }
+}
+
+/// An axis-aligned rectangle in SCREEN pixels (top-left origin), used for the
+/// selection-handle layout. Kept host-neutral (plain `f64`) so the pure hit-test
+/// module stays free of the renderer's camera/world types.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl ScreenRect {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
+    }
+}
+
+/// Screen-space geometry of a selection's 8 resize handles + rotate zone (W2-02).
+/// This is the SINGLE SOURCE OF TRUTH for handle placement: W2-02 builds it to
+/// classify the hover affordance over the selected object, and W2-04 reuses the
+/// same layout to RENDER the handles and to run the pointer-down hit-test, so the
+/// thing the user sees and the thing they can grab are guaranteed identical.
+///
+/// Each handle is a [`HANDLE_SIZE_PX`]-square centered on a corner / edge-midpoint
+/// of `bbox`; the rotate zone is the same-sized square centered
+/// [`ROTATE_ZONE_OFFSET_PX`] above the top edge's midpoint.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectionHandles {
+    pub nw: ScreenRect,
+    pub n: ScreenRect,
+    pub ne: ScreenRect,
+    pub e: ScreenRect,
+    pub se: ScreenRect,
+    pub s: ScreenRect,
+    pub sw: ScreenRect,
+    pub w: ScreenRect,
+    pub rotate: ScreenRect,
+}
+
+impl SelectionHandles {
+    /// Lay out the 8 resize handles + rotate zone around a screen-space selection
+    /// `bbox` (already camera-transformed; pass `world_rect_to_screen_rect` output).
+    pub fn from_screen_bbox(bbox: &ScreenRect) -> Self {
+        let half = HANDLE_SIZE_PX / 2.0;
+        // A handle square centered on (cx, cy).
+        let at = |cx: f64, cy: f64| ScreenRect {
+            x: cx - half,
+            y: cy - half,
+            width: HANDLE_SIZE_PX,
+            height: HANDLE_SIZE_PX,
+        };
+        let left = bbox.x;
+        let right = bbox.x + bbox.width;
+        let top = bbox.y;
+        let bottom = bbox.y + bbox.height;
+        let cx = bbox.x + bbox.width / 2.0;
+        let cy = bbox.y + bbox.height / 2.0;
+        SelectionHandles {
+            nw: at(left, top),
+            n: at(cx, top),
+            ne: at(right, top),
+            e: at(right, cy),
+            se: at(right, bottom),
+            s: at(cx, bottom),
+            sw: at(left, bottom),
+            w: at(left, cy),
+            rotate: at(cx, top - ROTATE_ZONE_OFFSET_PX),
+        }
+    }
+
+    /// Classify a screen point against the handles. Returns the resize/rotate
+    /// affordance the point falls in, or `None` when it is over no handle. The
+    /// rotate zone is tested first so it wins over a corner only where they do not
+    /// overlap (the offset keeps them apart for any non-degenerate selection).
+    pub fn affordance_at(&self, x: f64, y: f64) -> Option<HoverAffordance> {
+        if self.rotate.contains(x, y) {
+            return Some(HoverAffordance::Rotate);
+        }
+        let table = [
+            (&self.nw, HoverAffordance::ResizeNw),
+            (&self.ne, HoverAffordance::ResizeNe),
+            (&self.se, HoverAffordance::ResizeSe),
+            (&self.sw, HoverAffordance::ResizeSw),
+            (&self.n, HoverAffordance::ResizeN),
+            (&self.e, HoverAffordance::ResizeE),
+            (&self.s, HoverAffordance::ResizeS),
+            (&self.w, HoverAffordance::ResizeW),
+        ];
+        table
+            .iter()
+            .find(|(rect, _)| rect.contains(x, y))
+            .map(|(_, affordance)| *affordance)
+    }
+}
+
 /// Convert a quantized object-local `i32` coordinate to `f64` pixels.
 ///
 /// `f64` exactly represents every `i32`, so this is lossless; the explicit
@@ -372,5 +520,76 @@ mod tests {
         assert!(parse_path("M 0").is_none()); // short coordinate run
         assert!(parse_path("Q 0 0").is_none()); // unsupported verb
         assert!(parse_path("M 0 x").is_none()); // non-integer token
+    }
+
+    #[test]
+    fn hover_affordance_strings_are_stable() {
+        // The shell reads these exact strings; pin them.
+        assert_eq!(HoverAffordance::Empty.as_str(), "empty");
+        assert_eq!(HoverAffordance::Body.as_str(), "body");
+        assert_eq!(HoverAffordance::ResizeNw.as_str(), "resize-nw");
+        assert_eq!(HoverAffordance::ResizeN.as_str(), "resize-n");
+        assert_eq!(HoverAffordance::ResizeNe.as_str(), "resize-ne");
+        assert_eq!(HoverAffordance::ResizeE.as_str(), "resize-e");
+        assert_eq!(HoverAffordance::ResizeSe.as_str(), "resize-se");
+        assert_eq!(HoverAffordance::ResizeS.as_str(), "resize-s");
+        assert_eq!(HoverAffordance::ResizeSw.as_str(), "resize-sw");
+        assert_eq!(HoverAffordance::ResizeW.as_str(), "resize-w");
+        assert_eq!(HoverAffordance::Rotate.as_str(), "rotate");
+    }
+
+    #[test]
+    fn selection_handles_classify_corners_edges_and_rotate() {
+        // A 100×80 selection at (10, 20) in screen px.
+        let bbox = ScreenRect {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 80.0,
+        };
+        let handles = SelectionHandles::from_screen_bbox(&bbox);
+
+        // Corners (handles are centered on the bbox corners).
+        assert_eq!(
+            handles.affordance_at(10.0, 20.0),
+            Some(HoverAffordance::ResizeNw)
+        );
+        assert_eq!(
+            handles.affordance_at(110.0, 100.0),
+            Some(HoverAffordance::ResizeSe)
+        );
+        // Edge midpoints.
+        assert_eq!(
+            handles.affordance_at(60.0, 20.0),
+            Some(HoverAffordance::ResizeN)
+        );
+        assert_eq!(
+            handles.affordance_at(110.0, 60.0),
+            Some(HoverAffordance::ResizeE)
+        );
+        // Rotate zone: centered ROTATE_ZONE_OFFSET_PX above the top-edge midpoint.
+        assert_eq!(
+            handles.affordance_at(60.0, 20.0 - ROTATE_ZONE_OFFSET_PX),
+            Some(HoverAffordance::Rotate)
+        );
+        // Interior and far-away points are over no handle.
+        assert_eq!(handles.affordance_at(60.0, 60.0), None);
+        assert_eq!(handles.affordance_at(500.0, 500.0), None);
+    }
+
+    #[test]
+    fn selection_handle_size_is_fixed_screen_px() {
+        let bbox = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 40.0,
+            height: 40.0,
+        };
+        let handles = SelectionHandles::from_screen_bbox(&bbox);
+        // Each handle is a HANDLE_SIZE_PX square, centered on its anchor.
+        assert_eq!(handles.nw.width, HANDLE_SIZE_PX);
+        assert_eq!(handles.nw.height, HANDLE_SIZE_PX);
+        assert_eq!(handles.nw.x, -HANDLE_SIZE_PX / 2.0);
+        assert_eq!(handles.nw.y, -HANDLE_SIZE_PX / 2.0);
     }
 }

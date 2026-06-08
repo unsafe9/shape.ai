@@ -159,6 +159,10 @@ pub struct CoreInputBatchResult {
     pub object_selection: Option<String>,
     pub object_transform_delta: Option<ObjectTransformDelta>,
     pub object_marquee_ids: Option<Vec<String>>,
+    // W2-02: stable affordance string ("empty" | "body" | "resize-*" | "rotate")
+    // the shell maps to a cursor. Computed on a no-button hover move; "empty"
+    // otherwise (and outside object mode).
+    pub hover_affordance: String,
 }
 
 #[cfg(feature = "wgpu-probe")]

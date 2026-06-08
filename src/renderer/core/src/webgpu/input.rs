@@ -4,6 +4,7 @@
 //! tool + multi-select setters, the overlay/debug queries, and the batch
 //! rollback. `target_arch = "wasm32"` gated.
 
+use crate::hit_test_object::HoverAffordance;
 use crate::model::{
     ActiveTool, CameraState, CanvasInputEvent, RenderScenePatch, SceneSelection, WorldPoint,
 };
@@ -59,6 +60,11 @@ impl ShapeWebGpuRenderer {
             object_selection: object_out.selection,
             object_transform_delta: object_out.transform_delta,
             object_marquee_ids: object_out.marquee_ids,
+            hover_affordance: object_out
+                .hover_affordance
+                .unwrap_or(HoverAffordance::Empty)
+                .as_str()
+                .to_string(),
         })
     }
 
@@ -545,10 +551,15 @@ impl ShapeWebGpuRenderer {
         event: CanvasInputEvent,
         object_out: &mut ObjectInputOut,
     ) -> Result<(), JsValue> {
+        let selection = self
+            .object_scene
+            .as_ref()
+            .and_then(|scene| scene.selection.clone());
         step_object_pointer(
             &event,
             &self.object_regions,
             self.active_tool,
+            selection.as_deref(),
             &mut self.camera,
             &mut self.input_drag,
             object_out,

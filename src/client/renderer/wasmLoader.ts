@@ -126,7 +126,25 @@ export type RustInputBatchResult = {
   objectSelection?: string | null;
   objectTransformDelta?: RustObjectTransformDelta | null;
   objectMarqueeIds?: string[] | null;
+  // W2-02: hover affordance the shell maps to a cursor. Optional so a wasm build /
+  // test mock predating the field still typechecks; defaults to "empty".
+  hoverAffordance?: HoverAffordance;
 };
+
+// W2-02: stable hover-affordance wire strings (mirror the Rust enum). The shell
+// maps each to a cursor (W2-03).
+export type HoverAffordance =
+  | "empty"
+  | "body"
+  | "resize-nw"
+  | "resize-n"
+  | "resize-ne"
+  | "resize-e"
+  | "resize-se"
+  | "resize-s"
+  | "resize-sw"
+  | "resize-w"
+  | "rotate";
 
 export type RustDebugSnapshot = {
   camera: CameraState;
