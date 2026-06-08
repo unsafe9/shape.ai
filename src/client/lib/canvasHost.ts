@@ -23,7 +23,7 @@
 // This is the flagged live-pixels gap: build-verified, GPU-runtime-deferred.
 
 import type { CameraState } from "../../shared/geometry";
-import type { ObjectScene, ObjectSelection } from "../../shared/object";
+import { GEOMETRY_QUANTUM_PER_PX, type ObjectScene, type ObjectSelection, type Stroke } from "../../shared/object";
 import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions } from "../renderer/engine";
 import type { FrameStats, WorldRect } from "../renderer/scene";
 import { loadRustCore, type RustCoreStatus, type RustWebGpuRenderer } from "../renderer/wasmLoader";
@@ -92,10 +92,23 @@ export function objectSceneToRenderObjectScene(
       transform: object.transform ?? IDENTITY_3X3,
       geometryD: object.geometry.d,
       fill: object.fill ?? null,
-      stroke: object.stroke ?? null,
+      stroke: projectStroke(object.stroke),
       text: object.text ?? null,
       clip: object.clip ?? false
     }))
+  };
+}
+
+/** Project an object's stroke into the renderer feed. The model stores stroke
+ *  width and dash run lengths in QUANTIZED units (GEOMETRY_QUANTUM_PER_PX per px),
+ *  but the renderer treats `RStroke.width`/`dash` as logical px (geometry coords
+ *  are de-quantized inside the renderer), so convert width and each dash entry. */
+function projectStroke(stroke: Stroke | undefined): Record<string, unknown> | null {
+  if (!stroke) return null;
+  return {
+    ...stroke,
+    width: stroke.width / GEOMETRY_QUANTUM_PER_PX,
+    ...(stroke.dash ? { dash: stroke.dash.map((d) => d / GEOMETRY_QUANTUM_PER_PX) } : {})
   };
 }
 
@@ -336,12 +349,15 @@ export class ShapeCanvasHost {
   }
 }
 
-/** Summarize the opaque crate geometry build into counts for diagnostics. */
+/** Summarize the opaque crate geometry build into counts for diagnostics. The
+ *  wasm `buildObjectSceneGeometry` returns a flat summary
+ *  `{ objects, fillVertices, fillTriangles, strokeVertices, draws }` whose counts
+ *  are already numbers (see `ObjectGeometrySummary` in lib.rs), not arrays. */
 function summarizeObjectGeometry(raw: unknown): ObjectGeometryBuild {
-  const value = raw as { fillVertices?: unknown[]; strokeInstances?: unknown[] } | null;
+  const value = raw as { fillVertices?: unknown; strokeVertices?: unknown } | null;
   return {
-    fillVertexCount: Array.isArray(value?.fillVertices) ? value!.fillVertices.length : 0,
-    strokeInstanceCount: Array.isArray(value?.strokeInstances) ? value!.strokeInstances.length : 0,
+    fillVertexCount: typeof value?.fillVertices === "number" ? value.fillVertices : 0,
+    strokeInstanceCount: typeof value?.strokeVertices === "number" ? value.strokeVertices : 0,
     raw
   };
 }

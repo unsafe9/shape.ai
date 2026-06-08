@@ -144,7 +144,9 @@ pub struct RText {
 #[serde(rename_all = "camelCase")]
 pub struct RTextRun {
     pub text: String,
+    #[serde(default = "default_text_color")]
     pub color: String,
+    #[serde(default = "default_text_size")]
     pub size: f64,
     #[serde(default)]
     pub bold: bool,
@@ -158,9 +160,10 @@ pub struct RTextRun {
 #[serde(rename_all = "camelCase")]
 pub enum RTextAlign {
     #[default]
-    Left,
+    Start,
     Center,
-    Right,
+    End,
+    Justify,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -458,6 +461,14 @@ fn default_opacity() -> f64 {
     1.0
 }
 
+fn default_text_color() -> String {
+    "#111111".to_string()
+}
+
+fn default_text_size() -> f64 {
+    16.0
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -641,6 +652,35 @@ mod tests {
             },
         );
         assert!(hovered.focus_ring.is_none());
+    }
+
+    #[test]
+    fn deserializes_minimal_model_text_and_stroke() {
+        // The model is the source of truth: the shell sends a minimal text shape
+        // (runs without color/size, align as the model's `start` variant) and a
+        // stroke. The renderer feed must tolerate it (FC-01).
+        let json = r##"{
+            "sceneId": "s1",
+            "camera": { "x": 0, "y": 0, "zoom": 1 },
+            "objects": [{
+                "id": "o1",
+                "order": "a0",
+                "transform": [[1,0,0],[0,1,0],[0,0,1]],
+                "geometryD": "M 0 0 L 80 0 L 80 40 L 0 40 Z",
+                "stroke": { "paint": { "kind": "solid", "color": "#000000" }, "width": 8 },
+                "text": { "runs": [{ "text": "Note" }], "align": "start", "valign": "top" }
+            }]
+        }"##;
+        let scene: RenderObjectScene =
+            serde_json::from_str(json).expect("minimal model text + stroke deserializes");
+        let obj = &scene.objects[0];
+        let text = obj.text.as_ref().expect("text present");
+        assert_eq!(text.align, RTextAlign::Start);
+        assert_eq!(text.valign, RTextValign::Top);
+        let run = &text.runs[0];
+        assert_eq!(run.color, "#111111");
+        assert_eq!(run.size, 16.0);
+        assert_eq!(obj.stroke.as_ref().expect("stroke present").width, 8.0);
     }
 
     #[test]

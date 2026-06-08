@@ -22,6 +22,8 @@ use serde::Serialize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ObjectCommandCategory {
+    Tool,
+    Insert,
     Clipboard,
     Edit,
     Selection,
@@ -31,6 +33,7 @@ pub enum ObjectCommandCategory {
     Path,
     Style,
     Annotate,
+    View,
 }
 
 /// A single object command entry.
@@ -73,6 +76,74 @@ impl ObjectCommand {
 pub fn object_command_catalog() -> Vec<ObjectCommand> {
     use ObjectCommandCategory::*;
     vec![
+        // Tool — arm a canvas tool. Picking a tool is shell UI state (see
+        // crate::tool::ActiveTool); using one yields an ordinary op, so no op kind.
+        ObjectCommand::new(
+            "select-move",
+            "Select / Move",
+            Tool,
+            Some("V"),
+            "Arm the select/move tool.",
+            None,
+        ),
+        ObjectCommand::new(
+            "hand-pan",
+            "Hand / Pan",
+            Tool,
+            Some("H"),
+            "Arm the hand tool to pan the viewport.",
+            None,
+        ),
+        ObjectCommand::new(
+            "draw",
+            "Draw",
+            Tool,
+            Some("P"),
+            "Arm the pen/draw tool.",
+            None,
+        ),
+        // Insert — arm an insert gesture for a primitive. The shell lowers the
+        // picked kind to an insert-object op, so these carry no direct op kind.
+        ObjectCommand::new(
+            "insert-rectangle",
+            "Rectangle",
+            Insert,
+            Some("R"),
+            "Insert a rectangle.",
+            None,
+        ),
+        ObjectCommand::new(
+            "insert-ellipse",
+            "Ellipse",
+            Insert,
+            Some("O"),
+            "Insert an ellipse.",
+            None,
+        ),
+        ObjectCommand::new(
+            "insert-line",
+            "Line",
+            Insert,
+            Some("L"),
+            "Insert a line.",
+            None,
+        ),
+        ObjectCommand::new(
+            "insert-text",
+            "Text",
+            Insert,
+            Some("T"),
+            "Insert a text object.",
+            None,
+        ),
+        ObjectCommand::new(
+            "insert-frame",
+            "Frame",
+            Insert,
+            Some("F"),
+            "Insert a frame.",
+            None,
+        ),
         // Clipboard — clipboard I/O is shell-side (P1), so these carry no op kind.
         ObjectCommand::new(
             "copy",
@@ -130,6 +201,14 @@ pub fn object_command_catalog() -> Vec<ObjectCommand> {
             Selection,
             Some("Mod+A"),
             "Select all objects in the scene.",
+            None,
+        ),
+        ObjectCommand::new(
+            "clear-selection",
+            "Clear Selection",
+            Selection,
+            Some("Escape"),
+            "Clear the current selection.",
             None,
         ),
         // Arrange — nudge the selection by transform.
@@ -282,6 +361,49 @@ pub fn object_command_catalog() -> Vec<ObjectCommand> {
             "Set the tags on the selection.",
             Some("set-tags"),
         ),
+        // View — viewport and shell-panel actions. Pure shell concerns; no op kind.
+        // Bindings use symbol tokens (`=`, `-`, `,`, `/`) the shell matcher resolves
+        // from `KeyboardEvent.key`, mirroring the existing `Mod+]` / `Mod+[` entries.
+        ObjectCommand::new(
+            "zoom-in",
+            "Zoom In",
+            View,
+            Some("Mod+="),
+            "Zoom the viewport in.",
+            None,
+        ),
+        ObjectCommand::new(
+            "zoom-out",
+            "Zoom Out",
+            View,
+            Some("Mod+-"),
+            "Zoom the viewport out.",
+            None,
+        ),
+        ObjectCommand::new(
+            "zoom-fit",
+            "Zoom to Fit",
+            View,
+            Some("Shift+1"),
+            "Fit the whole scene in the viewport.",
+            None,
+        ),
+        ObjectCommand::new(
+            "open-settings",
+            "Settings",
+            View,
+            Some("Mod+,"),
+            "Open the settings panel.",
+            None,
+        ),
+        ObjectCommand::new(
+            "open-template-library",
+            "Template Library",
+            View,
+            Some("Mod+/"),
+            "Open the template library.",
+            None,
+        ),
     ]
 }
 
@@ -336,6 +458,20 @@ mod tests {
         let catalog = object_command_catalog();
         let ids: HashSet<&str> = catalog.iter().map(|c| c.id.as_str()).collect();
         for expected in [
+            "select-move",
+            "hand-pan",
+            "draw",
+            "insert-rectangle",
+            "insert-ellipse",
+            "insert-line",
+            "insert-text",
+            "insert-frame",
+            "clear-selection",
+            "zoom-in",
+            "zoom-out",
+            "zoom-fit",
+            "open-settings",
+            "open-template-library",
             "copy",
             "paste",
             "duplicate",
@@ -484,7 +620,28 @@ mod tests {
 
     #[test]
     fn shell_only_commands_have_no_op_kind() {
-        for id in ["copy", "paste", "duplicate", "select-all", "undo", "redo"] {
+        for id in [
+            "copy",
+            "paste",
+            "duplicate",
+            "select-all",
+            "undo",
+            "redo",
+            "select-move",
+            "hand-pan",
+            "draw",
+            "insert-rectangle",
+            "insert-ellipse",
+            "insert-line",
+            "insert-text",
+            "insert-frame",
+            "clear-selection",
+            "zoom-in",
+            "zoom-out",
+            "zoom-fit",
+            "open-settings",
+            "open-template-library",
+        ] {
             assert!(
                 find(id).op_kind.is_none(),
                 "{id} should not map to an op kind"
