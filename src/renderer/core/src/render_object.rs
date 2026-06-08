@@ -473,8 +473,12 @@ fn default_text_color() -> String {
     "#111111".to_string()
 }
 
+/// Default font size in WIRE-quantized units (D2: 8 units/px), so a run that
+/// omits `size` defaults to 16px AFTER the layout de-quant (`/QUANT_PER_PX`) — the
+/// same quantized space `size` carries on the wire. Returning raw px here would
+/// de-quant to 2px for a defaulted run.
 fn default_text_size() -> f64 {
-    16.0
+    16.0 * QUANT_PER_PX
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +691,9 @@ mod tests {
         assert_eq!(text.valign, RTextValign::Top);
         let run = &text.runs[0];
         assert_eq!(run.color, "#111111");
-        assert_eq!(run.size, 16.0);
+        // `size` is WIRE-quantized (8 u/px); a defaulted run holds 16px * 8 = 128,
+        // which de-quantizes to 16px at the layout boundary (RB2 commit C).
+        assert_eq!(run.size, 16.0 * QUANT_PER_PX);
         assert_eq!(obj.stroke.as_ref().expect("stroke present").width, 8.0);
     }
 

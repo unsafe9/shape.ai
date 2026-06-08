@@ -2148,6 +2148,34 @@ mod tests {
         );
     }
 
+    /// COMMIT C (defaulted size): a run that omits `size` on the wire defaults to
+    /// the WIRE-quantized default (16px * 8), so after the layout de-quant it lays
+    /// out at 16px — NOT 2px (raw 16 / 8). FAILS if `default_text_size` returns raw
+    /// px while the build de-quants.
+    #[test]
+    fn defaulted_run_size_lays_out_at_sixteen_px() {
+        let json = r##"{
+            "sceneId": "s1",
+            "camera": { "x": 0, "y": 0, "zoom": 1 },
+            "objects": [{
+                "id": "o1",
+                "order": "a0",
+                "transform": [[1,0,0],[0,1,0],[0,0,1]],
+                "geometryD": "M0 0 L1600 0 L1600 800 L0 800 Z",
+                "text": { "runs": [{ "text": "AB" }], "align": "start", "valign": "top" }
+            }]
+        }"##;
+        let scene: RenderObjectScene = serde_json::from_str(json).expect("deserializes");
+        let geo =
+            build_scene_geometry_themed_with_measure(&scene, Theme::light(), &unit_measure);
+        // Second glyph at +16 (de-quant of the 128 default), NOT +2 (16/8).
+        let g1_origin_x = geo.text_vertices[6].position[0];
+        assert!(
+            (g1_origin_x - 16.0).abs() < 1e-4,
+            "defaulted run lays out at 16px, got advance {g1_origin_x}"
+        );
+    }
+
     // ---- RB1 theme resolution + zero-rebake toggle --------------------------
 
     /// A rect whose fill + stroke are semantic theme TOKENS (not raw hex), so its
