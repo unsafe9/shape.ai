@@ -16,7 +16,9 @@ import {
   GEOMETRY_QUANTUM_PER_PX,
   IDENTITY_TRANSFORM,
   type Anchor,
+  type Geometry,
   type Object as SceneObject,
+  type ObjectOp,
   type Transform3x3
 } from "../../shared/object";
 
@@ -121,4 +123,73 @@ export function synthesizeCreateAnchors(
  */
 export function reprojectAnchoredEndpoint(target: SceneObject, anchor: Anchor): { x: number; y: number } {
   return applyTransform(target.transform, anchor.at.x / Q, anchor.at.y / Q);
+}
+
+/**
+ * Rewrite the `nodeIndex`-th coordinate pair of a path-string `d` to `(x,y)`
+ * (object-local quantized ints), preserving every command token and the rest of
+ * the coords. Returns `d` unchanged when the path has no such pair.
+ */
+function setPathNode(d: string, nodeIndex: number, x: number, y: number): string {
+  let pair = 0;
+  let numbersSeen = 0;
+  return d.replace(/-?\d+(?:\.\d+)?/g, (match) => {
+    const isX = numbersSeen % 2 === 0;
+    const atTarget = pair === nodeIndex;
+    if (!isX) pair++;
+    numbersSeen++;
+    if (!atTarget) return match;
+    return isX ? String(x) : String(y);
+  });
+}
+
+/**
+ * AP5 (#14) live move-together: reproject `anchored`'s anchored node so it tracks
+ * `target`'s CURRENT transform, returning the updated geometry — or `undefined`
+ * when `anchored` carries no anchor onto `target` (or the node is unaddressable).
+ *
+ * The world endpoint comes from {@link reprojectAnchoredEndpoint} (the target's
+ * transform applied to `anchor.at`); it is then mapped into `anchored`'s OWN local
+ * quantized space (the geometry coords are object-local, D2) and written back to
+ * the addressed node. Pure (no scene mutation, no op-apply) so it pins shell-side.
+ */
+export function reprojectAnchoredGeometry(anchored: SceneObject, target: SceneObject): Geometry | undefined {
+  const anchor = anchored.anchors?.find((a) => a.target === target.id);
+  if (!anchor) return undefined;
+  const world = reprojectAnchoredEndpoint(target, anchor);
+  const inv = invertAffine(anchored.transform);
+  const lx = Math.round((inv[0][0] * world.x + inv[0][1] * world.y + inv[0][2]) * Q);
+  const ly = Math.round((inv[1][0] * world.x + inv[1][1] * world.y + inv[1][2]) * Q);
+  const d = setPathNode(anchored.geometry.d, anchor.nodeIndex, lx, ly);
+  if (d === anchored.geometry.d) return undefined;
+  return { ...anchored.geometry, d };
+}
+
+/**
+ * The `edit-geometry` ops a committed move produces so anchored objects follow
+ * their target. `transformOps` are the move's `set-transform` ops (each a moved id
+ * + its NEW transform, e.g. the AP2 cascade); for every moved object, each scene
+ * object anchored to it has its bound node reprojected through that NEW transform.
+ *
+ * A moved object whose anchored object is itself being moved in the same batch is
+ * skipped (it carries its own transform), and an object anchored to nothing moved
+ * authors nothing — so an unanchored (Alt-created) move stays a no-op. Returns
+ * `[]` when nothing follows.
+ */
+export function anchorFollowOps(objects: SceneObject[], transformOps: ObjectOp[]): ObjectOp[] {
+  const movedIds = new Set<string>();
+  for (const op of transformOps) if (op.kind === "set-transform") movedIds.add(op.id);
+  const ops: ObjectOp[] = [];
+  for (const op of transformOps) {
+    if (op.kind !== "set-transform") continue;
+    const movedTarget: SceneObject | undefined = objects.find((o) => o.id === op.id);
+    if (!movedTarget) continue;
+    const target: SceneObject = { ...movedTarget, transform: op.transform };
+    for (const obj of objects) {
+      if (movedIds.has(obj.id) || !obj.anchors) continue;
+      const geometry = reprojectAnchoredGeometry(obj, target);
+      if (geometry) ops.push({ kind: "edit-geometry", id: obj.id, geometry });
+    }
+  }
+  return ops;
 }

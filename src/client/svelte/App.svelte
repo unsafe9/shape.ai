@@ -46,7 +46,7 @@
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import { cascadeTransformOps } from "../lib/transformCascade";
-  import { synthesizeCreateAnchors } from "../lib/anchorCreate";
+  import { anchorFollowOps, synthesizeCreateAnchors } from "../lib/anchorCreate";
   import { doubleClickAction, ungroupEnabled, popOutOp } from "../lib/grouping";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
@@ -260,7 +260,11 @@
       // (children transforms are world-absolute, D3), so a frame moves with its
       // contents. The dragged object is the first op; the rest are descendants.
       const ops = cascadeTransformOps(scene.objects, id, matrix);
-      const op: ObjectOp = ops.length === 1 ? ops[0] : { kind: "batch", ops };
+      // AP5 (#14): every object anchored to a moved object reprojects its bound
+      // node through that object's NEW transform, so anchored endpoints move WITH
+      // the target. No anchors onto anything moved => no extra ops (the no-op case).
+      const allOps = [...ops, ...anchorFollowOps(scene.objects, ops)];
+      const op: ObjectOp = allOps.length === 1 ? allOps[0] : { kind: "batch", ops: allOps };
       // FC-16: pre-connect authorOp applies synchronously (the committed scene is on
       // return, so the rebake $effect drops the preview matrix immediately). In the
       // connected path the scene update is async — the GPU instance matrix holds the
