@@ -752,10 +752,14 @@ pub struct ObjectDraw {
 /// translucent (dark mode) with the theme bit (zero-rebake color refresh, P4).
 const SHADOW_TOKEN: &str = "shadow";
 
-/// RB3 drop-shadow geometry constant (object-local px). The shadow is the
-/// object's OWN fill silhouette translated down-right by [`SHADOW_OFFSET_PX`]; a
-/// soft blur is the GPU-cutover residual, not a CPU feather ring.
+/// W3-G7/#2 soft drop-shadow constants (object-local px). The shadow is a stack of
+/// [`SHADOW_TIERS`] silhouette copies of the object's OWN fill, each grown about
+/// the bbox center by [`SHADOW_SPREAD`] per tier and dropped down-right toward
+/// [`SHADOW_OFFSET_PX`], giving a soft all-sides macOS-window halo with a slight
+/// downward bias. The small offset keeps the halo near-symmetric.
 const SHADOW_OFFSET_PX: f32 = 2.0;
+const SHADOW_TIERS: usize = 5;
+const SHADOW_SPREAD: f32 = 0.06;
 
 /// Owns the CPU-built object draw data and the GPU buffers it uploads to, and
 /// records the object render pass.
@@ -1478,12 +1482,25 @@ pub fn build_scene_geometry_themed_with_measure(
 
         let subpaths = flatten_object_subpaths(obj, scene.camera.zoom);
 
+        // W3-G7/#3: an OPEN-only path with NO explicit fill is NOT filled (Figma /
+        // macOS convention) — a freehand brush stroke commits as an open subpath
+        // with `fill: None`, and tessellating it as a chord region showed an ugly
+        // default-white fill. Closed shapes (rect/ellipse) and any explicit fill are
+        // unaffected. When skipped we still push a Fill/Shadow instance below so the
+        // per-object instance buffers stay index-aligned with `draws`.
+        let skip_fill =
+            obj.fill.is_none() && subpaths.iter().all(|(closed, _)| !closed);
+
         // ---- Fill: tessellate the closed region into the megabuffer --------
-        let fill_input: Vec<(bool, Vec<(f32, f32)>)> = subpaths
-            .iter()
-            .map(|(closed, pts)| (*closed, pts.clone()))
-            .collect();
-        let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
+        let mesh = if skip_fill {
+            crate::tessellate::Mesh::default()
+        } else {
+            let fill_input: Vec<(bool, Vec<(f32, f32)>)> = subpaths
+                .iter()
+                .map(|(closed, pts)| (*closed, pts.clone()))
+                .collect();
+            tessellate_fill(&fill_input, FillRuleKind::NonZero)
+        };
         // Silhouette flags travel index-aligned with the megabuffer's vertex array:
         // `push` appends this mesh's vertices, so we extend `fill_edges` with this
         // mesh's boundary flags in lockstep (D4 analytic fill AA).
@@ -1657,29 +1674,56 @@ fn flatten_object_subpaths(obj: &RenderObject, zoom: f64) -> Vec<(bool, Vec<(f32
     out
 }
 
-/// Append one object's drop-shadow geometry (RB3 #11) to `out`: a clean OFFSET
-/// SILHOUETTE beneath the object. The shadow REUSES the object's OWN fill `mesh`
-/// (the exact region triangulation lyon already produced for the fill — concave,
-/// curved, and hole-aware for free), expanding each indexed triangle into a flat
-/// triangle list with every vertex translated down-right by [`SHADOW_OFFSET_PX`]
-/// and `feather = 0` (a flat, fully-opaque silhouette in the FS). So ANY geometry
-/// (convex/concave/curved/open) casts a shadow matching its EXACT shape, with no
-/// faceting — the old per-edge feather ring + centroid fan self-intersected on
-/// curves and concavities and is gone. Baked once with the geometry (zero
-/// per-frame re-tessellation: this is just a triangle-list copy of an
-/// already-tessellated mesh with a constant offset). A soft blur stays the
-/// GPU-cutover residual.
+/// Append one object's soft drop-shadow geometry (W3-G7/#2) to `out`: a stack of
+/// [`SHADOW_TIERS`] translucent silhouettes beneath the object, giving the gentle
+/// all-sides halo of a macOS window shadow. Each tier REUSES the object's OWN fill
+/// `mesh` (the exact region triangulation lyon already produced — concave, curved,
+/// hole-aware for free), so there is no extra tessellation: this is just
+/// `SHADOW_TIERS` triangle-list copies of an already-tessellated mesh.
+///
+/// For tier `k` in `0..SHADOW_TIERS`, every fill vertex is scaled about the mesh
+/// bbox center by `1 + k*SHADOW_SPREAD` (the outer tiers grow a soft halo on all
+/// sides), translated by a small down-right drop ramped from ~0 at the core to
+/// [`SHADOW_OFFSET_PX`], and tagged `feather = k/(SHADOW_TIERS-1)`. The FS ramps
+/// alpha by `(1-feather)^2`, so the core tier reads solid-ish and the outer tiers
+/// fade — stacked src-over copies accumulate near the core and thin at the rim, a
+/// cheap blur that works on ANY geometry (unlike the removed self-intersecting
+/// feather ring). The small offset keeps the halo near-symmetric with a slight
+/// downward bias.
 ///
 /// An empty fill mesh (an open polyline / no fillable interior) casts nothing, so
 /// the object's `shadow_range` stays empty — matching the fill's "no boundable
 /// region emits nothing" contract.
 fn append_shadow_quad(out: &mut Vec<ShadowVertex>, mesh: &crate::tessellate::Mesh) {
+    if mesh.indices.is_empty() {
+        return;
+    }
+    // Mesh bbox center — the scale anchor so every tier grows symmetrically.
+    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+    let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
     for &index in &mesh.indices {
         let p = mesh.vertices[index as usize];
-        out.push(ShadowVertex {
-            position: [p[0] + SHADOW_OFFSET_PX, p[1] + SHADOW_OFFSET_PX],
-            feather: 0.0,
-        });
+        min_x = min_x.min(p[0]);
+        min_y = min_y.min(p[1]);
+        max_x = max_x.max(p[0]);
+        max_y = max_y.max(p[1]);
+    }
+    let cx = (min_x + max_x) * 0.5;
+    let cy = (min_y + max_y) * 0.5;
+    let last = (SHADOW_TIERS - 1).max(1) as f32;
+    for k in 0..SHADOW_TIERS {
+        let kf = k as f32;
+        let scale = 1.0 + kf * SHADOW_SPREAD;
+        let t = kf / last;
+        let drop = SHADOW_OFFSET_PX * t;
+        let feather = kf / last;
+        for &index in &mesh.indices {
+            let p = mesh.vertices[index as usize];
+            out.push(ShadowVertex {
+                position: [cx + (p[0] - cx) * scale + drop, cy + (p[1] - cy) * scale + drop],
+                feather,
+            });
+        }
     }
 }
 
@@ -2032,6 +2076,60 @@ mod tests {
         assert_eq!(geo.fill_instances[0].fill, [1.0, 0.0, 0.0, 1.0]);
         // Inline stroke #00ff00 -> green, full alpha.
         assert_eq!(geo.stroke_instances[0].stroke, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    /// W3-G7/#3: an OPEN-only path with NO explicit fill renders fill-less (no
+    /// default white chord region), while a CLOSED path with no fill keeps the
+    /// structural default fill. The per-object instance buffers stay index-aligned.
+    /// FAILS if open brush strokes still tessellate a fill (the ugly white region).
+    #[test]
+    fn open_path_without_fill_skips_fill_and_shadow() {
+        // A bare-bones object factory: identity transform, the given geometry, no
+        // inline fill, no stroke.
+        let fill_less = |id: &str, d: &str| RenderObject {
+            id: id.to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: identity(),
+            geometry_d: d.to_string(),
+            fill: None,
+            stroke: None,
+            text: None,
+            clip: false,
+        };
+
+        // (open) a freehand-style open polyline; (closed) a rect ending in Z.
+        let open = fill_less("brush", "M0 0 L80 40 L20 90");
+        let closed = fill_less("rect", "M0 0 L800 0 L800 800 L0 800 Z");
+        let scene = scene_with(vec![open, closed], None);
+        let geo = build_scene_geometry(&scene);
+
+        let open_draw = &geo.draws[0];
+        let closed_draw = &geo.draws[1];
+
+        // (a) Open + fill:None => NO fill region and NO shadow.
+        assert!(
+            open_draw.fill_range.is_empty(),
+            "open brush stroke must not tessellate a fill region"
+        );
+        assert!(
+            open_draw.shadow_range.is_empty(),
+            "an unfilled open stroke casts no shadow"
+        );
+        // It still strokes (an open path is a visible line).
+        assert!(!open_draw.stroke_range.is_empty(), "open stroke still draws a ribbon");
+
+        // (b) Closed + fill:None => the structural default fill STILL applies.
+        assert!(
+            !closed_draw.fill_range.is_empty(),
+            "a closed shape with no fill keeps the default white fill"
+        );
+        assert!(!closed_draw.shadow_range.is_empty(), "the filled rect casts a shadow");
+
+        // (c) Per-object instance buffers stay index-aligned with `draws`.
+        assert_eq!(geo.fill_instances.len(), geo.draws.len());
+        assert_eq!(geo.shadow_instances.len(), geo.draws.len());
+        assert_eq!(geo.stroke_instances.len(), geo.draws.len());
     }
 
     /// D4 analytic fill AA: the build populates `fill_edges` index-aligned with the
@@ -2949,45 +3047,51 @@ mod tests {
         }
     }
 
-    /// The shadow is a FLAT offset silhouette of the object's OWN fill mesh: every
-    /// vertex `feather == 0`, and the shadow triangle list is exactly the fill
-    /// triangulation (count == fill `triangle_count * 3`), translated by the drop
-    /// offset. Fails if the old feather ring (`feather == 1` verts) or centroid fan
-    /// (extra non-fill triangles) is reintroduced.
+    /// W3-G7/#2 SOFT shadow: the shadow STACKS `SHADOW_TIERS` silhouette copies of
+    /// the object's OWN fill mesh (count == fill triangle list * SHADOW_TIERS) and
+    /// ramps `feather` across tiers — the values include BOTH 0 (solid core) and a
+    /// value > 0 (faint outer halo). FAILS if the shadow collapses back to a single
+    /// flat tier (count == 1:1 with the fill, all feather == 0).
     #[test]
-    fn shadow_quad_is_flat_offset_copy_of_fill_mesh() {
+    fn shadow_quad_is_soft_stacked_silhouette_of_fill_mesh() {
         let scene = scene_with(vec![rect_object("o1")], None);
         let geo = build_scene_geometry(&scene);
         let verts = &geo.shadow_vertices;
         assert!(!verts.is_empty());
 
-        // The shadow vertex count equals the fill mesh's triangle list (3 verts/tri).
+        // Recompute the object's own fill mesh the same way the pipeline does.
         let subpaths = flatten_object_subpaths(&scene.objects[0], scene.camera.zoom);
         let fill_input: Vec<(bool, Vec<(f32, f32)>)> =
             subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();
         let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
         assert!(!mesh.indices.is_empty());
+
+        // (1) Stacking: SHADOW_TIERS copies of the fill triangle list.
         assert_eq!(
             verts.len(),
-            mesh.indices.len(),
-            "offset-silhouette shadow == fill triangle list (no core fan / feather ring)"
+            mesh.indices.len() * SHADOW_TIERS,
+            "soft shadow stacks SHADOW_TIERS copies of the fill triangle list"
         );
 
-        // Flat silhouette: NO feather ramp at all (the FS falloff is uniformly 1).
+        // (2) Soft ramp: feather spans the core (0) and at least one faint tier (>0).
         assert!(
-            verts.iter().all(|v| v.feather == 0.0),
-            "offset-silhouette shadow is flat (feather 0); the feather ring is gone"
+            verts.iter().any(|v| v.feather == 0.0),
+            "the core tier is solid-ish (feather 0)"
+        );
+        assert!(
+            verts.iter().any(|v| v.feather > 0.0),
+            "an outer tier is faint (feather > 0) — not a single flat tier"
         );
     }
 
-    /// CONCAVE shape (an arrowhead with a reflex vertex): the shadow is the EXACT
-    /// offset copy of the object's own fill triangulation — every triangle
-    /// translated by the drop offset, as a multiset (triangle order is an impl
-    /// detail). This FAILS on the old centroid-fan + feather-ring build, which
-    /// emitted a centroid apex and `feather == 1` ring verts that are NOT in the
-    /// offset fill mesh, self-intersecting into the faceted gray mess the user saw.
+    /// CONCAVE shape (an arrowhead with a reflex vertex): each shadow tier is the
+    /// EXACT silhouette of the object's own fill triangulation (no centroid fan,
+    /// no per-edge feather ring), grown about the bbox center per tier. The core
+    /// tier (k=0, scale 1, drop 0) is an EXACT copy of the fill mesh, and no tier
+    /// emits a centroid apex. FAILS on the old centroid-fan build, which placed an
+    /// apex outside this concave silhouette and self-intersected into facets.
     #[test]
-    fn shadow_is_exact_offset_copy_of_fill_mesh_for_concave_shape() {
+    fn shadow_stack_is_exact_silhouette_of_fill_mesh_for_concave_shape() {
         // A concave arrowhead: the reflex vertex at (300,400) is what makes a
         // centroid fan invalid (the centroid lies outside the silhouette).
         let mut obj = rect_object("arrow");
@@ -3002,35 +3106,40 @@ mod tests {
         let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
         assert!(!mesh.indices.is_empty(), "concave arrow has a fillable interior");
 
-        // (1) Flat silhouette: every vertex feather == 0 (no ring/falloff).
-        assert!(
-            geo.shadow_vertices.iter().all(|v| v.feather == 0.0),
-            "offset-silhouette shadow is flat (feather 0); the feather ring is gone"
+        // (1) Stacking: SHADOW_TIERS copies of the fill triangle list.
+        assert_eq!(
+            geo.shadow_vertices.len(),
+            mesh.indices.len() * SHADOW_TIERS,
+            "soft shadow stacks SHADOW_TIERS copies of the fill triangle list"
         );
 
-        // (2) Shadow vertex set == fill mesh triangles, each translated by the drop
-        // offset. Compare as multisets — triangle emission order is an impl detail.
+        // (2) The core tier (the first fill-triangle-list span) is an EXACT,
+        // unoffset copy of the fill mesh — same silhouette, never a centroid fan.
+        let n = mesh.indices.len();
         let mut expected: Vec<[f32; 2]> = mesh
             .indices
             .iter()
             .map(|&i| mesh.vertices[i as usize])
-            .map(|p| [p[0] + SHADOW_OFFSET_PX, p[1] + SHADOW_OFFSET_PX])
             .collect();
-        let mut got: Vec<[f32; 2]> = geo.shadow_vertices.iter().map(|v| v.position).collect();
+        let mut got: Vec<[f32; 2]> = geo.shadow_vertices[..n].iter().map(|v| v.position).collect();
         let key = |v: &[f32; 2]| (v[0].to_bits(), v[1].to_bits());
         expected.sort_by_key(key);
         got.sort_by_key(key);
         assert_eq!(
             got, expected,
-            "shadow == fill triangulation translated by the drop offset (exact, no faceting)"
+            "core shadow tier == fill triangulation exactly (no faceting, no centroid fan)"
+        );
+        assert!(
+            geo.shadow_vertices[..n].iter().all(|v| v.feather == 0.0),
+            "the core tier reads solid (feather 0)"
         );
 
         // (3) Regression guard against the centroid fan: NO shadow vertex sits at
-        // the offset polygon CENTROID (the old core-fan apex), which for this
-        // concave shape lies outside the silhouette and produced overlapping facets.
+        // the outline CENTROID (the old core-fan apex), which for this concave shape
+        // lies outside the silhouette and produced overlapping facets.
         let outline: Vec<(f32, f32)> = subpaths[0].1.clone();
-        let cx = outline.iter().map(|p| p.0).sum::<f32>() / outline.len() as f32 + SHADOW_OFFSET_PX;
-        let cy = outline.iter().map(|p| p.1).sum::<f32>() / outline.len() as f32 + SHADOW_OFFSET_PX;
+        let cx = outline.iter().map(|p| p.0).sum::<f32>() / outline.len() as f32;
+        let cy = outline.iter().map(|p| p.1).sum::<f32>() / outline.len() as f32;
         assert!(
             !geo
                 .shadow_vertices
@@ -3056,21 +3165,28 @@ mod tests {
             .to_string();
         let scene = scene_with(vec![obj], None);
         let geo = build_scene_geometry(&scene);
-        let verts = &geo.shadow_vertices;
-        assert!(!verts.is_empty(), "ellipse casts a shadow");
+        assert!(!geo.shadow_vertices.is_empty(), "ellipse casts a shadow");
 
-        // Region bbox in pixels (geometry de-quantizes at 8 units/px): ~0..100.
-        // Offset down-right by SHADOW_OFFSET_PX, the four bbox corners are the
-        // points a bbox-quad shadow would touch.
+        // The core tier (k=0: scale 1, drop 0) is the canonical un-grown silhouette;
+        // check IT against the un-offset region bbox corners. The grown halo tiers
+        // deliberately push outward, so the bbox-corner assertion belongs to the core.
+        let subpaths = flatten_object_subpaths(&scene.objects[0], 1.0);
+        let fill_input: Vec<(bool, Vec<(f32, f32)>)> =
+            subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();
+        let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
+        let core = &geo.shadow_vertices[..mesh.indices.len()];
+
+        // Region bbox in pixels (geometry de-quantizes at 8 units/px): ~0..100. The
+        // four bbox corners are the points a bbox-quad shadow would touch.
         let region = crate::outline::derive_region(
-            &flatten_object_subpaths(&scene.objects[0], 1.0),
+            &subpaths,
             crate::curve_lod::flatness_for_bucket(crate::curve_lod::zoom_bucket(1.0)),
         )
         .expect("ellipse has a region");
-        let min_x = region.min_x + SHADOW_OFFSET_PX;
-        let min_y = region.min_y + SHADOW_OFFSET_PX;
-        let max_x = region.max_x + SHADOW_OFFSET_PX;
-        let max_y = region.max_y + SHADOW_OFFSET_PX;
+        let min_x = region.min_x;
+        let min_y = region.min_y;
+        let max_x = region.max_x;
+        let max_y = region.max_y;
         let bbox_corners = [
             [min_x, min_y],
             [max_x, min_y],
@@ -3078,12 +3194,12 @@ mod tests {
             [min_x, max_y],
         ];
 
-        // No shadow vertex may coincide with a bbox corner: the ellipse silhouette
-        // (and its interior triangulation) pulls inward at every corner. Distance
-        // margin is a generous fraction of the radius so a flattened-curve vertex
-        // near (but not at) a corner still counts as "off the corner".
+        // No core-tier shadow vertex may coincide with a bbox corner: the ellipse
+        // silhouette (and its interior triangulation) pulls inward at every corner.
+        // Distance margin is a generous fraction of the radius so a flattened-curve
+        // vertex near (but not at) a corner still counts as "off the corner".
         let corner_margin = (max_x - min_x) * 0.1;
-        for v in verts.iter() {
+        for v in core.iter() {
             for c in &bbox_corners {
                 let d = ((v.position[0] - c[0]).powi(2) + (v.position[1] - c[1]).powi(2)).sqrt();
                 assert!(
@@ -3095,9 +3211,9 @@ mod tests {
             }
         }
 
-        // And the silhouette is genuinely curved: the offset fill mesh spans many
-        // more than a rect's 4 vertices, so the shadow is not a 4-corner quad.
-        let positions: std::collections::BTreeSet<[u32; 2]> = verts
+        // And the silhouette is genuinely curved: the fill mesh spans many more than
+        // a rect's 4 vertices, so the shadow is not a 4-corner quad.
+        let positions: std::collections::BTreeSet<[u32; 2]> = core
             .iter()
             .map(|v| [v.position[0].to_bits(), v.position[1].to_bits()])
             .collect();

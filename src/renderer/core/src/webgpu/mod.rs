@@ -322,6 +322,9 @@ pub struct ShapeWebGpuRenderer {
     // W2-04: dedicated buffer for the selection-handle overlay (8 resize handles +
     // rotate zone), written per-frame and drawn in a LoadOp::Load pass on top.
     handle_vertex_buffer: wgpu::Buffer,
+    // W3-G7/#1: dedicated buffer for the per-object multi-select outline highlight,
+    // written per-frame and drawn in a LoadOp::Load pass on top of the object pass.
+    multi_select_overlay_vertex_buffer: wgpu::Buffer,
     vertex_ranges: VertexRanges,
     text_engine: TextEngine,
     text_layout_cache: TextLayoutCache,
