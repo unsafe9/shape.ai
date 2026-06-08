@@ -49,6 +49,7 @@ fn parse<T: serde::de::DeserializeOwned>(label: &str, json: &str) -> Result<T, S
 
 use crate::object::apply::apply_object_op as apply_object_op_pure;
 use crate::object::commands::object_command_catalog_json;
+use crate::object::gestures::object_gesture_catalog_json;
 use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush, DrawingSession};
 use crate::object::model::{Geometry, ObjectScene};
 use crate::object::op::ObjectOp;
@@ -119,6 +120,12 @@ pub fn derive_region(geometry_json: &str, flatness: i32) -> String {
 #[wasm_bindgen]
 pub fn object_command_catalog() -> String {
     object_command_catalog_json()
+}
+
+/// `object_gesture_catalog() -> ObjectGesture[]` (id/label/category/hold-trigger).
+#[wasm_bindgen]
+pub fn object_gesture_catalog() -> String {
+    object_gesture_catalog_json()
 }
 
 /// `build_object_template(template_id, anchor_x, anchor_y, id_prefix) -> Object[]`.
