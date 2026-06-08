@@ -691,9 +691,18 @@
   // commits a primitive sized to the drag span and selects it; `cancel` discards.
   // A drag that never reaches MIN_DRAG_EXTENT_PX is treated as a click: it drops a
   // default fixed-size shape at the start point (so a single click still creates).
-  function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snapped: boolean, targetId: string | null): void {
+  function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snappedIn: boolean, targetIdIn: string | null): void {
     const kind = createKind;
     if (!kind) return;
+    // W2-07/AP5 (#6): the snap query runs against the renderer's loaded regions,
+    // which include the TRANSIENT drag-create preview (it rides the same feed). The
+    // preview corner sits under the cursor, so an over-empty-canvas move self-snaps
+    // to the preview's own outline — a phantom snap whose target is no real object.
+    // Honor a snap ONLY when its target is a real canonical object (the preview /
+    // snap-indicator ids never are), so the ring + AP5 anchor fire on a real edge
+    // and never on the preview itself.
+    const targetId = targetIdIn !== null && scene.objects.some((o) => o.id === targetIdIn) ? targetIdIn : null;
+    const snapped = snappedIn && targetId !== null;
     if (phase === "start") {
       createDrag = { span: { start: world, end: world }, snapped, target: targetId };
       return;
