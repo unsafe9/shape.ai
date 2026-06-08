@@ -15,7 +15,7 @@ import {
   parseShortcut
 } from "../src/client/lib/shortcuts";
 import { ensureSceneCore, loadSceneCore, type ObjectCommand } from "../src/client/scene/sceneCoreWasm";
-import { insertCommandToPrimitive, primitiveForCommand, primitiveOrder, toolbarShapeKinds } from "../src/client/lib/toolbar";
+import { insertCommandToPrimitive, primitiveForCommand, primitiveOrder, toggleColorPopup, toolbarShapeKinds } from "../src/client/lib/toolbar";
 
 let catalog: ObjectCommand[];
 
@@ -195,28 +195,50 @@ describe("toolbar shape buttons (TB1 / D7)", () => {
   });
 });
 
-describe("toolbar selected-color UI (TB1 / D1,#5)", () => {
+describe("toggleColorPopup (TB1 / #3 — single toggle button)", () => {
+  it("opens a closed popup and closes an open one (open->close on re-click)", () => {
+    expect(toggleColorPopup(false)).toBe(true); // closed -> open
+    expect(toggleColorPopup(true)).toBe(false); // open  -> closed (re-click closes)
+  });
+});
+
+describe("toolbar color-popup UI (TB1 / #3)", () => {
   // The node test env has no DOM, so we assert the component's prop/callback
-  // contract and color-picker wiring against the .svelte source. Falsifiable:
-  // removing the always-visible Color group, the native <input type="color">,
-  // the selectedColor prop, or the onSelectColor pick wiring fails the test.
+  // contract and the popup wiring against the .svelte source. Falsifiable: dropping
+  // the single toggle button, the popup-gated swatches, the native <input
+  // type="color">, the selectedColor prop, or the onSelectColor wiring fails this.
   const source = readFileSync(
     fileURLToPath(new URL("../src/client/svelte/Toolbar.svelte", import.meta.url)),
     "utf8"
   );
 
-  it("declares the selectedColor prop and onSelectColor callback", () => {
+  it("declares the selectedColor prop and onSelectColor callback (preserved contract)", () => {
     expect(source).toMatch(/selectedColor:\s*string;/);
     expect(source).toMatch(/onSelectColor:\s*\(color:\s*string\)\s*=>\s*void;/);
   });
 
-  it("renders an always-visible Color group (not gated on draw/erase) with a native picker", () => {
-    expect(source).toMatch(/aria-label="Color"/);
+  it("renders a single color-trigger button (rainbow swatch) that toggles the popup", () => {
+    expect(source).toMatch(/class="icon-button color-trigger/);
+    expect(source).toMatch(/onclick=\{toggleColorPopupOpen\}/);
+    expect(source).toMatch(/aria-expanded=\{colorPopupOpen\}/);
+    // The popup (and therefore the swatches + picker) is gated behind the open
+    // state — it is NOT an always-visible row.
+    expect(source).toMatch(/\{#if colorPopupOpen\}/);
+  });
+
+  it("the popup exposes BOTH the fixed PEN_PALETTE swatches AND the native picker", () => {
+    expect(source).toMatch(/class="color-popup"/);
+    expect(source).toMatch(/\{#each penPalette as color/);
     expect(source).toMatch(/type="color"/);
   });
 
-  it("wires a palette pick and the native picker to onSelectColor", () => {
+  it("selecting either a swatch or the picker updates selectedColor via onSelectColor", () => {
     expect(source).toMatch(/onclick=\{\(\)\s*=>\s*onSelectColor\(color\)\}/);
     expect(source).toMatch(/oninput=\{\(event\)\s*=>\s*onSelectColor\(/);
+  });
+
+  it("closes on outside-click and Escape while open", () => {
+    expect(source).toMatch(/colorPopupOpen\s*=\s*false/);
+    expect(source).toMatch(/event\.key\s*===\s*"Escape"/);
   });
 });

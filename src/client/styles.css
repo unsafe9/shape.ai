@@ -2,7 +2,20 @@
   color-scheme: light;
   --bg: #eef2f5;
   --canvas: #f7f9fb;
-  --surface: rgb(255 255 255 / 0.82);
+  /* AP4 (#12c): the themeable SURFACE base RGB triplet. Every translucent
+   * chrome/popup/panel surface is `rgb(var(--surface-rgb) / a)`, so flipping this
+   * one triplet in the dark block inverts every floating surface at once (no
+   * per-rule dark override). Light = white; dark = near-black. */
+  --surface-rgb: 255 255 255;
+  /* The light TINT triplets the panels layer over the surface (faint blue/teal
+   * washes). Re-pointed to the surface base in dark mode so they don't reintroduce
+   * a bright wash on a dark panel. */
+  --surface-tint-rgb: 236 245 255;
+  /* The solid color tag chips / mixes blend toward (white in light, near-black in
+   * dark) and the ink they read against. Themed so a tinted chip stays legible. */
+  --surface-mix: #ffffff;
+  --tag-ink: #1d252c;
+  --surface: rgb(var(--surface-rgb) / 0.82);
   --surface-solid: #ffffff;
   --surface-2: rgb(247 249 251 / 0.92);
   --surface-3: rgb(252 253 254 / 0.94);
@@ -29,6 +42,13 @@
   color-scheme: dark;
   --bg: #161618;
   --canvas: #1e1e20;
+  /* Flip the surface base to near-black: every `rgb(var(--surface-rgb) / a)`
+   * chrome/popup/panel surface inverts in one move, and the faint tint washes
+   * collapse onto the same dark base instead of staying bright. */
+  --surface-rgb: 28 28 30;
+  --surface-tint-rgb: 44 44 46;
+  --surface-mix: #1e1e20;
+  --tag-ink: #e7e9ee;
   --surface: rgb(44 44 46 / 0.82);
   --surface-solid: #2c2c2e;
   --surface-2: rgb(58 58 60 / 0.92);
@@ -40,6 +60,32 @@
   --shadow-low: 0 1px 2px rgb(0 0 0 / 0.4), 0 10px 28px rgb(0 0 0 / 0.4);
   --shadow-float: 0 18px 50px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.4);
   --shadow-deep: 0 28px 70px rgb(0 0 0 / 0.6), 0 8px 18px rgb(0 0 0 / 0.5);
+}
+
+/* AP4 (#12c): the few surfaces that layer a literal LIGHT triplet (faint blue /
+ * teal washes, near-white gradients) rather than `--surface-rgb` — flip them as a
+ * group in dark mode so no bright panel survives the toggle. Each mirrors its
+ * light rule but swaps the light triplet for the dark surface base / tint. */
+:root[data-theme="dark"] body {
+  background:
+    radial-gradient(circle at 20% 12%, rgb(var(--surface-rgb) / 0.5), transparent 32rem),
+    linear-gradient(135deg, #161618 0%, #1c1c1e 48%, #131315 100%);
+}
+
+:root[data-theme="dark"] .studio-stage::before {
+  background:
+    linear-gradient(180deg, rgb(var(--surface-rgb) / 0.62), rgb(var(--surface-rgb) / 0.24)),
+    var(--canvas);
+}
+
+:root[data-theme="dark"] .flow-wrap {
+  background:
+    radial-gradient(circle at 50% 34%, rgb(var(--surface-rgb) / 0.5), transparent 38rem),
+    linear-gradient(180deg, rgb(var(--surface-rgb) / 0.6), rgb(var(--surface-rgb) / 0.3));
+}
+
+:root[data-theme="dark"] .icon-button.is-active {
+  background: rgb(47 126 230 / 0.26);
 }
 
 * {
@@ -56,7 +102,7 @@ body,
 
 body {
   background:
-    radial-gradient(circle at 20% 12%, rgb(255 255 255 / 0.86), transparent 32rem),
+    radial-gradient(circle at 20% 12%, rgb(var(--surface-rgb) / 0.86), transparent 32rem),
     linear-gradient(135deg, #edf2f5 0%, #f8fafb 48%, #e6edf2 100%);
   color: var(--text);
   font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -81,7 +127,7 @@ button:disabled {
 button:focus-visible {
   outline: none;
   border-color: rgb(47 126 230 / 0.42);
-  box-shadow: 0 0 0 4px rgb(47 126 230 / 0.13), inset 0 1px 0 rgb(255 255 255 / 0.8);
+  box-shadow: 0 0 0 4px rgb(47 126 230 / 0.13), inset 0 1px 0 rgb(var(--surface-rgb) / 0.8);
 }
 
 h1,
@@ -109,12 +155,12 @@ p {
   position: absolute;
   inset: 12px;
   content: "";
-  border: 1px solid rgb(255 255 255 / 0.92);
+  border: 1px solid rgb(var(--surface-rgb) / 0.92);
   border-radius: 22px;
   background:
-    linear-gradient(180deg, rgb(255 255 255 / 0.62), rgb(246 249 251 / 0.24)),
+    linear-gradient(180deg, rgb(var(--surface-rgb) / 0.62), rgb(246 249 251 / 0.24)),
     var(--canvas);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.95), var(--shadow-low);
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.95), var(--shadow-low);
 }
 
 .floating-groups,
@@ -129,7 +175,7 @@ p {
 .export-drawer,
 .canvas-status,
 .canvas-toast {
-  border: 1px solid rgb(255 255 255 / 0.72);
+  border: 1px solid rgb(var(--surface-rgb) / 0.72);
   background: var(--surface);
   box-shadow: var(--shadow-float);
   backdrop-filter: var(--glass-blur);
@@ -148,9 +194,9 @@ p {
   gap: 7px;
   border: 1px solid var(--line);
   border-radius: 11px;
-  background: rgb(255 255 255 / 0.78);
+  background: rgb(var(--surface-rgb) / 0.78);
   color: var(--text);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(25 36 48 / 0.04);
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.8), 0 1px 2px rgb(25 36 48 / 0.04);
   transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
 }
 
@@ -161,7 +207,7 @@ p {
 .node-edit-toolbar button:hover,
 .node-inline-actions button:hover {
   border-color: rgb(47 126 230 / 0.28);
-  background: rgb(255 255 255 / 0.92);
+  background: rgb(var(--surface-rgb) / 0.92);
   transform: translateY(-1px);
 }
 
@@ -170,7 +216,7 @@ p {
   background: linear-gradient(180deg, #1fc8b6, #109484);
   color: white;
   font-weight: 750;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.32), 0 12px 24px rgb(17 148 132 / 0.22);
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.32), 0 12px 24px rgb(17 148 132 / 0.22);
 }
 
 .secondary-button {
@@ -187,7 +233,7 @@ p {
 .icon-button.is-active {
   color: var(--accent-2);
   border-color: rgb(47 126 230 / 0.3);
-  background: rgb(236 245 255 / 0.86);
+  background: rgb(var(--surface-tint-rgb) / 0.86);
 }
 
 .canvas-panel {
@@ -205,7 +251,7 @@ p {
   min-height: 100%;
   overflow: clip;
   background:
-    radial-gradient(circle at 50% 34%, rgb(255 255 255 / 0.92), transparent 38rem),
+    radial-gradient(circle at 50% 34%, rgb(var(--surface-rgb) / 0.92), transparent 38rem),
     linear-gradient(180deg, rgb(249 251 252 / 0.94), rgb(237 243 247 / 0.76));
 }
 
@@ -321,7 +367,7 @@ p {
   padding: 0;
   border: none;
   outline: 1px solid var(--accent, #2f7ee6);
-  background: rgb(255 255 255 / 0.92);
+  background: rgb(var(--surface-rgb) / 0.92);
   color: #1f2933;
   font: inherit;
   line-height: 1.3;
@@ -338,9 +384,9 @@ p {
   z-index: 6;
   max-width: min(640px, calc(100vw - 420px));
   padding: 8px 12px;
-  border: 1px solid rgb(255 255 255 / 0.72);
+  border: 1px solid rgb(var(--surface-rgb) / 0.72);
   border-radius: 14px;
-  background: rgb(255 255 255 / 0.7);
+  background: rgb(var(--surface-rgb) / 0.7);
   color: var(--muted);
   font-size: 12px;
   font-weight: 750;
@@ -360,9 +406,9 @@ p {
   overflow: auto;
   display: grid;
   gap: 12px;
-  border: 1px solid rgb(255 255 255 / 0.72);
+  border: 1px solid rgb(var(--surface-rgb) / 0.72);
   border-radius: 18px;
-  background: rgb(255 255 255 / 0.86);
+  background: rgb(var(--surface-rgb) / 0.86);
   padding: 12px;
   box-shadow: var(--shadow-float);
   backdrop-filter: var(--glass-blur);
@@ -379,7 +425,7 @@ p {
   margin: -12px -12px 0;
   padding: 12px;
   border-bottom: 1px solid var(--line);
-  background: rgb(255 255 255 / 0.9);
+  background: rgb(var(--surface-rgb) / 0.9);
 }
 
 .renderer-diagnostics-head > div {
@@ -422,7 +468,7 @@ p {
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgb(250 252 253 / 0.74);
+  background: rgb(var(--surface-tint-rgb) / 0.74);
 }
 
 .renderer-diagnostics-row {
@@ -464,9 +510,9 @@ p {
   grid-template-columns: repeat(5, 36px);
   gap: 7px;
   padding: 8px;
-  border: 1px solid rgb(255 255 255 / 0.72);
+  border: 1px solid rgb(var(--surface-rgb) / 0.72);
   border-radius: 18px;
-  background: rgb(255 255 255 / 0.72);
+  background: rgb(var(--surface-rgb) / 0.72);
   box-shadow: var(--shadow-float);
   backdrop-filter: var(--glass-blur);
 }
@@ -571,9 +617,9 @@ p {
   width: 218px;
   overflow: hidden;
   padding: 7px;
-  border: 1px solid rgb(255 255 255 / 0.74);
+  border: 1px solid rgb(var(--surface-rgb) / 0.74);
   border-radius: 15px;
-  background: rgb(255 255 255 / 0.86);
+  background: rgb(var(--surface-rgb) / 0.86);
   box-shadow: var(--shadow-deep);
   backdrop-filter: var(--glass-blur);
   transform: translate(4px, 4px);
@@ -587,9 +633,9 @@ p {
   width: 286px;
   overflow: hidden;
   padding: 8px;
-  border: 1px solid rgb(255 255 255 / 0.74);
+  border: 1px solid rgb(var(--surface-rgb) / 0.74);
   border-radius: 16px;
-  background: rgb(255 255 255 / 0.88);
+  background: rgb(var(--surface-rgb) / 0.88);
   box-shadow: var(--shadow-deep);
   backdrop-filter: var(--glass-blur);
 }
@@ -628,7 +674,7 @@ p {
 
 .template-picker-item:hover:not(:disabled),
 .template-picker-item:focus-visible {
-  background: rgb(235 243 251 / 0.92);
+  background: rgb(var(--surface-tint-rgb) / 0.92);
   box-shadow: none;
 }
 
@@ -679,7 +725,7 @@ p {
 
 .node-context-menu button:hover:not(:disabled),
 .node-context-menu button:focus-visible {
-  background: rgb(235 243 251 / 0.92);
+  background: rgb(var(--surface-tint-rgb) / 0.92);
   box-shadow: none;
 }
 
@@ -752,7 +798,7 @@ p {
   border: 1px solid var(--line);
   border-radius: 13px;
   padding: 10px 11px;
-  background: rgb(255 255 255 / 0.72);
+  background: rgb(var(--surface-rgb) / 0.72);
   color: var(--text);
   outline: none;
   box-shadow: inset 0 1px 1px rgb(25 36 48 / 0.04);
@@ -778,7 +824,7 @@ p {
   min-width: 0;
   border: 1px solid var(--line);
   border-radius: 11px;
-  background: rgb(255 255 255 / 0.72);
+  background: rgb(var(--surface-rgb) / 0.72);
   padding: 7px 10px;
   outline: none;
 }
@@ -795,17 +841,17 @@ p {
   min-height: 28px;
   border: 1px solid color-mix(in srgb, var(--tag-color) 35%, transparent);
   border-radius: 999px;
-  background: color-mix(in srgb, var(--tag-color) 10%, white);
-  color: color-mix(in srgb, var(--tag-color) 62%, #1d252c);
+  background: color-mix(in srgb, var(--tag-color) 10%, var(--surface-mix));
+  color: color-mix(in srgb, var(--tag-color) 62%, var(--tag-ink));
   padding: 5px 10px;
   font-size: 12px;
   font-weight: 850;
 }
 
 .tag-chip.is-active {
-  border-color: color-mix(in srgb, var(--tag-color) 62%, #1d252c);
-  background: color-mix(in srgb, var(--tag-color) 22%, white);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.76), 0 8px 18px color-mix(in srgb, var(--tag-color) 18%, transparent);
+  border-color: color-mix(in srgb, var(--tag-color) 62%, var(--tag-ink));
+  background: color-mix(in srgb, var(--tag-color) 22%, var(--surface-mix));
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.76), 0 8px 18px color-mix(in srgb, var(--tag-color) 18%, transparent);
 }
 
 .selected-group-tags > strong {
@@ -819,9 +865,9 @@ p {
 }
 
 .selected-group-tags .tag-chip.is-attached {
-  border-color: color-mix(in srgb, var(--tag-color) 68%, #1d252c);
-  background: color-mix(in srgb, var(--tag-color) 24%, white);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.82), 0 9px 18px color-mix(in srgb, var(--tag-color) 18%, transparent);
+  border-color: color-mix(in srgb, var(--tag-color) 68%, var(--tag-ink));
+  background: color-mix(in srgb, var(--tag-color) 24%, var(--surface-mix));
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.82), 0 9px 18px color-mix(in srgb, var(--tag-color) 18%, transparent);
 }
 
 .group-list {
@@ -840,20 +886,20 @@ p {
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: 13px;
-  background: rgb(255 255 255 / 0.58);
+  background: rgb(var(--surface-rgb) / 0.58);
   color: var(--text);
   text-align: left;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.72);
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.72);
 }
 
 .group-row:hover,
 .group-row.is-active {
   border-color: rgb(21 167 150 / 0.36);
-  background: linear-gradient(135deg, rgb(219 247 243 / 0.86), rgb(255 255 255 / 0.78));
+  background: linear-gradient(135deg, rgb(var(--surface-tint-rgb) / 0.86), rgb(var(--surface-rgb) / 0.78));
 }
 
 .group-row.is-active {
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 12px 24px rgb(21 167 150 / 0.12);
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.8), 0 12px 24px rgb(21 167 150 / 0.12);
 }
 
 .group-row strong,
@@ -917,11 +963,11 @@ p {
   border: 1px solid rgb(var(--node-accent) / 0.16);
   border-radius: 16px;
   background:
-    linear-gradient(180deg, rgb(255 255 255 / 0.96), rgb(var(--node-pastel) / 0.66)),
+    linear-gradient(180deg, rgb(var(--surface-rgb) / 0.96), rgb(var(--node-pastel) / 0.66)),
     var(--surface-solid);
   color: var(--text);
   box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 0.88),
+    inset 0 1px 0 rgb(var(--surface-rgb) / 0.88),
     0 18px 36px rgb(25 36 48 / 0.1),
     0 2px 7px rgb(25 36 48 / 0.06);
   transition: width 180ms ease, height 180ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
@@ -944,18 +990,18 @@ p {
   transform: translateY(-3px);
   border-color: rgb(var(--node-accent) / 0.52);
   background:
-    linear-gradient(180deg, rgb(255 255 255 / 0.98), rgb(var(--node-pastel) / 0.78)),
+    linear-gradient(180deg, rgb(var(--surface-rgb) / 0.98), rgb(var(--node-pastel) / 0.78)),
     var(--surface-solid);
   box-shadow:
     0 0 0 4px rgb(var(--node-accent) / 0.12),
     0 30px 64px rgb(var(--node-accent) / 0.14),
     0 10px 24px rgb(25 36 48 / 0.1),
-    inset 0 1px 0 rgb(255 255 255 / 0.9);
+    inset 0 1px 0 rgb(var(--surface-rgb) / 0.9);
 }
 
 .node-inspector-card.is-editing {
   background:
-    linear-gradient(180deg, rgb(255 255 255 / 0.98), rgb(248 251 254 / 0.98)),
+    linear-gradient(180deg, rgb(var(--surface-rgb) / 0.98), rgb(248 251 254 / 0.98)),
     var(--surface-solid);
 }
 
@@ -1164,7 +1210,7 @@ p {
   min-width: 0;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgb(255 255 255 / 0.78);
+  background: rgb(var(--surface-rgb) / 0.78);
   color: var(--text);
   outline: none;
   box-shadow: inset 0 1px 1px rgb(25 36 48 / 0.04);
@@ -1189,7 +1235,7 @@ p {
 .node-title-input:focus,
 .node-summary-input:focus {
   border-color: rgb(47 126 230 / 0.42);
-  background: rgb(255 255 255 / 0.94);
+  background: rgb(var(--surface-rgb) / 0.94);
   box-shadow: 0 0 0 3px rgb(47 126 230 / 0.12), inset 0 1px 1px rgb(25 36 48 / 0.04);
 }
 
@@ -1212,7 +1258,7 @@ p {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgb(255 255 255 / 0.74);
+  background: rgb(var(--surface-rgb) / 0.74);
   color: var(--text);
   font-size: 12px;
   line-height: 1.32;
@@ -1236,7 +1282,7 @@ p {
 .node-detail-field textarea:focus,
 .node-comments textarea:focus {
   border-color: rgb(47 126 230 / 0.42);
-  background: rgb(255 255 255 / 0.94);
+  background: rgb(var(--surface-rgb) / 0.94);
   box-shadow: 0 0 0 3px rgb(47 126 230 / 0.12), inset 0 1px 1px rgb(25 36 48 / 0.04);
 }
 
@@ -1264,7 +1310,7 @@ p {
   padding: 9px;
   border: 1px solid rgb(47 126 230 / 0.13);
   border-radius: 13px;
-  background: linear-gradient(180deg, rgb(244 249 255 / 0.82), rgb(255 255 255 / 0.58));
+  background: linear-gradient(180deg, rgb(var(--surface-tint-rgb) / 0.82), rgb(var(--surface-rgb) / 0.58));
 }
 
 .node-comments-title {
@@ -1294,17 +1340,17 @@ p {
   padding: 7px 8px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgb(255 255 255 / 0.62);
+  background: rgb(var(--surface-rgb) / 0.62);
   color: var(--text);
   font-size: 12px;
   line-height: 1.28;
   text-align: left;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.68);
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.68);
 }
 
 .node-comment-row:hover {
   border-color: rgb(47 126 230 / 0.24);
-  background: rgb(255 255 255 / 0.86);
+  background: rgb(var(--surface-rgb) / 0.86);
 }
 
 .node-comment-row span,
@@ -1388,11 +1434,11 @@ p {
   padding: 6px 9px;
   border: 1px solid var(--line);
   border-radius: 11px;
-  background: rgb(255 255 255 / 0.64);
+  background: rgb(var(--surface-rgb) / 0.64);
   color: var(--text);
   text-decoration: none;
   white-space: nowrap;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.76);
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.76);
 }
 
 .export-preview {
@@ -1458,13 +1504,13 @@ p {
   overflow: auto;
   border: 1px solid rgb(56 70 84 / 0.1);
   border-radius: 12px;
-  background: rgb(250 252 253 / 0.82);
+  background: rgb(var(--surface-tint-rgb) / 0.82);
   color: #24313c;
   padding: 12px;
   font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.82);
+  box-shadow: inset 0 1px 0 rgb(var(--surface-rgb) / 0.82);
 }
 
 .canvas-status {
@@ -1691,9 +1737,9 @@ p {
   align-items: stretch;
   gap: 6px;
   padding: 8px 10px;
-  border: 1px solid rgb(255 255 255 / 0.72);
+  border: 1px solid rgb(var(--surface-rgb) / 0.72);
   border-radius: 18px;
-  background: rgb(255 255 255 / 0.78);
+  background: rgb(var(--surface-rgb) / 0.78);
   box-shadow: var(--shadow-float);
   backdrop-filter: var(--glass-blur);
 }
@@ -1737,9 +1783,9 @@ p {
   align-items: stretch;
   gap: 6px;
   padding: 8px 10px;
-  border: 1px solid rgb(255 255 255 / 0.72);
+  border: 1px solid rgb(var(--surface-rgb) / 0.72);
   border-radius: 18px;
-  background: rgb(255 255 255 / 0.78);
+  background: rgb(var(--surface-rgb) / 0.78);
   box-shadow: var(--shadow-float);
   backdrop-filter: var(--glass-blur);
 }
@@ -1779,6 +1825,100 @@ p {
   cursor: pointer;
 }
 
+/* TB1 (#3): the single color-trigger button — a rainbow conic-gradient ring with
+   the current selected color as the inner dot. Clicking it toggles the popup. */
+.icon-button.color-trigger {
+  position: relative;
+}
+
+.color-trigger-rainbow {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    #ff0000,
+    #ff8a00,
+    #ffe600,
+    #00d26a,
+    #00b3ff,
+    #4b6bff,
+    #b14bff,
+    #ff00aa,
+    #ff0000
+  );
+  box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.18);
+}
+
+.color-trigger-current {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--surface-solid);
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.22);
+}
+
+/* TB1 (#3): the color popup — fixed PEN_PALETTE swatches + a native picker, opened
+   above the toolbar Color group. */
+.color-popup {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 10px;
+  z-index: 14;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface-solid);
+  box-shadow: var(--shadow-float);
+}
+
+.color-popup-swatches {
+  display: grid;
+  grid-template-columns: repeat(4, auto);
+  gap: 6px;
+}
+
+.color-popup-picker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  cursor: pointer;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.color-popup-picker .swatch-fill {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid rgb(0 0 0 / 0.18);
+}
+
+.color-popup-picker input[type="color"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  opacity: 0;
+  cursor: pointer;
+}
+
 /* ---------------------------------------------------------------------------
  * CC3.3 TemplateLibrary — popover above the toolbar remote
  * --------------------------------------------------------------------------- */
@@ -1794,9 +1934,9 @@ p {
   flex-direction: column;
   transform: translateX(-50%);
   padding: 12px;
-  border: 1px solid rgb(255 255 255 / 0.74);
+  border: 1px solid rgb(var(--surface-rgb) / 0.74);
   border-radius: 16px;
-  background: rgb(255 255 255 / 0.92);
+  background: rgb(var(--surface-rgb) / 0.92);
   box-shadow: var(--shadow-deep);
   backdrop-filter: var(--glass-blur);
 }
@@ -1846,14 +1986,14 @@ p {
   text-align: left;
   border: 1px solid var(--line);
   border-radius: 11px;
-  background: rgb(255 255 255 / 0.7);
+  background: rgb(var(--surface-rgb) / 0.7);
   transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
 }
 
 .template-library-apply:hover:not(:disabled),
 .template-library-apply:focus-visible {
   border-color: rgb(47 126 230 / 0.28);
-  background: rgb(255 255 255 / 0.95);
+  background: rgb(var(--surface-rgb) / 0.95);
   transform: translateY(-1px);
 }
 
@@ -1889,7 +2029,7 @@ p {
   padding: 6px 10px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgb(255 255 255 / 0.86);
+  background: rgb(var(--surface-rgb) / 0.86);
   font-size: 13px;
 }
 
@@ -1904,9 +2044,9 @@ p {
   flex-direction: column;
   gap: 3px;
   padding: 10px 12px;
-  border: 1px solid rgb(255 255 255 / 0.74);
+  border: 1px solid rgb(var(--surface-rgb) / 0.74);
   border-radius: 14px;
-  background: rgb(255 255 255 / 0.92);
+  background: rgb(var(--surface-rgb) / 0.92);
   box-shadow: var(--shadow-deep);
   backdrop-filter: var(--glass-blur);
   color: var(--text);
@@ -1935,9 +2075,9 @@ p {
   display: flex;
   flex-direction: column;
   padding: 18px;
-  border: 1px solid rgb(255 255 255 / 0.74);
+  border: 1px solid rgb(var(--surface-rgb) / 0.74);
   border-radius: 18px;
-  background: rgb(255 255 255 / 0.96);
+  background: rgb(var(--surface-rgb) / 0.96);
   box-shadow: var(--shadow-deep);
 }
 
@@ -2002,7 +2142,7 @@ p {
   padding: 2px 7px;
   border: 1px solid var(--line);
   border-radius: 7px;
-  background: rgb(244 247 250 / 0.9);
+  background: rgb(var(--surface-tint-rgb) / 0.9);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
 }

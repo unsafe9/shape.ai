@@ -45,7 +45,7 @@
     type DragSpan
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
-  import { cascadeTransformOps } from "../lib/transformCascade";
+  import { cascadeTransformOps, cascadeMultiTransformOps } from "../lib/transformCascade";
   import { anchorFollowOps, synthesizeCreateAnchors } from "../lib/anchorCreate";
   import { doubleClickAction, ungroupEnabled, popOutOp } from "../lib/grouping";
   import Toolbar from "./Toolbar.svelte";
@@ -240,10 +240,19 @@
       rendererHealth = health;
       if (health.state === "ready" && isDiagnosticsOnlyStatus(status)) status = "Ready";
     },
-    // W2-03: shift/meta-click toggles the object in/out of the multi-select set;
-    // a plain click replaces the selection with that object.
+    // W2-03/AP2 (#10): shift/meta-click toggles the object in/out of the multi set.
+    // A plain click on an object ALREADY in the current Multi keeps the whole Multi
+    // (so the pointer-down that begins a group-drag never collapses it to a single
+    // object — the drag then moves every member together, see onTransformCommit).
+    // A plain click on anything else replaces the selection with that object.
     onSelectObject: (id, additive) =>
-      selectObject(additive ? toggleObjectSelection(selection, id) : { kind: "object", id }),
+      selectObject(
+        additive
+          ? toggleObjectSelection(selection, id)
+          : selection.kind === "multi" && selection.ids.includes(id)
+            ? selection
+            : { kind: "object", id }
+      ),
     onTransformPreview: (id, _matrix, _kind) => {
       // W2-11: the matrix is already on the GPU instance buffer (pushed by the engine
       // per move). This handler only invalidates a stale pendingCommit so a new drag
@@ -258,8 +267,14 @@
       if (!src) return void host?.clearObjectPreview(id);
       // AP2 (#15): a parent drag cascades the world-space delta to its descendants
       // (children transforms are world-absolute, D3), so a frame moves with its
-      // contents. The dragged object is the first op; the rest are descendants.
-      const ops = cascadeTransformOps(scene.objects, id, matrix);
+      // contents. AP2 (#10): when a Multi selection is dragged, the renderer anchors
+      // the gesture on the one picked `id` but the delta applies to EVERY member (and
+      // each member's subtree) — so the whole set moves together. A single selection
+      // (or a drag of a non-member) cascades only the dragged object's subtree.
+      const ops =
+        selection.kind === "multi" && selection.ids.includes(id)
+          ? cascadeMultiTransformOps(scene.objects, selection.ids, matrix)
+          : cascadeTransformOps(scene.objects, id, matrix);
       // AP5 (#14): every object anchored to a moved object reprojects its bound
       // node through that object's NEW transform, so anchored endpoints move WITH
       // the target. No anchors onto anything moved => no extra ops (the no-op case).
@@ -271,7 +286,11 @@
       // previewed position until commitClientScene sees the committed transform land
       // (no snap-back). If the commit op fails, revert the GPU preview to canonical.
       const wasConnected = sceneClientReady && sceneClient !== null;
-      const rootTransform = ops[0].kind === "set-transform" ? ops[0].transform : src.transform;
+      // The GPU previewed only the dragged `id`; pendingCommit (snap-back guard) is
+      // keyed on it, so read ITS composed transform from the cascade — not ops[0],
+      // which under a multi cascade may be another member.
+      const draggedOp = ops.find((o) => o.kind === "set-transform" && o.id === id);
+      const rootTransform = draggedOp?.kind === "set-transform" ? draggedOp.transform : src.transform;
       if (wasConnected && rootTransform) pendingCommit = { id, transform: rootTransform };
       authorOp(op, true, (ok) => {
         if (!ok) {
@@ -672,9 +691,18 @@
   // commits a primitive sized to the drag span and selects it; `cancel` discards.
   // A drag that never reaches MIN_DRAG_EXTENT_PX is treated as a click: it drops a
   // default fixed-size shape at the start point (so a single click still creates).
-  function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snapped: boolean, targetId: string | null): void {
+  function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snappedIn: boolean, targetIdIn: string | null): void {
     const kind = createKind;
     if (!kind) return;
+    // W2-07/AP5 (#6): the snap query runs against the renderer's loaded regions,
+    // which include the TRANSIENT drag-create preview (it rides the same feed). The
+    // preview corner sits under the cursor, so an over-empty-canvas move self-snaps
+    // to the preview's own outline — a phantom snap whose target is no real object.
+    // Honor a snap ONLY when its target is a real canonical object (the preview /
+    // snap-indicator ids never are), so the ring + AP5 anchor fire on a real edge
+    // and never on the preview itself.
+    const targetId = targetIdIn !== null && scene.objects.some((o) => o.id === targetIdIn) ? targetIdIn : null;
+    const snapped = snappedIn && targetId !== null;
     if (phase === "start") {
       createDrag = { span: { start: world, end: world }, snapped, target: targetId };
       return;

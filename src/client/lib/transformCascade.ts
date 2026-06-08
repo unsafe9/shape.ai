@@ -51,3 +51,25 @@ export function cascadeTransformOps(objects: SceneObject[], id: string, delta: T
   }
   return ops;
 }
+
+/**
+ * AP2 (#10): a Multi selection drags as one unit. The renderer anchors the gesture
+ * on a single picked id, but the same world-space `delta` applies to EVERY selected
+ * member (and each member's subtree, via {@link cascadeTransformOps}). Unions the
+ * per-member cascades, deduping by id so an object that is both a selected member
+ * and a descendant of another member is transformed once. Order is member-input
+ * order, parent-before-child within each subtree. Returns `[]` when no id is live.
+ */
+export function cascadeMultiTransformOps(objects: SceneObject[], ids: string[], delta: Transform3x3): ObjectOp[] {
+  const ops: ObjectOp[] = [];
+  const seen = new Set<string>();
+  for (const id of ids) {
+    for (const op of cascadeTransformOps(objects, id, delta)) {
+      const opId = op.kind === "set-transform" ? op.id : "";
+      if (seen.has(opId)) continue;
+      seen.add(opId);
+      ops.push(op);
+    }
+  }
+  return ops;
+}
