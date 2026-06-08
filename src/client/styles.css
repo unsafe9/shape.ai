@@ -98,14 +98,16 @@ p {
 
 .floating-groups,
 .export-drawer,
-.canvas-status {
+.canvas-status,
+.canvas-toast {
   position: absolute;
   z-index: 10;
 }
 
 .floating-groups,
 .export-drawer,
-.canvas-status {
+.canvas-status,
+.canvas-toast {
   border: 1px solid rgb(255 255 255 / 0.72);
   background: var(--surface);
   box-shadow: var(--shadow-float);
@@ -1452,6 +1454,45 @@ p {
   transform: translateX(-50%);
 }
 
+/* AP6 (#19): transient action toast. Sits just above the persistent status row,
+ * shares its glass chrome, and fades in then out across its ~2.5s lifetime; the
+ * shell's toastChannel removes the node when the timer fires. */
+.canvas-toast {
+  left: 50%;
+  bottom: 148px;
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  max-width: min(520px, calc(100vw - 96px));
+  padding: 8px 12px;
+  border-radius: 14px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  transform: translateX(-50%);
+  animation: toast-fade 2500ms ease forwards;
+}
+
+@keyframes toast-fade {
+  0% {
+    opacity: 0;
+    transform: translateX(-50%) translateY(6px);
+  }
+  6% {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+  82% {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-4px);
+  }
+}
+
 .empty-canvas {
   min-height: 100%;
   display: grid;
@@ -1484,6 +1525,15 @@ p {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+  }
+
+  /* AP6: the collapsed animation would land the toast on its faded-out end frame
+   * (invisible). Drop the fade entirely so it shows steadily; the shell's timer
+   * still dismisses it after ~2.5s. */
+  .canvas-toast {
+    animation: none !important;
+    opacity: 1;
+    transform: translateX(-50%);
   }
 }
 
@@ -1588,6 +1638,11 @@ p {
 
   .canvas-status {
     bottom: 132px;
+    max-width: calc(100vw - 36px);
+  }
+
+  .canvas-toast {
+    bottom: 176px;
     max-width: calc(100vw - 36px);
   }
 }

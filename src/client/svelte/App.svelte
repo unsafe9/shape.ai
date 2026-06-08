@@ -35,6 +35,7 @@
     type UndoStack
   } from "../scene/sceneCoreWasm";
   import { createShortcutDispatcher } from "../lib/shortcuts";
+  import { ToastChannel } from "../lib/statusChannel";
   import {
     buildPrimitiveObject,
     buildPrimitiveObjectFromDrag,
@@ -111,6 +112,22 @@
   // ----- ephemeral camera / chrome -----
   let camera = $state<CameraState>({ x: 140, y: 120, zoom: 0.6 });
   let status = $state("Ready");
+  // AP6 (#19): the transient toast channel. Persistent hints stay in `status`
+  // (no timer); transient ACTION notices ("Inserted rectangle", "Comment added",
+  // "Export ready") flow through `showToast`, render below `.canvas-status`, and
+  // auto-dismiss after ~2.5s with a CSS fade. The pure ToastChannel owns the
+  // lifecycle; the real setTimeout/clearTimeout are injected here so scene-core
+  // stays time-free and the state machine is unit-testable.
+  let toast = $state<string | null>(null);
+  const toastChannel = new ToastChannel(
+    { set: (cb, ms) => setTimeout(cb, ms), clear: (h) => clearTimeout(h as ReturnType<typeof setTimeout>) },
+    (message) => (toast = message)
+  );
+  // A transient action notice (auto-dismisses). Persistent text keeps using
+  // `status = ...`; AP1 etc. should reuse THIS for one-shot confirmations.
+  function showToast(message: string): void {
+    toastChannel.show(message);
+  }
   let busy = $state(false);
   let diagnosticsOpen = $state(false);
   let settingsOpen = $state(false);
@@ -344,6 +361,8 @@
 
   onDestroy(() => {
     sceneClient?.close();
+    // AP6: cancel any in-flight toast timer so it can't fire after teardown.
+    toastChannel.dismiss();
   });
 
   // ----- connection -------------------------------------------------------
@@ -457,15 +476,15 @@
       return;
     }
     if (response.feature === "templateApplied") {
-      status = `Inserted ${response.object_ids.length} objects`;
+      showToast(`Inserted ${response.object_ids.length} objects`);
       return;
     }
     if (response.feature === "exportReady") {
-      status = `Export ready: ${response.artifact_ref}`;
+      showToast(`Export ready: ${response.artifact_ref}`);
       return;
     }
     if (response.feature === "commentUpserted") {
-      status = "Comment added";
+      showToast("Comment added");
     }
   }
 
@@ -584,7 +603,7 @@
     authorOp({ kind: "insert-object", object });
     selection = { kind: "object", id: object.id };
     persistSelection(selection);
-    status = `Inserted ${kind}`;
+    showToast(`Inserted ${kind}`);
     // W2-10: a freshly-created text object enters inline edit immediately.
     if (kind === "text") enterTextEdit(object.id);
   }
@@ -642,7 +661,7 @@
     selectObject({ kind: "object", id: object.id });
     createKind = null;
     setActiveTool("select");
-    status = `Inserted ${kind}`;
+    showToast(`Inserted ${kind}`);
   }
 
   // FC-11: drive the freehand pen. Accumulate world points across start/move; on
@@ -734,7 +753,7 @@
     }
     if (ops.length === 0) return;
     authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops });
-    status = "Duplicated selection";
+    showToast("Duplicated selection");
   }
 
   // Group: reparent the selected objects under a fresh frame object (D3). FC-14:
@@ -766,7 +785,7 @@
     authorOp({ kind: "batch", ops });
     selection = { kind: "object", id: frame.id };
     persistSelection(selection);
-    status = "Grouped selection";
+    showToast("Grouped selection");
   }
 
   // FC-14: ungroup reparents children out of the frame, then deletes the now-empty
@@ -781,7 +800,7 @@
     authorOp({ kind: "batch", ops });
     selection = { kind: "canvas" };
     persistSelection(selection);
-    status = "Ungrouped selection";
+    showToast("Ungrouped selection");
   }
 
   function nudgeSelection(dx: number, dy: number): void {
@@ -1557,6 +1576,14 @@
           {#if busy}<Loader2 class="spin" size={15} />{/if}
           {status}
         </div>
+      {/if}
+
+      <!-- AP6 (#19): transient action toast. Keyed by message so each new notice
+           remounts and replays the fade-in/out; auto-dismissed by toastChannel. -->
+      {#if toast}
+        {#key toast}
+          <div class="canvas-toast" role="status" aria-live="polite">{toast}</div>
+        {/key}
       {/if}
     </section>
   </main>
