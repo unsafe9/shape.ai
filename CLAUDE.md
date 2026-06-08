@@ -33,6 +33,12 @@ on the hot path).
 The pure cores stay pointer-width-agnostic: no 32-bit address assumptions, so a
 future 64-bit wasm (Memory64) port is a target-triple flip, not a rewrite.
 
+Shortcuts and gestures have a single source: a click/shortcut command lives in
+scene-core `commands.rs` (`object_command_catalog`); a hold-key gesture lives in
+scene-core `gestures.rs` (`object_gesture_catalog`). Both export JSON over
+`wasm_api`, and the settings modal renders them read-only — register a feature in
+its catalog once and it self-documents, with no second place to update.
+
 ## Operating Notes
 
 Applying operations has one source of truth — the Rust core — and the client runs
