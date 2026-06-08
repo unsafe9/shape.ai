@@ -11,6 +11,8 @@ import {
   buildPrimitiveObject,
   buildPrimitiveObjectFromDrag,
   buildSetStyleOp,
+  paintForColor,
+  THEME_DEFAULT_COLOR,
   type DragSpan
 } from "../src/client/lib/objectPrimitives";
 import type { Object as SceneObject } from "../src/shared/object";
@@ -85,6 +87,41 @@ describe("buildSetStyleOp recolor (AP1 recolor-selection path)", () => {
     if (op.kind !== "set-style") throw new Error("expected set-style");
     expect(op.fill).toEqual({ action: "set", value: { paint: { kind: "solid", color: COLOR }, opacity: 1 } });
     expect(op.stroke).toBeUndefined();
+  });
+});
+
+describe("paintForColor (S2 / #5 — theme-default token swatch)", () => {
+  it("maps the theme-default sentinel to a Paint::Token 'text' (NOT a solid hex)", () => {
+    expect(paintForColor(THEME_DEFAULT_COLOR)).toEqual({ kind: "token", name: "text" });
+  });
+
+  it("maps a real hex to a solid paint", () => {
+    expect(paintForColor("#ef4444")).toEqual({ kind: "solid", color: "#ef4444" });
+  });
+
+  it("paints a NEW shape authored with the sentinel as a token (fill AND stroke)", () => {
+    const object = buildPrimitiveObject("rectangle", { x: 0, y: 0 }, "rect-t", "a0", THEME_DEFAULT_COLOR);
+    expect(object.fill?.paint).toEqual({ kind: "token", name: "text" });
+    expect(object.stroke?.paint).toEqual({ kind: "token", name: "text" });
+  });
+
+  it("paints a drag-created shape authored with the sentinel as a token", () => {
+    const span: DragSpan = { start: { x: 0, y: 0 }, end: { x: 60, y: 40 } };
+    const object = buildPrimitiveObjectFromDrag("ellipse", span, "ell-t", "a0", THEME_DEFAULT_COLOR);
+    expect(object.fill?.paint).toEqual({ kind: "token", name: "text" });
+    expect(object.stroke?.paint).toEqual({ kind: "token", name: "text" });
+  });
+
+  it("recolors a selected object to the token via set-style when the sentinel is picked", () => {
+    const object = {
+      id: "o1",
+      order: "a0",
+      geometry: { d: "M 0 0 L 8 0" },
+      stroke: { paint: { kind: "solid", color: "#111111" }, width: 16 }
+    } as SceneObject;
+    const op = buildSetStyleOp(object, THEME_DEFAULT_COLOR);
+    if (op.kind !== "set-style") throw new Error("expected set-style");
+    expect(op.stroke).toEqual({ action: "set", value: { paint: { kind: "token", name: "text" }, width: 16 } });
   });
 });
 

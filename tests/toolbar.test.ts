@@ -15,7 +15,7 @@ import {
   parseShortcut
 } from "../src/client/lib/shortcuts";
 import { ensureSceneCore, loadSceneCore, type ObjectCommand } from "../src/client/scene/sceneCoreWasm";
-import { insertCommandToPrimitive, primitiveForCommand, primitiveOrder, toggleColorPopup, toolbarShapeKinds } from "../src/client/lib/toolbar";
+import { insertCommandToPrimitive, primitiveForCommand, primitiveOrder, toggleColorPopup, toggleStrokePopup, toolbarShapeKinds } from "../src/client/lib/toolbar";
 
 let catalog: ObjectCommand[];
 
@@ -199,6 +199,53 @@ describe("toggleColorPopup (TB1 / #3 — single toggle button)", () => {
   it("opens a closed popup and closes an open one (open->close on re-click)", () => {
     expect(toggleColorPopup(false)).toBe(true); // closed -> open
     expect(toggleColorPopup(true)).toBe(false); // open  -> closed (re-click closes)
+  });
+});
+
+describe("toggleStrokePopup (S1 / #4 — Stroke toggle button)", () => {
+  it("opens a closed popup and closes an open one (open->close on re-click)", () => {
+    expect(toggleStrokePopup(false)).toBe(true); // closed -> open
+    expect(toggleStrokePopup(true)).toBe(false); // open  -> closed (re-click closes)
+  });
+
+  it("is its own exported helper, independent of toggleColorPopup", () => {
+    expect(typeof toggleStrokePopup).toBe("function");
+    expect(toggleStrokePopup).not.toBe(toggleColorPopup);
+  });
+});
+
+describe("toolbar Stroke popup UI (S1 / #4)", () => {
+  // No DOM in the node test env: assert the wiring against the .svelte source.
+  // Falsifiable — re-adding the auto draw sub-toolbar, dropping the toggle button,
+  // or losing the size/color controls inside the popup all fail these.
+  const source = readFileSync(
+    fileURLToPath(new URL("../src/client/svelte/Toolbar.svelte", import.meta.url)),
+    "utf8"
+  );
+
+  it("drops the auto draw sub-toolbar (no activeTool === draw|erase gate)", () => {
+    expect(source).not.toMatch(/activeTool === "draw" \|\| activeTool === "erase"/);
+    expect(source).not.toMatch(/class="toolbar-draw"/);
+  });
+
+  it("renders a Stroke button that toggles its popup", () => {
+    expect(source).toMatch(/aria-label="Stroke"/);
+    expect(source).toMatch(/onclick=\{toggleStrokePopupOpen\}/);
+    expect(source).toMatch(/aria-expanded=\{strokePopupOpen\}/);
+    expect(source).toMatch(/\{#if strokePopupOpen\}/);
+  });
+
+  it("the Stroke popup holds the brush size buttons AND the brush color swatches", () => {
+    const popup = source.slice(source.indexOf('aria-label="Stroke settings"'));
+    expect(popup).toMatch(/\{#each penWidths as width/);
+    expect(popup).toMatch(/onclick=\{\(\)\s*=>\s*onSetPenWidth\(width\)\}/);
+    expect(popup).toMatch(/\{#each penPalette as color/);
+    expect(popup).toMatch(/onclick=\{\(\)\s*=>\s*onSetPenColor\(color\)\}/);
+  });
+
+  it("closes on outside-click and Escape while open (its own effect)", () => {
+    expect(source).toMatch(/strokePopupOpen\s*=\s*false/);
+    expect(source).toMatch(/strokeControl && !strokeControl\.contains/);
   });
 });
 

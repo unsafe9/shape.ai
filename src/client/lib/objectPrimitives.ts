@@ -15,6 +15,7 @@ import {
   type Fill,
   type Object as SceneObject,
   type ObjectOp,
+  type Paint,
   type Stroke,
   translateTransform
 } from "../../shared/object";
@@ -22,6 +23,17 @@ import { worldToScreen, type WorldRect } from "../renderer/scene";
 import type { PrimitiveKindId } from "./toolbar";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
+
+// S2 (#5): the sentinel a user color carries when "Theme default" is picked. It is
+// NOT a CSS hex — `paintForColor` maps it to a `Paint::Token { name: "text" }` so the
+// authored object follows the theme (the renderer re-resolves the "text" token per
+// theme, black-ish in light / white-ish in dark). Every other color stays a solid hex.
+export const THEME_DEFAULT_COLOR = "token:text";
+
+/** Map a toolbar color to its paint: the theme-default sentinel → a token, else solid. */
+export function paintForColor(color: string): Paint {
+  return color === THEME_DEFAULT_COLOR ? { kind: "token", name: "text" } : { kind: "solid", color };
+}
 
 /** Quantize logical pixels to object-local integer geometry units. */
 function q(px: number): number {
@@ -77,10 +89,11 @@ export type PrimitiveSpec = {
 // no color is selected, so the hardcoded defaults remain the fallback.
 function recolorSpec(spec: PrimitiveSpec, color: string | undefined): PrimitiveSpec {
   if (!color) return spec;
+  const paint = paintForColor(color);
   return {
     ...spec,
-    ...(spec.fill ? { fill: { ...spec.fill, paint: { kind: "solid", color } } } : {}),
-    ...(spec.stroke ? { stroke: { ...spec.stroke, paint: { kind: "solid", color } } } : {})
+    ...(spec.fill ? { fill: { ...spec.fill, paint } } : {}),
+    ...(spec.stroke ? { stroke: { ...spec.stroke, paint } } : {})
   };
 }
 
@@ -138,7 +151,7 @@ export function buildPrimitiveObject(
 // op rides the existing authorOp path; the inverse (the old style) comes from the
 // core, keeping undo correct (D21).
 export function buildSetStyleOp(object: SceneObject, color: string): ObjectOp {
-  const paint: Stroke["paint"] = { kind: "solid", color };
+  const paint: Stroke["paint"] = paintForColor(color);
   const op: { kind: "set-style"; id: string; fill?: { action: "set"; value: Fill }; stroke?: { action: "set"; value: Stroke } } = {
     kind: "set-style",
     id: object.id
