@@ -1166,22 +1166,25 @@ impl ObjectRenderer {
         let columns: [[f32; 3]; 3] = [m0, m1, m2];
         let bytes = bytemuck::cast_slice(&columns);
         // The matrix region (`m0,m1,m2` at offset 0) is overwritten in EVERY per-object
-        // instance buffer — fill, stroke AND text (G3) — so the dragged object's whole
-        // visual (region + glyphs) follows the preview. Each buffer is index-aligned
-        // with `draws`, so the write lands at `i * stride`. `preview_instance_strides`
-        // is the single source of truth pairing each buffer with its struct stride; a
-        // dropped buffer here is a dropped sub-visual under drag. Baked color sits past
-        // byte 36 (fill/stroke) or per-glyph (text), so it survives the matrix write.
+        // instance buffer — fill, stroke, text (G3) AND shadow (G5) — so the dragged
+        // object's whole visual (region + glyphs + drop shadow) follows the preview in
+        // lockstep. Each buffer is index-aligned with `draws`, so the write lands at
+        // `i * stride`. `preview_instance_strides` is the single source of truth pairing
+        // each buffer with its struct stride; a dropped buffer here is a dropped
+        // sub-visual under drag (the G5 bug: shadow lagging at canonical until rebake).
+        // Baked color sits past byte 36 (fill/stroke/shadow) or per-glyph (text), so it
+        // survives the matrix write.
         let strides = preview_instance_strides();
         let buffers = [
             &self.fill_instance_buffer,
             &self.stroke_instance_buffer,
             &self.text_instance_buffer,
+            &self.shadow_instance_buffer,
         ];
         debug_assert_eq!(
             buffers.len(),
             strides.len(),
-            "every previewed instance buffer has a stride (text included)"
+            "every previewed instance buffer has a stride (text + shadow included)"
         );
         for (buffer, stride) in buffers.iter().zip(strides) {
             queue.write_buffer(buffer, (i as u64) * stride, bytes);
@@ -1942,16 +1945,19 @@ pub fn preview_instance_columns(
 }
 
 /// The per-buffer strides [`ObjectRenderer::set_preview_transform`] writes the
-/// previewed matrix into, in lockstep with its `[fill, stroke, text]` buffer
-/// array: the matrix lands at `i * stride` in EACH. Fill/stroke moved the region
-/// from W2-11; text (G3) makes the glyphs follow the same drag. Pure and
-/// device-free so the live-drag follow set is testable under `cargo test` without
-/// a GPU — a dropped entry here means a sub-visual stops tracking the preview.
-pub fn preview_instance_strides() -> [u64; 3] {
+/// previewed matrix into, in lockstep with its `[fill, stroke, text, shadow]`
+/// buffer array: the matrix lands at `i * stride` in EACH. Fill/stroke moved the
+/// region from W2-11; text (G3) makes the glyphs follow the same drag; shadow (G5)
+/// makes the drop shadow follow it too, instead of lagging at canonical until the
+/// rebake. Pure and device-free so the live-drag follow set is testable under
+/// `cargo test` without a GPU — a dropped entry here means a sub-visual stops
+/// tracking the preview.
+pub fn preview_instance_strides() -> [u64; 4] {
     [
         std::mem::size_of::<FillInstance>() as u64,
         std::mem::size_of::<StrokeInstance>() as u64,
         std::mem::size_of::<TextInstance>() as u64,
+        std::mem::size_of::<ShadowInstance>() as u64,
     ]
 }
 
@@ -2444,17 +2450,19 @@ mod tests {
         assert_eq!(std::mem::offset_of!(TextInstance, m2), 24);
     }
 
-    /// G3 write-set pin: `set_preview_transform` writes the previewed matrix into
-    /// the `[fill, stroke, text]` buffer array, striding each by
+    /// G3/G5 write-set pin: `set_preview_transform` writes the previewed matrix into
+    /// the `[fill, stroke, text, shadow]` buffer array, striding each by
     /// `preview_instance_strides()`. This is the single source of truth for WHICH
     /// buffers follow the drag. FAILS if the text entry is dropped (the RB2 bug:
-    /// glyphs left at canonical during a live drag) — the strides set must carry all
-    /// three per-object instance buffers, text stride included.
+    /// glyphs left at canonical during a live drag) or the shadow entry is dropped
+    /// (the G5 bug: drop shadow lagging at canonical until rebake) — the strides set
+    /// must carry all four per-object instance buffers.
     #[test]
     fn preview_write_set_includes_text_instance_buffer() {
         let strides = preview_instance_strides();
-        // Three per-object instance buffers must follow the preview: fill, stroke, text.
-        assert_eq!(strides.len(), 3, "fill + stroke + text all follow the drag");
+        // Four per-object instance buffers must follow the preview: fill, stroke,
+        // text, shadow.
+        assert_eq!(strides.len(), 4, "fill + stroke + text + shadow all follow the drag");
         assert_eq!(strides[0], std::mem::size_of::<FillInstance>() as u64);
         assert_eq!(strides[1], std::mem::size_of::<StrokeInstance>() as u64);
         // The load-bearing G3 assertion: the text buffer IS in the write set, strided
@@ -2464,6 +2472,82 @@ mod tests {
             std::mem::size_of::<TextInstance>() as u64,
             "text instance buffer must be in the preview write set (G3)"
         );
+        // The load-bearing G5 assertion: the shadow buffer IS in the write set, strided
+        // by `ShadowInstance`. Drop the shadow write and this entry vanishes — failing
+        // here (the shadow would lag at canonical during a live drag).
+        assert_eq!(
+            strides[3],
+            std::mem::size_of::<ShadowInstance>() as u64,
+            "shadow instance buffer must be in the preview write set (G5)"
+        );
+    }
+
+    /// G5 byte-layout pin: the shadow instance preview write `set_preview_transform`
+    /// performs targets offset `i * size_of::<ShadowInstance>()` and overwrites the
+    /// 36-byte `m0,m1,m2` region at struct offset 0 — identical to the fill/stroke/
+    /// text writes (matrix-at-0). The baked `shadow` color sits at offset 36, past the
+    /// matrix, so it survives the write exactly like the fill/stroke color slot. FAILS
+    /// if `ShadowInstance` ever grows a field before the matrix, which would corrupt
+    /// the write or clobber the shadow color.
+    #[test]
+    fn shadow_instance_matrix_region_matches_preview_write_layout() {
+        assert_eq!(std::mem::offset_of!(ShadowInstance, m0), 0);
+        assert_eq!(std::mem::offset_of!(ShadowInstance, m1), 12);
+        assert_eq!(std::mem::offset_of!(ShadowInstance, m2), 24);
+        // The 36-byte matrix region the preview overwrites sits strictly before the
+        // color slot, so the matrix write never clobbers the baked shadow color.
+        assert_eq!(std::mem::offset_of!(ShadowInstance, shadow), 36);
+        assert!(
+            std::mem::offset_of!(ShadowInstance, shadow) >= 3 * std::mem::size_of::<[f32; 3]>()
+        );
+    }
+
+    /// G5 (the live-drag follow card): the drop SHADOW moves with the fill/stroke/
+    /// text under a live drag. `set_preview_transform` writes the previewed columns
+    /// into the shadow instance buffer at `i * size_of::<ShadowInstance>()` — the same
+    /// matrix-at-offset-0, index-aligned write the other three buffers get. This proves,
+    /// device-free, that (a) the previewed shadow instance equals the composed
+    /// `delta*base` transform — exactly what the write pushes — and matches fill/stroke,
+    /// and (b) it DIFFERS from the canonical baked shadow instance, so a missing shadow
+    /// write would leave the shadow at canonical (the bug this card closes). Mirrors
+    /// `text_preview_follows_drag_matches_composed_transform`.
+    #[test]
+    fn shadow_preview_follows_drag_matches_composed_transform() {
+        let base = [[2.0, 0.0, 30.0], [0.0, 2.0, -10.0], [0.0, 0.0, 1.0]];
+        let delta = crate::hit_test_object::translate_3x3(40.0, -25.0);
+
+        // Canonical (no preview): the baked shadow instance for the object at `base`.
+        let mut canonical = rect_object("s-drag");
+        canonical.transform = base;
+        let canon_geo = build_scene_geometry(&scene_with(vec![canonical], None));
+        let canon_shadow = canon_geo.shadow_instances[0];
+
+        // The preview columns `set_preview_transform` would write for this drag.
+        let preview = preview_instance_columns(&delta, &base);
+
+        // Without a preview the shadow instance is canonical: the un-dragged columns are
+        // NOT the previewed ones (a real move, so a missing write is observable). This
+        // is the assertion that FAILS if the shadow is left at canonical during preview.
+        assert!(
+            (canon_shadow.m0, canon_shadow.m1, canon_shadow.m2) != preview,
+            "canonical shadow instance differs from the previewed transform"
+        );
+
+        // Under the preview, the shadow instance equals the composed `delta*base` — and
+        // matches what fill/stroke get, so the shadow follows the same drag in lockstep.
+        let composed = crate::hit_test_object::mat3_mul(&delta, &base);
+        let mut moved = rect_object("s-drag");
+        moved.transform = composed;
+        let moved_geo = build_scene_geometry(&scene_with(vec![moved], None));
+        let moved_shadow = moved_geo.shadow_instances[0];
+        assert_eq!(preview.0, moved_shadow.m0);
+        assert_eq!(preview.1, moved_shadow.m1);
+        assert_eq!(preview.2, moved_shadow.m2);
+        // Shadow follows the SAME preview matrix as fill/stroke (lockstep, not lagging).
+        assert_eq!(moved_shadow.m0, moved_geo.fill_instances[0].m0);
+        assert_eq!(moved_shadow.m1, moved_geo.fill_instances[0].m1);
+        assert_eq!(moved_shadow.m2, moved_geo.fill_instances[0].m2);
+        assert_eq!(moved_shadow.m0, moved_geo.stroke_instances[0].m0);
     }
 
     /// W2-11 index==offset invariant: `draws[i].id` ↔ instance `i` in BOTH the fill
