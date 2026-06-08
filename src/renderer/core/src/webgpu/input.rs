@@ -60,6 +60,7 @@ impl ShapeWebGpuRenderer {
             object_selection: object_out.selection,
             object_transform_delta: object_out.transform_delta,
             object_marquee_ids: object_out.marquee_ids,
+            object_double_click: object_out.double_click,
             hover_affordance: object_out
                 .hover_affordance
                 .unwrap_or(HoverAffordance::Empty)
@@ -304,7 +305,8 @@ impl ShapeWebGpuRenderer {
                 CanvasInputEvent::PointerDown { .. }
                 | CanvasInputEvent::PointerMove { .. }
                 | CanvasInputEvent::PointerUp { .. }
-                | CanvasInputEvent::PointerCancel { .. } => {
+                | CanvasInputEvent::PointerCancel { .. }
+                | CanvasInputEvent::DoubleClick { .. } => {
                     return self.apply_object_pointer_event(event, object_out);
                 }
                 _ => {}
@@ -594,6 +596,17 @@ impl ShapeWebGpuRenderer {
         event: CanvasInputEvent,
         object_out: &mut ObjectInputOut,
     ) -> Result<(), JsValue> {
+        // RA2b (D6): a double-click that hits an object is reported as a branched
+        // signal — the shell drills in on a container, enters text edit on a leaf.
+        // It mutates neither selection nor drag, so it short-circuits the pointer
+        // state machine below.
+        if let CanvasInputEvent::DoubleClick { screen } = event {
+            if let Some(scene) = &self.object_scene {
+                object_out.double_click =
+                    object_double_click(&self.object_regions, &scene.objects, &self.camera, screen);
+            }
+            return Ok(());
+        }
         let selection = self
             .object_scene
             .as_ref()

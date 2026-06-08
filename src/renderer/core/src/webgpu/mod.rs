@@ -34,8 +34,8 @@ use crate::render_object::RenderObjectScene;
 use crate::serde_wasm;
 use crate::stats::{
     CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreOverlayRequest, CoreOverlayStyle,
-    CoreOverlayTarget, ObjectTransformDelta, WebGpuDebugSnapshot, WebGpuFrameStats,
-    WebGpuProbeReport,
+    CoreOverlayTarget, ObjectDoubleClick, ObjectTransformDelta, WebGpuDebugSnapshot,
+    WebGpuFrameStats, WebGpuProbeReport,
 };
 use crate::text::{
     CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_HEIGHT,
@@ -91,6 +91,8 @@ pub(crate) struct ObjectInputOut {
     // W2-02: hover affordance for the shell's cursor, set on a no-button move.
     // `None` outside object mode / when no hover move occurred in the batch.
     hover_affordance: Option<HoverAffordance>,
+    // RA2b: a double-click that hit an object, branched by `has_children` (D6).
+    double_click: Option<ObjectDoubleClick>,
 }
 
 #[cfg(feature = "wgpu-probe")]

@@ -148,6 +148,19 @@ pub struct ObjectTransformDelta {
     pub kind: &'static str,
 }
 
+/// RA2b (D6 Figma hierarchy): result of a double-click that hit an object. The
+/// shell branches on `has_children`: `true` => the object is a container, so drill
+/// in (set it as the active container, AP3); `false` => it is a leaf, so enter
+/// inline text edit. `has_children` is computed from the scene: any object whose
+/// `parent` equals `id` makes this object a parent.
+#[cfg(feature = "wgpu-probe")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectDoubleClick {
+    pub id: String,
+    pub has_children: bool,
+}
+
 /// W2-06: result of the nearest-outline-point query (anchor snapping for shape
 /// drag-create). The flat `{ snapped, x, y, targetId }` contract W2-07 consumes:
 /// on a hit, `snapped = true`, `(x, y)` is the nearest WORLD point and `target_id`
@@ -177,6 +190,9 @@ pub struct CoreInputBatchResult {
     pub object_selection: Option<String>,
     pub object_transform_delta: Option<ObjectTransformDelta>,
     pub object_marquee_ids: Option<Vec<String>>,
+    // RA2b: non-null only when a double-click hit an object. `has_children`
+    // discriminates the shell branch (drill-in vs text-edit).
+    pub object_double_click: Option<ObjectDoubleClick>,
     // W2-02: stable affordance string ("empty" | "body" | "resize-*" | "rotate")
     // the shell maps to a cursor. Computed on a no-button hover move; "empty"
     // otherwise (and outside object mode).

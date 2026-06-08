@@ -18,8 +18,8 @@ use crate::hit_test_object::{
     ScreenRect, SelectionHandles,
 };
 use crate::outline::{derive_region, parse_path_string};
-use crate::render_object::RenderObjectScene;
-use crate::stats::{CoreHitResult, CoreOverlayStyle, ObjectTransformDelta};
+use crate::render_object::{RenderObject, RenderObjectScene};
+use crate::stats::{CoreHitResult, CoreOverlayStyle, ObjectDoubleClick, ObjectTransformDelta};
 use crate::text::{CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_SOLID_UV};
 
 use super::*;
@@ -2225,6 +2225,25 @@ pub(crate) fn step_object_pointer(
     }
 }
 
+/// RA2b (D6): branch a double-click that hit an object into the discriminated
+/// signal the shell consumes. Hit-tests `screen` against the live regions; on a
+/// hit, reports `{ id, has_children }` where `has_children` is true iff any object
+/// in `objects` has `parent == hit id` (a container => drill-in; a leaf => text
+/// edit). Returns `None` when the double-click landed on empty canvas.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn object_double_click(
+    regions: &[ObjectRegion],
+    objects: &[RenderObject],
+    camera: &CameraState,
+    screen: WorldPoint,
+) -> Option<ObjectDoubleClick> {
+    let id = hit_object_in_regions(regions, camera, screen)?;
+    let has_children = objects
+        .iter()
+        .any(|object| object.parent.as_deref() == Some(id.as_str()));
+    Some(ObjectDoubleClick { id, has_children })
+}
+
 /// FC-07: object ids whose WORLD-space region AABB intersects the marquee rect.
 /// Each local outline vertex is transformed to world via the object transform; the
 /// min/max over those gives the world AABB tested against `rect`.
@@ -4022,6 +4041,50 @@ mod tests {
         );
         assert_eq!(out.hover_affordance, None);
         assert!(out.transform_delta.is_some());
+    }
+
+    #[test]
+    fn double_click_branches_parent_vs_leaf_by_children() {
+        // RA2b (D6): double-click an object WITH children => drill-in branch
+        // (has_children true); double-click a LEAF => text-edit branch (false).
+        // "o1" at world (0,0) has a child "c1" (parent=o1, off to the side so it
+        // does not overlap the click); "leaf" at world (50,0) has no children.
+        let mut child = rect_object("c1", 100.0, 100.0, 20);
+        child.parent = Some("o1".to_string());
+        let scene = object_scene(vec![
+            rect_object("o1", 0.0, 0.0, 20),
+            child,
+            rect_object("leaf", 50.0, 0.0, 20),
+        ]);
+        let regions = derive_object_regions(&scene);
+        let camera = identity_camera();
+
+        // Hit the parent "o1" (center of its 20px rect at origin) => has_children.
+        let parent_hit =
+            object_double_click(&regions, &scene.objects, &camera, WorldPoint { x: 10.0, y: 10.0 })
+                .expect("double-click on the parent must hit an object");
+        assert_eq!(parent_hit.id, "o1");
+        assert!(
+            parent_hit.has_children,
+            "an object with a child must take the drill-in branch"
+        );
+
+        // Hit the leaf (center of its 20px rect at world (50,0)) => no children.
+        let leaf_hit =
+            object_double_click(&regions, &scene.objects, &camera, WorldPoint { x: 60.0, y: 10.0 })
+                .expect("double-click on the leaf must hit an object");
+        assert_eq!(leaf_hit.id, "leaf");
+        assert!(
+            !leaf_hit.has_children,
+            "a leaf object must take the text-edit branch"
+        );
+
+        // Empty canvas => no signal at all.
+        assert!(
+            object_double_click(&regions, &scene.objects, &camera, WorldPoint { x: 500.0, y: 500.0 })
+                .is_none(),
+            "a double-click on empty canvas must not emit a branch"
+        );
     }
 
     #[test]
