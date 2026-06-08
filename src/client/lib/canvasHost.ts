@@ -26,7 +26,7 @@ import type { CameraState } from "../../shared/geometry";
 import { GEOMETRY_QUANTUM_PER_PX, type ObjectScene, type ObjectSelection, type Stroke } from "../../shared/object";
 import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions } from "../renderer/engine";
 import type { FrameStats, WorldRect } from "../renderer/scene";
-import { loadRustCore, type RustCoreStatus, type RustWebGpuRenderer } from "../renderer/wasmLoader";
+import { loadRustCore, type HoverAffordance, type RustCoreStatus, type RustWebGpuRenderer } from "../renderer/wasmLoader";
 
 export type RendererStats = FrameStats;
 
@@ -56,7 +56,9 @@ export type ShapeCanvasHostCallbacks = {
   // (cumulative world-px delta — a non-destructive preview); `onTransformCommit`
   // once on pointer-up when the drag moved (the single undoable op); `onMarquee` on
   // an empty-start drag's pointer-up.
-  onSelectObject: (id: string) => void;
+  // W2-03: `additive` is true when shift/meta was held at pick time, so the shell
+  // toggles the object in/out of the multi-select set instead of replacing it.
+  onSelectObject: (id: string, additive: boolean) => void;
   onTransformPreview: (id: string, dx: number, dy: number) => void;
   onTransformCommit: (id: string, dx: number, dy: number) => void;
   onMarquee: (ids: string[]) => void;
@@ -67,6 +69,9 @@ export type ShapeCanvasHostCallbacks = {
   // FC-11: freehand pen capture phases (world px). The shell accumulates the
   // points across start/move and commits the stroke to an object on `end`.
   onDraw: (phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }) => void;
+  // W2-03: hover affordance under the cursor (empty/body/resize-*/rotate). The
+  // shell maps it to a CSS cursor.
+  onAffordance: (affordance: HoverAffordance) => void;
 };
 
 const initialRustStatus: RustCoreStatus = {
@@ -319,9 +324,14 @@ export class ShapeCanvasHost {
     this.engine?.wheelAtScreen(screen, deltaY);
   }
 
-  /** CC1.4: set the active pointer tool (Select/Hand). */
+  /** W2-03: set the active pointer tool (Select/Draw). */
   setTool(tool: ActiveTool): void {
     this.engine?.setTool(tool);
+  }
+
+  /** W2-03: mirror the Space key state so a Space-held drag pans. */
+  setSpaceHeld(held: boolean): void {
+    this.engine?.setSpaceHeld(held);
   }
 
   getCamera(): CameraState {
@@ -355,7 +365,7 @@ export class ShapeCanvasHost {
 
     // FC-08: object-path input results route to the shell callbacks.
     if (event.type === "object-select") {
-      this.callbacks.onSelectObject(event.id);
+      this.callbacks.onSelectObject(event.id, event.additive);
       return;
     }
     if (event.type === "object-transform-preview") {
@@ -373,6 +383,11 @@ export class ShapeCanvasHost {
     // FC-11: freehand pen capture phase routes to the shell's draw controller.
     if (event.type === "draw") {
       this.callbacks.onDraw(event.phase, event.world);
+      return;
+    }
+    // W2-03: hover affordance routes to the shell's cursor.
+    if (event.type === "affordance") {
+      this.callbacks.onAffordance(event.affordance);
     }
   }
 

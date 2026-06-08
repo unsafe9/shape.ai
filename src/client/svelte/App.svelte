@@ -6,6 +6,7 @@
   import {
     emptyObjectScene,
     translateTransform,
+    toggleObjectSelection,
     IDENTITY_TRANSFORM,
     GEOMETRY_QUANTUM_PER_PX,
     type Object as SceneObject,
@@ -24,6 +25,7 @@
   import type { PeerPresence } from "../lib/peers";
   import type { ConnectionStatus } from "../lib/wsTransport";
   import type { ActiveTool } from "../renderer/engine";
+  import type { HoverAffordance } from "../renderer/wasmLoader";
   import {
     loadSceneCore,
     type ObjectCommand,
@@ -74,7 +76,11 @@
   let settingsOpen = $state(false);
   let templateOpen = $state(false);
   let activeTool = $state<ActiveTool>("select");
-  let spaceToolBeforeHold: ActiveTool | null = null;
+  // W2-03: Space-hold pan + dynamic hover cursor. `spaceHeld` flips the empty
+  // cursor to grab and arms the engine pan path; `affordance` is the core's
+  // per-move hover classification, mapped to a CSS cursor on the canvas wrapper.
+  let spaceHeld = $state(false);
+  let affordance = $state<HoverAffordance>("empty");
 
   // ----- context menu (U3) -----
   type ContextMenuState = { selection: ObjectSelection; x: number; y: number; world: { x: number; y: number } };
@@ -110,6 +116,11 @@
   let host: ShapeCanvasHost | null = null;
   let canvasWrap: HTMLDivElement;
 
+  // W2-03: the cursor affordance reflected onto the canvas wrapper. Space-hold
+  // shows the pan grab cursor; the draw tool keeps its own crosshair (no override);
+  // otherwise the core's per-move hover classification drives it (CSS in styles.css).
+  const cursorAffordance = $derived(spaceHeld ? "pan" : activeTool === "draw" ? null : affordance);
+
   const readyState = $derived(rendererHealth?.state ?? "wasm-unavailable");
   const rendererDetail = $derived(rendererHealth?.detail ?? "Detecting Rust/WASM package.");
   const hasRenderableScene = $derived(scene.objects.length > 0);
@@ -129,7 +140,10 @@
       rendererHealth = health;
       if (health.state === "ready" && isDiagnosticsOnlyStatus(status)) status = "Ready";
     },
-    onSelectObject: (id) => selectObject({ kind: "object", id }),
+    // W2-03: shift/meta-click toggles the object in/out of the multi-select set;
+    // a plain click replaces the selection with that object.
+    onSelectObject: (id, additive) =>
+      selectObject(additive ? toggleObjectSelection(selection, id) : { kind: "object", id }),
     onTransformPreview: (id, dx, dy) => {
       // A new drag supersedes any commit still waiting for its scene update, so a
       // stale pendingCommit can never clear (or freeze) the new preview.
@@ -167,7 +181,9 @@
     // FC-11: freehand pen capture. Accumulate world points across start/move; on
     // end, lower the stroke to an object via the wasm core and author an
     // insert-object op (the tool stays sticky in "draw"); cancel discards.
-    onDraw: (phase, world) => handleDraw(phase, world)
+    onDraw: (phase, world) => handleDraw(phase, world),
+    // W2-03: the core's per-move hover classification drives the canvas cursor.
+    onAffordance: (next) => (affordance = next)
   };
 
   // Boot the scene-core wasm (op-apply + catalog) and open the WS session.
@@ -238,22 +254,24 @@
         handleEscape();
         return;
       }
-      // U5: Space-hold temporarily activates Hand (pan); restore on keyup.
+      // W2-03: Space-hold arms the unified pointer's pan path (no separate Hand
+      // tool); release on keyup. The engine flips the core to hand-pan only for the
+      // duration of a Space-held drag.
       if (event.code === "Space" && !typing && !event.repeat) {
         event.preventDefault();
-        if (spaceToolBeforeHold === null) {
-          spaceToolBeforeHold = activeTool;
-          setActiveTool("hand");
+        if (!spaceHeld) {
+          spaceHeld = true;
+          host?.setSpaceHeld(true);
         }
         return;
       }
       dispatch(event);
     }
     function handleKeyUp(event: KeyboardEvent) {
-      if (event.code === "Space" && spaceToolBeforeHold !== null) {
+      if (event.code === "Space" && spaceHeld) {
         event.preventDefault();
-        setActiveTool(spaceToolBeforeHold);
-        spaceToolBeforeHold = null;
+        spaceHeld = false;
+        host?.setSpaceHeld(false);
       }
     }
     window.addEventListener("keydown", handleKeyDown);
@@ -786,7 +804,6 @@
   function shortcutHandlers() {
     return {
       "select-move": () => setActiveTool("select"),
-      "hand-pan": () => setActiveTool("hand"),
       draw: () => setActiveTool("draw"),
       "insert-rectangle": () => insertPrimitive("rectangle"),
       "insert-ellipse": () => insertPrimitive("ellipse"),
@@ -1124,7 +1141,7 @@
 <div class="app-shell">
   <main class="studio-stage">
     <section class="canvas-panel">
-      <div class="flow-wrap renderer-scene-surface" data-tool={activeTool} bind:this={canvasWrap} role="application" aria-label="Canvas" onpointermove={handlePointerMove}>
+      <div class="flow-wrap renderer-scene-surface" data-tool={activeTool} data-affordance={cursorAffordance} bind:this={canvasWrap} role="application" aria-label="Canvas" onpointermove={handlePointerMove}>
         <div class="canvas-watermark" aria-hidden="true">
           <BrainCircuit size={28} />
           <span>shape.ai</span>

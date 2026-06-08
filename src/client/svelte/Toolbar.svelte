@@ -3,7 +3,6 @@
     Activity,
     Circle,
     Download,
-    Hand,
     LayoutTemplate,
     Maximize2,
     Minus,
@@ -154,7 +153,8 @@
 
 <!-- Bottom-center toolbar: the sole persistent floating UI. -->
 <div class="toolbar-remote" role="toolbar" tabindex="-1" aria-label="Canvas toolbar" onpointerdown={(event) => event.stopPropagation()}>
-  <!-- Move: select picks/drags, hand pans (both are tool toggles). -->
+  <!-- W2-03: one unified Move/Select pointer (picks/drags/marquees). Pan rides
+       Space-hold / middle-button / wheel, so there is no separate Hand tool. -->
   <div class="toolbar-group" aria-label="Move">
     <span class="toolbar-group-label">Move</span>
     <div class="toolbar-group-buttons">
@@ -167,16 +167,6 @@
         onclick={() => onSetTool("select")}
       >
         <MousePointer2 size={16} />
-      </button>
-      <button
-        class="icon-button {activeTool === 'hand' ? 'is-active' : ''}"
-        type="button"
-        title="Hand / Pan (H)"
-        aria-label="Hand tool"
-        aria-pressed={activeTool === "hand"}
-        onclick={() => onSetTool("hand")}
-      >
-        <Hand size={16} />
       </button>
     </div>
   </div>

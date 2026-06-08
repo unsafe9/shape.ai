@@ -12,6 +12,7 @@ import {
   type WorldRect
 } from "./scene";
 import type {
+  HoverAffordance,
   RustCanvasInputEvent,
   RustDebugSnapshot,
   RustHitResult,
@@ -21,9 +22,19 @@ import type {
   RustWebGpuRenderer
 } from "./wasmLoader";
 
-/** CC1.4: the active pointer tool. "select" picks/drags, "hand" pans, "draw"
- *  captures a freehand stroke (FC-11). */
-export type ActiveTool = "select" | "hand" | "draw";
+/** W2-03: the active pointer tool. One unified "select" Move/Select pointer
+ *  (picks/drags/marquees) and "draw" (freehand capture, FC-11). Pan is no longer a
+ *  separate tool — it rides Space-hold/middle-button/wheel (see {@link isPanIntent}). */
+export type ActiveTool = "select" | "draw";
+
+// W2-03: a pointer-down is a pan gesture (not a pick/marquee) when the Space key
+// is held OR the middle mouse button is used. Pure so the shell test can pin the
+// classification without a renderer. `button` follows the DOM MouseEvent values
+// (0=left, 1=middle, 2=right); only left+Space or middle pans.
+export function isPanIntent(intent: { spaceHeld: boolean; button: number }): boolean {
+  if (intent.button === 1) return true;
+  return intent.button === 0 && intent.spaceHeld;
+}
 
 export type EngineEvent =
   | { type: "stats"; stats: FrameStats }
@@ -45,7 +56,9 @@ export type EngineEvent =
   // non-destructive preview, the shell does NOT author yet); `object-transform-commit`
   // is emitted once on pointer-up when the drag moved, and is the single undoable
   // op; `object-marquee` rides the pointer-up of an empty-start drag.
-  | { type: "object-select"; id: string }
+  // W2-03: `additive` carries the shift/meta held at pick time so the shell can
+  // toggle the object in/out of the multi-select set instead of replacing it.
+  | { type: "object-select"; id: string; additive: boolean }
   | { type: "object-transform-preview"; id: string; dx: number; dy: number }
   | { type: "object-transform-commit"; id: string; dx: number; dy: number }
   | { type: "object-marquee"; ids: string[] }
@@ -53,6 +66,9 @@ export type EngineEvent =
   // down/move/up emit draw phases instead of the select/marquee path; the shell
   // accumulates the world points and commits the stroke to an object on `end`.
   | { type: "draw"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint }
+  // W2-03: the hover affordance under the cursor (from result.hoverAffordance on a
+  // no-drag pointer move). The shell maps it to a CSS cursor.
+  | { type: "affordance"; affordance: HoverAffordance }
   | { type: "status"; message: string };
 
 export type ShapeCanvasEngineOptions = {
@@ -109,6 +125,12 @@ export class ShapeCanvasEngine {
   // pointer-down that picks an object, updated on each move, and committed once on
   // pointer-up when it moved. The renderer never mutates object transforms.
   private objectDrag: { id: string; dx: number; dy: number } | null = null;
+  // W2-03: whether Space is currently held (pushed from the shell). A pointer-down
+  // while Space is held — or a middle-button drag — is a pan gesture: the engine
+  // arms the core's hand-pan path for the gesture, then restores the user's tool on
+  // up. The pan state machine itself stays in the Rust core (boundary).
+  private spaceHeld = false;
+  private panGestureActive = false;
 
   constructor(options: ShapeCanvasEngineOptions) {
     this.canvas = options.canvas;
@@ -183,11 +205,38 @@ export class ShapeCanvasEngine {
     this.updateOverlayPosition();
   }
 
-  // CC1.4: set the active pointer tool. Prefer the direct wasm method (a tool
-  // toggle rarely coincides with a pointer batch); fall back to a set-tool input
-  // event if the build predates the direct method.
+  // W2-03: set the active pointer tool ("select" | "draw"). The renderer-core only
+  // knows select/hand; "draw" is shell-side routing (draw input is intercepted by
+  // the engine before it reaches the renderer), so the core stays in "select".
   setTool(tool: ActiveTool) {
     this.activeTool = tool;
+    this.coreSetTool("select");
+  }
+
+  // W2-03: the shell mirrors the Space key down/up here. A pointer-down while
+  // Space is held becomes a pan gesture instead of a pick/marquee.
+  setSpaceHeld(held: boolean) {
+    this.spaceHeld = held;
+  }
+
+  // W2-03: arm the core's hand-pan path for the duration of one pan gesture
+  // (Space-hold + left-drag, or a middle-button drag). The core owns the pan state
+  // machine; the engine only flips the core tool to "hand" for the gesture and
+  // restores the user's tool ("select"/"draw") on pointer-up.
+  private armPanGesture() {
+    this.panGestureActive = true;
+    this.coreSetTool("hand");
+  }
+
+  private disarmPanGesture() {
+    if (!this.panGestureActive) return;
+    this.panGestureActive = false;
+    this.coreSetTool(this.activeTool === "draw" ? "select" : this.activeTool);
+  }
+
+  // Push a raw core tool string (select|hand) without touching the shell-facing
+  // activeTool. Used only by the transient pan gesture.
+  private coreSetTool(tool: "select" | "hand") {
     if (!this.webGpuRenderer) return;
     if (typeof this.webGpuRenderer.setTool === "function") {
       try {
@@ -201,10 +250,7 @@ export class ShapeCanvasEngine {
       }
       return;
     }
-    // The renderer-core only knows select/hand; "draw" is shell-side routing, so
-    // the fallback keeps the renderer in the neutral select state (draw input is
-    // intercepted by the engine before it reaches the renderer).
-    this.sendInputBatch([{ kind: "set-tool", tool: tool === "hand" ? "hand" : "select" }]);
+    this.sendInputBatch([{ kind: "set-tool", tool }]);
   }
 
   // Push the transient multi-select highlight set to the renderer (marquee /
@@ -444,11 +490,14 @@ export class ShapeCanvasEngine {
 
   private onPointerDown = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
-    if (this.activeTool === "draw") {
+    // W2-03: Space-hold pans even under the draw tool; arm the core pan path first.
+    const pan = isPanIntent({ spaceHeld: this.spaceHeld, button: event.button });
+    if (this.activeTool === "draw" && !pan) {
       this.emitDraw("start", event);
       this.canvas.setPointerCapture(event.pointerId);
       return;
     }
+    if (pan) this.armPanGesture();
     this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
     const screen = this.eventPoint(event);
@@ -458,7 +507,9 @@ export class ShapeCanvasEngine {
 
   private onPointerMove = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
-    if (this.activeTool === "draw") {
+    // W2-03: a Space-armed pan stays on the pan path for the whole gesture, even
+    // under the draw tool, so the move feeds the core pan instead of the stroke.
+    if (this.activeTool === "draw" && !this.panGestureActive) {
       this.emitDraw("move", event);
       return;
     }
@@ -467,7 +518,7 @@ export class ShapeCanvasEngine {
 
   private onPointerUp = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
-    if (this.activeTool === "draw") {
+    if (this.activeTool === "draw" && !this.panGestureActive) {
       this.emitDraw("end", event);
       try {
         this.canvas.releasePointerCapture(event.pointerId);
@@ -485,6 +536,7 @@ export class ShapeCanvasEngine {
       }
     ]);
     this.commitObjectDrag();
+    this.disarmPanGesture();
     try {
       this.canvas.releasePointerCapture(event.pointerId);
     } catch {
@@ -495,7 +547,7 @@ export class ShapeCanvasEngine {
 
   private onPointerCancel = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
-    if (this.activeTool === "draw") {
+    if (this.activeTool === "draw" && !this.panGestureActive) {
       this.emitDraw("cancel", event);
       try {
         this.canvas.releasePointerCapture(event.pointerId);
@@ -506,18 +558,23 @@ export class ShapeCanvasEngine {
     }
     this.sendInputBatch([{ kind: "pointer-cancel", pointerId: event.pointerId }]);
     this.objectDrag = null;
+    this.disarmPanGesture();
     this.finishInputGesture();
   };
 
   private onMouseDown = (event: MouseEvent) => {
-    if (event.button !== 0) return;
+    // W2-03: left (0) drives select/draw; middle (1) is a pan gesture. Right (2)
+    // is the context menu (handled in the shell) — ignore it here.
+    const pan = isPanIntent({ spaceHeld: this.spaceHeld, button: event.button });
+    if (event.button !== 0 && !pan) return;
     event.preventDefault();
-    if (this.activeTool === "draw") {
+    if (this.activeTool === "draw" && !pan) {
       this.mouseDragActive = true;
       this.bindMouseFallbackMove();
       this.emitDraw("start", event);
       return;
     }
+    if (pan) this.armPanGesture();
     this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
     this.mouseDragActive = true;
@@ -528,7 +585,7 @@ export class ShapeCanvasEngine {
   private onMouseMove = (event: MouseEvent) => {
     if (!this.mouseDragActive) return;
     event.preventDefault();
-    if (this.activeTool === "draw") {
+    if (this.activeTool === "draw" && !this.panGestureActive) {
       this.emitDraw("move", event);
       return;
     }
@@ -540,7 +597,7 @@ export class ShapeCanvasEngine {
     event.preventDefault();
     this.mouseDragActive = false;
     this.unbindMouseFallbackMove();
-    if (this.activeTool === "draw") {
+    if (this.activeTool === "draw" && !this.panGestureActive) {
       this.emitDraw("end", event);
       return;
     }
@@ -553,6 +610,7 @@ export class ShapeCanvasEngine {
       }
     ]);
     this.commitObjectDrag();
+    this.disarmPanGesture();
     this.finishInputGesture();
   };
 
@@ -823,7 +881,7 @@ export class ShapeCanvasEngine {
     // marquee forwards its ids. The commit op is authored on pointer-up.
     if (typeof result.objectSelection === "string") {
       this.objectDrag = { id: result.objectSelection, dx: 0, dy: 0 };
-      this.onEvent({ type: "object-select", id: result.objectSelection });
+      this.onEvent({ type: "object-select", id: result.objectSelection, additive: this.lastPointerAdditive });
     }
     if (result.objectTransformDelta) {
       const { id, dx, dy } = result.objectTransformDelta;
@@ -833,6 +891,9 @@ export class ShapeCanvasEngine {
     if (result.objectMarqueeIds != null) {
       this.onEvent({ type: "object-marquee", ids: result.objectMarqueeIds });
     }
+    // W2-03: surface the hover affordance so the shell can set the cursor. The core
+    // computes it per no-drag move; older wasm builds omit it (defaults to "empty").
+    this.onEvent({ type: "affordance", affordance: result.hoverAffordance ?? "empty" });
   }
 
   // FC-08: emit the single undoable transform commit when an object drag moved,

@@ -190,6 +190,22 @@ export type ObjectSelection =
   | { kind: "object"; id: ObjectId }
   | { kind: "multi"; ids: ObjectId[] };
 
+/**
+ * W2-03: Shift+click toggle of `id` in/out of the current selection set. Adding to
+ * a single/empty selection grows it to a `multi`; removing collapses it back to
+ * `object`/`canvas`. Pure (no scene access) so the shell test can pin the
+ * classification. Selection order is preserved; the toggled id appends to the end.
+ */
+export function toggleObjectSelection(current: ObjectSelection, id: ObjectId): ObjectSelection {
+  const ids = current.kind === "object" ? [current.id] : current.kind === "multi" ? [...current.ids] : [];
+  const at = ids.indexOf(id);
+  if (at >= 0) ids.splice(at, 1);
+  else ids.push(id);
+  if (ids.length === 0) return { kind: "canvas" };
+  if (ids.length === 1) return { kind: "object", id: ids[0] };
+  return { kind: "multi", ids };
+}
+
 /** The canonical object scene snapshot (the welcome payload). */
 export type ObjectScene = {
   sceneVersion: number;

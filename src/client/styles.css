@@ -191,16 +191,49 @@ p {
   touch-action: none;
 }
 
-/* CC2.4 tool cursors: hand pans (grab/grabbing), draw uses a crosshair, select shows the default. */
-.renderer-scene-surface[data-tool="hand"] {
+/* W2-03 tool cursors: draw uses a crosshair, the unified Move pointer's cursor is
+ * driven by the hover affordance below. */
+.renderer-scene-surface[data-tool="draw"] {
+  cursor: crosshair;
+}
+
+/* W2-03 affordance cursors for the unified Move pointer: the core's per-move hover
+ * classification maps to the matching resize/rotate/move cursor; Space-hold ("pan")
+ * shows the grab/grabbing pan cursor. data-affordance always wins over data-tool
+ * (more specific). */
+.renderer-scene-surface[data-affordance="pan"] {
   cursor: grab;
 }
 
-.renderer-scene-surface[data-tool="hand"]:active {
+.renderer-scene-surface[data-affordance="pan"]:active {
   cursor: grabbing;
 }
 
-.renderer-scene-surface[data-tool="draw"] {
+.renderer-scene-surface[data-affordance="body"] {
+  cursor: move;
+}
+
+.renderer-scene-surface[data-affordance="resize-nw"],
+.renderer-scene-surface[data-affordance="resize-se"] {
+  cursor: nwse-resize;
+}
+
+.renderer-scene-surface[data-affordance="resize-ne"],
+.renderer-scene-surface[data-affordance="resize-sw"] {
+  cursor: nesw-resize;
+}
+
+.renderer-scene-surface[data-affordance="resize-n"],
+.renderer-scene-surface[data-affordance="resize-s"] {
+  cursor: ns-resize;
+}
+
+.renderer-scene-surface[data-affordance="resize-e"],
+.renderer-scene-surface[data-affordance="resize-w"] {
+  cursor: ew-resize;
+}
+
+.renderer-scene-surface[data-affordance="rotate"] {
   cursor: crosshair;
 }
 
