@@ -101,6 +101,22 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
+    /// W3-G5/#5: flip the live object renderer's light/dark theme bit so the shell's
+    /// dark-mode toggle actually reaches the canvas. Forwards to the live
+    /// [`ObjectRenderer::set_theme`], which re-resolves the canvas clear color +
+    /// token-backed shadow/fill/stroke instance colors against the queue this struct
+    /// owns — a zero-rebake uniform/color refresh, no re-tessellation. The next
+    /// `renderFrame` (the shell's render loop) presents with the new theme: the clear
+    /// color tracks the bit and the rewritten instance colors are already on the GPU.
+    /// No-op when no object scene/renderer is live (matches the optional `?.` call in
+    /// the shell).
+    #[wasm_bindgen(js_name = setObjectTheme)]
+    pub fn set_object_theme(&mut self, dark: bool) {
+        if let Some(renderer) = self.object_renderer.as_mut() {
+            renderer.set_theme(&self.queue, dark);
+        }
+    }
+
 
     /// Hit-test a screen-space point without mutating selection or camera (CC4.1).
     /// Returns the picked object (or null) so the shell can show a right-click
