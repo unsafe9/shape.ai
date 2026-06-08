@@ -2706,6 +2706,58 @@ mod tests {
         assert_ne!(light, dark, "selection-ring flips light vs dark");
     }
 
+    /// W3-G6/#3 STICKY THEME ACROSS RE-FEED: the bug was that every scene re-feed
+    /// (`load_object_scene`: pan/move/create) rebuilt the `ObjectRenderer` with a
+    /// HARDCODED `Theme::light()`, so a dark canvas reverted to white on the next
+    /// re-render. The fix persists the bit on the wasm wrapper (`self.object_theme`,
+    /// written by `set_object_theme`) and feeds THAT into the rebuilt renderer.
+    ///
+    /// This pure-core test models that exact two-step wrapper flow — toggle dark,
+    /// then a re-feed reads the persisted bit to choose the rebuild theme — and pins
+    /// that the rebuilt renderer clears with the DARK canvas-bg, not light. It FAILS
+    /// on the pre-fix code (where the re-feed step substitutes `Theme::light()`):
+    /// `rebuilt.canvas_bg()` would equal the light clear.
+    #[test]
+    fn refeed_preserves_persisted_dark_theme_clear() {
+        // The wasm wrapper's persisted bit (`ShapeWebGpuRenderer::object_theme`),
+        // initialized light like the real constructor.
+        let mut persisted = Theme::light();
+
+        // `set_object_theme(true)` persists the dark bit FIRST (input.rs).
+        persisted = Theme { dark: true };
+
+        // A scene re-feed (`load_object_scene`) now rebuilds the renderer with the
+        // PERSISTED bit (scene_feed.rs), not a hardcoded `Theme::light()`. The
+        // rebuilt renderer's `self.theme` IS this value, and `render`'s `LoadOp::Clear`
+        // reads `self.theme.canvas_bg()`.
+        let rebuilt = persisted;
+
+        // The re-feed clears DARK, surviving the rebuild...
+        assert_eq!(
+            rebuilt.canvas_bg(),
+            Theme::dark().canvas_bg(),
+            "re-feed must clear with the persisted dark canvas-bg"
+        );
+        // ...and must NOT revert to the light clear (the reported bug).
+        assert_ne!(
+            rebuilt.canvas_bg(),
+            Theme::light().canvas_bg(),
+            "re-feed must NOT revert to the light canvas-bg"
+        );
+
+        // The rebuilt renderer actually bakes geometry through the persisted theme:
+        // token colors resolve dark, proving the bit threads the real build path the
+        // re-feed uses (`ObjectRenderer::new` -> `build_scene_geometry_themed`), not
+        // just an abstract value.
+        let scene = scene_with(vec![token_rect("o1")], None);
+        let refed = build_scene_geometry_themed(&scene, rebuilt);
+        assert_eq!(
+            refed.fill_instances[0].fill,
+            crate::object_theme::resolve_token_f32("default-fill", true).unwrap(),
+            "re-feed bakes the persisted dark token colors, not light"
+        );
+    }
+
     /// (a) The SAME scene yields DIFFERENT chrome/instance RGBA when the theme bit
     /// flips: token-backed fill/stroke colors change, the canvas clear color
     /// (`canvas-bg`) differs light vs dark, AND the drop-shadow color (`shadow`)

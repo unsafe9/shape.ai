@@ -112,6 +112,9 @@ impl ShapeWebGpuRenderer {
     /// the shell).
     #[wasm_bindgen(js_name = setObjectTheme)]
     pub fn set_object_theme(&mut self, dark: bool) {
+        // W3-G6/#3: persist the bit FIRST so it survives a `load_object_scene`
+        // re-feed even if no renderer is live yet — the rebuilt renderer reads it.
+        self.object_theme = crate::object_theme::Theme { dark };
         if let Some(renderer) = self.object_renderer.as_mut() {
             renderer.set_theme(&self.queue, dark);
         }

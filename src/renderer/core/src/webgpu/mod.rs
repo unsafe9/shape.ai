@@ -365,4 +365,11 @@ pub struct ShapeWebGpuRenderer {
     // None the legacy 2D path stays authoritative.
     object_scene: Option<RenderObjectScene>,
     object_regions: Vec<ObjectRegion>,
+    // W3-G6/#3: the persisted light/dark theme bit. The live theme is owned by the
+    // per-scene `ObjectRenderer` (`self.theme`), which is destroyed and rebuilt on
+    // every `load_object_scene` re-feed (pan/move/create), so the dark bit would be
+    // lost on each re-feed. Holding it here (like `multi_select`/`active_tool`) lets
+    // `set_object_theme` remember the last-set theme and `load_object_scene` rebuild
+    // every renderer directly in that theme — sticky across reloads, zero rebake.
+    object_theme: crate::object_theme::Theme,
 }

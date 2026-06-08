@@ -395,6 +395,7 @@ impl ShapeWebGpuRenderer {
             object_renderer: None,
             object_scene: None,
             object_regions: Vec::new(),
+            object_theme: crate::object_theme::Theme::light(),
         };
         renderer.write_uniform();
         Ok(renderer)

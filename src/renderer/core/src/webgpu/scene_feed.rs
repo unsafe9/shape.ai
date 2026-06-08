@@ -85,9 +85,12 @@ impl ShapeWebGpuRenderer {
             &scene,
             self.width as f32,
             self.height as f32,
-            // RB1: load in light mode; AP4 threads the persisted dark/light bit and
-            // flips it via `ObjectRenderer::set_theme` (zero-rebake toggle).
-            crate::object_theme::Theme::light(),
+            // W3-G6/#3: build in the PERSISTED theme so the dark canvas-bg survives
+            // every re-feed (pan/move/create). The bit is owned by the wrapper
+            // (`self.object_theme`, set by `set_object_theme`), not the per-scene
+            // renderer that this re-feed throws away — so the clear stays dark with
+            // zero extra GPU work (no post-build `set_theme` call needed).
+            self.object_theme,
         );
         let counts = ObjectSceneLoadResult {
             objects: scene.objects.len(),
