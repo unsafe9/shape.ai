@@ -318,22 +318,28 @@ fn line_height_for(token: &Token, runs: &[TextRunInput]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// R8 — MSDF atlas plan
+// R8 — SDF atlas generator
 // ---------------------------------------------------------------------------
 //
-// Full multi-channel signed-distance-field (MSDF) generation is a documented
-// follow-up. What this module provides now is the *contract* the MSDF text
-// shader (`shaders/msdf_text.wgsl`) consumes: a glyph -> atlas-UV mapping plus
-// the distance-range the shader needs to convert sampled distances into screen
-// coverage. The layout above produces `GlyphPlacement`s in region-local pixels;
-// the GPU pass resolves each placement's `ch`/`size` against `MsdfAtlasPlan` to
-// fetch the four corner UVs and the per-glyph bearing, then renders the quad.
+// [`MsdfAtlasPlan`] now generates a real CPU distance-field atlas from glyph
+// coverage rasters, alongside the glyph -> atlas-UV mapping the MSDF text shader
+// (`shaders/msdf_text.wgsl`) consumes. The layout above produces
+// `GlyphPlacement`s in region-local pixels; the GPU pass resolves each
+// placement's glyph against the plan to fetch the four corner UVs + the per-glyph
+// bearing, samples the atlas, and `median3(rgb)` reconstructs the signed
+// distance for `screenPxRange` AA.
 //
-// Why a plan object rather than generating SDFs here: SDF generation needs the
-// glyph outline (vector contours) and a distance-field rasterizer, neither of
-// which is pure-CPU-cheap nor needed to validate layout. Keeping the plan as a
-// thin lookup lets the layout + shader contract be tested and shipped first;
-// the generator fills `MsdfGlyphEntry`s later without changing this interface.
+// SDF, not MSDF-proper: a true multi-channel MSDF needs the glyph's vector
+// contours (to assign edges to color channels at corners), which fontdue does
+// not expose. This generates a single-channel signed distance field from the
+// fontdue coverage raster (`text.rs`) and replicates it into R/G/B, so the
+// shader's `median3` returns that one distance unchanged. Single-channel SDF
+// loses MSDF's sharp-corner reconstruction but is still resolution-independent
+// (the R9 win over a baked raster); MSDF-proper stays a documented follow-up.
+//
+// The distance transform is the 8-points Signed Sequential Euclidean Distance
+// Transform (dead-reckoning), pure and deterministic — no rng/time/IO and no new
+// crate — so the same coverage always yields byte-identical atlas pixels.
 
 /// Identifies a rasterized MSDF glyph in the atlas. Mirrors the raster key in
 /// `text.rs` but is decoupled so the MSDF path can evolve independently. `px`
@@ -362,39 +368,163 @@ pub struct MsdfGlyphEntry {
     pub height: f32,
 }
 
-/// The shader-facing MSDF atlas contract: atlas dimensions, the SDF distance
-/// range (in atlas texels) used to scale sampled distances to coverage, and the
-/// glyph -> slot mapping. This is intentionally a passive lookup; population is
-/// the follow-up generator's job.
+/// A glyph's fontdue coverage raster + placement metrics, the generator input.
+/// `coverage` is row-major 8-bit alpha (1 byte/px, as fontdue's
+/// `rasterize_indexed` returns), `width`×`height` px. The bearings/`advance`
+/// mirror fontdue `Metrics` so the registered [`MsdfGlyphEntry`] positions the
+/// quad identically to the legacy atlas path in `text.rs`.
+#[derive(Clone, Debug)]
+pub struct GlyphCoverage<'a> {
+    pub key: MsdfGlyphKey,
+    pub coverage: &'a [u8],
+    pub width: usize,
+    pub height: usize,
+    /// Horizontal bearing (px) from pen origin to glyph left (fontdue `xmin`).
+    pub bearing_x: f32,
+    /// Vertical bearing (px) from line top to glyph top.
+    pub bearing_y: f32,
+}
+
+/// The shader-facing SDF atlas: dimensions, the SDF distance range (in atlas
+/// texels) the shader uses to scale sampled distances to coverage, the glyph ->
+/// slot mapping, and the generated RGBA distance-field pixels. The atlas is
+/// populated by [`MsdfAtlasPlan::generate_glyph`] from fontdue coverage rasters.
 #[derive(Clone, Debug)]
 pub struct MsdfAtlasPlan {
     pub atlas_width: u32,
     pub atlas_height: u32,
     /// Distance field spread in atlas texels; the shader divides screen-space
-    /// distance derivatives by this to recover anti-aliased edges.
+    /// distance derivatives by this to recover anti-aliased edges. Doubles as the
+    /// padding added around each glyph cell so the field has room to ramp.
     pub distance_range: f32,
     entries: std::collections::HashMap<MsdfGlyphKey, MsdfGlyphEntry>,
+    /// RGBA8 distance-field texels (`atlas_width * atlas_height * 4`). The signed
+    /// distance is replicated into R/G/B (single-channel SDF, see module note);
+    /// A is the same distance so an alpha-only sampler also works.
+    pixels: Vec<u8>,
+    /// Shelf allocator cursor (mirrors the `text.rs` atlas packer).
+    cursor_x: u32,
+    cursor_y: u32,
+    row_height: u32,
 }
 
 impl MsdfAtlasPlan {
     pub fn new(atlas_width: u32, atlas_height: u32, distance_range: f32) -> Self {
+        let width = atlas_width.max(4);
+        let height = atlas_height.max(4);
         MsdfAtlasPlan {
-            atlas_width,
-            atlas_height,
-            distance_range,
+            atlas_width: width,
+            atlas_height: height,
+            distance_range: distance_range.max(1.0),
             entries: std::collections::HashMap::new(),
+            // 0 = fully outside (distance 0.0 < 0.5 threshold), so untouched
+            // texels never read as "inside".
+            pixels: vec![0_u8; (width * height * 4) as usize],
+            cursor_x: 1,
+            cursor_y: 1,
+            row_height: 0,
         }
     }
 
-    /// Register a glyph slot. The follow-up generator calls this; the layout
-    /// path and tests treat the plan as read-only after population.
+    /// Register a pre-built glyph slot directly (used by tests / callers that
+    /// already hold an entry). Generation uses [`Self::generate_glyph`].
     pub fn insert(&mut self, key: MsdfGlyphKey, entry: MsdfGlyphEntry) {
         self.entries.insert(key, entry);
     }
 
+    /// Generate one glyph's SDF cell from its fontdue coverage raster, pack it
+    /// into the atlas, and register its [`MsdfGlyphEntry`]. Idempotent per key:
+    /// a glyph already generated returns its existing entry without re-packing.
+    /// `None` means the atlas is full (the caller falls back to the legacy
+    /// fontdue raster atlas). A blank glyph (empty coverage, e.g. a space) maps
+    /// to a zero-size entry so the shader emits no quad.
+    pub fn generate_glyph(&mut self, glyph: &GlyphCoverage<'_>) -> Option<MsdfGlyphEntry> {
+        if let Some(entry) = self.entries.get(&glyph.key) {
+            return Some(*entry);
+        }
+        if glyph.width == 0 || glyph.height == 0 || glyph.coverage.is_empty() {
+            let entry = MsdfGlyphEntry {
+                uv: [[0.0, 0.0]; 4],
+                bearing_x: glyph.bearing_x,
+                bearing_y: glyph.bearing_y,
+                width: 0.0,
+                height: 0.0,
+            };
+            self.entries.insert(glyph.key, entry);
+            return Some(entry);
+        }
+
+        // Each cell is padded by `distance_range` texels on every side so the
+        // signed field has room to ramp from inside to outside.
+        let pad = self.distance_range.ceil().max(1.0) as u32;
+        let glyph_w = glyph.width as u32;
+        let glyph_h = glyph.height as u32;
+        let cell_w = glyph_w + pad * 2;
+        let cell_h = glyph_h + pad * 2;
+
+        let (origin_x, origin_y) = self.allocate_cell(cell_w, cell_h)?;
+
+        // Build the padded inside/outside field and write it into the atlas.
+        let sdf = coverage_to_sdf(
+            glyph.coverage,
+            glyph.width,
+            glyph.height,
+            pad as usize,
+            self.distance_range,
+        );
+        let atlas_w = self.atlas_width;
+        for row in 0..cell_h {
+            for col in 0..cell_w {
+                let value = sdf[(row * cell_w + col) as usize];
+                let texel = (value * 255.0).round().clamp(0.0, 255.0) as u8;
+                let index = (((origin_y + row) * atlas_w + (origin_x + col)) * 4) as usize;
+                self.pixels[index] = texel;
+                self.pixels[index + 1] = texel;
+                self.pixels[index + 2] = texel;
+                self.pixels[index + 3] = texel;
+            }
+        }
+
+        // The drawn quad covers the full padded cell so the AA ramp is visible;
+        // the bearings shift left/up by `pad` to keep the glyph's ink registered
+        // against the pen origin exactly as the unpadded raster would.
+        let aw = self.atlas_width as f32;
+        let ah = self.atlas_height as f32;
+        let left = origin_x as f32 / aw;
+        let right = (origin_x + cell_w) as f32 / aw;
+        let top = origin_y as f32 / ah;
+        let bottom = (origin_y + cell_h) as f32 / ah;
+        let entry = MsdfGlyphEntry {
+            uv: [[left, top], [right, top], [right, bottom], [left, bottom]],
+            bearing_x: glyph.bearing_x - pad as f32,
+            bearing_y: glyph.bearing_y - pad as f32,
+            width: cell_w as f32,
+            height: cell_h as f32,
+        };
+        self.entries.insert(glyph.key, entry);
+        Some(entry)
+    }
+
+    /// Shelf-allocate a `w`×`h` cell, advancing to the next row when the current
+    /// one is full. `None` when no row has vertical room left.
+    fn allocate_cell(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        if self.cursor_x + w >= self.atlas_width {
+            self.cursor_x = 1;
+            self.cursor_y += self.row_height + 1;
+            self.row_height = 0;
+        }
+        if self.cursor_y + h >= self.atlas_height {
+            return None;
+        }
+        let origin = (self.cursor_x, self.cursor_y);
+        self.cursor_x += w + 1;
+        self.row_height = self.row_height.max(h);
+        Some(origin)
+    }
+
     /// Resolve a glyph's atlas slot for the shader. `None` means the glyph is
-    /// not yet generated and the caller should fall back (e.g. to the legacy
-    /// fontdue atlas) or trigger on-demand generation.
+    /// not yet generated and the caller should generate it (or fall back to the
+    /// legacy fontdue atlas).
     pub fn lookup(&self, key: &MsdfGlyphKey) -> Option<&MsdfGlyphEntry> {
         self.entries.get(key)
     }
@@ -402,6 +532,152 @@ impl MsdfAtlasPlan {
     pub fn glyph_count(&self) -> usize {
         self.entries.len()
     }
+
+    /// The generated RGBA8 distance-field texels, ready to upload as the MSDF
+    /// atlas texture the shader samples.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+}
+
+/// Build a single-channel signed distance field from a glyph coverage raster.
+///
+/// The coverage (`width`×`height`, 1 byte/px alpha) is thresholded at 0.5 into an
+/// inside/outside mask, embedded into a `pad`-padded cell, and converted with the
+/// 8-points Signed Sequential Euclidean Distance Transform (dead-reckoning): two
+/// passes propagate the nearest opposite-side feature point, yielding the
+/// unsigned distance to the edge, signed negative outside. The signed distance is
+/// then normalized so 0.5 sits exactly on the outline and ±`distance_range`
+/// texels map to the [0,1] ends — the encoding the MSDF shader's `screenPxRange`
+/// AA expects. Pure: same input -> identical output.
+fn coverage_to_sdf(
+    coverage: &[u8],
+    width: usize,
+    height: usize,
+    pad: usize,
+    distance_range: f32,
+) -> Vec<f32> {
+    let cell_w = width + pad * 2;
+    let cell_h = height + pad * 2;
+    let n = cell_w * cell_h;
+
+    // Inside mask in the padded cell: coverage >= 128 is "inside the glyph".
+    let mut inside = vec![false; n];
+    for y in 0..height {
+        for x in 0..width {
+            if coverage[y * width + x] >= 128 {
+                inside[(y + pad) * cell_w + (x + pad)] = true;
+            }
+        }
+    }
+
+    // Two distance transforms (one per side), each to the boundary of the other
+    // side, combined into a signed distance. `INF` seeds far-from-edge cells.
+    let dist_inside = euclidean_distance_to_other(&inside, cell_w, cell_h, true);
+    let dist_outside = euclidean_distance_to_other(&inside, cell_w, cell_h, false);
+
+    let mut out = vec![0.0_f32; n];
+    for i in 0..n {
+        // Signed distance to the outline: positive inside, negative outside.
+        // `dist_inside` is each inside cell's distance to the nearest outside cell
+        // (the inside depth); `dist_outside` the mirror. Subtracting a half-texel
+        // centers the zero crossing on the edge.
+        let signed = if inside[i] {
+            dist_inside[i] - 0.5
+        } else {
+            -(dist_outside[i] - 0.5)
+        };
+        // Map [-range, +range] texels -> [0, 1], 0.5 = outline.
+        out[i] = (signed / (2.0 * distance_range) + 0.5).clamp(0.0, 1.0);
+    }
+    out
+}
+
+/// Euclidean distance transform: for every cell, the distance to the nearest
+/// cell whose `inside` flag is the opposite of `target` (i.e. when `target` is
+/// true, distance from each inside cell to the nearest outside cell, and vice
+/// versa). Cells not matching `target` get distance 0. Implemented as the
+/// dead-reckoning 8SSEDT: store the offset to the nearest boundary feature point
+/// and relax it in a forward then backward sweep.
+fn euclidean_distance_to_other(
+    inside: &[bool],
+    w: usize,
+    h: usize,
+    target: bool,
+) -> Vec<f32> {
+    const INF: f32 = 1.0e9;
+    let n = w * h;
+    // Per-cell nearest-feature offset (dx, dy); distance is its hypot.
+    let mut dx = vec![0_i32; n];
+    let mut dy = vec![0_i32; n];
+    let mut dist = vec![INF; n];
+
+    // Seed: a cell of the OPPOSITE side is a boundary feature point at distance 0.
+    for i in 0..n {
+        if inside[i] != target {
+            dist[i] = 0.0;
+            dx[i] = 0;
+            dy[i] = 0;
+        }
+    }
+
+    let hypot = |x: i32, y: i32| -> f32 { ((x * x + y * y) as f32).sqrt() };
+
+    // Relax cell `i` against neighbour `j` offset by (ox, oy).
+    let relax = |i: usize, j: usize, ox: i32, oy: i32, dx: &mut [i32], dy: &mut [i32], dist: &mut [f32]| {
+        let cand_x = dx[j] + ox;
+        let cand_y = dy[j] + oy;
+        let cand = hypot(cand_x, cand_y);
+        if cand < dist[i] {
+            dist[i] = cand;
+            dx[i] = cand_x;
+            dy[i] = cand_y;
+        }
+    };
+
+    // Forward pass: top-to-bottom, left-to-right (W, NW, N, NE neighbours).
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if x > 0 {
+                relax(i, i - 1, 1, 0, &mut dx, &mut dy, &mut dist);
+            }
+            if y > 0 {
+                relax(i, i - w, 0, 1, &mut dx, &mut dy, &mut dist);
+                if x > 0 {
+                    relax(i, i - w - 1, 1, 1, &mut dx, &mut dy, &mut dist);
+                }
+                if x + 1 < w {
+                    relax(i, i - w + 1, 1, 1, &mut dx, &mut dy, &mut dist);
+                }
+            }
+        }
+    }
+    // Backward pass: bottom-to-top, right-to-left (E, SE, S, SW neighbours).
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            let i = y * w + x;
+            if x + 1 < w {
+                relax(i, i + 1, 1, 0, &mut dx, &mut dy, &mut dist);
+            }
+            if y + 1 < h {
+                relax(i, i + w, 0, 1, &mut dx, &mut dy, &mut dist);
+                if x + 1 < w {
+                    relax(i, i + w + 1, 1, 1, &mut dx, &mut dy, &mut dist);
+                }
+                if x > 0 {
+                    relax(i, i + w - 1, 1, 1, &mut dx, &mut dy, &mut dist);
+                }
+            }
+        }
+    }
+
+    for d in &mut dist {
+        if *d >= INF {
+            *d = 0.0;
+        }
+    }
+    dist
 }
 
 #[cfg(test)]
@@ -657,5 +933,139 @@ mod tests {
         assert_eq!(plan.lookup(&key), Some(&entry));
         assert_eq!(plan.atlas_width, 2048);
         assert_eq!(plan.distance_range, 4.0);
+    }
+
+    /// A fully-covered square block as a synthetic glyph coverage raster.
+    fn solid_block(side: usize) -> Vec<u8> {
+        vec![255_u8; side * side]
+    }
+
+    fn glyph_key(glyph_id: u16) -> MsdfGlyphKey {
+        MsdfGlyphKey { font_index: 0, glyph_id, px: 32 }
+    }
+
+    /// Sample the median-of-3 SDF value the shader reads at atlas texel (x, y).
+    fn sampled_distance(plan: &MsdfAtlasPlan, x: u32, y: u32) -> f32 {
+        let i = ((y * plan.atlas_width + x) * 4) as usize;
+        let px = plan.pixels();
+        let r = px[i] as f32 / 255.0;
+        let g = px[i + 1] as f32 / 255.0;
+        let b = px[i + 2] as f32 / 255.0;
+        // median3 — what msdf_text.wgsl computes.
+        (r.min(g)).max(b.min(r.max(g)))
+    }
+
+    #[test]
+    fn generate_glyph_packs_a_real_distance_field() {
+        let mut plan = MsdfAtlasPlan::new(256, 256, 4.0);
+        let side = 16;
+        let coverage = solid_block(side);
+        let entry = plan
+            .generate_glyph(&GlyphCoverage {
+                key: glyph_key(7),
+                coverage: &coverage,
+                width: side,
+                height: side,
+                bearing_x: 2.0,
+                bearing_y: 3.0,
+            })
+            .expect("atlas has room");
+
+        // The glyph is registered, with a padded cell larger than the raw raster.
+        assert_eq!(plan.glyph_count(), 1);
+        assert!(entry.width > side as f32 && entry.height > side as f32);
+        // Bearings are shifted left/up by the pad so the ink stays registered.
+        assert!(entry.bearing_x < 2.0 && entry.bearing_y < 3.0);
+        // Non-degenerate UVs that fit inside the atlas.
+        for [u, v] in entry.uv {
+            assert!((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v));
+        }
+        assert!(entry.uv[1][0] > entry.uv[0][0], "right u > left u");
+        assert!(entry.uv[2][1] > entry.uv[0][1], "bottom v > top v");
+
+        // The field reads "inside" (>0.5) at the cell center and "outside" (<0.5)
+        // at a far corner of the padded cell — a real signed distance ramp.
+        let origin_x = (entry.uv[0][0] * plan.atlas_width as f32).round() as u32;
+        let origin_y = (entry.uv[0][1] * plan.atlas_height as f32).round() as u32;
+        let cell_w = entry.width as u32;
+        let cell_h = entry.height as u32;
+        let center = sampled_distance(&plan, origin_x + cell_w / 2, origin_y + cell_h / 2);
+        let corner = sampled_distance(&plan, origin_x, origin_y);
+        assert!(center > 0.5, "glyph interior is inside the outline: {center}");
+        assert!(corner < 0.5, "padded corner is outside the outline: {corner}");
+        assert!(center > corner, "distance ramps from corner to center");
+    }
+
+    #[test]
+    fn generate_glyph_is_idempotent_per_key() {
+        let mut plan = MsdfAtlasPlan::new(256, 256, 4.0);
+        let coverage = solid_block(12);
+        let g = GlyphCoverage {
+            key: glyph_key(9),
+            coverage: &coverage,
+            width: 12,
+            height: 12,
+            bearing_x: 0.0,
+            bearing_y: 0.0,
+        };
+        let first = plan.generate_glyph(&g).unwrap();
+        let pixels_after_first = plan.pixels().to_vec();
+        let second = plan.generate_glyph(&g).unwrap();
+        // Same entry, no re-packing (pixel buffer unchanged, count stays 1).
+        assert_eq!(first, second);
+        assert_eq!(plan.glyph_count(), 1);
+        assert_eq!(plan.pixels(), pixels_after_first.as_slice());
+    }
+
+    #[test]
+    fn blank_glyph_maps_to_a_zero_size_entry() {
+        let mut plan = MsdfAtlasPlan::new(64, 64, 4.0);
+        let entry = plan
+            .generate_glyph(&GlyphCoverage {
+                key: glyph_key(0),
+                coverage: &[],
+                width: 0,
+                height: 0,
+                bearing_x: 5.0,
+                bearing_y: 6.0,
+            })
+            .expect("blank always fits");
+        // No quad (zero size), bearings preserved (e.g. a space advance).
+        assert_eq!(entry.width, 0.0);
+        assert_eq!(entry.height, 0.0);
+        assert_eq!(entry.bearing_x, 5.0);
+        assert_eq!(entry.bearing_y, 6.0);
+    }
+
+    #[test]
+    fn generate_glyph_returns_none_when_atlas_is_full() {
+        // A tiny atlas with no room for even one padded cell.
+        let mut plan = MsdfAtlasPlan::new(8, 8, 4.0);
+        let coverage = solid_block(16);
+        let result = plan.generate_glyph(&GlyphCoverage {
+            key: glyph_key(1),
+            coverage: &coverage,
+            width: 16,
+            height: 16,
+            bearing_x: 0.0,
+            bearing_y: 0.0,
+        });
+        assert!(result.is_none(), "no room: caller falls back to fontdue raster");
+        assert_eq!(plan.glyph_count(), 0);
+    }
+
+    #[test]
+    fn coverage_to_sdf_is_deterministic_and_centered() {
+        let side = 10;
+        let coverage = solid_block(side);
+        let a = coverage_to_sdf(&coverage, side, side, 4, 4.0);
+        let b = coverage_to_sdf(&coverage, side, side, 4, 4.0);
+        assert_eq!(a, b, "pure: same input -> identical field");
+        let cell = side + 8; // width + pad*2
+        // Center is inside (>0.5), an outer-padding corner is outside (<0.5).
+        let center = a[(cell / 2) * cell + cell / 2];
+        let corner = a[0];
+        assert!(center > 0.5, "interior inside: {center}");
+        assert!(corner < 0.5, "padding outside: {corner}");
     }
 }

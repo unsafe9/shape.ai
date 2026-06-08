@@ -84,8 +84,8 @@ pub use tessellate::{
 };
 #[allow(unused_imports)]
 pub use text_layout::{
-    layout_runs, GlyphPlacement, MsdfAtlasPlan, MsdfGlyphEntry, MsdfGlyphKey, TextAlign,
-    TextRunInput, TextVAlign,
+    layout_runs, GlyphCoverage, GlyphPlacement, MsdfAtlasPlan, MsdfGlyphEntry, MsdfGlyphKey,
+    TextAlign, TextRunInput, TextVAlign,
 };
 
 #[wasm_bindgen]
