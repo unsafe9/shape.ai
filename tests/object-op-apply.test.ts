@@ -143,6 +143,111 @@ describe("object command catalog (OB3.S9)", () => {
   });
 });
 
+describe("undo stack (createUndoStack, FC-15)", () => {
+  // Drive the core's UndoStack the way the shell does: author -> record, then
+  // undo/redo by re-authoring the handed-out op through the SAME op-apply path
+  // and reporting the resulting inverse back (D21).
+  function authorAndRecord(
+    stack: ReturnType<SceneCore["createUndoStack"]>,
+    scene: ObjectScene,
+    op: ObjectOp
+  ): ObjectScene {
+    const applied = core.applyObjectOp(scene, op);
+    expect(applied.errors).toEqual([]);
+    expect(applied.inverse).not.toBeNull();
+    stack.record(op, applied.inverse!);
+    return applied.scene;
+  }
+
+  it("round-trips undo/redo through the same op-apply path", () => {
+    const stack = core.createUndoStack("actor-1");
+    let scene = core.applyObjectOp(emptyObjectScene(), insert(rect("r"))).scene;
+    const move: ObjectOp = { kind: "set-transform", id: "r", transform: translateTransform(5, 5) };
+    scene = authorAndRecord(stack, scene, move);
+    expect(stack.canUndo()).toBe(true);
+    expect(stack.canRedo()).toBe(false);
+
+    // Undo: apply the handed-out inverse, report the re-inverse.
+    const undoOp = stack.undo();
+    expect(undoOp).not.toBeNull();
+    const undone = core.applyObjectOp(scene, undoOp!);
+    stack.noteUndoApplied(undone.inverse!);
+    scene = undone.scene;
+    expect(scene.objects[0].transform).toEqual(IDENTITY_TRANSFORM);
+    expect(stack.canUndo()).toBe(false);
+    expect(stack.canRedo()).toBe(true);
+
+    // Redo: hands back the original forward, re-reaches the edit.
+    const redoOp = stack.redo();
+    expect(redoOp).toEqual(move);
+    const redone = core.applyObjectOp(scene, redoOp!);
+    stack.noteRedoApplied(redone.inverse!);
+    scene = redone.scene;
+    expect(scene.objects[0].transform).toEqual(translateTransform(5, 5));
+    expect(stack.canUndo()).toBe(true);
+    expect(stack.canRedo()).toBe(false);
+  });
+
+  it("collapses a coalesced gesture into one undo step", () => {
+    const stack = core.createUndoStack("dragger");
+    let scene = core.applyObjectOp(emptyObjectScene(), insert(rect("r"))).scene;
+
+    stack.beginCoalesce();
+    expect(stack.isCoalescing()).toBe(true);
+    for (let step = 1; step <= 3; step++) {
+      const move: ObjectOp = {
+        kind: "set-transform",
+        id: "r",
+        transform: translateTransform(step * 10, 0)
+      };
+      scene = authorAndRecord(stack, scene, move);
+    }
+    stack.endCoalesce();
+    expect(stack.isCoalescing()).toBe(false);
+
+    // One undo lands back at the pre-gesture (identity) state.
+    const undoOp = stack.undo();
+    const undone = core.applyObjectOp(scene, undoOp!);
+    stack.noteUndoApplied(undone.inverse!);
+    expect(undone.scene.objects[0].transform).toEqual(IDENTITY_TRANSFORM);
+    expect(stack.canUndo()).toBe(false);
+
+    // One redo replays the gesture's final state.
+    const redoOp = stack.redo();
+    const redone = core.applyObjectOp(undone.scene, redoOp!);
+    stack.noteRedoApplied(redone.inverse!);
+    expect(redone.scene.objects[0].transform).toEqual(translateTransform(30, 0));
+  });
+
+  it("clears redo when a fresh op is recorded", () => {
+    const stack = core.createUndoStack("a");
+    let scene = core.applyObjectOp(emptyObjectScene(), insert(rect("r"))).scene;
+    scene = authorAndRecord(stack, scene, {
+      kind: "set-transform",
+      id: "r",
+      transform: translateTransform(1, 0)
+    });
+    const undone = core.applyObjectOp(scene, stack.undo()!);
+    stack.noteUndoApplied(undone.inverse!);
+    expect(stack.canRedo()).toBe(true);
+
+    authorAndRecord(stack, undone.scene, {
+      kind: "set-transform",
+      id: "r",
+      transform: translateTransform(2, 0)
+    });
+    expect(stack.canRedo()).toBe(false);
+  });
+
+  it("returns null on empty stacks", () => {
+    const stack = core.createUndoStack("a");
+    expect(stack.undo()).toBeNull();
+    expect(stack.redo()).toBeNull();
+    expect(stack.canUndo()).toBe(false);
+    expect(stack.canRedo()).toBe(false);
+  });
+});
+
 describe("template lowering (build_object_template)", () => {
   it("builds a recipe of inline-styled objects and round-trips through op-apply", () => {
     // `todo_board` is one of the crate's template ids (templates.rs registry).

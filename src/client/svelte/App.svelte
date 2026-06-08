@@ -26,7 +26,8 @@
   import {
     loadSceneCore,
     type ObjectCommand,
-    type SceneCore
+    type SceneCore,
+    type UndoStack
   } from "../scene/sceneCoreWasm";
   import { createShortcutDispatcher } from "../lib/shortcuts";
   import { buildPrimitiveObject } from "../lib/objectPrimitives";
@@ -90,10 +91,11 @@
   let connectionStatus = $state<ConnectionStatus>("offline");
   let canvasBusy = $state(false);
 
-  // ----- per-actor undo/redo stacks (D21): inverse ops authored back through
-  //       the SAME op-apply path; only this client's ops are undoable. -----
-  let undoStack: ObjectOp[] = [];
-  let redoStack: ObjectOp[] = [];
+  // ----- per-actor undo/redo (D21/FC-15): the core's UndoStack owns the
+  //       bookkeeping; inverse ops are authored back through the SAME op-apply
+  //       path. Only this client's ops are undoable. Created once the wasm core
+  //       loads (bootstrapSceneCore). -----
+  let undoStack: UndoStack | null = null;
 
   // ----- non-reactive refs -----
   let host: ShapeCanvasHost | null = null;
@@ -151,6 +153,7 @@
     try {
       sceneCore = await loadSceneCore();
       commandCatalog = sceneCore.objectCommandCatalog();
+      undoStack = sceneCore.createUndoStack(userIdentity());
     } catch {
       sceneCore = null;
     }
@@ -279,8 +282,8 @@
       canvasId = nextCanvasId;
       scene = welcome;
       selection = validSelection(welcome, welcome.selection);
-      undoStack = [];
-      redoStack = [];
+      // A switched canvas starts a fresh undo history.
+      if (sceneCore) undoStack = sceneCore.createUndoStack(userIdentity());
     } catch (error) {
       status = error instanceof Error ? error.message : "Canvas switch failed";
     } finally {
@@ -350,8 +353,10 @@
   // ----- op authoring (the ONE op-apply path, P1) -------------------------
 
   // Author an ObjectOp: the data layer applies it optimistically through the
-  // wasm core and returns the inverse (the undo entry, D21). A fresh user op
-  // clears the redo stack; an undo/redo replay does not (handled by the caller).
+  // wasm core and returns the inverse (the undo entry, D21). On success the
+  // forward+inverse are recorded into the core undo stack — which clears redo (a
+  // fresh user op forks history). An undo/redo replay is NOT undoable (the core
+  // stack drives those via its own handshake, below).
   function authorOp(op: ObjectOp, undoable = true): void {
     if (!sceneClientReady || !sceneClient) {
       // Pre-connect: apply optimistically through the core only, no wire.
@@ -360,10 +365,7 @@
         if (applied.errors.length > 0) status = applied.errors.join("; ");
         else {
           scene = applied.scene;
-          if (undoable && applied.inverse) {
-            undoStack.push(applied.inverse);
-            redoStack = [];
-          }
+          if (undoable && applied.inverse) undoStack?.record(op, applied.inverse);
         }
       }
       return;
@@ -373,34 +375,44 @@
         status = result.errors.join("; ");
         return;
       }
-      if (undoable && result.inverse) {
-        undoStack.push(result.inverse);
-        redoStack = [];
-      }
+      if (undoable && result.inverse) undoStack?.record(op, result.inverse);
       // The engine's onScene callback commits the optimistic scene.
     });
     sceneClient.flush();
   }
 
+  // The core's undo/redo is a two-step handshake (hand out an op, apply it, then
+  // report the re-inverse). The op-apply resolves asynchronously, so back-to-back
+  // presses must not re-enter the handshake before the prior one settles. Chain
+  // every undo/redo onto this tail so they run strictly in order.
+  let undoChain: Promise<void> = Promise.resolve();
+
   function undo(): void {
-    const inverse = undoStack.pop();
-    if (!inverse || !sceneClient) return;
-    // Capture this undo's own inverse so redo can re-apply (D21 same pipeline).
-    void sceneClient.applyObjectOp(inverse).then((result) => {
-      if (result.errors.length === 0 && result.inverse) redoStack.push(result.inverse);
-      else if (result.errors.length > 0) status = result.errors.join("; ");
-    });
-    sceneClient.flush();
+    undoChain = undoChain.then(() => runUndoStep("undo"));
   }
 
   function redo(): void {
-    const inverse = redoStack.pop();
-    if (!inverse || !sceneClient) return;
-    void sceneClient.applyObjectOp(inverse).then((result) => {
-      if (result.errors.length === 0 && result.inverse) undoStack.push(result.inverse);
-      else if (result.errors.length > 0) status = result.errors.join("; ");
-    });
+    undoChain = undoChain.then(() => runUndoStep("redo"));
+  }
+
+  // Pull the next op from the core stack and re-author it through the SAME
+  // op-apply path (D21); report the resulting inverse back to complete the
+  // handshake. Awaiting the apply keeps the core stack's pending handshake from
+  // being re-entered by a queued press.
+  async function runUndoStep(dir: "undo" | "redo"): Promise<void> {
+    if (!undoStack || !sceneClient) return;
+    const op = dir === "undo" ? undoStack.undo() : undoStack.redo();
+    if (!op) return;
+    const result = await sceneClient.applyObjectOp(op);
     sceneClient.flush();
+    if (result.errors.length > 0) {
+      status = result.errors.join("; ");
+      return;
+    }
+    if (result.inverse) {
+      if (dir === "undo") undoStack.noteUndoApplied(result.inverse);
+      else undoStack.noteRedoApplied(result.inverse);
+    }
   }
 
   // ----- insertion / editing ----------------------------------------------

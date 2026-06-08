@@ -74,6 +74,49 @@ type SceneCoreModule = {
     id: string,
     order: string
   ) => string;
+  WasmUndoStack: new (actorId: string) => WasmUndoStack;
+};
+
+// The core's per-actor undo stack (FC-15), exported as a wasm-bindgen class. Ops
+// cross the boundary as ObjectOp JSON; `undo`/`redo` return the op JSON to apply
+// (or `undefined` when the stack is empty). Method names stay snake_case.
+type WasmUndoStack = {
+  record: (forwardJson: string, inverseJson: string) => boolean;
+  begin_coalesce: () => void;
+  end_coalesce: () => void;
+  is_coalescing: () => boolean;
+  undo: () => string | undefined;
+  note_undo_applied: (reInverseJson: string) => boolean;
+  redo: () => string | undefined;
+  note_redo_applied: (inverseJson: string) => boolean;
+  can_undo: () => boolean;
+  can_redo: () => boolean;
+};
+
+/**
+ * Per-actor undo/redo stack (FC-15), backed by the core's `UndoStack` (D21). It
+ * owns no scene and performs no apply: `undo`/`redo` hand back the op the caller
+ * must re-author through the SAME `applyObjectOp` path, then the caller reports
+ * the re-inverse via `noteUndoApplied`/`noteRedoApplied`. A continuous gesture
+ * collapses to one step inside a `beginCoalesce`/`endCoalesce` window.
+ */
+export type UndoStack = {
+  /** Record an applied edit (forward op + the inverse op-apply returned). A
+   *  fresh record clears redo; during a coalesce window it folds into one entry. */
+  record(forward: ObjectOp, inverse: ObjectOp): void;
+  beginCoalesce(): void;
+  endCoalesce(): void;
+  isCoalescing(): boolean;
+  /** The inverse op to apply, or null when nothing to undo. */
+  undo(): ObjectOp | null;
+  /** Report the re-inverse `applyObjectOp` returned for the undo op. */
+  noteUndoApplied(reInverse: ObjectOp): void;
+  /** The forward op to re-apply, or null when nothing to redo. */
+  redo(): ObjectOp | null;
+  /** Report the inverse `applyObjectOp` returned for the redo op. */
+  noteRedoApplied(inverse: ObjectOp): void;
+  canUndo(): boolean;
+  canRedo(): boolean;
 };
 
 /** Typed handle returned by {@link loadSceneCore}. The object-native op-apply +
@@ -99,6 +142,8 @@ export type SceneCore = {
     id: string,
     order: string
   ): SceneObject;
+  /** FC-15: create a per-actor undo/redo stack backed by the core (D21). */
+  createUndoStack(actorId: string): UndoStack;
 };
 
 let modulePromise: Promise<SceneCoreModule> | null = null;
@@ -207,6 +252,44 @@ export async function loadSceneCore(): Promise<SceneCore> {
           order
         )
       );
+    },
+    createUndoStack(actorId) {
+      const inner = new mod.WasmUndoStack(actorId);
+      // `undo`/`redo` return the op JSON to apply (or `undefined` when empty).
+      const popOp = (raw: string | undefined): ObjectOp | null =>
+        raw === undefined ? null : (JSON.parse(raw) as ObjectOp);
+      return {
+        record(forward, inverse) {
+          inner.record(JSON.stringify(forward), JSON.stringify(inverse));
+        },
+        beginCoalesce() {
+          inner.begin_coalesce();
+        },
+        endCoalesce() {
+          inner.end_coalesce();
+        },
+        isCoalescing() {
+          return inner.is_coalescing();
+        },
+        undo() {
+          return popOp(inner.undo());
+        },
+        noteUndoApplied(reInverse) {
+          inner.note_undo_applied(JSON.stringify(reInverse));
+        },
+        redo() {
+          return popOp(inner.redo());
+        },
+        noteRedoApplied(inverse) {
+          inner.note_redo_applied(JSON.stringify(inverse));
+        },
+        canUndo() {
+          return inner.can_undo();
+        },
+        canRedo() {
+          return inner.can_redo();
+        }
+      };
     }
   };
 }
