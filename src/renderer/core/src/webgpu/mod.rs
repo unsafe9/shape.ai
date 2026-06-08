@@ -375,4 +375,9 @@ pub struct ShapeWebGpuRenderer {
     // `set_object_theme` remember the last-set theme and `load_object_scene` rebuild
     // every renderer directly in that theme — sticky across reloads, zero rebake.
     object_theme: crate::object_theme::Theme,
+    // W3-G8/A: offscreen targets + pipelines for the real separable-Gaussian drop-
+    // shadow blur. Surface-sized (config.width x config.height); recreated in
+    // `resize` after the config updates. Isolated underlay — a fault here can at
+    // worst drop the shadow, never the fill/stroke/text on top.
+    shadow_blur: crate::shadow_blur::ShadowBlur,
 }

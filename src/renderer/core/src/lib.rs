@@ -19,6 +19,7 @@ mod object_pipeline;
 mod object_theme;
 mod render_object;
 mod shaders;
+mod shadow_blur;
 mod stroke_expand;
 mod tessellate;
 #[allow(dead_code)]
@@ -56,6 +57,16 @@ pub use object_pipeline::{
 #[allow(unused_imports)]
 pub use object_pipeline::{ObjectPipeline, ObjectRenderer};
 
+// W3-G8/A real drop-shadow blur. The pure Gaussian-kernel core + tuning constants
+// build for every target (host-testable); the `ShadowBlur` GPU offscreen-target +
+// pipeline holder needs `wgpu`. Re-exported so the wasm32-only consumer (the live
+// frame loop) isn't the lone reference (mirrors the `ObjectRenderer` re-export).
+#[allow(unused_imports)]
+pub use shadow_blur::{gaussian_kernel, SHADOW_BLUR_MAX_RADIUS, SHADOW_BLUR_RADIUS_PX};
+#[cfg(feature = "wgpu-probe")]
+#[allow(unused_imports)]
+pub use shadow_blur::ShadowBlur;
+
 // OB-3 object render-model surface (additive; consumed at the OB-4 cutover).
 #[allow(unused_imports)]
 pub use curve_lod::{
@@ -80,7 +91,10 @@ pub use render_object::{
     QUANT_PER_PX,
 };
 #[allow(unused_imports)]
-pub use shaders::{CLIP_WGSL, MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_STROKE_WGSL};
+pub use shaders::{
+    CLIP_WGSL, MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_STROKE_WGSL, SHADOW_BLUR_WGSL,
+    SHADOW_COMPOSITE_WGSL,
+};
 #[allow(unused_imports)]
 pub use stroke_expand::{
     dash_segments, expand_stroke, Cap, Join, Mesh as StrokeMesh,

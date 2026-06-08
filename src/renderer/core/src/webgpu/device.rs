@@ -346,6 +346,18 @@ impl ShapeWebGpuRenderer {
             cache: None,
         });
 
+        // W3-G8/A: build the offscreen drop-shadow blur targets at the surface size.
+        // Created here and recreated in `resize`; isolated from the fill/stroke/text
+        // path so a fault degrades to "no shadow", never a blank canvas.
+        let shadow_blur = crate::shadow_blur::ShadowBlur::new(
+            &device,
+            &queue,
+            config.format,
+            config.width,
+            config.height,
+            device_pixel_ratio.max(1.0) as f32,
+        );
+
         let renderer = ShapeWebGpuRenderer {
             canvas,
             scene: None,
@@ -403,6 +415,7 @@ impl ShapeWebGpuRenderer {
             object_scene: None,
             object_regions: Vec::new(),
             object_theme: crate::object_theme::Theme::light(),
+            shadow_blur,
         };
         renderer.write_uniform();
         Ok(renderer)
@@ -417,6 +430,18 @@ impl ShapeWebGpuRenderer {
         self.canvas.set_width(self.config.width);
         self.canvas.set_height(self.config.height);
         self.surface.configure(&self.device, &self.config);
+        // W3-G8/A: the offscreen shadow targets are surface-sized, so rebuild them to
+        // match the new physical resolution (only when the size actually changed).
+        if !self.shadow_blur.matches(self.config.width, self.config.height) {
+            self.shadow_blur = crate::shadow_blur::ShadowBlur::new(
+                &self.device,
+                &self.queue,
+                self.config.format,
+                self.config.width,
+                self.config.height,
+                self.device_pixel_ratio as f32,
+            );
+        }
         self.write_uniform();
     }
 }

@@ -69,6 +69,14 @@ pub const MSDF_TEXT_WGSL: &str = include_str!("shaders/msdf_text.wgsl");
 /// See the module docs for the full stencil compose plan.
 pub const CLIP_WGSL: &str = include_str!("shaders/clip.wgsl");
 
+/// W3-G8/A separable Gaussian blur over the offscreen shadow mask: one fullscreen
+/// pass per axis (H then V), reading CPU-computed normalized Gaussian taps.
+pub const SHADOW_BLUR_WGSL: &str = include_str!("shaders/shadow_blur.wgsl");
+
+/// W3-G8/A drop-shadow composite: a fullscreen pass that samples the blurred mask's
+/// coverage and tints it by the theme `shadow` token, src-over under the fill.
+pub const SHADOW_COMPOSITE_WGSL: &str = include_str!("shaders/shadow_composite.wgsl");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +92,8 @@ mod tests {
             ("object_stroke", OBJECT_STROKE_WGSL),
             ("msdf_text", MSDF_TEXT_WGSL),
             ("clip", CLIP_WGSL),
+            ("shadow_blur", SHADOW_BLUR_WGSL),
+            ("shadow_composite", SHADOW_COMPOSITE_WGSL),
         ] {
             assert!(!src.trim().is_empty(), "{name} WGSL source is empty");
             assert!(
