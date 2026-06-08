@@ -19,7 +19,7 @@
     WifiOff
   } from "lucide-svelte";
   import type { ActiveTool } from "../renderer/engine";
-  import { toolbarShapeKinds, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
+  import { toolbarShapeKinds, toggleColorPopup, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import type { CanvasSummary } from "../lib/sceneClient";
   import type { ConnectionStatus } from "../lib/wsTransport";
   import type { Object as SceneObject } from "../../shared/object";
@@ -120,6 +120,32 @@
 
   // First text run of the selected object, the editable label in the property panel.
   const selectedText = $derived(selectedObject?.text?.runs?.map((run) => run.text).join("") ?? "");
+
+  // TB1 (#3): the color control is a single rainbow swatch that toggles a popup
+  // holding BOTH the native picker and the fixed PEN_PALETTE swatches. Local UI
+  // state only — the selected color + apply contract still live in the parent.
+  let colorPopupOpen = $state(false);
+  let colorControl = $state<HTMLDivElement | null>(null);
+  function toggleColorPopupOpen(): void {
+    colorPopupOpen = toggleColorPopup(colorPopupOpen);
+  }
+  // Close on outside-click / Escape while the popup is open (re-click on the
+  // button is handled by the toggle above; this only catches clicks elsewhere).
+  $effect(() => {
+    if (!colorPopupOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (colorControl && !colorControl.contains(event.target as Node)) colorPopupOpen = false;
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") colorPopupOpen = false;
+    };
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  });
 </script>
 
 <!-- Canvas switcher + connection status (top-left chrome). -->
@@ -297,33 +323,53 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <!-- D1/#5: always-visible color. Palette swatches set the toolbar's selected
-       color; the trailing native picker opens the OS color popup for any color.
-       AP1 reads `selectedColor` and applies it to the selection via SetStyle. -->
-  <div class="toolbar-group" aria-label="Color">
+  <!-- TB1 (#3): one rainbow-gradient swatch BUTTON toggles a color popup holding
+       BOTH the native picker and the fixed PEN_PALETTE swatches (presets + custom
+       in one place). AP1 reads `selectedColor` and applies it to the selection via
+       SetStyle; the toggle + popup are local UI chrome only. -->
+  <div class="toolbar-group" aria-label="Color" bind:this={colorControl}>
     <span class="toolbar-group-label">Color</span>
     <div class="toolbar-group-buttons">
-      {#each penPalette as color (color)}
-        <button
-          class="icon-button swatch {selectedColor === color ? 'is-active' : ''}"
-          type="button"
-          title={color}
-          aria-label={`Color ${color}`}
-          aria-pressed={selectedColor === color}
-          onclick={() => onSelectColor(color)}
-        >
-          <span class="swatch-fill" style={`background:${color};`}></span>
-        </button>
-      {/each}
-      <label class="icon-button swatch color-picker" title="Pick color" aria-label="Pick color">
-        <span class="swatch-fill" style={`background:${selectedColor};`}></span>
-        <input
-          type="color"
-          value={selectedColor}
-          oninput={(event) => onSelectColor((event.currentTarget as HTMLInputElement).value)}
-        />
-      </label>
+      <button
+        class="icon-button color-trigger {colorPopupOpen ? 'is-active' : ''}"
+        type="button"
+        title="Color"
+        aria-label="Color"
+        aria-haspopup="dialog"
+        aria-expanded={colorPopupOpen}
+        onclick={toggleColorPopupOpen}
+      >
+        <span class="color-trigger-rainbow"></span>
+        <span class="color-trigger-current" style={`background:${selectedColor};`}></span>
+      </button>
     </div>
+    {#if colorPopupOpen}
+      <div class="color-popup" role="dialog" aria-label="Choose color" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="color-popup-swatches">
+          {#each penPalette as color (color)}
+            <button
+              class="icon-button swatch {selectedColor === color ? 'is-active' : ''}"
+              type="button"
+              title={color}
+              aria-label={`Color ${color}`}
+              aria-pressed={selectedColor === color}
+              onclick={() => onSelectColor(color)}
+            >
+              <span class="swatch-fill" style={`background:${color};`}></span>
+            </button>
+          {/each}
+        </div>
+        <label class="color-popup-picker" title="Custom color" aria-label="Custom color">
+          <span class="swatch-fill" style={`background:${selectedColor};`}></span>
+          <span class="color-popup-picker-label">Custom</span>
+          <input
+            type="color"
+            value={selectedColor}
+            oninput={(event) => onSelectColor((event.currentTarget as HTMLInputElement).value)}
+          />
+        </label>
+      </div>
+    {/if}
   </div>
 
   <div class="toolbar-sep" aria-hidden="true"></div>

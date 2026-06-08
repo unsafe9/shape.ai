@@ -42,4 +42,13 @@ export function primitiveForCommand(commandId: string): PrimitiveKindId | null {
   return insertCommandToPrimitive[commandId] ?? null;
 }
 
+/**
+ * TB1 (#3): the color control is a single rainbow swatch that TOGGLES a popup —
+ * clicking it while closed opens, while open closes. Pure so the toolbar test can
+ * pin the open->close-on-re-click behavior without a Svelte mount.
+ */
+export function toggleColorPopup(open: boolean): boolean {
+  return !open;
+}
+
 export const primitiveOrder: PrimitiveKindId[] = ["rectangle", "ellipse", "line", "text", "frame"];
