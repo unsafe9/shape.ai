@@ -13,7 +13,6 @@
     type ObjectOp,
     type ObjectScene,
     type ObjectSelection,
-    type Transform3x3,
     type FeatureResponse
   } from "../../shared/object";
   import {
@@ -46,6 +45,7 @@
     type DragSpan
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
+  import { cascadeTransformOps } from "../lib/transformCascade";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
   import CanvasHost from "./ShapeCanvasHost.svelte";
@@ -228,15 +228,20 @@
       const src = scene.objects.find((o) => o.id === id);
       // W2-11: with no src the GPU preview must not linger — revert it to canonical.
       if (!src) return void host?.clearObjectPreview(id);
-      const transform = composeTransform(matrix, src.transform);
+      // AP2 (#15): a parent drag cascades the world-space delta to its descendants
+      // (children transforms are world-absolute, D3), so a frame moves with its
+      // contents. The dragged object is the first op; the rest are descendants.
+      const ops = cascadeTransformOps(scene.objects, id, matrix);
+      const op: ObjectOp = ops.length === 1 ? ops[0] : { kind: "batch", ops };
       // FC-16: pre-connect authorOp applies synchronously (the committed scene is on
       // return, so the rebake $effect drops the preview matrix immediately). In the
       // connected path the scene update is async — the GPU instance matrix holds the
       // previewed position until commitClientScene sees the committed transform land
       // (no snap-back). If the commit op fails, revert the GPU preview to canonical.
       const wasConnected = sceneClientReady && sceneClient !== null;
-      if (wasConnected) pendingCommit = { id, transform };
-      authorOp({ kind: "set-transform", id, transform }, true, (ok) => {
+      const rootTransform = ops[0].kind === "set-transform" ? ops[0].transform : src.transform;
+      if (wasConnected && rootTransform) pendingCommit = { id, transform: rootTransform };
+      authorOp(op, true, (ok) => {
         if (!ok) {
           pendingCommit = null;
           host?.clearObjectPreview(id);
@@ -1274,24 +1279,6 @@
       [transform[1][0], transform[1][1], oy + dy],
       [transform[2][0], transform[2][1], transform[2][2]]
     ];
-  }
-
-  // W2-05: 3x3 row-major pre-multiply newTransform = delta * base, with an absent
-  // base treated as the identity. The delta is the cumulative world-space gesture
-  // matrix from the renderer core; the base is the object's existing transform.
-  function composeTransform(delta: Transform3x3, base: SceneObject["transform"]): Transform3x3 {
-    const b = base ?? IDENTITY_TRANSFORM;
-    const out: Transform3x3 = [
-      [0, 0, 0],
-      [0, 0, 0],
-      [0, 0, 0]
-    ];
-    for (let r = 0; r < 3; r++) {
-      for (let c = 0; c < 3; c++) {
-        out[r][c] = delta[r][0] * b[0][c] + delta[r][1] * b[1][c] + delta[r][2] * b[2][c];
-      }
-    }
-    return out;
   }
 
   // W2-08: map a world point into an object's local quantized geometry space
