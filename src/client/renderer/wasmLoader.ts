@@ -205,6 +205,13 @@ export type RustWebGpuRenderer = {
   // the host feature-detects before calling.
   loadObjectScene?(sceneJson: string): { objects: number; fillIndices: number; strokeVertices: number };
   drawObjects?(): void;
+  // W2-11: drag zero-rebake. `setObjectPreviewTransform` pushes ONLY the dragged
+  // object's instance model matrix (a row-major [[f64;3];3] cumulative world DELTA,
+  // JSON) to the GPU with no re-tessellation; `clearObjectPreview` reverts it to the
+  // canonical baked transform. Optional so a wasm build predating these stays valid;
+  // the host feature-detects before calling.
+  setObjectPreviewTransform?(id: string, matrixJson: string): void;
+  clearObjectPreview?(id: string): void;
   inputBatch(eventsJson: string): RustInputBatchResult;
   overlayRequest(cardId: string, field: string): DomOverlayRequest | null;
   debugSnapshot(): RustDebugSnapshot;

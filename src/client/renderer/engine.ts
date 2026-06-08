@@ -1014,6 +1014,11 @@ export class ShapeCanvasEngine {
       // the shell composes the matrix onto the object and commits on pointer-up.
       const { id, matrix, kind } = result.objectTransformDelta;
       this.objectDrag = { id, matrix, kind };
+      // W2-11 drag zero-rebake: push the cumulative delta straight to the GPU
+      // instance matrix (no Svelte round-trip, lowest latency, no re-tessellation).
+      // The preview event still rides through so the shell does its commit/snap-back
+      // bookkeeping; it no longer drives a full feedScene rebuild.
+      this.webGpuRenderer?.setObjectPreviewTransform?.(id, JSON.stringify(matrix));
       this.onEvent({ type: "object-transform-preview", id, matrix, kind });
     }
     if (result.objectMarqueeIds != null) {

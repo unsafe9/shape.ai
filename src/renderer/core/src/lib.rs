@@ -46,8 +46,8 @@ pub use webgpu::ShapeWebGpuRenderer;
 // without the GPU pipeline).
 #[allow(unused_imports)]
 pub use object_pipeline::{
-    build_scene_geometry, FillInstance, FillVertex, ObjectDraw, ObjectMatrixUniform, SceneGeometry,
-    StrokeInstance, StrokeParamsUniform, StrokeVertex,
+    build_scene_geometry, preview_instance_columns, FillInstance, FillVertex, ObjectDraw,
+    ObjectMatrixUniform, SceneGeometry, StrokeInstance, StrokeParamsUniform, StrokeVertex,
 };
 
 // OB-4 object GPU pipeline (needs `wgpu`; the client flips to it at the cutover).

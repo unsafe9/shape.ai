@@ -110,6 +110,56 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
+    /// W2-11 drag zero-rebake: push ONLY the dragged object's instance model matrix
+    /// to the GPU. `matrix_json` is a row-major `[[f64;3];3]` CUMULATIVE world-space
+    /// DELTA (the same contract as `ObjectTransformDelta.matrix`). The canonical
+    /// `object_scene` / `object_regions` are NOT mutated — the base transform is read
+    /// from the untouched scene and `delta * base` is written straight to the
+    /// instance buffer (no re-tessellation, no region re-derive). The RAF
+    /// `render_frame` loop then draws from the updated instance buffer on the next
+    /// tick, so no explicit redraw is needed. No-op if the object scene is unloaded
+    /// or the id is absent.
+    #[wasm_bindgen(js_name = setObjectPreviewTransform)]
+    pub fn set_object_preview_transform(
+        &mut self,
+        id: &str,
+        matrix_json: &str,
+    ) -> Result<(), JsValue> {
+        let delta: [[f64; 3]; 3] = serde_json::from_str(matrix_json)
+            .map_err(|error| JsValue::from_str(&format!("Invalid preview matrix: {error}")))?;
+        let Some(base) = self
+            .object_scene
+            .as_ref()
+            .and_then(|scene| scene.objects.iter().find(|o| o.id == id))
+            .map(|o| o.transform)
+        else {
+            return Ok(());
+        };
+        if let Some(renderer) = self.object_renderer.as_ref() {
+            renderer.set_preview_transform(&self.queue, id, &delta, &base);
+        }
+        Ok(())
+    }
+
+    /// W2-11: revert the dragged object's instance matrix to its canonical baked
+    /// transform (`delta = identity`), dropping the live preview. No-op if the
+    /// object scene is unloaded or the id is absent.
+    #[wasm_bindgen(js_name = clearObjectPreview)]
+    pub fn clear_object_preview(&mut self, id: &str) -> Result<(), JsValue> {
+        let Some(base) = self
+            .object_scene
+            .as_ref()
+            .and_then(|scene| scene.objects.iter().find(|o| o.id == id))
+            .map(|o| o.transform)
+        else {
+            return Ok(());
+        };
+        if let Some(renderer) = self.object_renderer.as_ref() {
+            renderer.clear_preview_transform(&self.queue, id, &base);
+        }
+        Ok(())
+    }
+
 }
 
 #[cfg(feature = "wgpu-probe")]

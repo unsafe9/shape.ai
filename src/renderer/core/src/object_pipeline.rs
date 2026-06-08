@@ -624,6 +624,42 @@ impl ObjectRenderer {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
     }
 
+    /// W2-11 drag zero-rebake: write ONLY the dragged object's instance model
+    /// matrix to the GPU — no re-tessellation, no scene rebuild (P4). Looks up the
+    /// object's instance index `i` in `self.draws` (which is built in the same loop
+    /// as both instance buffers, so `draws[i]` ↔ instance `i` in fill AND stroke),
+    /// composes `delta * base` via [`preview_instance_columns`], and overwrites the
+    /// 36-byte matrix region (`m0,m1,m2` at offset 0) of BOTH `FillInstance` and
+    /// `StrokeInstance` at offset `i * size_of::<…>()`. The baked color sits past
+    /// byte 36, so it is preserved. Returns false if `id` is absent.
+    pub fn set_preview_transform(
+        &self,
+        queue: &wgpu::Queue,
+        id: &str,
+        delta: &[[f64; 3]; 3],
+        base: &[[f64; 3]; 3],
+    ) -> bool {
+        let Some(i) = self.draws.iter().position(|d| d.id == id) else {
+            return false;
+        };
+        let (m0, m1, m2) = preview_instance_columns(delta, base);
+        let columns: [[f32; 3]; 3] = [m0, m1, m2];
+        let bytes = bytemuck::cast_slice(&columns);
+        let fill_offset = (i * std::mem::size_of::<FillInstance>()) as u64;
+        let stroke_offset = (i * std::mem::size_of::<StrokeInstance>()) as u64;
+        queue.write_buffer(&self.fill_instance_buffer, fill_offset, bytes);
+        queue.write_buffer(&self.stroke_instance_buffer, stroke_offset, bytes);
+        true
+    }
+
+    /// W2-11: revert the dragged object's instance matrix to its canonical baked
+    /// transform (`delta = identity`), i.e. drop the live preview. Used by the
+    /// shell as a defensive snap-back on commit-failure before the canonical scene
+    /// rebake lands. Returns false if `id` is absent.
+    pub fn clear_preview_transform(&self, queue: &wgpu::Queue, id: &str, base: &[[f64; 3]; 3]) -> bool {
+        self.set_preview_transform(queue, id, &crate::hit_test_object::identity_3x3(), base)
+    }
+
     /// Record the object draw pass into `encoder` targeting `view`. Each object
     /// is one instanced indexed fill draw (its megabuffer range against its
     /// instance) followed by one instanced stroke draw. `clear` chooses whether
@@ -933,6 +969,26 @@ fn matrix_col(transform: &[[f64; 3]; 3], col: usize) -> [f32; 3] {
     ]
 }
 
+/// W2-11 drag zero-rebake: compose the preview world matrix `delta * base` and
+/// return its three instance columns in the exact same packing
+/// [`build_scene_geometry`] uses for [`FillInstance`]/[`StrokeInstance`]
+/// (`M = [m0 | m1 | m2]`). This is the single source of truth for the preview
+/// matrix: the GPU writer ([`ObjectRenderer::set_preview_transform`]) and the
+/// perf-gate test both call it, so the live-drag instance push is byte-equivalent
+/// to a full rebake of the same object at `compose(delta, base)`. Pure and
+/// device-free so it runs under `cargo test --workspace` too.
+pub fn preview_instance_columns(
+    delta: &[[f64; 3]; 3],
+    base: &[[f64; 3]; 3],
+) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let world = crate::hit_test_object::mat3_mul(delta, base);
+    (
+        matrix_col(&world, 0),
+        matrix_col(&world, 1),
+        matrix_col(&world, 2),
+    )
+}
+
 /// Resolve a paint to a single RGBA color for the inline-solid first cutover.
 /// Gradient/image paints collapse to their representative color (first stop /
 /// neutral) here; richer paints get their own bind group later (D7 note).
@@ -1203,5 +1259,108 @@ mod tests {
             geo.stroke_vertices.len() > solid.stroke_vertices.len(),
             "dashing splits the line into more ribbon runs"
         );
+    }
+
+    /// W2-11 perf gate (the whole point of S7): a sustained drag updates ONLY each
+    /// dragged object's instance model matrix via `preview_instance_columns` — a
+    /// pure column compose — and NEVER re-runs `build_scene_geometry`. We bake a
+    /// 10_000-object scene once (the single tessellation entry), then drive
+    /// DRAG_FRAMES of per-object preview pushes and assert the bake closure ran
+    /// exactly once across the whole scenario (zero re-tessellation, P4).
+    #[test]
+    fn perf_gate_drag_10k_objects_zero_retessellation_instance_path() {
+        const N: usize = 10_000;
+        const DRAG_FRAMES: usize = 60;
+
+        let scene = scene_with((0..N).map(|i| rect_object(&format!("obj-{i}"))).collect(), None);
+
+        // The ONLY tessellation entry: bake the whole scene once. A counter pins
+        // the ground-truth `build_scene_geometry` call count; the drag must not move
+        // it past 1.
+        let mut bake_calls = 0usize;
+        let geo = {
+            bake_calls += 1;
+            build_scene_geometry(&scene)
+        };
+        assert_eq!(geo.draws.len(), N);
+        assert_eq!(bake_calls, 1, "initial bake is the sole tessellation");
+
+        // A cumulative translate delta, advancing each frame so the matrix actually
+        // moves (a real drag, not a no-op).
+        for frame in 0..DRAG_FRAMES {
+            let delta = crate::hit_test_object::translate_3x3((frame as f64) + 1.0, -(frame as f64));
+            for obj in &scene.objects {
+                let (m0, m1, m2) = preview_instance_columns(&delta, &obj.transform);
+                // Finite, no NaN/inf on the hot path.
+                for v in m0.iter().chain(m1.iter()).chain(m2.iter()) {
+                    assert!(v.is_finite(), "preview columns stay finite");
+                }
+                // Correctness: the pushed columns equal `delta * base`'s columns,
+                // exactly the packing `build_scene_geometry` would have baked.
+                let world = crate::hit_test_object::mat3_mul(&delta, &obj.transform);
+                assert_eq!(m0, matrix_col(&world, 0));
+                assert_eq!(m1, matrix_col(&world, 1));
+                assert_eq!(m2, matrix_col(&world, 2));
+            }
+        }
+
+        // THE 0-REBAKE GATE: the entire N * DRAG_FRAMES drag re-tessellated nothing.
+        assert_eq!(
+            bake_calls, 1,
+            "1만 object 드래그 = 재tessellation 0: the instance-matrix push must never re-bake (P4)"
+        );
+    }
+
+    /// W2-11: the GPU instance shortcut is geometry-equivalent to the old
+    /// full-rebake feed. `preview_instance_columns(delta, base)` must yield the SAME
+    /// instance columns as a full `build_scene_geometry` of a scene whose object
+    /// transform was set to `compose(delta, base)` — proving the per-move push is
+    /// pixel-equivalent to the W2-05 `sceneWithObjectTransformed` rebake it replaces.
+    #[test]
+    fn preview_columns_equal_full_rebake_at_composed_transform() {
+        let base = [[2.0, 0.0, 30.0], [0.0, 2.0, -10.0], [0.0, 0.0, 1.0]];
+        let delta = crate::hit_test_object::rotate_about_3x3(std::f64::consts::FRAC_PI_3, 5.0, 7.0);
+
+        let mut obj = rect_object("o1");
+        obj.transform = base;
+        let preview = preview_instance_columns(&delta, &base);
+
+        // Full rebake: bake the object at the composed world transform and read its
+        // baked instance columns.
+        let composed = crate::hit_test_object::mat3_mul(&delta, &base);
+        let mut rebaked_obj = rect_object("o1");
+        rebaked_obj.transform = composed;
+        let geo = build_scene_geometry(&scene_with(vec![rebaked_obj], None));
+        let inst = geo.fill_instances[0];
+
+        assert_eq!(preview.0, inst.m0);
+        assert_eq!(preview.1, inst.m1);
+        assert_eq!(preview.2, inst.m2);
+        // And the stroke instance carries the same matrix columns.
+        let stroke = geo.stroke_instances[0];
+        assert_eq!(preview.0, stroke.m0);
+        assert_eq!(preview.1, stroke.m1);
+        assert_eq!(preview.2, stroke.m2);
+    }
+
+    /// W2-11 index==offset invariant: `draws[i].id` ↔ instance `i` in BOTH the fill
+    /// and stroke instance buffers. `set_preview_transform` looks up `i` via
+    /// `draws.position(id)` and writes `i * size_of` in both buffers, so this
+    /// alignment is load-bearing. Pin it so a future reorder of draws-vs-instances
+    /// can't silently corrupt the preview write.
+    #[test]
+    fn draws_index_aligns_with_both_instance_buffers() {
+        let scene = scene_with(
+            vec![rect_object("a"), rect_object("b"), rect_object("c")],
+            None,
+        );
+        let geo = build_scene_geometry(&scene);
+        assert_eq!(geo.draws.len(), geo.fill_instances.len());
+        assert_eq!(geo.draws.len(), geo.stroke_instances.len());
+        for (i, draw) in geo.draws.iter().enumerate() {
+            assert_eq!(draw.id, scene.objects[i].id, "draws stay in scene order");
+            assert_eq!(draw.fill_instance, geo.fill_instances[i]);
+            assert_eq!(draw.stroke_instance, geo.stroke_instances[i]);
+        }
     }
 }

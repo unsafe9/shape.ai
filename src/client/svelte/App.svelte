@@ -55,19 +55,18 @@
   // ----- selection: single ObjectSelection + transient multi -----
   let selection = $state<ObjectSelection>({ kind: "canvas" });
 
-  // ----- FC-08/W2-05: non-destructive live object transform preview. The canonical
-  //       `scene` is never mutated mid-drag; the renderer is fed a clone with this
-  //       one object's transform pre-multiplied by the cumulative delta `matrix`
-  //       (translate/resize/rotate), so the commit op on pointer-up captures the
-  //       correct inverse (original transform), keeping undo correct (D21). -----
-  let dragPreview = $state<{ id: string; matrix: Transform3x3 } | null>(null);
+  // ----- W2-11: non-destructive live object transform preview, now GPU-side. The
+  //       canonical `scene` is never mutated mid-drag; the dragged object's instance
+  //       model matrix is pushed straight to the GPU (engine.setObjectPreviewTransform)
+  //       with zero re-tessellation (P4). The commit op on pointer-up still captures
+  //       the correct inverse (original transform), keeping undo correct (D21). -----
 
   // FC-16: in the connected path authorOp's scene update is async (it arrives via
-  // commitClientScene), so clearing dragPreview the instant the commit op is
-  // authored would let `feedScene` briefly revert to the pre-drag canonical scene
-  // — the object snaps back to its start then jumps to final. Instead remember the
-  // committed {id, transform} and clear dragPreview inside commitClientScene once
-  // the next canonical scene reflects that object's committed transform.
+  // commitClientScene), so the GPU instance matrix is the ONLY thing holding the
+  // object at its previewed position during the commit window. Remember the
+  // committed {id, transform}; the next canonical scene that reflects it triggers the
+  // single rebake (via the feedScene->loadObjectScene $effect), which drops the
+  // stale preview matrix with no snap-back.
   let pendingCommit: { id: string; transform: SceneObject["transform"] } | null = null;
 
   // ----- FC-11: freehand pen. While the draw tool is active, the in-progress
@@ -172,10 +171,14 @@
   const selectedObject = $derived(selection.kind === "object" ? scene.objects.find((o) => o.id === selection.id) ?? null : null);
 
   // FC-08: the scene actually fed to the renderer — the canonical scene during
-  // normal editing, or a clone with the dragged object shifted during a live drag.
-  // FC-11: while a freehand stroke is in progress, append a transient preview
-  // object built from the world points (no op-apply — geometry-vocabulary only).
-  const feedScene = $derived(buildFeedScene(scene, dragPreview, drawPoints, createKind, createDrag));
+  // normal editing. W2-11: a live object transform NO LONGER rebuilds this scene;
+  // the dragged object's instance model matrix is pushed straight to the GPU
+  // (engine.setObjectPreviewTransform) with zero re-tessellation (P4), so `feedScene`
+  // depends only on the canonical scene + the new-object previews below.
+  // FC-11/W2-07: while a freehand stroke or shape drag-create is in progress, append
+  // a transient preview object (a NEW object has no instance to update, so it bakes
+  // once per geometry change — correct, not a P4 violation).
+  const feedScene = $derived(buildFeedScene(scene, drawPoints, createKind, createDrag));
 
   const hostCallbacks: ShapeCanvasHostCallbacks = {
     onCameraChange: (next) => (camera = next),
@@ -189,32 +192,32 @@
     // a plain click replaces the selection with that object.
     onSelectObject: (id, additive) =>
       selectObject(additive ? toggleObjectSelection(selection, id) : { kind: "object", id }),
-    onTransformPreview: (id, matrix, _kind) => {
-      // A new drag supersedes any commit still waiting for its scene update, so a
-      // stale pendingCommit can never clear (or freeze) the new preview.
+    onTransformPreview: (id, _matrix, _kind) => {
+      // W2-11: the matrix is already on the GPU instance buffer (pushed by the engine
+      // per move). This handler only invalidates a stale pendingCommit so a new drag
+      // can never freeze on a commit still waiting for its scene update.
       if (pendingCommit && pendingCommit.id !== id) pendingCommit = null;
-      dragPreview = { id, matrix };
     },
     onTransformCommit: (id, matrix, _kind) => {
       // The canonical scene was never mutated during the drag, so op-apply
       // captures the correct inverse (original transform), satisfying D21 undo.
       const src = scene.objects.find((o) => o.id === id);
-      if (!src) return void (dragPreview = null);
+      // W2-11: with no src the GPU preview must not linger — revert it to canonical.
+      if (!src) return void host?.clearObjectPreview(id);
       const transform = composeTransform(matrix, src.transform);
-      // FC-16: pre-connect authorOp applies synchronously (scene is already the
-      // committed scene on return), so the preview can clear immediately. In the
-      // connected path the scene update is async — hold the preview until
-      // commitClientScene sees the committed transform land (no snap-back). If the
-      // commit op fails, clear the preview here so it never freezes the object.
+      // FC-16: pre-connect authorOp applies synchronously (the committed scene is on
+      // return, so the rebake $effect drops the preview matrix immediately). In the
+      // connected path the scene update is async — the GPU instance matrix holds the
+      // previewed position until commitClientScene sees the committed transform land
+      // (no snap-back). If the commit op fails, revert the GPU preview to canonical.
       const wasConnected = sceneClientReady && sceneClient !== null;
       if (wasConnected) pendingCommit = { id, transform };
       authorOp({ kind: "set-transform", id, transform }, true, (ok) => {
         if (!ok) {
           pendingCommit = null;
-          dragPreview = null;
+          host?.clearObjectPreview(id);
         }
       });
-      if (!wasConnected) dragPreview = null;
     },
     onMarquee: (ids) => {
       // FC-16: route the marquee result through the same validation as
@@ -425,16 +428,17 @@
   function commitClientScene(next: ObjectScene): void {
     scene = next;
     selection = validSelection(next, selection);
-    // FC-16: once the canonical scene reflects the committed drag transform, drop
-    // the preview so `feedScene` falls back to the canonical scene with no flash.
+    // FC-16/W2-11: once the canonical scene reflects the committed drag transform,
+    // the `scene = next` above already triggered the single rebake (feedScene ->
+    // loadObjectScene $effect) at the committed transform, dropping the stale GPU
+    // preview matrix with no flash. Clear the pendingCommit (and defensively revert
+    // any residual preview) once the canonical transform lands (success) or the
+    // object is gone (concurrent delete).
     if (pendingCommit) {
       const committed = next.objects.find((o) => o.id === pendingCommit!.id);
-      // Drop the preview once the canonical transform lands (success) or the
-      // object is gone (concurrent delete) — either way the canonical scene is
-      // now authoritative, so the preview must not linger.
       if (!committed || transformsEqual(committed.transform, pendingCommit.transform)) {
+        host?.clearObjectPreview(pendingCommit.id);
         pendingCommit = null;
-        dragPreview = null;
       }
     }
   }
@@ -1229,17 +1233,6 @@
     ];
   }
 
-  // FC-08/W2-05: a shallow clone of the scene with one object's transform composed
-  // with the cumulative delta `matrix` (pre-multiplied: newWorld = matrix * obj).
-  // Used only for the live transform preview feed; the canonical scene is never
-  // mutated, so undo stays correct.
-  function sceneWithObjectTransformed(source: ObjectScene, id: string, matrix: Transform3x3): ObjectScene {
-    return {
-      ...source,
-      objects: source.objects.map((o) => (o.id === id ? { ...o, transform: composeTransform(matrix, o.transform) } : o))
-    };
-  }
-
   // W2-05: 3x3 row-major pre-multiply newTransform = delta * base, with an absent
   // base treated as the identity. The delta is the cumulative world-space gesture
   // matrix from the renderer core; the base is the object's existing transform.
@@ -1279,17 +1272,18 @@
     return { x: Math.round(localX * GEOMETRY_QUANTUM_PER_PX), y: Math.round(localY * GEOMETRY_QUANTUM_PER_PX) };
   }
 
-  // FC-08/FC-11: the renderer feed. Start from the canonical scene, apply a live
-  // drag-preview shift, and append a transient pen-stroke preview — neither mutates
-  // the canonical `scene` nor runs op-apply (geometry-vocabulary construction only).
+  // FC-11/W2-07: the renderer feed. Start from the canonical scene and append a
+  // transient pen-stroke / shape-drag-create preview — neither mutates the canonical
+  // `scene` nor runs op-apply (geometry-vocabulary construction only). W2-11: an
+  // existing object's live transform is NOT previewed here anymore (it rides the GPU
+  // instance matrix); only NEW-object previews, which inherently need one bake.
   function buildFeedScene(
     source: ObjectScene,
-    drag: { id: string; matrix: Transform3x3 } | null,
     pen: { x: number; y: number }[] | null,
     create: DragCreateShape | null,
     createState: { span: DragSpan; snapped: boolean } | null
   ): ObjectScene {
-    let feed = drag ? sceneWithObjectTransformed(source, drag.id, drag.matrix) : source;
+    let feed = source;
     const preview = pen && pen.length >= 1 ? drawPreviewObject(pen) : null;
     if (preview) feed = { ...feed, objects: [...feed.objects, preview] };
     // W2-07: a transient rubber-band preview of the shape being drag-created, plus

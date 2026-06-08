@@ -298,6 +298,15 @@ export class ShapeCanvasHost {
     }
   }
 
+  /** W2-11 drag zero-rebake: revert the dragged object's GPU instance matrix to its
+   *  canonical baked transform, dropping the live preview. The shell calls this on a
+   *  commit-failure (defensive snap-back) before the canonical-scene rebake lands;
+   *  the success path lets the next `loadObjectScene` rebake drop the stale matrix.
+   *  No-op without a live renderer or on a wasm build predating the method. */
+  clearObjectPreview(id: string): void {
+    this.webGpuRenderer?.clearObjectPreview?.(id);
+  }
+
   /** Upload the object scene to the live renderer when available (browser-only;
    *  a no-op without a WebGPU device). FC-05: this only UPLOADS the geometry; the
    *  RAF `renderFrame` loop is the sole frame driver and records the object pass
