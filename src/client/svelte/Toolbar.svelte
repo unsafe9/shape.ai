@@ -20,7 +20,7 @@
     WifiOff
   } from "lucide-svelte";
   import type { ActiveTool } from "../renderer/engine";
-  import type { PrimitiveKindId } from "../lib/toolbar";
+  import type { DragCreateShape, PrimitiveKindId } from "../lib/toolbar";
   import type { CanvasSummary } from "../lib/sceneClient";
   import type { ConnectionStatus } from "../lib/wsTransport";
   import type { Object as SceneObject } from "../../shared/object";
@@ -32,6 +32,9 @@
   // routes through the parent; this component renders + dispatches only.
   type Props = {
     activeTool: ActiveTool;
+    // W2-07: the armed drag-create shape (rect/ellipse/line), or null. Highlights
+    // the active shape button while the create tool is armed.
+    createKind: DragCreateShape | null;
     busy: boolean;
     templateOpen: boolean;
     diagnosticsOpen: boolean;
@@ -60,6 +63,7 @@
 
   let {
     activeTool,
+    createKind,
     busy,
     templateOpen,
     diagnosticsOpen,
@@ -198,11 +202,12 @@
     <div class="toolbar-group-buttons">
       {#each shapes as shape (shape.id)}
         <button
-          class="icon-button"
+          class="icon-button {createKind === shape.id ? 'is-active' : ''}"
           type="button"
           disabled={busy}
           title={shape.label}
           aria-label={`Insert ${shape.label}`}
+          aria-pressed={createKind === shape.id}
           onclick={() => onInsertPrimitive(shape.id)}
         >
           <shape.icon size={16} />

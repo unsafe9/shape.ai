@@ -191,9 +191,10 @@ p {
   touch-action: none;
 }
 
-/* W2-03 tool cursors: draw uses a crosshair, the unified Move pointer's cursor is
- * driven by the hover affordance below. */
-.renderer-scene-surface[data-tool="draw"] {
+/* W2-03/W2-07 tool cursors: draw + shape drag-create use a crosshair, the unified
+ * Move pointer's cursor is driven by the hover affordance below. */
+.renderer-scene-surface[data-tool="draw"],
+.renderer-scene-surface[data-tool="create"] {
   cursor: crosshair;
 }
 

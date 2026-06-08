@@ -113,3 +113,55 @@ export function buildPrimitiveObject(
     ...(kind === "frame" ? { clip: true } : {})
   };
 }
+
+// W2-07: a drag span — the gesture's start corner and current/end corner (world
+// px). Closed primitives (rect/ellipse/frame/text) are sized to the normalized
+// bbox; the open line runs corner-to-corner so a diagonal drag draws a diagonal.
+export type DragSpan = { start: { x: number; y: number }; end: { x: number; y: number } };
+
+// Smallest extent (logical px) a drag must reach before a closed primitive is
+// considered sized; below this the caller treats the gesture as a click.
+export const MIN_DRAG_EXTENT_PX = 4;
+
+/** Object-local geometry + the world translation for a primitive sized to a drag. */
+function dragGeometry(kind: PrimitiveKindId, span: DragSpan): { d: string; tx: number; ty: number } {
+  if (kind === "line") {
+    // The line rides corner-to-corner: object-local from start (0,0) to the end
+    // delta, positioned by a translation at the start point.
+    const dx = span.end.x - span.start.x;
+    const dy = span.end.y - span.start.y;
+    return { d: `M 0 0 L ${q(dx)} ${q(dy)}`, tx: span.start.x, ty: span.start.y };
+  }
+  const minX = Math.min(span.start.x, span.end.x);
+  const minY = Math.min(span.start.y, span.end.y);
+  const w = Math.abs(span.end.x - span.start.x);
+  const h = Math.abs(span.end.y - span.start.y);
+  const d = kind === "ellipse" ? ellipsePath(w, h) : rectPath(w, h);
+  return { d, tx: minX, ty: minY };
+}
+
+/**
+ * Build the `Object` for a primitive kind sized to a drag span (W2-07), with a
+ * fresh `id`/`order`. The geometry is object-local; the world position rides a
+ * pure-translation transform (D7) so a later move is matrix-only (P4). Style
+ * mirrors {@link buildPrimitiveObject}; only the size/position come from the drag.
+ */
+export function buildPrimitiveObjectFromDrag(
+  kind: PrimitiveKindId,
+  span: DragSpan,
+  id: string,
+  order: string
+): SceneObject {
+  const spec = primitiveSpec(kind);
+  const { d, tx, ty } = dragGeometry(kind, span);
+  return {
+    id,
+    order,
+    transform: translateTransform(tx, ty),
+    geometry: { d, fillRule: "nonZero" },
+    ...(spec.fill ? { fill: spec.fill } : {}),
+    ...(spec.stroke ? { stroke: spec.stroke } : {}),
+    ...(spec.text ? { text: spec.text } : {}),
+    ...(kind === "frame" ? { clip: true } : {})
+  };
+}

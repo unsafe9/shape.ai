@@ -34,8 +34,8 @@
     type UndoStack
   } from "../scene/sceneCoreWasm";
   import { createShortcutDispatcher } from "../lib/shortcuts";
-  import { buildPrimitiveObject } from "../lib/objectPrimitives";
-  import type { PrimitiveKindId } from "../lib/toolbar";
+  import { buildPrimitiveObject, buildPrimitiveObjectFromDrag, MIN_DRAG_EXTENT_PX, type DragSpan } from "../lib/objectPrimitives";
+  import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
   import CanvasHost from "./ShapeCanvasHost.svelte";
@@ -69,6 +69,15 @@
   //       the points lower to a committed `Object` via the wasm core. -----
   let drawPoints = $state<{ x: number; y: number }[] | null>(null);
   const PEN = { color: "#1f2933", widthPx: 2, epsilon: 2.0 };
+
+  // ----- W2-07: shape drag-create. Arming a shape tool sets `createKind`; the
+  //       pointer down-drag-up rubber-bands a bbox accumulated in `createDrag`
+  //       (start corner + current corner + whether the current corner is snapped
+  //       to an outline anchor). `feedScene` appends a transient preview object so
+  //       the rubber-band shows before it commits; on pointer-up the span lowers to
+  //       a sized primitive via an insert-object op, then the object is selected. -----
+  let createKind = $state<DragCreateShape | null>(null);
+  let createDrag = $state<{ span: DragSpan; snapped: boolean } | null>(null);
 
   // ----- ephemeral camera / chrome -----
   let camera = $state<CameraState>({ x: 140, y: 120, zoom: 0.6 });
@@ -121,7 +130,7 @@
   // W2-03: the cursor affordance reflected onto the canvas wrapper. Space-hold
   // shows the pan grab cursor; the draw tool keeps its own crosshair (no override);
   // otherwise the core's per-move hover classification drives it (CSS in styles.css).
-  const cursorAffordance = $derived(spaceHeld ? "pan" : activeTool === "draw" ? null : affordance);
+  const cursorAffordance = $derived(spaceHeld ? "pan" : activeTool === "draw" || activeTool === "create" ? null : affordance);
 
   const readyState = $derived(rendererHealth?.state ?? "wasm-unavailable");
   const rendererDetail = $derived(rendererHealth?.detail ?? "Detecting Rust/WASM package.");
@@ -132,7 +141,7 @@
   // normal editing, or a clone with the dragged object shifted during a live drag.
   // FC-11: while a freehand stroke is in progress, append a transient preview
   // object built from the world points (no op-apply — geometry-vocabulary only).
-  const feedScene = $derived(buildFeedScene(scene, dragPreview, drawPoints));
+  const feedScene = $derived(buildFeedScene(scene, dragPreview, drawPoints, createKind, createDrag));
 
   const hostCallbacks: ShapeCanvasHostCallbacks = {
     onCameraChange: (next) => (camera = next),
@@ -184,6 +193,8 @@
     // end, lower the stroke to an object via the wasm core and author an
     // insert-object op (the tool stays sticky in "draw"); cancel discards.
     onDraw: (phase, world) => handleDraw(phase, world),
+    // W2-07: shape drag-create rubber-band + commit + select-after-create.
+    onCreate: (phase, world, snapped) => handleCreate(phase, world, snapped),
     // W2-03: the core's per-move hover classification drives the canvas cursor.
     onAffordance: (next) => (affordance = next)
   };
@@ -510,12 +521,77 @@
     return screenToWorld({ x: rect.width / 2, y: rect.height / 2 }, camera);
   }
 
+  // W2-07: rect/ellipse/line ARM drag-create (the button only selects the tool; the
+  // shape is sized by a pointer down-drag-up). A context-menu insert passes an
+  // explicit `anchor`, which keeps the legacy immediate fixed-size insert so the
+  // right-click "Insert rectangle" still drops a shape at the click point. Text and
+  // frame always insert immediately at an anchor (no drag-create, per the card).
   function insertPrimitive(kind: PrimitiveKindId, anchor?: { x: number; y: number }): void {
+    if (anchor === undefined && isDragCreateShape(kind)) {
+      armCreate(kind);
+      return;
+    }
     const center = anchor ?? viewportCenterWorld();
     const object = buildPrimitiveObject(kind, center, freshId(kind), nextOrderKey());
     authorOp({ kind: "insert-object", object });
     selection = { kind: "object", id: object.id };
     persistSelection(selection);
+    status = `Inserted ${kind}`;
+  }
+
+  // W2-07: arm the shape drag-create submode. Mirrors the pen arming the draw tool:
+  // the active tool flips to "create" and `createKind` holds which shape the next
+  // pointer drag will rubber-band. A second click on the same shape disarms back to
+  // select (toggle), matching the pen toggle feel.
+  function armCreate(kind: DragCreateShape): void {
+    if (activeTool === "create" && createKind === kind) {
+      createKind = null;
+      setActiveTool("select");
+      return;
+    }
+    createKind = kind;
+    createDrag = null;
+    setActiveTool("create");
+    status = `Drag to create ${kind}`;
+  }
+
+  // W2-07: drive shape drag-create. `start` anchors the bbox; `move` extends the
+  // current corner (already snapped to the nearest outline anchor when `snapped`,
+  // unless the Alt snap-bypass modifier was held — handled in the engine); `end`
+  // commits a primitive sized to the drag span and selects it; `cancel` discards.
+  // A drag that never reaches MIN_DRAG_EXTENT_PX is treated as a click: it drops a
+  // default fixed-size shape at the start point (so a single click still creates).
+  function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snapped: boolean): void {
+    const kind = createKind;
+    if (!kind) return;
+    if (phase === "start") {
+      createDrag = { span: { start: world, end: world }, snapped };
+      return;
+    }
+    if (phase === "cancel") {
+      createDrag = null;
+      return;
+    }
+    if (!createDrag) return;
+    if (phase === "move") {
+      createDrag = { span: { start: createDrag.span.start, end: world }, snapped };
+      return;
+    }
+    // phase === "end": commit a sized primitive (or a default at a click).
+    const span: DragSpan = { start: createDrag.span.start, end: world };
+    createDrag = null;
+    const dx = Math.abs(span.end.x - span.start.x);
+    const dy = Math.abs(span.end.y - span.start.y);
+    const tooSmall = kind === "line" ? dx < MIN_DRAG_EXTENT_PX && dy < MIN_DRAG_EXTENT_PX : dx < MIN_DRAG_EXTENT_PX || dy < MIN_DRAG_EXTENT_PX;
+    const object = tooSmall
+      ? buildPrimitiveObject(kind, span.start, freshId(kind), nextOrderKey())
+      : buildPrimitiveObjectFromDrag(kind, span, freshId(kind), nextOrderKey());
+    authorOp({ kind: "insert-object", object });
+    // Select-after-create (request 6) and return to the select tool so the new
+    // object can be moved/resized immediately.
+    selectObject({ kind: "object", id: object.id });
+    createKind = null;
+    setActiveTool("select");
     status = `Inserted ${kind}`;
   }
 
@@ -790,6 +866,12 @@
   function handleEscape(): void {
     // FC-11: a pending Escape first cancels an in-progress pen stroke.
     if (drawPoints) return void (drawPoints = null);
+    // W2-07: cancel an in-progress shape drag-create, then disarm the tool.
+    if (createDrag) return void (createDrag = null);
+    if (createKind) {
+      createKind = null;
+      return void setActiveTool("select");
+    }
     if (settingsOpen) return void (settingsOpen = false);
     if (templateOpen) return void (templateOpen = false);
     if (diagnosticsOpen) return void (diagnosticsOpen = false);
@@ -798,6 +880,11 @@
   }
 
   function setActiveTool(tool: ActiveTool): void {
+    // W2-07: leaving the create tool (e.g. picking Select/Pen) disarms the shape.
+    if (tool !== "create") {
+      createKind = null;
+      createDrag = null;
+    }
     activeTool = tool;
   }
 
@@ -1049,12 +1136,56 @@
   function buildFeedScene(
     source: ObjectScene,
     drag: { id: string; matrix: Transform3x3 } | null,
-    pen: { x: number; y: number }[] | null
+    pen: { x: number; y: number }[] | null,
+    create: DragCreateShape | null,
+    createState: { span: DragSpan; snapped: boolean } | null
   ): ObjectScene {
     let feed = drag ? sceneWithObjectTransformed(source, drag.id, drag.matrix) : source;
     const preview = pen && pen.length >= 1 ? drawPreviewObject(pen) : null;
     if (preview) feed = { ...feed, objects: [...feed.objects, preview] };
+    // W2-07: a transient rubber-band preview of the shape being drag-created, plus
+    // a snap indicator marker when the dragged corner is snapped to an outline.
+    if (create && createState) {
+      const extra = createPreviewObjects(create, createState.span, createState.snapped);
+      if (extra.length > 0) feed = { ...feed, objects: [...feed.objects, ...extra] };
+    }
     return feed;
+  }
+
+  // W2-07: transient preview objects for the in-progress shape drag-create — the
+  // rubber-band primitive (built directly in TS like the pen preview, NOT op-apply)
+  // and, when the dragged corner is snapped to an outline anchor, a small circle
+  // marker at that corner. The committed object replaces them on pointer-up.
+  function createPreviewObjects(kind: DragCreateShape, span: DragSpan, snapped: boolean): SceneObject[] {
+    const preview = buildPrimitiveObjectFromDrag(kind, span, "create-preview", nextOrderKey());
+    const objects: SceneObject[] = [preview];
+    if (snapped) objects.push(snapIndicatorObject(span.end));
+    return objects;
+  }
+
+  // W2-07: a small ring drawn at the snapped corner so the user sees the snap.
+  // Geometry is a world-px ellipse (identity transform, so local==world); built in
+  // TS like the pen preview (NOT op-apply).
+  function snapIndicatorObject(at: { x: number; y: number }): SceneObject {
+    const q = (px: number) => Math.round(px * GEOMETRY_QUANTUM_PER_PX);
+    const r = 5;
+    const k = r * 0.5523;
+    const cx = at.x;
+    const cy = at.y;
+    const d = [
+      `M ${q(cx - r)} ${q(cy)}`,
+      `C ${q(cx - r)} ${q(cy - k)} ${q(cx - k)} ${q(cy - r)} ${q(cx)} ${q(cy - r)}`,
+      `C ${q(cx + k)} ${q(cy - r)} ${q(cx + r)} ${q(cy - k)} ${q(cx + r)} ${q(cy)}`,
+      `C ${q(cx + r)} ${q(cy + k)} ${q(cx + k)} ${q(cy + r)} ${q(cx)} ${q(cy + r)}`,
+      `C ${q(cx - k)} ${q(cy + r)} ${q(cx - r)} ${q(cy + k)} ${q(cx - r)} ${q(cy)}`,
+      "Z"
+    ].join(" ");
+    return {
+      id: "create-snap-indicator",
+      order: nextOrderKey(),
+      geometry: { d, fillRule: "nonZero" },
+      stroke: { paint: { kind: "solid", color: "#ff3b6b" }, width: 2 * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
+    };
   }
 
   // FC-11: a transient preview object for the in-progress pen stroke. Geometry is
@@ -1171,6 +1302,7 @@
 
         <Toolbar
           {activeTool}
+          {createKind}
           {busy}
           {templateOpen}
           {diagnosticsOpen}

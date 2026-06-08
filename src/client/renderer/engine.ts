@@ -24,9 +24,10 @@ import type {
 } from "./wasmLoader";
 
 /** W2-03: the active pointer tool. One unified "select" Move/Select pointer
- *  (picks/drags/marquees) and "draw" (freehand capture, FC-11). Pan is no longer a
- *  separate tool — it rides Space-hold/middle-button/wheel (see {@link isPanIntent}). */
-export type ActiveTool = "select" | "draw";
+ *  (picks/drags/marquees), "draw" (freehand capture, FC-11), and "create" (W2-07
+ *  drag-to-create shapes). Pan is no longer a separate tool — it rides
+ *  Space-hold/middle-button/wheel (see {@link isPanIntent}). */
+export type ActiveTool = "select" | "draw" | "create";
 
 // W2-03: a pointer-down is a pan gesture (not a pick/marquee) when the Space key
 // is held OR the middle mouse button is used. Pure so the shell test can pin the
@@ -40,6 +41,14 @@ export function isPanIntent(intent: { spaceHeld: boolean; button: number }): boo
 // W2-04/W2-05: the gesture that produced a transform delta. Mirrors the Rust
 // ObjectTransformDelta.kind; the shell uses it to drive the commit op kind/status.
 export type TransformKind = "translate" | "resize" | "rotate";
+
+// W2-07: whether a shape drag-create phase should run the outline snap query. Snap
+// is bypassed when the Alt modifier is held (request 4: "modifier nullifies snap")
+// or on the terminal `cancel` phase (no preview to snap). Pure so the shell test
+// can pin the decision without a renderer.
+export function shouldQuerySnap(intent: { altHeld: boolean; phase: "start" | "move" | "end" | "cancel" }): boolean {
+  return !intent.altHeld && intent.phase !== "cancel";
+}
 
 export type EngineEvent =
   | { type: "stats"; stats: FrameStats }
@@ -73,6 +82,12 @@ export type EngineEvent =
   // down/move/up emit draw phases instead of the select/marquee path; the shell
   // accumulates the world points and commits the stroke to an object on `end`.
   | { type: "draw"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint }
+  // W2-07: drag-to-create shapes. While the create tool is active, pointer/mouse
+  // down-drag-up rubber-band a bbox; the shell renders a transient preview and
+  // commits a sized primitive on `end`. `world` is the pointer in world space,
+  // already snapped to the nearest object outline anchor when within tolerance
+  // (`snapped` true) unless the snap-bypass modifier (Alt) was held.
+  | { type: "create"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint; snapped: boolean }
   // W2-03: the hover affordance under the cursor (from result.hoverAffordance on a
   // no-drag pointer move). The shell maps it to a CSS cursor.
   | { type: "affordance"; affordance: HoverAffordance }
@@ -95,6 +110,10 @@ export type FocusBoundsOptions = {
 };
 
 const MOUSE_POINTER_ID = -1;
+
+// W2-07: screen-pixel snap radius for shape drag-create. Passed to the W2-06 core
+// query (nearestOutlinePoint), which converts it to world via the camera zoom.
+const CREATE_SNAP_TOLERANCE_PX = 8;
 
 export class ShapeCanvasEngine {
   private canvas: HTMLCanvasElement;
@@ -239,7 +258,9 @@ export class ShapeCanvasEngine {
   private disarmPanGesture() {
     if (!this.panGestureActive) return;
     this.panGestureActive = false;
-    this.coreSetTool(this.activeTool === "draw" ? "select" : this.activeTool);
+    // "draw"/"create" are shell-side routing tools; the core only knows
+    // select/hand, so restore the core to "select" for any non-pan tool.
+    this.coreSetTool("select");
   }
 
   // Push a raw core tool string (select|hand) without touching the shell-facing
@@ -505,6 +526,11 @@ export class ShapeCanvasEngine {
       this.canvas.setPointerCapture(event.pointerId);
       return;
     }
+    if (this.activeTool === "create" && !pan) {
+      this.emitCreate("start", event);
+      this.canvas.setPointerCapture(event.pointerId);
+      return;
+    }
     if (pan) this.armPanGesture();
     this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
@@ -521,6 +547,10 @@ export class ShapeCanvasEngine {
       this.emitDraw("move", event);
       return;
     }
+    if (this.activeTool === "create" && !this.panGestureActive) {
+      this.emitCreate("move", event);
+      return;
+    }
     this.sendInputBatch([{ kind: "pointer-move", pointerId: event.pointerId, screen: this.eventPoint(event) }]);
   };
 
@@ -528,6 +558,15 @@ export class ShapeCanvasEngine {
     if (isMousePointerEvent(event)) return;
     if (this.activeTool === "draw" && !this.panGestureActive) {
       this.emitDraw("end", event);
+      try {
+        this.canvas.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released after cancellation.
+      }
+      return;
+    }
+    if (this.activeTool === "create" && !this.panGestureActive) {
+      this.emitCreate("end", event);
       try {
         this.canvas.releasePointerCapture(event.pointerId);
       } catch {
@@ -564,6 +603,15 @@ export class ShapeCanvasEngine {
       }
       return;
     }
+    if (this.activeTool === "create" && !this.panGestureActive) {
+      this.emitCreate("cancel", event);
+      try {
+        this.canvas.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released.
+      }
+      return;
+    }
     this.sendInputBatch([{ kind: "pointer-cancel", pointerId: event.pointerId }]);
     this.objectDrag = null;
     this.disarmPanGesture();
@@ -582,6 +630,12 @@ export class ShapeCanvasEngine {
       this.emitDraw("start", event);
       return;
     }
+    if (this.activeTool === "create" && !pan) {
+      this.mouseDragActive = true;
+      this.bindMouseFallbackMove();
+      this.emitCreate("start", event);
+      return;
+    }
     if (pan) this.armPanGesture();
     this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
@@ -597,6 +651,10 @@ export class ShapeCanvasEngine {
       this.emitDraw("move", event);
       return;
     }
+    if (this.activeTool === "create" && !this.panGestureActive) {
+      this.emitCreate("move", event);
+      return;
+    }
     this.sendInputBatch([{ kind: "pointer-move", pointerId: MOUSE_POINTER_ID, screen: this.eventPoint(event) }]);
   };
 
@@ -607,6 +665,10 @@ export class ShapeCanvasEngine {
     this.unbindMouseFallbackMove();
     if (this.activeTool === "draw" && !this.panGestureActive) {
       this.emitDraw("end", event);
+      return;
+    }
+    if (this.activeTool === "create" && !this.panGestureActive) {
+      this.emitCreate("end", event);
       return;
     }
     this.sendInputBatch([
@@ -924,6 +986,37 @@ export class ShapeCanvasEngine {
   private emitDraw(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
     const world = screenToWorld(this.eventPoint(event), this.camera);
     this.onEvent({ type: "draw", phase, world });
+  }
+
+  // W2-07: emit a create phase with the dragged corner in world space. During the
+  // drag the corner snaps to the nearest object outline anchor when within
+  // tolerance, unless the snap-bypass modifier (Alt) is held (request 4: "modifier
+  // nullifies snap"). The snap query is the W2-06 core path (nearestOutlinePoint),
+  // so the geometry truth stays in Rust (P1) — the shell only forwards the result.
+  private emitCreate(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
+    const raw = screenToWorld(this.eventPoint(event), this.camera);
+    const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(raw) : null;
+    const world = snap ?? raw;
+    this.onEvent({ type: "create", phase, world, snapped: snap !== null });
+  }
+
+  // W2-07: snap a world point to the nearest object outline anchor via the W2-06
+  // core query. Returns the snapped WORLD point when within tolerance, else null.
+  // Feature-detected: a wasm build predating the method never snaps.
+  private querySnap(world: WorldPoint): WorldPoint | null {
+    const renderer = this.webGpuRenderer;
+    if (!renderer || typeof renderer.nearestOutlinePoint !== "function") return null;
+    try {
+      const result = renderer.nearestOutlinePoint(world.x, world.y, CREATE_SNAP_TOLERANCE_PX, this.camera.zoom);
+      this.rustBoundaryCalls += 1;
+      return result.snapped ? { x: result.x, y: result.y } : null;
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust nearestOutlinePoint failed: ${error.message}` : "Rust nearestOutlinePoint failed"
+      });
+      return null;
+    }
   }
 
   // FC-08: pure object pick for the shell's right-click context menu.

@@ -69,6 +69,10 @@ export type ShapeCanvasHostCallbacks = {
   // FC-11: freehand pen capture phases (world px). The shell accumulates the
   // points across start/move and commits the stroke to an object on `end`.
   onDraw: (phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }) => void;
+  // W2-07: shape drag-create phases. `world` is the dragged corner (already snapped
+  // to the nearest outline anchor when `snapped`); the shell rubber-bands a bbox
+  // preview and commits a sized primitive on `end`.
+  onCreate: (phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snapped: boolean) => void;
   // W2-03: hover affordance under the cursor (empty/body/resize-*/rotate). The
   // shell maps it to a CSS cursor.
   onAffordance: (affordance: HoverAffordance) => void;
@@ -383,6 +387,11 @@ export class ShapeCanvasHost {
     // FC-11: freehand pen capture phase routes to the shell's draw controller.
     if (event.type === "draw") {
       this.callbacks.onDraw(event.phase, event.world);
+      return;
+    }
+    // W2-07: shape drag-create phase routes to the shell's create controller.
+    if (event.type === "create") {
+      this.callbacks.onCreate(event.phase, event.world, event.snapped);
       return;
     }
     // W2-03: hover affordance routes to the shell's cursor.
