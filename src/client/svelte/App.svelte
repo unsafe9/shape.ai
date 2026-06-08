@@ -80,6 +80,9 @@
   const PEN_EPSILON = 2.0;
   let penColor = $state("#1f2933");
   let penWidthPx = $state(2);
+  // D1/#5: the toolbar's always-visible selected color. AP1 wires onSelectColor
+  // to apply this to the selection via SetStyle; here it only holds the state.
+  let selectedColor = $state("#1f2933");
   // W2-08: draw-mode palette + brush sizes the sub-toolbar offers.
   const PEN_PALETTE = ["#1f2933", "#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#ffffff"];
   const PEN_WIDTHS = [1, 2, 4, 8];
@@ -1454,6 +1457,7 @@
           {penWidthPx}
           penPalette={PEN_PALETTE}
           penWidths={PEN_WIDTHS}
+          {selectedColor}
           {busy}
           {templateOpen}
           {diagnosticsOpen}
@@ -1465,6 +1469,7 @@
           onSetTool={setActiveTool}
           onSetPenColor={(color) => (penColor = color)}
           onSetPenWidth={(width) => (penWidthPx = width)}
+          onSelectColor={(color) => (selectedColor = color)}
           onInsertPrimitive={insertPrimitive}
           onToggleTemplates={toggleTemplates}
           onZoomIn={() => zoomAtCenter(-160)}

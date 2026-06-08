@@ -13,15 +13,13 @@
     Plus,
     Scan,
     Square,
-    SquareDashed,
-    Type,
     Loader2,
     Trash2,
     Wifi,
     WifiOff
   } from "lucide-svelte";
   import type { ActiveTool } from "../renderer/engine";
-  import type { DragCreateShape, PrimitiveKindId } from "../lib/toolbar";
+  import { toolbarShapeKinds, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import type { CanvasSummary } from "../lib/sceneClient";
   import type { ConnectionStatus } from "../lib/wsTransport";
   import type { Object as SceneObject } from "../../shared/object";
@@ -42,6 +40,9 @@
     penWidthPx: number;
     penPalette: string[];
     penWidths: number[];
+    // D1/#5: always-visible toolbar color. AP1 applies this to the selection via
+    // SetStyle; the toolbar owns only the swatch palette + native-picker UI.
+    selectedColor: string;
     busy: boolean;
     templateOpen: boolean;
     diagnosticsOpen: boolean;
@@ -56,6 +57,7 @@
     // W2-08: draw-mode sub-toolbar setters.
     onSetPenColor: (color: string) => void;
     onSetPenWidth: (widthPx: number) => void;
+    onSelectColor: (color: string) => void;
     onInsertPrimitive: (kind: PrimitiveKindId) => void;
     onToggleTemplates: () => void;
     onZoomIn: () => void;
@@ -78,6 +80,7 @@
     penWidthPx,
     penPalette,
     penWidths,
+    selectedColor,
     busy,
     templateOpen,
     diagnosticsOpen,
@@ -89,6 +92,7 @@
     onSetTool,
     onSetPenColor,
     onSetPenWidth,
+    onSelectColor,
     onInsertPrimitive,
     onToggleTemplates,
     onZoomIn,
@@ -104,14 +108,15 @@
     onDeleteSelected
   }: Props = $props();
 
-  // W2-09: basic shapes live in one section (Frame is not a basic shape — split
-  // into its own group below). Text is a basic-shape inserter and sits here too.
-  const shapes: { id: PrimitiveKindId; label: string; icon: typeof Square }[] = [
-    { id: "rectangle", label: "Rectangle (R)", icon: Square },
-    { id: "ellipse", label: "Ellipse (O)", icon: Circle },
-    { id: "line", label: "Line (L)", icon: LineIcon },
-    { id: "text", label: "Text (T)", icon: Type }
-  ];
+  // D7: the basic-shape inserters (Rect / Ellipse / Line). Text is authored by
+  // rect + double-click and Frame is not a basic shape, so neither has a button —
+  // `toolbarShapeKinds` (toolbar.ts) is the single source of which buttons render.
+  const SHAPE_META: Record<DragCreateShape, { label: string; icon: typeof Square }> = {
+    rectangle: { label: "Rectangle (R)", icon: Square },
+    ellipse: { label: "Ellipse (O)", icon: Circle },
+    line: { label: "Line (L)", icon: LineIcon }
+  };
+  const shapes = toolbarShapeKinds.map((id) => ({ id, ...SHAPE_META[id] }));
 
   // First text run of the selected object, the editable label in the property panel.
   const selectedText = $derived(selectedObject?.text?.runs?.map((run) => run.text).join("") ?? "");
@@ -292,20 +297,32 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <!-- Frame: a container, not a basic shape — split into its own group. -->
-  <div class="toolbar-group" aria-label="Frame">
-    <span class="toolbar-group-label">Frame</span>
+  <!-- D1/#5: always-visible color. Palette swatches set the toolbar's selected
+       color; the trailing native picker opens the OS color popup for any color.
+       AP1 reads `selectedColor` and applies it to the selection via SetStyle. -->
+  <div class="toolbar-group" aria-label="Color">
+    <span class="toolbar-group-label">Color</span>
     <div class="toolbar-group-buttons">
-      <button
-        class="icon-button"
-        type="button"
-        disabled={busy}
-        title="Frame (F)"
-        aria-label="Insert Frame (F)"
-        onclick={() => onInsertPrimitive("frame")}
-      >
-        <SquareDashed size={16} />
-      </button>
+      {#each penPalette as color (color)}
+        <button
+          class="icon-button swatch {selectedColor === color ? 'is-active' : ''}"
+          type="button"
+          title={color}
+          aria-label={`Color ${color}`}
+          aria-pressed={selectedColor === color}
+          onclick={() => onSelectColor(color)}
+        >
+          <span class="swatch-fill" style={`background:${color};`}></span>
+        </button>
+      {/each}
+      <label class="icon-button swatch color-picker" title="Pick color" aria-label="Pick color">
+        <span class="swatch-fill" style={`background:${selectedColor};`}></span>
+        <input
+          type="color"
+          value={selectedColor}
+          oninput={(event) => onSelectColor((event.currentTarget as HTMLInputElement).value)}
+        />
+      </label>
     </div>
   </div>
 

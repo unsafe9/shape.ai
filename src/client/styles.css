@@ -1673,6 +1673,27 @@ p {
   border: 1px solid rgb(0 0 0 / 0.18);
 }
 
+/* D1/#5: the native color-picker swatch — the <input type="color"> fills the
+   label as a transparent overlay so a click opens the OS picker; the visible
+   chip is the swatch-fill underneath showing the current selected color. */
+.icon-button.swatch.color-picker {
+  position: relative;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.icon-button.swatch.color-picker input[type="color"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  opacity: 0;
+  cursor: pointer;
+}
+
 /* ---------------------------------------------------------------------------
  * CC3.3 TemplateLibrary — popover above the toolbar remote
  * --------------------------------------------------------------------------- */

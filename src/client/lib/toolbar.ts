@@ -21,7 +21,9 @@ export function isDragCreateShape(kind: PrimitiveKindId): kind is DragCreateShap
   return DRAG_CREATE_SHAPES.has(kind);
 }
 
-/** The shape commands the toolbar exposes, in display order. */
+/** The insert-* command → primitive kind mapping (shortcuts + context menu).
+ * Text/frame stay here because they are still authored via shortcut/context-menu;
+ * only the toolbar's shape *buttons* (see `toolbarShapeKinds`) drop them (D7). */
 export const insertCommandToPrimitive: Record<string, PrimitiveKindId> = {
   "insert-rectangle": "rectangle",
   "insert-ellipse": "ellipse",
@@ -29,6 +31,11 @@ export const insertCommandToPrimitive: Record<string, PrimitiveKindId> = {
   "insert-text": "text",
   "insert-frame": "frame"
 };
+
+/** The shape kinds the toolbar shows as buttons, in display order. D7: text is
+ * authored by rect + double-click and frame is not a basic shape, so neither has
+ * a toolbar button — they survive only via shortcut/context-menu. */
+export const toolbarShapeKinds: readonly DragCreateShape[] = ["rectangle", "ellipse", "line"];
 
 /** Resolve an insert-* command id to its primitive kind, or null if not a shape command. */
 export function primitiveForCommand(commandId: string): PrimitiveKindId | null {

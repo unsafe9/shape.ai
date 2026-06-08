@@ -5,6 +5,8 @@
 // WASM — P1, no TS mirror) and invokes a registered handler. The toolbar's
 // insert-* commands map to object-primitive kinds.
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import {
   createShortcutDispatcher,
@@ -13,7 +15,7 @@ import {
   parseShortcut
 } from "../src/client/lib/shortcuts";
 import { ensureSceneCore, loadSceneCore, type ObjectCommand } from "../src/client/scene/sceneCoreWasm";
-import { insertCommandToPrimitive, primitiveForCommand, primitiveOrder } from "../src/client/lib/toolbar";
+import { insertCommandToPrimitive, primitiveForCommand, primitiveOrder, toolbarShapeKinds } from "../src/client/lib/toolbar";
 
 let catalog: ObjectCommand[];
 
@@ -174,5 +176,47 @@ describe("toolbar object-primitive mapping (U1)", () => {
 
   it("covers the same primitive set as the toolbar order", () => {
     expect(new Set(Object.values(insertCommandToPrimitive))).toEqual(new Set(primitiveOrder));
+  });
+});
+
+describe("toolbar shape buttons (TB1 / D7)", () => {
+  it("shows only rect/ellipse/line buttons in order", () => {
+    expect(toolbarShapeKinds).toEqual(["rectangle", "ellipse", "line"]);
+  });
+
+  it("drops the frame and text shape buttons (authored via shortcut/context-menu only)", () => {
+    expect(toolbarShapeKinds).not.toContain("frame");
+    expect(toolbarShapeKinds).not.toContain("text");
+  });
+
+  it("keeps text/frame in the insert command mapping (shortcut + context-menu survive)", () => {
+    expect(primitiveForCommand("insert-text")).toBe("text");
+    expect(primitiveForCommand("insert-frame")).toBe("frame");
+  });
+});
+
+describe("toolbar selected-color UI (TB1 / D1,#5)", () => {
+  // The node test env has no DOM, so we assert the component's prop/callback
+  // contract and color-picker wiring against the .svelte source. Falsifiable:
+  // removing the always-visible Color group, the native <input type="color">,
+  // the selectedColor prop, or the onSelectColor pick wiring fails the test.
+  const source = readFileSync(
+    fileURLToPath(new URL("../src/client/svelte/Toolbar.svelte", import.meta.url)),
+    "utf8"
+  );
+
+  it("declares the selectedColor prop and onSelectColor callback", () => {
+    expect(source).toMatch(/selectedColor:\s*string;/);
+    expect(source).toMatch(/onSelectColor:\s*\(color:\s*string\)\s*=>\s*void;/);
+  });
+
+  it("renders an always-visible Color group (not gated on draw/erase) with a native picker", () => {
+    expect(source).toMatch(/aria-label="Color"/);
+    expect(source).toMatch(/type="color"/);
+  });
+
+  it("wires a palette pick and the native picker to onSelectColor", () => {
+    expect(source).toMatch(/onclick=\{\(\)\s*=>\s*onSelectColor\(color\)\}/);
+    expect(source).toMatch(/oninput=\{\(event\)\s*=>\s*onSelectColor\(/);
   });
 });
