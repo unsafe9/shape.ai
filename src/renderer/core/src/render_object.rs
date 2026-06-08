@@ -160,8 +160,10 @@ pub struct RTextRun {
 #[serde(rename_all = "camelCase")]
 pub enum RTextAlign {
     #[default]
+    #[serde(alias = "left")]
     Start,
     Center,
+    #[serde(alias = "right")]
     End,
     Justify,
 }

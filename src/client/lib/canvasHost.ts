@@ -264,14 +264,17 @@ export class ShapeCanvasHost {
    * available. The live GPU PASS only runs in a real browser (no WebGPU device in
    * CI).
    */
-  loadObjectScene(scene: ObjectScene, selection: ObjectSelection): ObjectGeometryBuild {
+  loadObjectScene(scene: ObjectScene, selection: ObjectSelection, collectGeometry = false): ObjectGeometryBuild {
     this.lastObjectScene = scene;
     this.lastSelection = selection;
     const json = JSON.stringify(
       objectSceneToRenderObjectScene(scene, this.camera, selection, `object-scene-v${scene.sceneVersion}`)
     );
     this.uploadObjectSceneToRenderer(json);
-    const build = this.rustStatus.buildObjectSceneGeometry;
+    // The CPU geometry build is diagnostics-only (the live GPU upload above already
+    // tessellates + uploads). The live feed re-runs every drag/freehand frame and
+    // discards the result, so skip it unless a caller explicitly wants the counts.
+    const build = collectGeometry ? this.rustStatus.buildObjectSceneGeometry : null;
     if (!build) return null;
     try {
       const raw = build(json);

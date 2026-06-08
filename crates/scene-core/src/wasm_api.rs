@@ -314,6 +314,14 @@ impl WasmUndoStack {
         true
     }
 
+    /// Abort an in-flight undo/redo handshake whose apply did not succeed (domain
+    /// error or wire failure). Clears the wrapper's mirrored `pending` and the
+    /// core's, so the stack stays consistent and future undo/redo keep working.
+    pub fn abort(&mut self) {
+        self.pending = None;
+        self.inner.abort_pending();
+    }
+
     pub fn can_undo(&self) -> bool {
         self.inner.can_undo()
     }

@@ -497,6 +497,11 @@ export class ShapeCanvasEngine {
     if (isMousePointerEvent(event)) return;
     if (this.activeTool === "draw") {
       this.emitDraw("cancel", event);
+      try {
+        this.canvas.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released.
+      }
       return;
     }
     this.sendInputBatch([{ kind: "pointer-cancel", pointerId: event.pointerId }]);

@@ -63,7 +63,7 @@ export type RenderTextRun = {
 
 export type RenderText = {
   runs: RenderTextRun[];
-  align?: "left" | "center" | "right";
+  align?: "start" | "center" | "end" | "justify";
   valign?: "top" | "middle" | "bottom";
 };
 

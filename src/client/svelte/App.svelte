@@ -130,7 +130,12 @@
       if (health.state === "ready" && isDiagnosticsOnlyStatus(status)) status = "Ready";
     },
     onSelectObject: (id) => selectObject({ kind: "object", id }),
-    onTransformPreview: (id, dx, dy) => (dragPreview = { id, dx, dy }),
+    onTransformPreview: (id, dx, dy) => {
+      // A new drag supersedes any commit still waiting for its scene update, so a
+      // stale pendingCommit can never clear (or freeze) the new preview.
+      if (pendingCommit && pendingCommit.id !== id) pendingCommit = null;
+      dragPreview = { id, dx, dy };
+    },
     onTransformCommit: (id, dx, dy) => {
       // The canonical scene was never mutated during the drag, so op-apply
       // captures the correct inverse (original transform), satisfying D21 undo.
@@ -140,10 +145,16 @@
       // FC-16: pre-connect authorOp applies synchronously (scene is already the
       // committed scene on return), so the preview can clear immediately. In the
       // connected path the scene update is async — hold the preview until
-      // commitClientScene sees the committed transform land (no snap-back).
+      // commitClientScene sees the committed transform land (no snap-back). If the
+      // commit op fails, clear the preview here so it never freezes the object.
       const wasConnected = sceneClientReady && sceneClient !== null;
       if (wasConnected) pendingCommit = { id, transform };
-      authorOp({ kind: "set-transform", id, transform });
+      authorOp({ kind: "set-transform", id, transform }, true, (ok) => {
+        if (!ok) {
+          pendingCommit = null;
+          dragPreview = null;
+        }
+      });
       if (!wasConnected) dragPreview = null;
     },
     onMarquee: (ids) => {
@@ -328,6 +339,9 @@
       const other = canvases.find((c) => c.id !== targetCanvasId);
       if (!other) return;
       await switchToCanvas(other.id);
+      // switchToCanvas swallows its own errors (leaving canvasId unchanged); never
+      // delete the canvas the session is still pointed at.
+      if (canvasId === targetCanvasId) return;
     }
     canvasBusy = true;
     try {
@@ -348,7 +362,10 @@
     // the preview so `feedScene` falls back to the canonical scene with no flash.
     if (pendingCommit) {
       const committed = next.objects.find((o) => o.id === pendingCommit!.id);
-      if (committed && transformsEqual(committed.transform, pendingCommit.transform)) {
+      // Drop the preview once the canonical transform lands (success) or the
+      // object is gone (concurrent delete) — either way the canonical scene is
+      // now authoritative, so the preview must not linger.
+      if (!committed || transformsEqual(committed.transform, pendingCommit.transform)) {
         pendingCommit = null;
         dragPreview = null;
       }
@@ -380,7 +397,7 @@
   // forward+inverse are recorded into the core undo stack — which clears redo (a
   // fresh user op forks history). An undo/redo replay is NOT undoable (the core
   // stack drives those via its own handshake, below).
-  function authorOp(op: ObjectOp, undoable = true): void {
+  function authorOp(op: ObjectOp, undoable = true, onSettled?: (ok: boolean) => void): void {
     if (!sceneClientReady || !sceneClient) {
       // Pre-connect: apply optimistically through the core only, no wire.
       if (sceneCore) {
@@ -390,15 +407,20 @@
           scene = applied.scene;
           if (undoable && applied.inverse) undoStack?.record(op, applied.inverse);
         }
+        onSettled?.(applied.errors.length === 0);
+      } else {
+        onSettled?.(false);
       }
       return;
     }
     void sceneClient.applyObjectOp(op).then((result) => {
       if (result.errors.length > 0) {
         status = result.errors.join("; ");
+        onSettled?.(false);
         return;
       }
       if (undoable && result.inverse) undoStack?.record(op, result.inverse);
+      onSettled?.(true);
       // The engine's onScene callback commits the optimistic scene.
     });
     sceneClient.flush();
@@ -411,11 +433,14 @@
   let undoChain: Promise<void> = Promise.resolve();
 
   function undo(): void {
-    undoChain = undoChain.then(() => runUndoStep("undo"));
+    // A rejection must never poison the serialization tail (else all later
+    // undo/redo silently no-op); runUndoStep self-handles errors, the catch is
+    // a belt-and-braces guard.
+    undoChain = undoChain.then(() => runUndoStep("undo")).catch(() => {});
   }
 
   function redo(): void {
-    undoChain = undoChain.then(() => runUndoStep("redo"));
+    undoChain = undoChain.then(() => runUndoStep("redo")).catch(() => {});
   }
 
   // Pull the next op from the core stack and re-author it through the SAME
@@ -426,15 +451,22 @@
     if (!undoStack || !sceneClient) return;
     const op = dir === "undo" ? undoStack.undo() : undoStack.redo();
     if (!op) return;
-    const result = await sceneClient.applyObjectOp(op);
-    sceneClient.flush();
-    if (result.errors.length > 0) {
-      status = result.errors.join("; ");
-      return;
-    }
-    if (result.inverse) {
+    // From here the core stack is mid-handshake (pending set). Any exit path that
+    // does NOT complete it MUST abort() it, or the stuck pending corrupts every
+    // future undo/redo (the core's debug_assert is compiled out of release wasm).
+    try {
+      const result = await sceneClient.applyObjectOp(op);
+      sceneClient.flush();
+      if (result.errors.length > 0 || !result.inverse) {
+        if (result.errors.length > 0) status = result.errors.join("; ");
+        undoStack.abort();
+        return;
+      }
       if (dir === "undo") undoStack.noteUndoApplied(result.inverse);
       else undoStack.noteRedoApplied(result.inverse);
+    } catch (error) {
+      status = error instanceof Error ? error.message : "Undo failed";
+      undoStack.abort();
     }
   }
 
@@ -755,6 +787,7 @@
     return {
       "select-move": () => setActiveTool("select"),
       "hand-pan": () => setActiveTool("hand"),
+      draw: () => setActiveTool("draw"),
       "insert-rectangle": () => insertPrimitive("rectangle"),
       "insert-ellipse": () => insertPrimitive("ellipse"),
       "insert-line": () => insertPrimitive("line"),

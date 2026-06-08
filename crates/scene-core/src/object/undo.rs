@@ -201,6 +201,15 @@ impl UndoStack {
         }
     }
 
+    /// Abort an in-flight undo/redo handshake when the host's apply did not
+    /// succeed (domain error or wire failure). Drops the pending handshake so the
+    /// stack stays consistent and future undo/redo keep working; the in-flight
+    /// entry is discarded (a failed apply left the scene unchanged, so there is
+    /// nothing to roll back). No-op when no handshake is in flight.
+    pub fn abort_pending(&mut self) {
+        self.pending = None;
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty() || self.coalescing.is_some()
     }
@@ -447,5 +456,21 @@ mod tests {
         let mut stack = UndoStack::new("a".into());
         assert!(stack.undo().is_none());
         assert!(stack.redo().is_none());
+    }
+
+    #[test]
+    fn abort_pending_clears_handshake_so_next_undo_is_reusable() {
+        let mut scene = scene_with_rect();
+        let mut stack = UndoStack::new("a".into());
+        let forward = set_transform("r", 7.0, 0.0);
+        let inverse = apply_object_op(&mut scene, forward.clone()).expect("apply");
+        stack.record(forward, inverse);
+        // Begin an undo, then abort it (host apply failed) without noting.
+        let _op = stack.undo().expect("undo hands out the inverse");
+        stack.abort_pending();
+        // The handshake is cleared: a fresh undo must not panic on the leftover
+        // pending. The aborted entry was consumed (nothing left to undo).
+        assert!(!stack.can_undo());
+        assert!(stack.undo().is_none());
     }
 }

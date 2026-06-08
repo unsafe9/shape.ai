@@ -89,6 +89,7 @@ type WasmUndoStack = {
   note_undo_applied: (reInverseJson: string) => boolean;
   redo: () => string | undefined;
   note_redo_applied: (inverseJson: string) => boolean;
+  abort: () => void;
   can_undo: () => boolean;
   can_redo: () => boolean;
 };
@@ -115,6 +116,8 @@ export type UndoStack = {
   redo(): ObjectOp | null;
   /** Report the inverse `applyObjectOp` returned for the redo op. */
   noteRedoApplied(inverse: ObjectOp): void;
+  /** Abort an in-flight undo/redo handshake whose apply failed (clears pending). */
+  abort(): void;
   canUndo(): boolean;
   canRedo(): boolean;
 };
@@ -282,6 +285,9 @@ export async function loadSceneCore(): Promise<SceneCore> {
         },
         noteRedoApplied(inverse) {
           inner.note_redo_applied(JSON.stringify(inverse));
+        },
+        abort() {
+          inner.abort();
         },
         canUndo() {
           return inner.can_undo();

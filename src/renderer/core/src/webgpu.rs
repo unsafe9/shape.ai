@@ -1998,9 +1998,17 @@ impl ShapeWebGpuRenderer {
         );
         // Mirror the picked selection onto the persisted single-anchor selection so
         // a later draw/debug reads it; the result already carries it for the shell.
+        // An empty Select pointer-down (which starts a marquee) clears it, matching
+        // the legacy clear-on-empty-click invariant.
         if let Some(id) = &object_out.selection {
             if let Some(scene) = &mut self.object_scene {
                 scene.selection = Some(id.clone());
+            }
+        } else if self.active_tool == ActiveTool::Select
+            && matches!(event, CanvasInputEvent::PointerDown { .. })
+        {
+            if let Some(scene) = &mut self.object_scene {
+                scene.selection = None;
             }
         }
         Ok(())
@@ -6146,8 +6154,12 @@ fn step_object_pointer(
                     object_out.marquee_ids = Some(object_regions_in_marquee(regions, &rect));
                 }
             }
-            // Object drag commits on the shell side (one undoable op); just clear.
-            *input_drag = None;
+            // Object drag commits on the shell side (one undoable op); clear only
+            // when THIS pointer owns the active drag, so a second finger lifting
+            // (different pointerId) can't cancel an in-progress drag mid-gesture.
+            if drag_pointer_id(input_drag.as_ref()) == Some(pointer_id) {
+                *input_drag = None;
+            }
         }
         CanvasInputEvent::PointerCancel { pointer_id } => {
             if drag_pointer_id(input_drag.as_ref()) == Some(*pointer_id) {
