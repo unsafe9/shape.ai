@@ -1341,8 +1341,8 @@ impl ShapeWebGpuRenderer {
             renderer.update_camera(
                 &self.queue,
                 &self.camera,
-                self.config.width as f32,
-                self.config.height as f32,
+                self.width as f32,
+                self.height as f32,
             );
             renderer.render(&mut encoder, &view, pipeline, true);
         } else {
@@ -1498,8 +1498,8 @@ impl ShapeWebGpuRenderer {
             &self.queue,
             pipeline,
             &scene,
-            self.config.width as f32,
-            self.config.height as f32,
+            self.width as f32,
+            self.height as f32,
         );
         let counts = ObjectSceneLoadResult {
             objects: scene.objects.len(),
@@ -5110,6 +5110,69 @@ mod tests {
         // Same viewport packing; camera differs because the live camera moved.
         assert_eq!(from_scene.viewport, live.viewport);
         assert_eq!(live.camera, [12.0, -7.0, 2.5, 0.0]);
+    }
+
+    // W2-01: the object camera uniform must be fed LOGICAL pixels, the same space
+    // the pointer path (screen->world) and the shaders work in. At DPR>1 the
+    // physical viewport (logical*DPR) drifts objects toward the upper-right
+    // because the larger denominator shrinks NDC. This pins the round-trip:
+    // a logical screen point -> world (pointer math) -> NDC (shader math) lands
+    // back at the same NDC the screen point maps to directly.
+    #[test]
+    fn object_camera_logical_viewport_round_trips_at_dpr2() {
+        use crate::object_pipeline::ObjectMatrixUniform;
+
+        let logical_w = 800.0_f32;
+        let logical_h = 600.0_f32;
+        let dpr = 2.0_f32;
+        let physical_w = logical_w * dpr;
+        let physical_h = logical_h * dpr;
+
+        let camera = CameraState {
+            x: 30.0,
+            y: -15.0,
+            zoom: 1.5,
+        };
+
+        // Pointer path: a logical screen point becomes world via the camera.
+        let screen = (210.0_f32, 140.0_f32);
+        let world = (
+            (screen.0 - camera.x as f32) / camera.zoom as f32,
+            (screen.1 - camera.y as f32) / camera.zoom as f32,
+        );
+
+        // Shader path (object_fill.wgsl world_to_clip): screen = world*zoom+cam,
+        // then NDC against the uniform viewport.
+        let to_ndc = |viewport: [f32; 4]| {
+            let sx = world.0 * camera.zoom as f32 + camera.x as f32;
+            let sy = world.1 * camera.zoom as f32 + camera.y as f32;
+            (
+                (sx / viewport[0]) * 2.0 - 1.0,
+                1.0 - (sy / viewport[1]) * 2.0,
+            )
+        };
+
+        // The NDC the original logical screen point maps to directly.
+        let expected = (
+            (screen.0 / logical_w) * 2.0 - 1.0,
+            1.0 - (screen.1 / logical_h) * 2.0,
+        );
+
+        // from_scene packs the viewport it is handed; feed it LOGICAL pixels.
+        let logical = ObjectMatrixUniform::from_scene(
+            &object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]),
+            logical_w,
+            logical_h,
+        );
+        let logical_ndc = to_ndc(logical.viewport);
+        assert!((logical_ndc.0 - expected.0).abs() < 1e-5);
+        assert!((logical_ndc.1 - expected.1).abs() < 1e-5);
+
+        // The physical viewport (the pre-fix bug) does NOT round-trip: NDC shrinks
+        // by 1/DPR toward the origin, which on screen reads as upper-right drift.
+        let physical_ndc = to_ndc([physical_w, physical_h, 0.0, 0.0]);
+        assert!((physical_ndc.0 - expected.0).abs() > 0.1);
+        assert!((physical_ndc.1 - expected.1).abs() > 0.1);
     }
 
     #[test]
