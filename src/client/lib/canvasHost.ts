@@ -51,6 +51,16 @@ export type ShapeCanvasHostCallbacks = {
   onStats: (stats: RendererStats) => void;
   onStatus: (message: string) => void;
   onHealthChange: (health: RendererHealth) => void;
+  // FC-08: object-path input results from the renderer. `onSelectObject` fires on
+  // the pointer-down that picked an object; `onTransformPreview` on each drag move
+  // (cumulative world-px delta — a non-destructive preview); `onTransformCommit`
+  // once on pointer-up when the drag moved (the single undoable op); `onMarquee` on
+  // an empty-start drag's pointer-up; `onContextPick` carries the right-click pick.
+  onSelectObject: (id: string) => void;
+  onTransformPreview: (id: string, dx: number, dy: number) => void;
+  onTransformCommit: (id: string, dx: number, dy: number) => void;
+  onMarquee: (ids: string[]) => void;
+  onContextPick: (id: string | null) => void;
 };
 
 const initialRustStatus: RustCoreStatus = {
@@ -331,7 +341,31 @@ export class ShapeCanvasHost {
         this.emitHealth();
       }
       this.callbacks.onStatus(event.message);
+      return;
     }
+
+    // FC-08: object-path input results route to the shell callbacks.
+    if (event.type === "object-select") {
+      this.callbacks.onSelectObject(event.id);
+      return;
+    }
+    if (event.type === "object-transform-preview") {
+      this.callbacks.onTransformPreview(event.id, event.dx, event.dy);
+      return;
+    }
+    if (event.type === "object-transform-commit") {
+      this.callbacks.onTransformCommit(event.id, event.dx, event.dy);
+      return;
+    }
+    if (event.type === "object-marquee") {
+      this.callbacks.onMarquee(event.ids);
+    }
+  }
+
+  /** FC-08: pure object pick (no mutation) at canvas-local screen coords, used by
+   *  the shell's right-click context menu. */
+  hitTestObjectAt(screenX: number, screenY: number): string | null {
+    return this.engine?.objectHitTest({ x: screenX, y: screenY }) ?? null;
   }
 
   private emitHealth(): void {

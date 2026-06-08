@@ -6,6 +6,7 @@
   import {
     emptyObjectScene,
     translateTransform,
+    GEOMETRY_QUANTUM_PER_PX,
     type Object as SceneObject,
     type ObjectOp,
     type ObjectScene,
@@ -41,6 +42,12 @@
 
   // ----- selection: single ObjectSelection + transient multi -----
   let selection = $state<ObjectSelection>({ kind: "canvas" });
+
+  // ----- FC-08: non-destructive live object drag preview. The canonical `scene`
+  //       is never mutated mid-drag; the renderer is fed a clone with this one
+  //       object shifted, so the commit op on pointer-up captures the correct
+  //       inverse (original transform), keeping undo correct (D21). -----
+  let dragPreview = $state<{ id: string; dx: number; dy: number } | null>(null);
 
   // ----- ephemeral camera / chrome -----
   let camera = $state<CameraState>({ x: 140, y: 120, zoom: 0.6 });
@@ -90,6 +97,12 @@
   const hasRenderableScene = $derived(scene.objects.length > 0);
   const selectedObject = $derived(selection.kind === "object" ? scene.objects.find((o) => o.id === selection.id) ?? null : null);
 
+  // FC-08: the scene actually fed to the renderer — the canonical scene during
+  // normal editing, or a clone with the dragged object shifted during a live drag.
+  const feedScene = $derived(
+    dragPreview ? sceneWithObjectShifted(scene, dragPreview.id, dragPreview.dx, dragPreview.dy) : scene
+  );
+
   const hostCallbacks: ShapeCanvasHostCallbacks = {
     onCameraChange: (next) => (camera = next),
     onStats: (stats) => (rendererStats = stats),
@@ -97,7 +110,26 @@
     onHealthChange: (health) => {
       rendererHealth = health;
       if (health.state === "ready" && isDiagnosticsOnlyStatus(status)) status = "Ready";
-    }
+    },
+    onSelectObject: (id) => selectObject({ kind: "object", id }),
+    onTransformPreview: (id, dx, dy) => (dragPreview = { id, dx, dy }),
+    onTransformCommit: (id, dx, dy) => {
+      // The canonical scene was never mutated during the drag, so op-apply
+      // captures the correct inverse (original transform), satisfying D21 undo.
+      const src = scene.objects.find((o) => o.id === id);
+      if (src) authorOp({ kind: "set-transform", id, transform: shiftTransform(src.transform, dx, dy) });
+      dragPreview = null;
+    },
+    onMarquee: (ids) => {
+      if (ids.length >= 2) selection = { kind: "multi", ids };
+      else if (ids.length === 1) selection = { kind: "object", id: ids[0] };
+      else selection = { kind: "canvas" };
+      persistSelection(selection);
+    },
+    // FC-08/FC-13: a right-click pick result; the shell builds the context menu
+    // target from it. The right-click flow itself is driven synchronously in
+    // handleContextMenuRequest, so this is the engine-event entry for the same.
+    onContextPick: (id) => handleContextPick(contextTargetFromPick(id))
   };
 
   // Boot the scene-core wasm (op-apply + catalog) and open the WS session.
@@ -114,8 +146,10 @@
   }
 
   // Push the object scene into the renderer whenever it or the selection changes.
+  // FC-08: feeds `feedScene` (the canonical scene, or a drag-preview clone) so a
+  // live drag previews without mutating the canonical state.
   $effect(() => {
-    const current = scene;
+    const current = feedScene;
     const sel = selection;
     host?.loadObjectScene(current, sel);
   });
@@ -257,8 +291,16 @@
     }
   }
 
+  // FC-14: delete a canvas, including the active one. Deleting the active canvas
+  // first switches to another remaining canvas (so the session is never left
+  // pointing at a deleted id), then deletes the old one and reloads the list.
   async function deleteCanvas(targetCanvasId: string): Promise<void> {
-    if (!sceneClient || targetCanvasId === canvasId) return;
+    if (!sceneClient) return;
+    if (targetCanvasId === canvasId) {
+      const other = canvases.find((c) => c.id !== targetCanvasId);
+      if (!other) return;
+      await switchToCanvas(other.id);
+    }
     canvasBusy = true;
     try {
       await sceneClient.deleteCanvas(targetCanvasId);
@@ -409,14 +451,24 @@
     status = "Duplicated selection";
   }
 
-  // Group: reparent the selected objects under a fresh frame object (D3).
+  // Group: reparent the selected objects under a fresh frame object (D3). FC-14:
+  // the frame geometry encloses the children — a rect sized to the union world-AABB
+  // of the selected objects, positioned by a pure-translation transform at the
+  // AABB's top-left. Children transforms are world-absolute, so they are reparented
+  // unchanged.
   function groupSelection(): void {
     const ids = currentSelectionIds();
     if (ids.length < 2) return;
+    const objects = ids.map((id) => scene.objects.find((o) => o.id === id)).filter((o): o is SceneObject => Boolean(o));
+    const bounds = unionWorldAabb(objects);
     const frame: SceneObject = {
       id: freshId("frame"),
       order: nextOrderKey(),
-      geometry: { d: "M 0 0 L 1 0 L 1 1 L 0 1 Z", fillRule: "nonZero" },
+      transform: bounds ? translateTransform(bounds.minX, bounds.minY) : translateTransform(0, 0),
+      geometry: {
+        d: rectPathQuantized(bounds ? bounds.maxX - bounds.minX : 1, bounds ? bounds.maxY - bounds.minY : 1),
+        fillRule: "nonZero"
+      },
       clip: false
     };
     const ops: ObjectOp[] = [{ kind: "insert-object", object: frame }];
@@ -431,13 +483,18 @@
     status = "Grouped selection";
   }
 
+  // FC-14: ungroup reparents children out of the frame, then deletes the now-empty
+  // frame in the SAME batch op.
   function ungroupSelection(): void {
     if (selection.kind !== "object") return;
     const id = selection.id;
     const children = scene.objects.filter((o) => o.parent === id);
     if (children.length === 0) return;
     const ops: ObjectOp[] = children.map((child) => ({ kind: "reparent", id: child.id, order: child.order }));
+    ops.push({ kind: "delete", id });
     authorOp({ kind: "batch", ops });
+    selection = { kind: "canvas" };
+    persistSelection(selection);
     status = "Ungrouped selection";
   }
 
@@ -459,6 +516,34 @@
     const order = direction === "front" ? nextOrderKey() : backOrderKey();
     const ops: ObjectOp[] = ids.map((id) => ({ kind: "reorder", id, order }));
     authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops });
+  }
+
+  // FC-14: true single-step reorder. Sort objects by order string; for "forward"
+  // swap the selected object's order with its next-higher neighbor, for "backward"
+  // swap with the next-lower neighbor. Applies to the single selected object only
+  // (a step reorder over a multi-set has no well-defined neighbor).
+  function reorderStep(direction: "forward" | "backward"): void {
+    const ids = currentSelectionIds();
+    if (ids.length !== 1) {
+      // Fall back to front/back for the multi case (no single neighbor to swap).
+      reorderSelection(direction === "forward" ? "front" : "back");
+      return;
+    }
+    const id = ids[0];
+    const sorted = [...scene.objects].sort((a, b) => (a.order < b.order ? -1 : a.order > b.order ? 1 : 0));
+    const index = sorted.findIndex((o) => o.id === id);
+    if (index < 0) return;
+    const neighborIndex = direction === "forward" ? index + 1 : index - 1;
+    const neighbor = sorted[neighborIndex];
+    if (!neighbor) return;
+    const self = sorted[index];
+    authorOp({
+      kind: "batch",
+      ops: [
+        { kind: "reorder", id: self.id, order: neighbor.order },
+        { kind: "reorder", id: neighbor.id, order: self.order }
+      ]
+    });
   }
 
   function backOrderKey(): string {
@@ -612,8 +697,8 @@
       "nudge-right": () => nudgeSelection(8, 0),
       "bring-to-front": () => reorderSelection("front"),
       "send-to-back": () => reorderSelection("back"),
-      "bring-forward": () => reorderSelection("front"),
-      "send-backward": () => reorderSelection("back"),
+      "bring-forward": () => reorderStep("forward"),
+      "send-backward": () => reorderStep("backward"),
       undo: () => undo(),
       redo: () => redo(),
       "edit-text": () => {
@@ -631,18 +716,31 @@
 
   // ----- context menu (U3, from the command catalog) ----------------------
 
+  // FC-13: hit-test the object under the cursor and open a menu that acts on it.
   function handleContextMenuRequest(point: { x: number; y: number }): void {
     if (!canvasWrap) return;
     pendingContextScreen = { clientX: point.x, clientY: point.y };
-    // Object hit-test is part of the deferred renderer object pass; until then,
-    // the right-click acts on the current selection (or canvas).
-    handleContextPick(selection, point);
+    const rect = canvasWrap.getBoundingClientRect();
+    const id = host?.hitTestObjectAt(point.x - rect.left, point.y - rect.top) ?? null;
+    const target = contextTargetFromPick(id);
+    // Right-clicking an object selects it (unless it is already part of the
+    // current multi-select) so the menu acts on the right-clicked object.
+    if (target.kind !== "canvas") selectObject(target);
+    handleContextPick(target);
   }
 
-  function handleContextPick(picked: ObjectSelection, screen: { x: number; y: number }): void {
-    const anchor = pendingContextScreen ?? { clientX: screen.x, clientY: screen.y };
+  // FC-13: build the context-menu target from a picked id. If the pick is part of
+  // the current multi-select, keep the whole multi so the menu acts on the set.
+  function contextTargetFromPick(id: string | null): ObjectSelection {
+    if (!id) return { kind: "canvas" };
+    if (selection.kind === "multi" && selection.ids.includes(id)) return selection;
+    return { kind: "object", id };
+  }
+
+  function handleContextPick(picked: ObjectSelection): void {
+    const anchor = pendingContextScreen;
     pendingContextScreen = null;
-    if (!canvasWrap) return;
+    if (!canvasWrap || !anchor) return;
     const rect = canvasWrap.getBoundingClientRect();
     const world = screenToWorld({ x: anchor.clientX - rect.left, y: anchor.clientY - rect.top }, camera);
     contextMenu = { selection: picked, x: anchor.clientX, y: anchor.clientY, world };
@@ -655,32 +753,69 @@
     return () => window.removeEventListener("pointerdown", dismiss);
   });
 
-  // The unified object context menu, derived from the object command catalog.
+  // FC-13: the right-click menu is derived from the object command catalog. The
+  // catalog (the wasm core's `objectCommandCatalog()`) supplies the label/order;
+  // each id routes to the SAME shell handler the shortcut layer uses. The
+  // object/canvas split picks which command ids appear, and a `null` entry renders
+  // a separator. Icons + the delete danger flag are decorated here.
+  type ContextMenuEntry = "separator" | { id: string; icon?: typeof Copy; danger?: boolean; disabledFor?: ObjectSelection["kind"] };
+
+  const OBJECT_MENU: ContextMenuEntry[] = [
+    { id: "duplicate", icon: Copy },
+    { id: "group", icon: GroupIcon, disabledFor: "object" },
+    { id: "ungroup", icon: Ungroup },
+    { id: "bring-to-front" },
+    { id: "send-to-back" },
+    { id: "add-comment", icon: MessageSquarePlus },
+    "separator",
+    { id: "delete", icon: Trash2, danger: true }
+  ];
+
+  const CANVAS_MENU: ContextMenuEntry[] = [
+    { id: "insert-rectangle" },
+    { id: "insert-text", icon: MessageSquarePlus },
+    { id: "open-template-library", icon: LayoutTemplate },
+    "separator",
+    { id: "select-all" }
+  ];
+
   function contextMenuItems(menu: ContextMenuState): (ContextMenuItem | null)[] {
     const picked = menu.selection;
-    if (picked.kind === "object" || picked.kind === "multi") {
-      return [
-        { label: "Duplicate", icon: Copy, onSelect: () => closeContextThen(() => duplicateSelection()) },
-        { label: "Group", icon: GroupIcon, disabled: picked.kind !== "multi", onSelect: () => closeContextThen(() => groupSelection()) },
-        { label: "Ungroup", icon: Ungroup, onSelect: () => closeContextThen(() => ungroupSelection()) },
-        { label: "Bring to front", onSelect: () => closeContextThen(() => reorderSelection("front")) },
-        { label: "Send to back", onSelect: () => closeContextThen(() => reorderSelection("back")) },
-        { label: "Add comment", icon: MessageSquarePlus, onSelect: () => closeContextThen(() => addCommentToSelected()) },
-        null,
-        { label: "Delete", icon: Trash2, danger: true, onSelect: () => closeContextThen(() => deleteSelection()) }
-      ];
-    }
-    return [
-      { label: "Insert rectangle", onSelect: () => closeContextThen(() => insertPrimitive("rectangle", menu.world)) },
-      { label: "Insert text", icon: StickyIcon, onSelect: () => closeContextThen(() => insertPrimitive("text", menu.world)) },
-      { label: "Templates", icon: LayoutTemplate, onSelect: () => closeContextThen(() => toggleTemplates()) },
-      null,
-      { label: "Select all", onSelect: () => closeContextThen(() => selectAll()) }
-    ];
+    const layout = picked.kind === "object" || picked.kind === "multi" ? OBJECT_MENU : CANVAS_MENU;
+    const handlers = contextHandlers(menu);
+    return layout.map((entry) => {
+      if (entry === "separator") return null;
+      const command = commandCatalog.find((c) => c.id === entry.id);
+      const run = handlers[entry.id];
+      if (!run) return null;
+      return {
+        label: command?.label ?? entry.id,
+        icon: entry.icon,
+        danger: entry.danger,
+        disabled: entry.disabledFor === picked.kind,
+        onSelect: () => closeContextThen(run)
+      };
+    });
   }
-  // StickyIcon alias kept local to avoid a second lucide import cluster.
-  const StickyIcon = MessageSquarePlus;
 
+  // Map a context-menu command id to the existing shell handler. Canvas inserts
+  // anchor at the right-click world point (menu.world).
+  function contextHandlers(menu: ContextMenuState): Record<string, () => void> {
+    const base = shortcutHandlers();
+    return {
+      duplicate: base.duplicate,
+      group: base.group,
+      ungroup: base.ungroup,
+      "bring-to-front": base["bring-to-front"],
+      "send-to-back": base["send-to-back"],
+      "add-comment": base["add-comment"],
+      delete: base.delete,
+      "insert-rectangle": () => insertPrimitive("rectangle", menu.world),
+      "insert-text": () => insertPrimitive("text", menu.world),
+      "open-template-library": base["open-template-library"],
+      "select-all": base["select-all"]
+    };
+  }
   function closeContextThen(action: () => void): void {
     contextMenu = null;
     action();
@@ -743,6 +878,73 @@
       [transform[1][0], transform[1][1], oy + dy],
       [transform[2][0], transform[2][1], transform[2][2]]
     ];
+  }
+
+  // FC-08: a shallow clone of the scene with one object's transform shifted by
+  // (dx,dy) world px. Used only for the live drag preview feed; the canonical
+  // scene is never mutated, so undo stays correct.
+  function sceneWithObjectShifted(source: ObjectScene, id: string, dx: number, dy: number): ObjectScene {
+    return {
+      ...source,
+      objects: source.objects.map((o) => (o.id === id ? { ...o, transform: shiftTransform(o.transform, dx, dy) } : o))
+    };
+  }
+
+  // FC-14: the union world-AABB of the given objects, computed from each object's
+  // geometry path bbox (object-local quantized px → logical px) transformed by its
+  // affine transform. Returns null when no object yields a finite bbox.
+  function unionWorldAabb(objects: SceneObject[]): { minX: number; minY: number; maxX: number; maxY: number } | null {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const object of objects) {
+      const local = pathLocalBbox(object.geometry.d);
+      if (!local) continue;
+      const t = object.transform;
+      for (const [lx, ly] of [
+        [local.minX, local.minY],
+        [local.maxX, local.minY],
+        [local.maxX, local.maxY],
+        [local.minX, local.maxY]
+      ]) {
+        const [wx, wy] = t ? [t[0][0] * lx + t[0][1] * ly + t[0][2], t[1][0] * lx + t[1][1] * ly + t[1][2]] : [lx, ly];
+        minX = Math.min(minX, wx);
+        minY = Math.min(minY, wy);
+        maxX = Math.max(maxX, wx);
+        maxY = Math.max(maxY, wy);
+      }
+    }
+    return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
+  }
+
+  // The object-local bbox (in logical px) of a path-string's coordinate pairs.
+  // Coords are quantized integers (GEOMETRY_QUANTUM_PER_PX per px); commands are
+  // single letters, so reading every numeric pair covers M/L/C control points —
+  // a conservative-enough enclosing box for the group frame.
+  function pathLocalBbox(d: string): { minX: number; minY: number; maxX: number; maxY: number } | null {
+    const nums = d.match(/-?\d+(?:\.\d+)?/g);
+    if (!nums || nums.length < 2) return null;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i + 1 < nums.length; i += 2) {
+      const x = Number(nums[i]) / GEOMETRY_QUANTUM_PER_PX;
+      const y = Number(nums[i + 1]) / GEOMETRY_QUANTUM_PER_PX;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+    return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
+  }
+
+  // FC-14: a closed object-local rect path of `w`×`h` logical px, quantized.
+  function rectPathQuantized(w: number, h: number): string {
+    const qw = Math.round(Math.max(1, w) * GEOMETRY_QUANTUM_PER_PX);
+    const qh = Math.round(Math.max(1, h) * GEOMETRY_QUANTUM_PER_PX);
+    return `M 0 0 L ${qw} 0 L ${qw} ${qh} L 0 ${qh} Z`;
   }
 
   // ----- status helpers ----------------------------------------------------

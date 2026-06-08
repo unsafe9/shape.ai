@@ -193,6 +193,10 @@ export type RustWebGpuRenderer = {
   // hitTest is a pure pick (no mutation) for the right-click context menu.
   setTool?(tool: string): void;
   hitTest?(screenX: number, screenY: number): RustHitResult | null;
+  // FC-08: pure object pick for the right-click context menu — returns the id of
+  // the top-most object under the screen point (no mutation). Optional so a wasm
+  // build predating it is treated as "no object" by the engine.
+  hitTestObject?(screenX: number, screenY: number): string | null;
   // Replace the transient multi-select highlight set (JSON array of ids). Optional
   // so a wasm build predating it is treated as a no-op by the engine.
   setMultiSelect?(idsJson: string): void;

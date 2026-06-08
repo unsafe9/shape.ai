@@ -384,7 +384,7 @@ pub fn object_command_catalog() -> Vec<ObjectCommand> {
             "zoom-fit",
             "Zoom to Fit",
             View,
-            Some("Shift+1"),
+            Some("Mod+0"),
             "Fit the whole scene in the viewport.",
             None,
         ),

@@ -1630,6 +1630,21 @@ impl ShapeWebGpuRenderer {
         serde_wasm(hit)
     }
 
+    /// FC-08: pure object pick for the right-click context menu. Returns the id of
+    /// the top-most object under the screen point (or null) without mutating
+    /// selection, camera, or drag state.
+    #[wasm_bindgen(js_name = hitTestObject)]
+    pub fn hit_test_object_at(&self, screen_x: f64, screen_y: f64) -> Option<String> {
+        hit_object_in_regions(
+            &self.object_regions,
+            &self.camera,
+            WorldPoint {
+                x: screen_x,
+                y: screen_y,
+            },
+        )
+    }
+
     #[wasm_bindgen(js_name = debugSnapshot)]
     pub fn debug_snapshot(&self) -> Result<JsValue, JsValue> {
         let (selection, selection_world_rect, total_groups, total_cards, total_edges) =

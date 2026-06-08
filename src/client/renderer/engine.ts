@@ -37,6 +37,16 @@ export type EngineEvent =
   | { type: "marquee"; rect: WorldRect; ids: string[] }
   // CC4.1: right-click pick result, for the context menu. Does not change selection.
   | { type: "context-pick"; hit: HitResult | null; screen: WorldPoint }
+  // FC-08: object-path input results. `object-select` rides the pointer-down that
+  // picked an object; `object-transform-preview` rides each pointer-move during an
+  // object drag (cumulative world-px delta from the pointer-down point — a
+  // non-destructive preview, the shell does NOT author yet); `object-transform-commit`
+  // is emitted once on pointer-up when the drag moved, and is the single undoable
+  // op; `object-marquee` rides the pointer-up of an empty-start drag.
+  | { type: "object-select"; id: string }
+  | { type: "object-transform-preview"; id: string; dx: number; dy: number }
+  | { type: "object-transform-commit"; id: string; dx: number; dy: number }
+  | { type: "object-marquee"; ids: string[] }
   | { type: "status"; message: string };
 
 export type ShapeCanvasEngineOptions = {
@@ -86,6 +96,10 @@ export class ShapeCanvasEngine {
   private lastPointerAdditive = false;
   private deferredScene: SceneSnapshot | null = null;
   private deferredSceneRaf = 0;
+  // FC-08: the in-progress object drag (id + cumulative world-px delta). Set on the
+  // pointer-down that picks an object, updated on each move, and committed once on
+  // pointer-up when it moved. The renderer never mutates object transforms.
+  private objectDrag: { id: string; dx: number; dy: number } | null = null;
 
   constructor(options: ShapeCanvasEngineOptions) {
     this.canvas = options.canvas;
@@ -439,6 +453,7 @@ export class ShapeCanvasEngine {
         edgeId: `renderer-edge-${crypto.randomUUID().slice(0, 8)}`
       }
     ]);
+    this.commitObjectDrag();
     try {
       this.canvas.releasePointerCapture(event.pointerId);
     } catch {
@@ -450,6 +465,7 @@ export class ShapeCanvasEngine {
   private onPointerCancel = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
     this.sendInputBatch([{ kind: "pointer-cancel", pointerId: event.pointerId }]);
+    this.objectDrag = null;
     this.finishInputGesture();
   };
 
@@ -482,6 +498,7 @@ export class ShapeCanvasEngine {
         edgeId: `renderer-edge-${crypto.randomUUID().slice(0, 8)}`
       }
     ]);
+    this.commitObjectDrag();
     this.finishInputGesture();
   };
 
@@ -746,6 +763,48 @@ export class ShapeCanvasEngine {
     // the intersected ids so the shell merges them into multiSelectIds.
     const marquee = marqueeFromResult(result);
     if (marquee) this.onEvent({ type: "marquee", rect: marquee.rect, ids: marquee.ids });
+
+    // FC-08: object-path input results. An object pick on pointer-down starts a
+    // remembered drag; each move delta updates it and previews; an empty-start
+    // marquee forwards its ids. The commit op is authored on pointer-up.
+    if (typeof result.objectSelection === "string") {
+      this.objectDrag = { id: result.objectSelection, dx: 0, dy: 0 };
+      this.onEvent({ type: "object-select", id: result.objectSelection });
+    }
+    if (result.objectTransformDelta) {
+      const { id, dx, dy } = result.objectTransformDelta;
+      this.objectDrag = { id, dx, dy };
+      this.onEvent({ type: "object-transform-preview", id, dx, dy });
+    }
+    if (result.objectMarqueeIds != null) {
+      this.onEvent({ type: "object-marquee", ids: result.objectMarqueeIds });
+    }
+  }
+
+  // FC-08: emit the single undoable transform commit when an object drag moved,
+  // then clear the remembered drag. Called on pointer-up/mouse-up AFTER the batch.
+  private commitObjectDrag() {
+    const drag = this.objectDrag;
+    this.objectDrag = null;
+    if (drag && (drag.dx !== 0 || drag.dy !== 0)) {
+      this.onEvent({ type: "object-transform-commit", id: drag.id, dx: drag.dx, dy: drag.dy });
+    }
+  }
+
+  // FC-08: pure object pick for the shell's right-click context menu.
+  objectHitTest(screen: WorldPoint): string | null {
+    if (!this.webGpuRenderer || typeof this.webGpuRenderer.hitTestObject !== "function") return null;
+    try {
+      const id = this.webGpuRenderer.hitTestObject(screen.x, screen.y);
+      this.rustBoundaryCalls += 1;
+      return id ?? null;
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust hitTestObject failed: ${error.message}` : "Rust hitTestObject failed"
+      });
+      return null;
+    }
   }
 
   private mirrorAcceptedPatches(patches: ScenePatch[], emitPatchEvents: boolean) {
