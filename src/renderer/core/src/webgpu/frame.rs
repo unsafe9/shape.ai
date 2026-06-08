@@ -23,6 +23,7 @@ impl ShapeWebGpuRenderer {
         self.flush_text_atlas();
         let overlay_vertex_count = self.write_marquee_overlay();
         let handle_vertex_count = self.write_handle_overlay();
+        let multi_select_vertex_count = self.write_multi_select_overlay();
         let mut draw_list = self.build_draw_list();
         // Carry this frame's per-object tiers forward so the next frame's
         // hysteresis resolves against them (T3.1 §3). Tiers are diagnostics; they
@@ -59,6 +60,35 @@ impl ShapeWebGpuRenderer {
                 self.height as f32,
             );
             renderer.render(&mut encoder, &view, pipeline, true);
+            // W3-G7/#1: per-object outline highlight for the multi-select set, drawn
+            // on top of the object pass with the world-space pipeline (LoadOp::Load
+            // preserves the fill/stroke output). Single selection draws no outline
+            // here — it keeps its 8-handle overlay below. The outline rectangles are
+            // world-space quads built from each region's world bbox, so the matrix
+            // transform path never re-tessellates them.
+            if multi_select_vertex_count > 0 {
+                let color_attachments = [Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shape.ai multi-select outline overlay pass"),
+                    color_attachments: &color_attachments,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.multi_select_overlay_vertex_buffer.slice(..));
+                pass.draw(0..multi_select_vertex_count as u32, 0..1);
+            }
             // W2-04: selection-handle overlay, drawn on top of the object pass with
             // the legacy world-space pipeline (LoadOp::Load preserves the object
             // pass output). The handles are screen-fixed world quads (see
@@ -279,6 +309,28 @@ impl ShapeWebGpuRenderer {
         }
         self.queue
             .write_buffer(&self.handle_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        vertices.len()
+    }
+
+    /// W3-G7/#1: write the per-object outline highlight for the active multi-select
+    /// set into its dedicated buffer, returning the vertex count to draw. Zero when
+    /// the set is empty (single selection keeps its handle overlay instead).
+    fn write_multi_select_overlay(&mut self) -> usize {
+        let ids = self
+            .object_scene
+            .as_ref()
+            .map(|scene| scene.multi_select.clone())
+            .unwrap_or_default();
+        let vertices =
+            build_multi_select_overlay_vertices(&self.object_regions, &ids, self.camera.zoom);
+        if vertices.is_empty() {
+            return 0;
+        }
+        self.queue.write_buffer(
+            &self.multi_select_overlay_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&vertices),
+        );
         vertices.len()
     }
 

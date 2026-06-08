@@ -1727,6 +1727,42 @@ pub(crate) fn build_handle_overlay_vertices(world_bbox: &WorldRect, zoom: f64) -
     vertices
 }
 
+/// W3-G7/#1: per-object outline highlight for the multi-select set. For each id
+/// present in `regions`, draw the object's world-space bbox as a 4-edge rectangle
+/// outline (constant ~2px screen width via `2.0 / zoom`) in the selection blue, so
+/// a marquee/shortcut multi-select shows a visible ring on every member (single
+/// selection keeps its 8-handle overlay). Stops once the buffer capacity is hit.
+/// Empty when `ids` is empty. World-space so the legacy overlay pipeline draws it.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn build_multi_select_overlay_vertices(
+    regions: &[ObjectRegion],
+    ids: &[String],
+    zoom: f64,
+) -> Vec<GpuVertex> {
+    let mut vertices = Vec::new();
+    let thickness = (2.0 / zoom.max(0.025)) as f32;
+    for id in ids {
+        if vertices.len() + 24 > MULTI_SELECT_OVERLAY_VERTEX_CAPACITY {
+            break;
+        }
+        let Some(region) = regions.iter().find(|region| &region.id == id) else {
+            continue;
+        };
+        let Some(bounds) = region_world_bounds(region, None) else {
+            continue;
+        };
+        let x = bounds.x as f32;
+        let y = bounds.y as f32;
+        let w = bounds.width as f32;
+        let h = bounds.height as f32;
+        add_line(&mut vertices, [x, y], [x + w, y], thickness, MULTI_SELECT_OUTLINE_COLOR);
+        add_line(&mut vertices, [x + w, y], [x + w, y + h], thickness, MULTI_SELECT_OUTLINE_COLOR);
+        add_line(&mut vertices, [x + w, y + h], [x, y + h], thickness, MULTI_SELECT_OUTLINE_COLOR);
+        add_line(&mut vertices, [x, y + h], [x, y], thickness, MULTI_SELECT_OUTLINE_COLOR);
+    }
+    vertices
+}
+
 /// Node ids AND group ids whose world bounds intersect the marquee rect (AABB).
 /// Cards come first (selection-anchor friendly), then groups; both deduped by the
 /// scene's natural order.
@@ -3000,6 +3036,15 @@ pub(crate) const HANDLE_OVERLAY_VERTEX_CAPACITY: usize = 54;
 // Solid focus-blue handle fill (#2f7ee6).
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const HANDLE_FILL_COLOR: [f32; 4] = [0.184, 0.494, 0.902, 1.0];
+
+// W3-G7/#1: multi-select outline = up to ~96 objects, each a 4-edge rectangle
+// (4 line quads * 6 verts = 24 verts/object).
+#[cfg(feature = "wgpu-probe")]
+pub(crate) const MULTI_SELECT_OVERLAY_VERTEX_CAPACITY: usize = 96 * 24;
+// Selection-ring blue (#007aff), opaque. Same sRGB-normalized convention as the
+// marquee/handle color consts above.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) const MULTI_SELECT_OUTLINE_COLOR: [f32; 4] = [0.0, 0.478, 1.0, 1.0];
 
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn webgpu_vertex_buffer_usage() -> wgpu::BufferUsages {
@@ -4468,6 +4513,35 @@ mod tests {
                 "handle screen size must be constant HANDLE_SIZE_PX at zoom {zoom}, got {screen_w}"
             );
         }
+    }
+
+    #[test]
+    fn multi_select_overlay_draws_one_outline_per_selected_object() {
+        // Two 20px rects; multi-select both => one 4-edge outline per object.
+        let scene = object_scene(vec![
+            rect_object("a", 0.0, 0.0, 20),
+            rect_object("b", 50.0, 50.0, 20),
+        ]);
+        let regions = derive_object_regions(&scene);
+
+        let verts = build_multi_select_overlay_vertices(
+            &regions,
+            &["a".to_string(), "b".to_string()],
+            1.0,
+        );
+        // 4 edge quads * 6 verts = 24 per object; non-empty and a clean multiple.
+        assert!(!verts.is_empty(), "multi-select highlight must emit geometry");
+        assert_eq!(verts.len(), 24 * 2, "one 24-vert outline per selected object");
+        assert_eq!(verts.len() % 24, 0, "outline must be whole-object multiples");
+        assert!(
+            verts.len() <= MULTI_SELECT_OVERLAY_VERTEX_CAPACITY,
+            "must stay within the overlay buffer capacity"
+        );
+        // The outline uses the selection-ring blue, not transparent.
+        assert_eq!(verts[0].color, MULTI_SELECT_OUTLINE_COLOR);
+
+        // Empty set => nothing drawn (single selection keeps its handle overlay).
+        assert!(build_multi_select_overlay_vertices(&regions, &[], 1.0).is_empty());
     }
 
     #[test]
