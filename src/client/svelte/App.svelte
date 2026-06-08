@@ -49,6 +49,13 @@
   //       inverse (original transform), keeping undo correct (D21). -----
   let dragPreview = $state<{ id: string; dx: number; dy: number } | null>(null);
 
+  // ----- FC-11: freehand pen. While the draw tool is active, the in-progress
+  //       stroke's world points accumulate here; `feedScene` appends a transient
+  //       preview object so the stroke is visible before it commits. On pointer-up
+  //       the points lower to a committed `Object` via the wasm core. -----
+  let drawPoints = $state<{ x: number; y: number }[] | null>(null);
+  const PEN = { color: "#1f2933", widthPx: 2, epsilon: 2.0 };
+
   // ----- ephemeral camera / chrome -----
   let camera = $state<CameraState>({ x: 140, y: 120, zoom: 0.6 });
   let status = $state("Ready");
@@ -99,9 +106,9 @@
 
   // FC-08: the scene actually fed to the renderer — the canonical scene during
   // normal editing, or a clone with the dragged object shifted during a live drag.
-  const feedScene = $derived(
-    dragPreview ? sceneWithObjectShifted(scene, dragPreview.id, dragPreview.dx, dragPreview.dy) : scene
-  );
+  // FC-11: while a freehand stroke is in progress, append a transient preview
+  // object built from the world points (no op-apply — geometry-vocabulary only).
+  const feedScene = $derived(buildFeedScene(scene, dragPreview, drawPoints));
 
   const hostCallbacks: ShapeCanvasHostCallbacks = {
     onCameraChange: (next) => (camera = next),
@@ -129,7 +136,11 @@
     // FC-08/FC-13: a right-click pick result; the shell builds the context menu
     // target from it. The right-click flow itself is driven synchronously in
     // handleContextMenuRequest, so this is the engine-event entry for the same.
-    onContextPick: (id) => handleContextPick(contextTargetFromPick(id))
+    onContextPick: (id) => handleContextPick(contextTargetFromPick(id)),
+    // FC-11: freehand pen capture. Accumulate world points across start/move; on
+    // end, lower the stroke to an object via the wasm core and author an
+    // insert-object op (the tool stays sticky in "draw"); cancel discards.
+    onDraw: (phase, world) => handleDraw(phase, world)
   };
 
   // Boot the scene-core wasm (op-apply + catalog) and open the WS session.
@@ -421,6 +432,32 @@
     status = `Inserted ${kind}`;
   }
 
+  // FC-11: drive the freehand pen. Accumulate world points across start/move; on
+  // end, lower the stroke to an object through the wasm core and author an
+  // insert-object op. The tool stays sticky in "draw". A cancel discards the
+  // in-progress stroke.
+  function handleDraw(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }): void {
+    if (phase === "start") {
+      drawPoints = [world];
+      return;
+    }
+    if (phase === "cancel") {
+      drawPoints = null;
+      return;
+    }
+    if (!drawPoints) return;
+    const points = [...drawPoints, world];
+    if (phase === "move") {
+      drawPoints = points;
+      return;
+    }
+    // phase === "end": commit the stroke to an object (>=2 points have extent).
+    drawPoints = null;
+    if (points.length < 2 || !sceneCore) return;
+    const object = sceneCore.freehandToObject(points, PEN.color, PEN.widthPx, PEN.epsilon, freshId("draw"), nextOrderKey());
+    authorOp({ kind: "insert-object", object });
+  }
+
   function deleteSelection(): void {
     const ids = currentSelectionIds();
     if (ids.length === 0) return;
@@ -664,6 +701,8 @@
   }
 
   function handleEscape(): void {
+    // FC-11: a pending Escape first cancels an in-progress pen stroke.
+    if (drawPoints) return void (drawPoints = null);
     if (settingsOpen) return void (settingsOpen = false);
     if (templateOpen) return void (templateOpen = false);
     if (diagnosticsOpen) return void (diagnosticsOpen = false);
@@ -887,6 +926,35 @@
     return {
       ...source,
       objects: source.objects.map((o) => (o.id === id ? { ...o, transform: shiftTransform(o.transform, dx, dy) } : o))
+    };
+  }
+
+  // FC-08/FC-11: the renderer feed. Start from the canonical scene, apply a live
+  // drag-preview shift, and append a transient pen-stroke preview — neither mutates
+  // the canonical `scene` nor runs op-apply (geometry-vocabulary construction only).
+  function buildFeedScene(
+    source: ObjectScene,
+    drag: { id: string; dx: number; dy: number } | null,
+    pen: { x: number; y: number }[] | null
+  ): ObjectScene {
+    let feed = drag ? sceneWithObjectShifted(source, drag.id, drag.dx, drag.dy) : source;
+    const preview = pen && pen.length >= 1 ? drawPreviewObject(pen) : null;
+    if (preview) feed = { ...feed, objects: [...feed.objects, preview] };
+    return feed;
+  }
+
+  // FC-11: a transient preview object for the in-progress pen stroke. Geometry is
+  // a world-px polyline (identity transform, so local==world) with the pen brush;
+  // built directly in TS like objectPrimitives.ts (NOT op-apply). The committed
+  // object replaces it on pointer-up.
+  function drawPreviewObject(points: { x: number; y: number }[]): SceneObject {
+    const q = (px: number) => Math.round(px * GEOMETRY_QUANTUM_PER_PX);
+    const d = points.map((p, i) => `${i === 0 ? "M" : "L"} ${q(p.x)} ${q(p.y)}`).join(" ");
+    return {
+      id: "draw-preview",
+      order: nextOrderKey(),
+      geometry: { d },
+      stroke: { paint: { kind: "solid", color: PEN.color }, width: PEN.widthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
     };
   }
 

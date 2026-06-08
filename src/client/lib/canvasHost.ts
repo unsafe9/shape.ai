@@ -61,6 +61,9 @@ export type ShapeCanvasHostCallbacks = {
   onTransformCommit: (id: string, dx: number, dy: number) => void;
   onMarquee: (ids: string[]) => void;
   onContextPick: (id: string | null) => void;
+  // FC-11: freehand pen capture phases (world px). The shell accumulates the
+  // points across start/move and commits the stroke to an object on `end`.
+  onDraw: (phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }) => void;
 };
 
 const initialRustStatus: RustCoreStatus = {
@@ -359,6 +362,11 @@ export class ShapeCanvasHost {
     }
     if (event.type === "object-marquee") {
       this.callbacks.onMarquee(event.ids);
+      return;
+    }
+    // FC-11: freehand pen capture phase routes to the shell's draw controller.
+    if (event.type === "draw") {
+      this.callbacks.onDraw(event.phase, event.world);
     }
   }
 

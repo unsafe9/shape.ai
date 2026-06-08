@@ -1,5 +1,6 @@
 import {
   applyScenePatch,
+  screenToWorld,
   type CameraState,
   type DomOverlayRequest,
   type FrameStats,
@@ -20,8 +21,9 @@ import type {
   RustWebGpuRenderer
 } from "./wasmLoader";
 
-/** CC1.4: the active pointer tool. "select" picks/drags, "hand" pans. */
-export type ActiveTool = "select" | "hand";
+/** CC1.4: the active pointer tool. "select" picks/drags, "hand" pans, "draw"
+ *  captures a freehand stroke (FC-11). */
+export type ActiveTool = "select" | "hand" | "draw";
 
 export type EngineEvent =
   | { type: "stats"; stats: FrameStats }
@@ -47,6 +49,10 @@ export type EngineEvent =
   | { type: "object-transform-preview"; id: string; dx: number; dy: number }
   | { type: "object-transform-commit"; id: string; dx: number; dy: number }
   | { type: "object-marquee"; ids: string[] }
+  // FC-11: freehand pen capture. While the draw tool is active, pointer/mouse
+  // down/move/up emit draw phases instead of the select/marquee path; the shell
+  // accumulates the world points and commits the stroke to an object on `end`.
+  | { type: "draw"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint }
   | { type: "status"; message: string };
 
 export type ShapeCanvasEngineOptions = {
@@ -96,6 +102,9 @@ export class ShapeCanvasEngine {
   private lastPointerAdditive = false;
   private deferredScene: SceneSnapshot | null = null;
   private deferredSceneRaf = 0;
+  // FC-11: the locally-tracked active tool. When "draw", pointer/mouse handlers
+  // emit draw phases instead of the renderer select/marquee input path.
+  private activeTool: ActiveTool = "select";
   // FC-08: the in-progress object drag (id + cumulative world-px delta). Set on the
   // pointer-down that picks an object, updated on each move, and committed once on
   // pointer-up when it moved. The renderer never mutates object transforms.
@@ -178,6 +187,7 @@ export class ShapeCanvasEngine {
   // toggle rarely coincides with a pointer batch); fall back to a set-tool input
   // event if the build predates the direct method.
   setTool(tool: ActiveTool) {
+    this.activeTool = tool;
     if (!this.webGpuRenderer) return;
     if (typeof this.webGpuRenderer.setTool === "function") {
       try {
@@ -191,7 +201,10 @@ export class ShapeCanvasEngine {
       }
       return;
     }
-    this.sendInputBatch([{ kind: "set-tool", tool }]);
+    // The renderer-core only knows select/hand; "draw" is shell-side routing, so
+    // the fallback keeps the renderer in the neutral select state (draw input is
+    // intercepted by the engine before it reaches the renderer).
+    this.sendInputBatch([{ kind: "set-tool", tool: tool === "hand" ? "hand" : "select" }]);
   }
 
   // Push the transient multi-select highlight set to the renderer (marquee /
@@ -431,6 +444,11 @@ export class ShapeCanvasEngine {
 
   private onPointerDown = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    if (this.activeTool === "draw") {
+      this.emitDraw("start", event);
+      this.canvas.setPointerCapture(event.pointerId);
+      return;
+    }
     this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
     const screen = this.eventPoint(event);
@@ -440,11 +458,24 @@ export class ShapeCanvasEngine {
 
   private onPointerMove = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    if (this.activeTool === "draw") {
+      this.emitDraw("move", event);
+      return;
+    }
     this.sendInputBatch([{ kind: "pointer-move", pointerId: event.pointerId, screen: this.eventPoint(event) }]);
   };
 
   private onPointerUp = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    if (this.activeTool === "draw") {
+      this.emitDraw("end", event);
+      try {
+        this.canvas.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released after cancellation.
+      }
+      return;
+    }
     this.sendInputBatch([
       {
         kind: "pointer-up",
@@ -464,6 +495,10 @@ export class ShapeCanvasEngine {
 
   private onPointerCancel = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    if (this.activeTool === "draw") {
+      this.emitDraw("cancel", event);
+      return;
+    }
     this.sendInputBatch([{ kind: "pointer-cancel", pointerId: event.pointerId }]);
     this.objectDrag = null;
     this.finishInputGesture();
@@ -472,6 +507,12 @@ export class ShapeCanvasEngine {
   private onMouseDown = (event: MouseEvent) => {
     if (event.button !== 0) return;
     event.preventDefault();
+    if (this.activeTool === "draw") {
+      this.mouseDragActive = true;
+      this.bindMouseFallbackMove();
+      this.emitDraw("start", event);
+      return;
+    }
     this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
     this.mouseDragActive = true;
@@ -482,6 +523,10 @@ export class ShapeCanvasEngine {
   private onMouseMove = (event: MouseEvent) => {
     if (!this.mouseDragActive) return;
     event.preventDefault();
+    if (this.activeTool === "draw") {
+      this.emitDraw("move", event);
+      return;
+    }
     this.sendInputBatch([{ kind: "pointer-move", pointerId: MOUSE_POINTER_ID, screen: this.eventPoint(event) }]);
   };
 
@@ -490,6 +535,10 @@ export class ShapeCanvasEngine {
     event.preventDefault();
     this.mouseDragActive = false;
     this.unbindMouseFallbackMove();
+    if (this.activeTool === "draw") {
+      this.emitDraw("end", event);
+      return;
+    }
     this.sendInputBatch([
       {
         kind: "pointer-up",
@@ -789,6 +838,14 @@ export class ShapeCanvasEngine {
     if (drag && (drag.dx !== 0 || drag.dy !== 0)) {
       this.onEvent({ type: "object-transform-commit", id: drag.id, dx: drag.dx, dy: drag.dy });
     }
+  }
+
+  // FC-11: emit a draw phase with the world point under the cursor. Used by the
+  // pointer/mouse handlers while the draw tool is active, replacing the renderer
+  // select/marquee input path.
+  private emitDraw(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
+    const world = screenToWorld(this.eventPoint(event), this.camera);
+    this.onEvent({ type: "draw", phase, world });
   }
 
   // FC-08: pure object pick for the shell's right-click context menu.

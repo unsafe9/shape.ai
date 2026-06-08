@@ -66,6 +66,14 @@ type SceneCoreModule = {
     anchorY: number,
     idPrefix: string
   ) => string;
+  freehand_to_object: (
+    pointsJson: string,
+    color: string,
+    widthPx: number,
+    epsilon: number,
+    id: string,
+    order: string
+  ) => string;
 };
 
 /** Typed handle returned by {@link loadSceneCore}. The object-native op-apply +
@@ -80,6 +88,17 @@ export type SceneCore = {
     anchorY: number,
     idPrefix: string
   ): SceneObject[];
+  /** FC-11: lower one freehand stroke (world-px points) to a committed `Object`
+   *  with an object-local geometry + brush stroke. Points become a JSON array of
+   *  `[x, y]` pairs for the wasm bridge. */
+  freehandToObject(
+    points: { x: number; y: number }[],
+    color: string,
+    widthPx: number,
+    epsilon: number,
+    id: string,
+    order: string
+  ): SceneObject;
 };
 
 let modulePromise: Promise<SceneCoreModule> | null = null;
@@ -174,6 +193,19 @@ export async function loadSceneCore(): Promise<SceneCore> {
       return parseBridge<SceneObject[]>(
         "build_object_template",
         mod.build_object_template(templateId, anchorX, anchorY, idPrefix)
+      );
+    },
+    freehandToObject(points, color, widthPx, epsilon, id, order) {
+      return parseBridge<SceneObject>(
+        "freehand_to_object",
+        mod.freehand_to_object(
+          JSON.stringify(points.map((p) => [p.x, p.y])),
+          color,
+          widthPx,
+          epsilon,
+          id,
+          order
+        )
       );
     }
   };
