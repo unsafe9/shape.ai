@@ -129,6 +129,35 @@ impl ShapeWebGpuRenderer {
         )
     }
 
+    /// RA3 swept erase: every object crossed by the eraser between two consecutive
+    /// SCREEN samples `(prev, curr)` — not just the top-most object at each sample —
+    /// so a fast drag that skips between samples still erases everything the segment
+    /// passes through. Pure pick: no mutation of selection, camera, or drag state.
+    /// Returns the crossed object ids (top-down order) as a JSON array; EN1 (the
+    /// shell eraser) authors the delete ops from the returned ids.
+    #[wasm_bindgen(js_name = sweptEraseAt)]
+    pub fn swept_erase_at(
+        &self,
+        prev_x: f64,
+        prev_y: f64,
+        curr_x: f64,
+        curr_y: f64,
+    ) -> Result<JsValue, JsValue> {
+        let ids = swept_erase_in_regions(
+            &self.object_regions,
+            &self.camera,
+            WorldPoint {
+                x: prev_x,
+                y: prev_y,
+            },
+            WorldPoint {
+                x: curr_x,
+                y: curr_y,
+            },
+        );
+        serde_wasm(ids)
+    }
+
     /// W2-06: nearest point on any object outline to a WORLD query point, for shape
     /// drag-create anchor snapping (W2-07).
     ///

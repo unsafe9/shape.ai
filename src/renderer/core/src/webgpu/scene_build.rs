@@ -14,8 +14,8 @@ use crate::model::{
     SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken, WorldPoint, WorldRect,
 };
 use crate::hit_test_object::{
-    hit_test_object, resize_delta_matrix, rotate_delta_matrix, translate_3x3, HoverAffordance,
-    ScreenRect, SelectionHandles,
+    hit_test_object_or_bbox, resize_delta_matrix, rotate_delta_matrix, swept_segment_hits_object,
+    translate_3x3, HoverAffordance, ScreenRect, SelectionHandles,
 };
 use crate::outline::{derive_region, parse_path_string};
 use crate::render_object::{RenderObject, RenderObjectScene};
@@ -1962,10 +1962,19 @@ pub(crate) fn derive_object_regions(scene: &RenderObjectScene) -> Vec<ObjectRegi
     regions
 }
 
+/// Object-local pad (px) for the RA3 body bbox fallback so a zero-size /
+/// collapsed stroke or text object still presents a finite grab target. Only
+/// applied to objects with no closed fill (filled bodies keep the exact fill
+/// hit), so it never makes empty canvas read as a hit on a filled shape.
+#[cfg(feature = "wgpu-probe")]
+const BODY_BBOX_GRAB_PAD_PX: f32 = 4.0;
+
 /// FC-07: pick the top-most object whose region contains the screen point. Regions
 /// are iterated in reverse (top-down, since later objects draw on top); the query
 /// point is mapped to world then inverse-transformed into each object's local space
-/// (D8) by [`hit_test_object`].
+/// (D8). RA3: a closed fill keeps the even-odd polygon hit; a stroke / text / open /
+/// zero-size object (no closed fill) falls back to its object-local bbox so it is
+/// still grabbable, while empty canvas still misses.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn hit_object_in_regions(
     regions: &[ObjectRegion],
@@ -1976,8 +1985,55 @@ pub(crate) fn hit_object_in_regions(
     regions
         .iter()
         .rev()
-        .find(|region| hit_test_object(&region.transform, &region.outline, world.x, world.y))
+        .find(|region| {
+            hit_test_object_or_bbox(
+                &region.transform,
+                &region.outline,
+                region.closed,
+                BODY_BBOX_GRAB_PAD_PX,
+                world.x,
+                world.y,
+            )
+        })
         .map(|region| region.id.clone())
+}
+
+/// RA3 swept-erase: ids of EVERY object the pointer crossed between two samples.
+/// `prev`/`curr` are SCREEN points (consecutive eraser-drag samples); both are
+/// mapped to world and the world segment between them is swept against each
+/// object via [`swept_segment_hits_object`] (filled => outline crossing; stroke /
+/// text / open / zero-size => padded local-bbox crossing). Top-down order (later
+/// objects first), so a fast drag that skips between samples still erases every
+/// object the segment passes through, not just the endpoints' top-most hit.
+///
+/// A zero-length segment (`prev == curr`) degenerates to a point sweep, matching
+/// [`hit_object_in_regions`] but returning ALL overlapping ids rather than one.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn swept_erase_in_regions(
+    regions: &[ObjectRegion],
+    camera: &CameraState,
+    prev: WorldPoint,
+    curr: WorldPoint,
+) -> Vec<String> {
+    let a = screen_to_world(prev, camera);
+    let b = screen_to_world(curr, camera);
+    regions
+        .iter()
+        .rev()
+        .filter(|region| {
+            swept_segment_hits_object(
+                &region.transform,
+                &region.outline,
+                region.closed,
+                BODY_BBOX_GRAB_PAD_PX,
+                a.x,
+                a.y,
+                b.x,
+                b.y,
+            )
+        })
+        .map(|region| region.id.clone())
+        .collect()
 }
 
 /// W2-02: compute the hover affordance under `screen` for the shell's cursor.
@@ -3792,6 +3848,65 @@ mod tests {
         // Outside both.
         let id = hit_object_in_regions(&regions, &camera, WorldPoint { x: 100.0, y: 100.0 });
         assert_eq!(id, None);
+    }
+
+    #[test]
+    fn hit_object_grabs_zero_fill_stroke_via_bbox_fallback() {
+        // RA3 (1): an OPEN line (no closed fill) at world (0,0), local (0,0)->(40,0).
+        // A point ON the stroke body must grab it via the bbox fallback (the even-odd
+        // fill test would miss an open contour); empty canvas off the stroke misses.
+        let scene = object_scene(vec![line_object("l", 0.0, 0.0, 40)]);
+        let regions = derive_object_regions(&scene);
+        let camera = identity_camera();
+
+        let id = hit_object_in_regions(&regions, &camera, WorldPoint { x: 20.0, y: 0.0 });
+        assert_eq!(id.as_deref(), Some("l"), "stroke body grabbable via bbox fallback");
+
+        // Far from the stroke bbox -> empty space still misses (marquee stays reachable).
+        let id = hit_object_in_regions(&regions, &camera, WorldPoint { x: 20.0, y: 100.0 });
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn swept_erase_crosses_all_objects_between_two_samples() {
+        // RA3 (2): three 10px rects spaced along x at world x = 0, 30, 60 (all y=0).
+        // A FAST eraser drag samples only the endpoints (-5, 5) and (75, 5): the
+        // segment crosses all three between samples though no single sample point sits
+        // inside more than one. The swept test must accumulate EVERY crossed object.
+        let scene = object_scene(vec![
+            rect_object("a", 0.0, 0.0, 10),
+            rect_object("b", 30.0, 0.0, 10),
+            rect_object("c", 60.0, 0.0, 10),
+        ]);
+        let regions = derive_object_regions(&scene);
+        let camera = identity_camera(); // screen == world.
+
+        let ids = swept_erase_in_regions(
+            &regions,
+            &camera,
+            WorldPoint { x: -5.0, y: 5.0 },
+            WorldPoint { x: 75.0, y: 5.0 },
+        );
+        let mut ids = ids;
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+
+        // Sanity: the per-sample point hit-test catches at most ONE of them at each
+        // endpoint, proving the gap the swept test closes. Endpoint (-5,5) is left of
+        // every rect, so the discrete sample erases nothing there.
+        assert_eq!(
+            hit_object_in_regions(&regions, &camera, WorldPoint { x: -5.0, y: 5.0 }),
+            None
+        );
+
+        // A drag well above all three rects crosses none.
+        let none = swept_erase_in_regions(
+            &regions,
+            &camera,
+            WorldPoint { x: -5.0, y: 500.0 },
+            WorldPoint { x: 75.0, y: 500.0 },
+        );
+        assert!(none.is_empty());
     }
 
     #[test]

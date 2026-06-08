@@ -429,6 +429,209 @@ pub fn hit_test_object(
     point_in_polygon(region_outline, lx as f32, ly as f32)
 }
 
+/// Object-local axis-aligned bounding box of an outline as `(min_x, min_y,
+/// max_x, max_y)`. `None` when the outline is empty or has no finite vertex.
+/// Used for the stroke/text/open/zero-size body grab fallback (RA3).
+pub fn outline_local_bbox(outline: &[(f32, f32)]) -> Option<(f32, f32, f32, f32)> {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &(x, y) in outline {
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    if min_x.is_finite() && max_x >= min_x && max_y >= min_y {
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
+    }
+}
+
+/// RA3 body hit with a bbox fallback for objects with no closed fill polygon.
+///
+/// A FILLED object (`closed == true`, a real ≥3-vertex polygon) keeps the
+/// even-odd fill hit, so empty canvas and a concave notch still MISS the body
+/// and fall through to the marquee. A stroke / text / open / zero-size object
+/// has no closed fill region; its even-odd test always misses (an open hull or
+/// a degenerate ring), making it ungrabbable. For those, fall back to the
+/// object-LOCAL bounding box of the outline (a zero-size bbox is grown by
+/// `bbox_pad_px` on each side so a collapsed object is still a finite target).
+///
+/// `bbox_pad_px` is an OBJECT-LOCAL pad; callers pass a screen-pixel grab radius
+/// already de-scaled to local units (or `0.0` to use the raw bbox).
+pub fn hit_test_object_or_bbox(
+    transform: &[[f64; 3]; 3],
+    region_outline: &[(f32, f32)],
+    closed: bool,
+    bbox_pad_px: f32,
+    world_x: f64,
+    world_y: f64,
+) -> bool {
+    let Some((lx, ly)) = world_to_local(transform, world_x, world_y) else {
+        return false;
+    };
+    let (lx, ly) = (lx as f32, ly as f32);
+    if closed && point_in_polygon(region_outline, lx, ly) {
+        return true;
+    }
+    if closed {
+        return false;
+    }
+    match outline_local_bbox(region_outline) {
+        Some((min_x, min_y, max_x, max_y)) => {
+            lx >= min_x - bbox_pad_px
+                && lx <= max_x + bbox_pad_px
+                && ly >= min_y - bbox_pad_px
+                && ly <= max_y + bbox_pad_px
+        }
+        None => false,
+    }
+}
+
+/// Do the two segments `p1->p2` and `p3->p4` intersect (including touching at an
+/// endpoint)? Uses the orientation / cross-product test; handles the collinear
+/// overlap case via bounding-box containment of the touching point. Pure `f32`.
+fn segments_intersect(
+    p1: (f32, f32),
+    p2: (f32, f32),
+    p3: (f32, f32),
+    p4: (f32, f32),
+) -> bool {
+    let orient = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| -> f32 {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let on_segment = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| -> bool {
+        // c is collinear with a-b; is it within the segment's bbox?
+        c.0 >= a.0.min(b.0) && c.0 <= a.0.max(b.0) && c.1 >= a.1.min(b.1) && c.1 <= a.1.max(b.1)
+    };
+    let d1 = orient(p3, p4, p1);
+    let d2 = orient(p3, p4, p2);
+    let d3 = orient(p1, p2, p3);
+    let d4 = orient(p1, p2, p4);
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    {
+        return true;
+    }
+    (d1 == 0.0 && on_segment(p3, p4, p1))
+        || (d2 == 0.0 && on_segment(p3, p4, p2))
+        || (d3 == 0.0 && on_segment(p1, p2, p3))
+        || (d4 == 0.0 && on_segment(p1, p2, p4))
+}
+
+/// Does the local-space segment `(ax, ay)->(bx, by)` cross / touch the polygon
+/// `poly` (a closed ring; implicit closing edge included)? True when either
+/// endpoint is inside the ring (even-odd) or the segment intersects any edge.
+/// `poly` shorter than a triangle is treated as edge-only (no interior).
+pub fn segment_hits_polygon(
+    poly: &[(f32, f32)],
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+) -> bool {
+    if point_in_polygon(poly, ax, ay) || point_in_polygon(poly, bx, by) {
+        return true;
+    }
+    let n = poly.len();
+    if n < 2 {
+        return false;
+    }
+    let mut j = n - 1;
+    for i in 0..n {
+        if segments_intersect((ax, ay), (bx, by), poly[j], poly[i]) {
+            return true;
+        }
+        j = i;
+    }
+    false
+}
+
+/// Does the local-space segment `(ax, ay)->(bx, by)` cross / touch the
+/// axis-aligned bbox `(min_x, min_y, max_x, max_y)`? True when either endpoint is
+/// inside the bbox or the segment crosses any of its four edges. Used for the RA3
+/// stroke/text/open/zero-size swept-erase fallback.
+pub fn segment_hits_bbox(
+    bbox: (f32, f32, f32, f32),
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+) -> bool {
+    let (min_x, min_y, max_x, max_y) = bbox;
+    let inside = |x: f32, y: f32| x >= min_x && x <= max_x && y >= min_y && y <= max_y;
+    if inside(ax, ay) || inside(bx, by) {
+        return true;
+    }
+    let corners = [
+        (min_x, min_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        (min_x, max_y),
+    ];
+    let mut j = 3;
+    for i in 0..4 {
+        if segments_intersect((ax, ay), (bx, by), corners[j], corners[i]) {
+            return true;
+        }
+        j = i;
+    }
+    false
+}
+
+/// RA3 swept hit-test for ONE object: does the WORLD-space segment
+/// `(world_ax, world_ay)->(world_bx, world_by)` cross / touch the object? Both
+/// segment endpoints are inverse-transformed into object-LOCAL space (D8) and the
+/// crossing is tested there against the local outline (filled) or its local bbox
+/// (stroke / text / open / zero-size, padded by `bbox_pad_px`). Returns `false`
+/// when the transform is non-invertible (no local preimage of either endpoint).
+///
+/// This is the per-object kernel a region-level swept-erase loop calls; it
+/// catches every object the segment passes through between two pointer samples,
+/// not just whichever is top-most at the endpoints.
+pub fn swept_segment_hits_object(
+    transform: &[[f64; 3]; 3],
+    region_outline: &[(f32, f32)],
+    closed: bool,
+    bbox_pad_px: f32,
+    world_ax: f64,
+    world_ay: f64,
+    world_bx: f64,
+    world_by: f64,
+) -> bool {
+    let Some((lax, lay)) = world_to_local(transform, world_ax, world_ay) else {
+        return false;
+    };
+    let Some((lbx, lby)) = world_to_local(transform, world_bx, world_by) else {
+        return false;
+    };
+    let (lax, lay, lbx, lby) = (lax as f32, lay as f32, lbx as f32, lby as f32);
+    if closed {
+        return segment_hits_polygon(region_outline, lax, lay, lbx, lby);
+    }
+    match outline_local_bbox(region_outline) {
+        Some((min_x, min_y, max_x, max_y)) => segment_hits_bbox(
+            (
+                min_x - bbox_pad_px,
+                min_y - bbox_pad_px,
+                max_x + bbox_pad_px,
+                max_y + bbox_pad_px,
+            ),
+            lax,
+            lay,
+            lbx,
+            lby,
+        ),
+        None => false,
+    }
+}
+
 /// One command in a parsed object-local geometry path (D2 SVG-subset):
 /// `M`/`L`/`C`/`Z`. Coordinates are object-local pixels (already de-quantized
 /// from the `i32` 8-units/px encoding). `C` carries absolute control points,
@@ -828,6 +1031,77 @@ mod tests {
         let m = mat3_mul(&delta, &obj);
         let expected = [[2.0, 0.0, 5.0], [0.0, 2.0, 7.0], [0.0, 0.0, 1.0]];
         assert!(approx_eq_mat(&m, &expected, 1e-12));
+    }
+
+    #[test]
+    fn bbox_fallback_grabs_zero_fill_open_stroke() {
+        // RA3 (1): an OPEN 2-vertex stroke from local (0,0)->(10,0). Its outline is
+        // not a closed fill, so the even-odd polygon test always misses — without the
+        // bbox fallback this object is ungrabbable. The fallback hits its local bbox
+        // (padded), so a point near the stroke grabs it; a far point still misses.
+        let stroke = vec![(0.0_f32, 0.0_f32), (10.0, 0.0)];
+        // Bare polygon hit misses (open, < closed fill): proves the gap the fallback fills.
+        assert!(!hit_test_object(&IDENTITY, &stroke, 5.0, 0.0));
+        // closed=false => bbox fallback. On the stroke (pad lets a slightly-off point hit).
+        assert!(hit_test_object_or_bbox(&IDENTITY, &stroke, false, 1.0, 5.0, 0.5));
+        // Far outside the padded bbox: misses (empty space still misses).
+        assert!(!hit_test_object_or_bbox(&IDENTITY, &stroke, false, 1.0, 50.0, 50.0));
+    }
+
+    #[test]
+    fn bbox_fallback_does_not_make_filled_body_grab_empty_space() {
+        // RA3 (1): a CLOSED fill keeps the exact even-odd hit — the bbox fallback must
+        // NOT fire for filled objects, or a click in a concave notch / on empty canvas
+        // inside the bbox would wrongly grab. Concave arrow: notch reads as a miss.
+        let arrow = vec![
+            (0.0_f32, 0.0_f32),
+            (4.0, 0.0),
+            (4.0, 4.0),
+            (2.0, 2.0),
+            (0.0, 4.0),
+        ];
+        assert!(hit_test_object_or_bbox(&IDENTITY, &arrow, true, 4.0, 2.0, 0.5)); // body
+        assert!(!hit_test_object_or_bbox(&IDENTITY, &arrow, true, 4.0, 2.0, 3.5)); // notch
+    }
+
+    #[test]
+    fn zero_size_object_is_grabbable_via_padded_bbox() {
+        // RA3 (1): a collapsed (zero-size) object — a single local point. Its bbox is a
+        // point; only the pad makes it a finite target. A point within the pad hits.
+        let collapsed = vec![(0.0_f32, 0.0_f32)];
+        assert!(hit_test_object_or_bbox(&IDENTITY, &collapsed, false, 4.0, 2.0, 2.0));
+        assert!(!hit_test_object_or_bbox(&IDENTITY, &collapsed, false, 4.0, 10.0, 10.0));
+    }
+
+    #[test]
+    fn swept_segment_crosses_filled_object_between_endpoints() {
+        // RA3 (2): the unit rect [0,1]^2. A world segment from (-1,0.5) to (2,0.5)
+        // passes THROUGH the rect though NEITHER endpoint is inside it — the swept
+        // test must still hit (a point test at either endpoint would miss).
+        let rect = unit_rect();
+        assert!(!hit_test_object(&IDENTITY, &rect, -1.0, 0.5)); // endpoint A outside
+        assert!(!hit_test_object(&IDENTITY, &rect, 2.0, 0.5)); // endpoint B outside
+        assert!(swept_segment_hits_object(
+            &IDENTITY, &rect, true, 0.0, -1.0, 0.5, 2.0, 0.5,
+        ));
+        // A parallel segment that misses the rect entirely stays a miss.
+        assert!(!swept_segment_hits_object(
+            &IDENTITY, &rect, true, 0.0, -1.0, 5.0, 2.0, 5.0,
+        ));
+    }
+
+    #[test]
+    fn swept_segment_crosses_open_stroke_via_bbox() {
+        // RA3 (2): an open stroke local (0,0)->(10,0). A world segment crossing its
+        // local bbox (a near-vertical line at x=5) hits via the bbox-crossing fallback.
+        let stroke = vec![(0.0_f32, 0.0_f32), (10.0, 0.0)];
+        assert!(swept_segment_hits_object(
+            &IDENTITY, &stroke, false, 0.0, 5.0, -3.0, 5.0, 3.0,
+        ));
+        // A segment well clear of the bbox misses.
+        assert!(!swept_segment_hits_object(
+            &IDENTITY, &stroke, false, 0.0, 50.0, -3.0, 50.0, 3.0,
+        ));
     }
 
     #[test]
