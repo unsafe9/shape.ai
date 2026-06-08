@@ -9,11 +9,12 @@
     Minus,
     Minus as LineIcon,
     MousePointer2,
+    Pencil,
     Plus,
     Scan,
     Square,
     SquareDashed,
-    StickyNote,
+    Type,
     Loader2,
     Trash2,
     Wifi,
@@ -84,11 +85,10 @@
     onDeleteSelected
   }: Props = $props();
 
-  const primitives: { id: PrimitiveKindId; label: string; icon: typeof Square }[] = [
+  const shapes: { id: PrimitiveKindId; label: string; icon: typeof Square }[] = [
     { id: "rectangle", label: "Rectangle (R)", icon: Square },
     { id: "ellipse", label: "Ellipse (O)", icon: Circle },
     { id: "line", label: "Line (L)", icon: LineIcon },
-    { id: "text", label: "Text (T)", icon: StickyNote },
     { id: "frame", label: "Frame (F)", icon: SquareDashed }
   ];
 
@@ -153,89 +153,141 @@
 {/if}
 
 <!-- Bottom-center toolbar: the sole persistent floating UI. -->
-<div class="cockpit-remote" role="toolbar" tabindex="-1" aria-label="Canvas toolbar" onpointerdown={(event) => event.stopPropagation()}>
-  <div class="cockpit-group" aria-label="Tools">
-    <button
-      class="icon-button {activeTool === 'select' ? 'is-active' : ''}"
-      type="button"
-      title="Select / Move (V)"
-      aria-label="Select tool"
-      aria-pressed={activeTool === "select"}
-      onclick={() => onSetTool("select")}
-    >
-      <MousePointer2 size={16} />
-    </button>
-    <button
-      class="icon-button {activeTool === 'hand' ? 'is-active' : ''}"
-      type="button"
-      title="Hand / Pan (H)"
-      aria-label="Hand tool"
-      aria-pressed={activeTool === "hand"}
-      onclick={() => onSetTool("hand")}
-    >
-      <Hand size={16} />
-    </button>
+<div class="toolbar-remote" role="toolbar" tabindex="-1" aria-label="Canvas toolbar" onpointerdown={(event) => event.stopPropagation()}>
+  <!-- Move: select picks/drags, hand pans (both are tool toggles). -->
+  <div class="toolbar-group" aria-label="Move">
+    <span class="toolbar-group-label">Move</span>
+    <div class="toolbar-group-buttons">
+      <button
+        class="icon-button {activeTool === 'select' ? 'is-active' : ''}"
+        type="button"
+        title="Select / Move (V)"
+        aria-label="Select tool"
+        aria-pressed={activeTool === "select"}
+        onclick={() => onSetTool("select")}
+      >
+        <MousePointer2 size={16} />
+      </button>
+      <button
+        class="icon-button {activeTool === 'hand' ? 'is-active' : ''}"
+        type="button"
+        title="Hand / Pan (H)"
+        aria-label="Hand tool"
+        aria-pressed={activeTool === "hand"}
+        onclick={() => onSetTool("hand")}
+      >
+        <Hand size={16} />
+      </button>
+    </div>
   </div>
 
-  <div class="cockpit-sep" aria-hidden="true"></div>
+  <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <div class="cockpit-group" aria-label="Insert objects">
-    {#each primitives as primitive (primitive.id)}
+  <!-- Draw: the Pen is a tool toggle (free-draw), not an inserter. -->
+  <div class="toolbar-group" aria-label="Draw">
+    <span class="toolbar-group-label">Draw</span>
+    <div class="toolbar-group-buttons">
+      <button
+        class="icon-button {activeTool === 'draw' ? 'is-active' : ''}"
+        type="button"
+        title="Pen (P)"
+        aria-label="Pen tool"
+        aria-pressed={activeTool === "draw"}
+        onclick={() => onSetTool("draw")}
+      >
+        <Pencil size={16} />
+      </button>
+    </div>
+  </div>
+
+  <div class="toolbar-sep" aria-hidden="true"></div>
+
+  <!-- Shapes: object-primitive inserters. -->
+  <div class="toolbar-group" aria-label="Shapes">
+    <span class="toolbar-group-label">Shapes</span>
+    <div class="toolbar-group-buttons">
+      {#each shapes as shape (shape.id)}
+        <button
+          class="icon-button"
+          type="button"
+          disabled={busy}
+          title={shape.label}
+          aria-label={`Insert ${shape.label}`}
+          onclick={() => onInsertPrimitive(shape.id)}
+        >
+          <shape.icon size={16} />
+        </button>
+      {/each}
+    </div>
+  </div>
+
+  <div class="toolbar-sep" aria-hidden="true"></div>
+
+  <!-- Text: object-primitive inserter. -->
+  <div class="toolbar-group" aria-label="Text">
+    <span class="toolbar-group-label">Text</span>
+    <div class="toolbar-group-buttons">
       <button
         class="icon-button"
         type="button"
         disabled={busy}
-        title={primitive.label}
-        aria-label={`Insert ${primitive.label}`}
-        onclick={() => onInsertPrimitive(primitive.id)}
+        title="Text (T)"
+        aria-label="Insert Text (T)"
+        onclick={() => onInsertPrimitive("text")}
       >
-        <primitive.icon size={16} />
+        <Type size={16} />
       </button>
-    {/each}
+    </div>
   </div>
 
-  <div class="cockpit-sep" aria-hidden="true"></div>
+  <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <div class="cockpit-group" aria-label="Templates and export">
-    <button
-      class="icon-button {templateOpen ? 'is-active' : ''}"
-      type="button"
-      title="Templates (T)"
-      aria-label="Open templates"
-      aria-expanded={templateOpen}
-      onclick={onToggleTemplates}
-    >
-      <LayoutTemplate size={16} />
-    </button>
-    <button class="icon-button" type="button" title="Export" aria-label="Export selection" onclick={onExport}>
-      <Download size={16} />
-    </button>
-    <button
-      class="icon-button {diagnosticsOpen ? 'is-active' : ''}"
-      type="button"
-      title="Diagnostics"
-      aria-label="Toggle diagnostics"
-      aria-expanded={diagnosticsOpen}
-      onclick={onToggleDiagnostics}
-    >
-      <Activity size={16} />
-    </button>
+  <div class="toolbar-group" aria-label="Templates and export">
+    <span class="toolbar-group-label">More</span>
+    <div class="toolbar-group-buttons">
+      <button
+        class="icon-button {templateOpen ? 'is-active' : ''}"
+        type="button"
+        title="Templates"
+        aria-label="Open templates"
+        aria-expanded={templateOpen}
+        onclick={onToggleTemplates}
+      >
+        <LayoutTemplate size={16} />
+      </button>
+      <button class="icon-button" type="button" title="Export" aria-label="Export selection" onclick={onExport}>
+        <Download size={16} />
+      </button>
+      <button
+        class="icon-button {diagnosticsOpen ? 'is-active' : ''}"
+        type="button"
+        title="Diagnostics"
+        aria-label="Toggle diagnostics"
+        aria-expanded={diagnosticsOpen}
+        onclick={onToggleDiagnostics}
+      >
+        <Activity size={16} />
+      </button>
+    </div>
   </div>
 
-  <div class="cockpit-sep" aria-hidden="true"></div>
+  <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <div class="cockpit-group" aria-label="Zoom">
-    <button class="icon-button" type="button" title="Zoom out" aria-label="Zoom out" onclick={onZoomOut}>
-      <Minus size={16} />
-    </button>
-    <button class="icon-button" type="button" title="Zoom in" aria-label="Zoom in" onclick={onZoomIn}>
-      <Plus size={16} />
-    </button>
-    <button class="icon-button" type="button" title="Fit scene" aria-label="Fit scene" onclick={onFit}>
-      <Scan size={16} />
-    </button>
-    <button class="icon-button" type="button" title="Fullscreen" aria-label="Fullscreen" onclick={onFullscreen}>
-      <Maximize2 size={16} />
-    </button>
+  <div class="toolbar-group" aria-label="Zoom">
+    <span class="toolbar-group-label">Zoom</span>
+    <div class="toolbar-group-buttons">
+      <button class="icon-button" type="button" title="Zoom out" aria-label="Zoom out" onclick={onZoomOut}>
+        <Minus size={16} />
+      </button>
+      <button class="icon-button" type="button" title="Zoom in" aria-label="Zoom in" onclick={onZoomIn}>
+        <Plus size={16} />
+      </button>
+      <button class="icon-button" type="button" title="Fit scene" aria-label="Fit scene" onclick={onFit}>
+        <Scan size={16} />
+      </button>
+      <button class="icon-button" type="button" title="Fullscreen" aria-label="Fullscreen" onclick={onFullscreen}>
+        <Maximize2 size={16} />
+      </button>
+    </div>
   </div>
 </div>

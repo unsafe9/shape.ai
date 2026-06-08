@@ -191,13 +191,17 @@ p {
   touch-action: none;
 }
 
-/* CC2.4 tool cursors: hand pans (grab/grabbing), select shows the default. */
+/* CC2.4 tool cursors: hand pans (grab/grabbing), draw uses a crosshair, select shows the default. */
 .renderer-scene-surface[data-tool="hand"] {
   cursor: grab;
 }
 
 .renderer-scene-surface[data-tool="hand"]:active {
   cursor: grabbing;
+}
+
+.renderer-scene-surface[data-tool="draw"] {
+  cursor: crosshair;
 }
 
 .renderer-host {
@@ -1535,54 +1539,17 @@ p {
 }
 
 /* ---------------------------------------------------------------------------
- * CanvasEditingToolbar — T2.2 selection-context editing actions
+ * FC-12 toolbar — Figma-style bottom-center remote, labeled groups
  * --------------------------------------------------------------------------- */
 
-.canvas-editing-toolbar {
-  position: absolute;
-  top: 22px;
-  left: 50%;
-  z-index: 12;
-  transform: translateX(-50%);
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 8px;
-  border: 1px solid rgb(255 255 255 / 0.72);
-  border-radius: 14px;
-  background: var(--surface);
-  box-shadow: var(--shadow-float);
-  backdrop-filter: var(--glass-blur);
-}
-
-.canvas-editing-toolbar-sep {
-  width: 1px;
-  height: 18px;
-  background: var(--line);
-  margin: 0 2px;
-}
-
-.canvas-editing-toolbar-delete {
-  color: var(--bad);
-}
-
-.canvas-editing-toolbar-delete:hover {
-  border-color: rgb(214 75 69 / 0.28);
-  background: rgb(255 240 240 / 0.92);
-}
-
-/* ---------------------------------------------------------------------------
- * CC1.1 CockpitRemote — bottom-center remote control
- * --------------------------------------------------------------------------- */
-
-.cockpit-remote {
+.toolbar-remote {
   position: absolute;
   left: 50%;
   bottom: 28px;
   z-index: 13;
   transform: translateX(-50%);
   display: flex;
-  align-items: center;
+  align-items: stretch;
   gap: 6px;
   padding: 8px 10px;
   border: 1px solid rgb(255 255 255 / 0.72);
@@ -1592,21 +1559,36 @@ p {
   backdrop-filter: var(--glass-blur);
 }
 
-.cockpit-group {
+.toolbar-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+
+.toolbar-group-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.toolbar-group-buttons {
   display: flex;
   align-items: center;
   gap: 4px;
 }
 
-.cockpit-sep {
+.toolbar-sep {
   width: 1px;
-  height: 22px;
+  align-self: stretch;
   background: var(--line);
   margin: 0 4px;
 }
 
 /* ---------------------------------------------------------------------------
- * CC3.3 TemplateLibrary — popover above the cockpit remote
+ * CC3.3 TemplateLibrary — popover above the toolbar remote
  * --------------------------------------------------------------------------- */
 
 .template-library {
