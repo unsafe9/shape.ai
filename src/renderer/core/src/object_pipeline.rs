@@ -2828,8 +2828,13 @@ mod tests {
     }
 
     /// (a) The SAME scene yields DIFFERENT chrome/instance RGBA when the theme bit
-    /// flips: token-backed fill/stroke colors change, and the canvas clear color
-    /// (`canvas-bg`) differs light vs dark.
+    /// flips: token-backed fill/stroke colors change, the canvas clear color
+    /// (`canvas-bg`) differs light vs dark, AND the drop-shadow color (`shadow`)
+    /// flips light-translucent vs dark-translucent (G5: full dark mode, not just
+    /// the floating UI). The clear color and shadow color are BOTH sourced from the
+    /// theme bit at runtime — `render`'s `LoadOp::Clear` reads `self.theme.canvas_bg()`
+    /// and `set_theme` re-resolves `self.theme.shadow()` into each shadow instance —
+    /// so this asserts the renderer-side dark-mode halves both move.
     #[test]
     fn theme_flip_changes_token_instance_and_clear_rgba() {
         let scene = scene_with(vec![token_rect("o1")], None);
@@ -2854,8 +2859,31 @@ mod tests {
             dark.fill_instances[0].fill,
             crate::object_theme::resolve_token_f32("default-fill", true).unwrap()
         );
-        // Canvas clear (chrome) flips light vs dark.
-        assert_ne!(Theme::light().canvas_bg(), Theme::dark().canvas_bg());
+
+        // Canvas CLEAR color (the backdrop `render` clears to) flips light vs dark:
+        // light `canvas-bg` is near-white, dark is near-black. This is the half the
+        // user reported missing (canvas background not inverting).
+        let light_clear = Theme::light().canvas_bg();
+        let dark_clear = Theme::dark().canvas_bg();
+        assert_ne!(light_clear, dark_clear, "canvas clear RGBA flips with the theme bit");
+        // Light backdrop is bright, dark backdrop is near-black (a real inversion,
+        // not two arbitrary colors).
+        assert!(light_clear[0] > 0.8, "light canvas-bg is near-white");
+        assert!(dark_clear[0] < 0.2, "dark canvas-bg is near-black");
+
+        // Drop-SHADOW color flips too: dark-translucent (black) in light mode,
+        // light-translucent (whitish) in dark mode. The shadow instance color is
+        // re-resolved from `self.theme.shadow()` on every flip, never hardcoded.
+        let light_shadow = light.shadow_instances[0].shadow;
+        let dark_shadow = dark.shadow_instances[0].shadow;
+        assert_ne!(light_shadow, dark_shadow, "shadow RGBA flips with the theme bit");
+        assert_eq!(light_shadow, Theme::light().shadow(), "shadow sourced from token");
+        assert_eq!(dark_shadow, Theme::dark().shadow());
+        // Light-mode shadow is a dark cast (black-ish); dark-mode shadow is a light
+        // cast (whitish) — the user's requested flip. Both translucent.
+        assert!(light_shadow[0] < 0.2, "light-mode shadow casts dark");
+        assert!(dark_shadow[0] > 0.8, "dark-mode shadow casts whitish");
+        assert!(light_shadow[3] < 1.0 && dark_shadow[3] < 1.0, "shadow stays translucent");
     }
 
     /// (b) ZERO-REBAKE: flipping the theme must NOT re-tessellate. Across a theme
