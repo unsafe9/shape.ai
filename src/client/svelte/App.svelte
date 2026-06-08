@@ -46,6 +46,7 @@
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import { cascadeTransformOps } from "../lib/transformCascade";
+  import { doubleClickAction, ungroupEnabled, popOutOp } from "../lib/grouping";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
   import CanvasHost from "./ShapeCanvasHost.svelte";
@@ -58,6 +59,12 @@
 
   // ----- selection: single ObjectSelection + transient multi -----
   let selection = $state<ObjectSelection>({ kind: "canvas" });
+
+  // ----- AP3 (#9): active container (drill-in). A double-click on a container
+  //       object (one with children, per RA2b's drill-in signal) drills into it; the
+  //       shell holds the active container id so subsequent edits scope to it. Null =
+  //       the canvas root is active. -----
+  let activeContainer = $state<string | null>(null);
 
   // ----- W2-11: non-destructive live object transform preview, now GPU-side. The
   //       canonical `scene` is never mutated mid-drag; the dragged object's instance
@@ -787,7 +794,9 @@
   // unchanged.
   function groupSelection(): void {
     const ids = currentSelectionIds();
-    if (ids.length < 2) return;
+    // AP3 (#9): group works on 1+ objects — a single object grouped under a fresh
+    // neutral parent container is a valid one-child frame.
+    if (ids.length < 1) return;
     const objects = ids.map((id) => scene.objects.find((o) => o.id === id)).filter((o): o is SceneObject => Boolean(o));
     const bounds = unionWorldAabb(objects);
     const frame: SceneObject = {
@@ -825,6 +834,17 @@
     selection = { kind: "canvas" };
     persistSelection(selection);
     showToast("Ungrouped selection");
+  }
+
+  // AP3 (#18): pop the right-clicked child out one level — reparent it to its
+  // parent's parent (or canvas root when the parent sits at the root). The op is
+  // built by the pure `popOutOp` helper; a non-child picked target yields null.
+  function popOutSelection(picked: ObjectSelection): void {
+    if (picked.kind !== "object") return;
+    const op = popOutOp(scene.objects, picked.id);
+    if (!op) return;
+    authorOp(op);
+    showToast("Popped out one level");
   }
 
   function nudgeSelection(dx: number, dy: number): void {
@@ -905,6 +925,24 @@
     const object = scene.objects.find((o) => o.id === selection.id);
     if (!object) return;
     authorOp(buildSetStyleOp(object, color));
+  }
+
+  // ----- AP3 (#9): double-click drill-in -----
+
+  // RA2b surfaces a double-click on an object as { id, hasChildren } on the
+  // inputBatch result. Branch it (D6): a container (hasChildren) drills in — the
+  // shell sets the active container; a leaf enters inline text edit (the existing
+  // path). A null signal (double-click missed every object) is a no-op.
+  function handleObjectDoubleClick(signal: { id: string; hasChildren: boolean } | null): void {
+    const action = doubleClickAction(signal);
+    if (!action) return;
+    if (action.kind === "drill-in") {
+      activeContainer = action.id;
+      selectObject({ kind: "object", id: action.id });
+      showToast("Entered group");
+      return;
+    }
+    enterTextEdit(action.id);
   }
 
   // ----- W2-10: inline text editing -----
@@ -1168,12 +1206,39 @@
   // each id routes to the SAME shell handler the shortcut layer uses. The
   // object/canvas split picks which command ids appear, and a `null` entry renders
   // a separator. Icons + the delete danger flag are decorated here.
-  type ContextMenuEntry = "separator" | { id: string; icon?: typeof Copy; danger?: boolean; disabledFor?: ObjectSelection["kind"] };
+  // AP3: `enabled` is an optional predicate gating an entry on the picked target's
+  // shape in the forest (children/parent), beyond the coarse `disabledFor` kind
+  // check — e.g. ungroup needs a container, pop-out needs a child.
+  type ContextMenuEntry =
+    | "separator"
+    | {
+        id: string;
+        label?: string;
+        icon?: typeof Copy;
+        danger?: boolean;
+        disabledFor?: ObjectSelection["kind"];
+        enabled?: (picked: ObjectSelection) => boolean;
+      };
+
+  // AP3 (#13): ungroup is enabled only for a single container object (has children).
+  function ungroupPickEnabled(picked: ObjectSelection): boolean {
+    return picked.kind === "object" && ungroupEnabled(scene.objects, picked.id);
+  }
+
+  // AP3 (#18): pop-out is enabled only when the single picked object has a parent.
+  function popOutPickEnabled(picked: ObjectSelection): boolean {
+    return picked.kind === "object" && popOutOp(scene.objects, picked.id) !== null;
+  }
 
   const OBJECT_MENU: ContextMenuEntry[] = [
     { id: "duplicate", icon: Copy },
     { id: "group", icon: GroupIcon, disabledFor: "object" },
-    { id: "ungroup", icon: Ungroup },
+    // AP3 (#13): ungroup is meaningful only for a single container object (one with
+    // children) — disabled for a multi-select and for a childless leaf.
+    { id: "ungroup", icon: Ungroup, enabled: ungroupPickEnabled },
+    // AP3 (#18): pop a child out one level — only when the picked object has a parent.
+    // Shell-only command (no catalog entry), so it carries its own label.
+    { id: "pop-out", label: "Pop out one level", enabled: popOutPickEnabled },
     { id: "bring-to-front" },
     { id: "send-to-back" },
     { id: "add-comment", icon: MessageSquarePlus },
@@ -1181,9 +1246,11 @@
     { id: "delete", icon: Trash2, danger: true }
   ];
 
+  // AP3 (#18, D7): the empty-canvas menu — quick inserts, the template library, and
+  // select-all. The insert-text entry is gone (D7); text arrives via the toolbar.
   const CANVAS_MENU: ContextMenuEntry[] = [
     { id: "insert-rectangle" },
-    { id: "insert-text", icon: MessageSquarePlus },
+    { id: "insert-ellipse" },
     { id: "open-template-library", icon: LayoutTemplate },
     "separator",
     { id: "select-all" }
@@ -1198,11 +1265,14 @@
       const command = commandCatalog.find((c) => c.id === entry.id);
       const run = handlers[entry.id];
       if (!run) return null;
+      // AP3: an entry is disabled when its target kind matches `disabledFor`, OR when
+      // its `enabled` predicate (children/parent shape) rejects the picked target.
+      const disabled = entry.disabledFor === picked.kind || (entry.enabled !== undefined && !entry.enabled(picked));
       return {
-        label: command?.label ?? entry.id,
+        label: entry.label ?? command?.label ?? entry.id,
         icon: entry.icon,
         danger: entry.danger,
-        disabled: entry.disabledFor === picked.kind,
+        disabled,
         onSelect: () => closeContextThen(run)
       };
     });
@@ -1216,12 +1286,15 @@
       duplicate: base.duplicate,
       group: base.group,
       ungroup: base.ungroup,
+      // AP3 (#18): pop the right-clicked child out one level (to its grandparent, or
+      // canvas root). Operates on the picked object id, not the active selection.
+      "pop-out": () => popOutSelection(menu.selection),
       "bring-to-front": base["bring-to-front"],
       "send-to-back": base["send-to-back"],
       "add-comment": base["add-comment"],
       delete: base.delete,
       "insert-rectangle": () => insertPrimitive("rectangle", menu.world),
-      "insert-text": () => insertPrimitive("text", menu.world),
+      "insert-ellipse": () => insertPrimitive("ellipse", menu.world),
       "open-template-library": base["open-template-library"],
       "select-all": base["select-all"]
     };
