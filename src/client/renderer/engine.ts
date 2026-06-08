@@ -244,9 +244,10 @@ export class ShapeCanvasEngine {
     this.updateOverlayPosition();
   }
 
-  // W2-03: set the active pointer tool ("select" | "draw"). The renderer-core only
-  // knows select/hand; "draw" is shell-side routing (draw input is intercepted by
-  // the engine before it reaches the renderer), so the core stays in "select".
+  // W2-03/W2-07/W2-08: set the active pointer tool ("select" | "draw" | "create" |
+  // "erase"). The renderer-core only knows select/hand; "draw"/"create"/"erase" are
+  // shell-side routing (their input is intercepted by the engine before it reaches
+  // the renderer), so the core stays in "select".
   setTool(tool: ActiveTool) {
     this.activeTool = tool;
     this.coreSetTool("select");

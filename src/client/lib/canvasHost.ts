@@ -341,7 +341,7 @@ export class ShapeCanvasHost {
     this.engine?.wheelAtScreen(screen, deltaY);
   }
 
-  /** W2-03: set the active pointer tool (Select/Draw). */
+  /** W2-03/W2-07/W2-08: set the active pointer tool (Select/Draw/Create/Erase). */
   setTool(tool: ActiveTool): void {
     this.engine?.setTool(tool);
   }
