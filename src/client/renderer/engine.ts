@@ -884,9 +884,17 @@ export class ShapeCanvasEngine {
       this.onEvent({ type: "object-select", id: result.objectSelection, additive: this.lastPointerAdditive });
     }
     if (result.objectTransformDelta) {
-      const { id, dx, dy } = result.objectTransformDelta;
-      this.objectDrag = { id, dx, dy };
-      this.onEvent({ type: "object-transform-preview", id, dx, dy });
+      // W2-04 generalized the delta to a full matrix + kind. The translate preview
+      // path is unchanged (dx/dy are the matrix translation column); resize/rotate
+      // preview + commit is W2-05's responsibility and is intentionally not wired
+      // here yet.
+      const { id, matrix, kind } = result.objectTransformDelta;
+      if (kind === "translate") {
+        const dx = matrix[0][2];
+        const dy = matrix[1][2];
+        this.objectDrag = { id, dx, dy };
+        this.onEvent({ type: "object-transform-preview", id, dx, dy });
+      }
     }
     if (result.objectMarqueeIds != null) {
       this.onEvent({ type: "object-marquee", ids: result.objectMarqueeIds });

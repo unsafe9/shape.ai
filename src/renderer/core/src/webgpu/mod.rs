@@ -254,6 +254,26 @@ pub(crate) enum InputDragState {
         object_id: String,
         start: WorldPoint,
     },
+    // W2-04: resizing the selected object by a grabbed handle. `corner` is the
+    // grabbed resize affordance (anchor = its OPPOSITE). `start` is the fixed
+    // pointer-down WORLD point; `world_bbox` is the selection's WORLD AABB captured
+    // AT pointer-down (`(min_x, min_y, max_x, max_y)`) so the gesture is anchored
+    // and does not chase the live preview transform.
+    Resize {
+        pointer_id: i32,
+        object_id: String,
+        corner: HoverAffordance,
+        start: WorldPoint,
+        world_bbox: (f64, f64, f64, f64),
+    },
+    // W2-04: rotating the selected object about its bbox `center` (WORLD px,
+    // captured at pointer-down). `start` is the fixed pointer-down WORLD point.
+    Rotate {
+        pointer_id: i32,
+        object_id: String,
+        start: WorldPoint,
+        center: WorldPoint,
+    },
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -293,6 +313,9 @@ pub struct ShapeWebGpuRenderer {
     _text_sampler: wgpu::Sampler,
     vertex_buffer: wgpu::Buffer,
     overlay_vertex_buffer: wgpu::Buffer,
+    // W2-04: dedicated buffer for the selection-handle overlay (8 resize handles +
+    // rotate zone), written per-frame and drawn in a LoadOp::Load pass on top.
+    handle_vertex_buffer: wgpu::Buffer,
     vertex_ranges: VertexRanges,
     text_engine: TextEngine,
     text_layout_cache: TextLayoutCache,

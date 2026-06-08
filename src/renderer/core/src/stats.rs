@@ -131,17 +131,21 @@ pub struct CoreMarqueeResult {
     pub ids: Vec<String>,
 }
 
-/// FC-07: a cumulative object drag delta. `id` is the dragged object; `dx`/`dy`
-/// are world-px offsets from the pointer-down world point (not per-move deltas).
-/// The shell authors one undoable transform op from the final delta and re-feeds
-/// the object scene; the renderer never mutates the object transform itself.
+/// W2-04: a cumulative object transform delta. `id` is the transformed object;
+/// `matrix` is a ROW-MAJOR world-space DELTA to PRE-MULTIPLY onto the object's
+/// existing transform (`new = matrix * obj.transform`, homogeneous `(x,y,1)`). It
+/// is cumulative from the FIXED pointer-down anchor (not per-move), so the last
+/// delta of a gesture is the whole transform. `kind` names the gesture
+/// (`"translate"` | `"resize"` | `"rotate"`). The shell composes it
+/// non-destructively for preview and authors one undoable op on pointer-up; the
+/// renderer never mutates the object transform itself.
 #[cfg(feature = "wgpu-probe")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectTransformDelta {
     pub id: String,
-    pub dx: f64,
-    pub dy: f64,
+    pub matrix: [[f64; 3]; 3],
+    pub kind: &'static str,
 }
 
 #[cfg(feature = "wgpu-probe")]

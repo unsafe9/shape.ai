@@ -22,6 +22,7 @@ impl ShapeWebGpuRenderer {
         self.write_uniform();
         self.flush_text_atlas();
         let overlay_vertex_count = self.write_marquee_overlay();
+        let handle_vertex_count = self.write_handle_overlay();
         let mut draw_list = self.build_draw_list();
         // Carry this frame's per-object tiers forward so the next frame's
         // hysteresis resolves against them (T3.1 §3). Tiers are diagnostics; they
@@ -58,6 +59,34 @@ impl ShapeWebGpuRenderer {
                 self.height as f32,
             );
             renderer.render(&mut encoder, &view, pipeline, true);
+            // W2-04: selection-handle overlay, drawn on top of the object pass with
+            // the legacy world-space pipeline (LoadOp::Load preserves the object
+            // pass output). The handles are screen-fixed world quads (see
+            // `build_handle_overlay_vertices`); the matrix transform W2-11 pushes to
+            // the object instance path never re-tessellates these.
+            if handle_vertex_count > 0 {
+                let color_attachments = [Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shape.ai selection-handle overlay pass"),
+                    color_attachments: &color_attachments,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.handle_vertex_buffer.slice(..));
+                pass.draw(0..handle_vertex_count as u32, 0..1);
+            }
         } else {
             let color_attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: &view,
@@ -190,6 +219,31 @@ impl ShapeWebGpuRenderer {
 #[cfg(feature = "wgpu-probe")]
 #[cfg(target_arch = "wasm32")]
 impl ShapeWebGpuRenderer {
+    /// W2-04: write the selection-handle overlay (8 resize handles + rotate zone)
+    /// for the current object-scene selection into the dedicated handle buffer,
+    /// returning the vertex count to draw. Zero when no object is selected (or the
+    /// selection has no finite world bounds). World-space quads sized
+    /// `HANDLE_SIZE_PX / zoom` so the legacy pipeline draws them at a fixed screen
+    /// size; the shared `selection_handles` layout keeps render == hit-test.
+    fn write_handle_overlay(&mut self) -> usize {
+        let selection = self
+            .object_scene
+            .as_ref()
+            .and_then(|scene| scene.selection.clone());
+        let Some((_, world_bbox)) =
+            selection_handles(&self.object_regions, &self.camera, selection.as_deref())
+        else {
+            return 0;
+        };
+        let vertices = build_handle_overlay_vertices(&world_bbox, self.camera.zoom);
+        if vertices.is_empty() {
+            return 0;
+        }
+        self.queue
+            .write_buffer(&self.handle_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        vertices.len()
+    }
+
     /// Write the marquee overlay quads for the active drag (if any) into the
     /// dedicated overlay vertex buffer, returning the vertex count to draw. Zero
     /// when no marquee is in flight.

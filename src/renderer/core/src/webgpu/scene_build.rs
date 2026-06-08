@@ -13,7 +13,10 @@ use crate::model::{
     ActiveTool, CameraState, CanvasInputEvent, CubicRoute, RenderCard, RenderEdge, RenderGroup,
     SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken, WorldPoint, WorldRect,
 };
-use crate::hit_test_object::{hit_test_object, HoverAffordance, ScreenRect, SelectionHandles};
+use crate::hit_test_object::{
+    hit_test_object, resize_delta_matrix, rotate_delta_matrix, translate_3x3, HoverAffordance,
+    ScreenRect, SelectionHandles,
+};
 use crate::outline::{derive_region, parse_path_string};
 use crate::render_object::RenderObjectScene;
 use crate::stats::{CoreHitResult, CoreOverlayStyle, ObjectTransformDelta};
@@ -1662,6 +1665,52 @@ pub(crate) fn build_marquee_overlay_vertices(rect: &WorldRect, zoom: f64) -> Vec
     vertices
 }
 
+/// W2-04: build the selection-handle overlay (8 resize handles + 1 rotate zone) in
+/// WORLD space for the selected object's `world_bbox`. Each handle is a square of
+/// `HANDLE_SIZE_PX / zoom` world units so the legacy shader's `* zoom` renders it at
+/// a CONSTANT [`HANDLE_SIZE_PX`] screen size at any zoom. Centers mirror
+/// [`SelectionHandles::from_screen_bbox`] (corners + edge midpoints; rotate zone
+/// `ROTATE_ZONE_OFFSET_PX` above the top-edge midpoint) so what is drawn matches
+/// what hover and pointer-down hit-test. Returns up to
+/// [`HANDLE_OVERLAY_VERTEX_CAPACITY`] vertices.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn build_handle_overlay_vertices(world_bbox: &WorldRect, zoom: f64) -> Vec<GpuVertex> {
+    use crate::hit_test_object::{HANDLE_SIZE_PX, ROTATE_ZONE_OFFSET_PX};
+    let mut vertices = Vec::with_capacity(HANDLE_OVERLAY_VERTEX_CAPACITY);
+    let z = zoom.max(0.025);
+    let size = HANDLE_SIZE_PX / z;
+    let half = size / 2.0;
+    let rotate_offset = ROTATE_ZONE_OFFSET_PX / z;
+    let left = world_bbox.x;
+    let right = world_bbox.x + world_bbox.width;
+    let top = world_bbox.y;
+    let bottom = world_bbox.y + world_bbox.height;
+    let cx = world_bbox.x + world_bbox.width / 2.0;
+    let cy = world_bbox.y + world_bbox.height / 2.0;
+    let mut handle = |hx: f64, hy: f64| {
+        add_rect(
+            &mut vertices,
+            &WorldRect {
+                x: hx - half,
+                y: hy - half,
+                width: size,
+                height: size,
+            },
+            HANDLE_FILL_COLOR,
+        );
+    };
+    handle(left, top);
+    handle(cx, top);
+    handle(right, top);
+    handle(right, cy);
+    handle(right, bottom);
+    handle(cx, bottom);
+    handle(left, bottom);
+    handle(left, cy);
+    handle(cx, top - rotate_offset);
+    vertices
+}
+
 /// Node ids AND group ids whose world bounds intersect the marquee rect (AABB).
 /// Cards come first (selection-anchor friendly), then groups; both deduped by the
 /// scene's natural order.
@@ -1921,6 +1970,31 @@ pub(crate) fn hit_object_in_regions(
 /// (laid out by the SHARED [`SelectionHandles`] helper, in screen space, so the
 /// hover test matches exactly what W2-04 renders and pointer-down hit-tests) win
 /// over everything; then a body hit against any object's region; otherwise empty.
+/// W2-04: the SHARED selection-handle layout for the selected object, returning
+/// the screen-space [`SelectionHandles`] plus the WORLD bbox they were laid out
+/// from. This is the single bridge that keeps hover (W2-02), the pointer-down
+/// hit-test, and the GPU handle render (W2-04) on one source of truth: all three
+/// read the same screen-space handles built from the same world bbox. `None` when
+/// nothing is selected or the selected region has no finite world bounds.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn selection_handles(
+    regions: &[ObjectRegion],
+    camera: &CameraState,
+    selection: Option<&str>,
+) -> Option<(SelectionHandles, WorldRect)> {
+    let id = selection?;
+    let region = regions.iter().find(|region| region.id == id)?;
+    let world_bbox = region_world_bounds(region)?;
+    let screen_rect = world_rect_to_screen_rect(&world_bbox, camera);
+    let handles = SelectionHandles::from_screen_bbox(&ScreenRect {
+        x: screen_rect.x,
+        y: screen_rect.y,
+        width: screen_rect.width,
+        height: screen_rect.height,
+    });
+    Some((handles, world_bbox))
+}
+
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn hover_affordance_at(
     regions: &[ObjectRegion],
@@ -1928,20 +2002,9 @@ pub(crate) fn hover_affordance_at(
     selection: Option<&str>,
     screen: WorldPoint,
 ) -> HoverAffordance {
-    if let Some(id) = selection {
-        if let Some(region) = regions.iter().find(|region| region.id == id) {
-            if let Some(world_bbox) = region_world_bounds(region) {
-                let screen_rect = world_rect_to_screen_rect(&world_bbox, camera);
-                let handles = SelectionHandles::from_screen_bbox(&ScreenRect {
-                    x: screen_rect.x,
-                    y: screen_rect.y,
-                    width: screen_rect.width,
-                    height: screen_rect.height,
-                });
-                if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
-                    return affordance;
-                }
-            }
+    if let Some((handles, _)) = selection_handles(regions, camera, selection) {
+        if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
+            return affordance;
         }
     }
     if hit_object_in_regions(regions, camera, screen).is_some() {
@@ -1987,6 +2050,40 @@ pub(crate) fn step_object_pointer(
                     camera: camera.clone(),
                 });
                 return;
+            }
+            // W2-04: grabbing a resize handle / the rotate zone of the CURRENT
+            // selection starts a transform gesture (no selection change). Uses the
+            // SHARED handle layout so what is grabbed == what hover reports == what
+            // is drawn. Priority matches hover: handles > body > empty.
+            if let Some((handles, world_bbox)) = selection_handles(regions, camera, selection) {
+                if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
+                    let object_id = selection.expect("selection_handles requires a selection");
+                    let start = screen_to_world(screen, camera);
+                    *input_drag = Some(match affordance {
+                        HoverAffordance::Rotate => InputDragState::Rotate {
+                            pointer_id,
+                            object_id: object_id.to_string(),
+                            start,
+                            center: WorldPoint {
+                                x: world_bbox.x + world_bbox.width / 2.0,
+                                y: world_bbox.y + world_bbox.height / 2.0,
+                            },
+                        },
+                        corner => InputDragState::Resize {
+                            pointer_id,
+                            object_id: object_id.to_string(),
+                            corner,
+                            start,
+                            world_bbox: (
+                                world_bbox.x,
+                                world_bbox.y,
+                                world_bbox.x + world_bbox.width,
+                                world_bbox.y + world_bbox.height,
+                            ),
+                        },
+                    });
+                    return;
+                }
             }
             match hit_object_in_regions(regions, camera, screen) {
                 Some(id) => {
@@ -2035,12 +2132,50 @@ pub(crate) fn step_object_pointer(
                     object_id,
                     start,
                 } if drag_pointer_id == pointer_id => {
-                    // Cumulative delta from the FIXED pointer-down world point.
+                    // Cumulative translation from the FIXED pointer-down world point.
                     let world_now = screen_to_world(screen, camera);
                     object_out.transform_delta = Some(ObjectTransformDelta {
                         id: object_id,
-                        dx: world_now.x - start.x,
-                        dy: world_now.y - start.y,
+                        matrix: translate_3x3(world_now.x - start.x, world_now.y - start.y),
+                        kind: "translate",
+                    });
+                }
+                InputDragState::Resize {
+                    pointer_id: drag_pointer_id,
+                    object_id,
+                    corner,
+                    start,
+                    world_bbox,
+                } if drag_pointer_id == pointer_id => {
+                    // Cumulative scale about the OPPOSITE anchor of the grabbed handle.
+                    let world_now = screen_to_world(screen, camera);
+                    object_out.transform_delta = Some(ObjectTransformDelta {
+                        id: object_id,
+                        matrix: resize_delta_matrix(
+                            world_bbox,
+                            corner,
+                            (world_now.x, world_now.y),
+                            (start.x, start.y),
+                        ),
+                        kind: "resize",
+                    });
+                }
+                InputDragState::Rotate {
+                    pointer_id: drag_pointer_id,
+                    object_id,
+                    start,
+                    center,
+                } if drag_pointer_id == pointer_id => {
+                    // Cumulative rotation about the bbox center from the anchor angle.
+                    let world_now = screen_to_world(screen, camera);
+                    object_out.transform_delta = Some(ObjectTransformDelta {
+                        id: object_id,
+                        matrix: rotate_delta_matrix(
+                            (center.x, center.y),
+                            (world_now.x, world_now.y),
+                            (start.x, start.y),
+                        ),
+                        kind: "rotate",
                     });
                 }
                 InputDragState::Marquee {
@@ -2399,7 +2534,9 @@ pub(crate) fn drag_pointer_id(drag: Option<&InputDragState>) -> Option<i32> {
         | Some(InputDragState::Card { pointer_id, .. })
         | Some(InputDragState::Edge { pointer_id, .. })
         | Some(InputDragState::Marquee { pointer_id, .. })
-        | Some(InputDragState::Object { pointer_id, .. }) => Some(*pointer_id),
+        | Some(InputDragState::Object { pointer_id, .. })
+        | Some(InputDragState::Resize { pointer_id, .. })
+        | Some(InputDragState::Rotate { pointer_id, .. }) => Some(*pointer_id),
         None => None,
     }
 }
@@ -2671,6 +2808,14 @@ pub(crate) const MARQUEE_OVERLAY_VERTEX_CAPACITY: usize = 30;
 pub(crate) const MARQUEE_FILL_COLOR: [f32; 4] = [0.231, 0.510, 0.965, 0.12];
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const MARQUEE_STROKE_COLOR: [f32; 4] = [0.231, 0.510, 0.965, 0.9];
+
+// W2-04: selection-handle overlay = 8 resize handles + 1 rotate zone, each a fill
+// quad (6 verts) = 9 * 6 = 54.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) const HANDLE_OVERLAY_VERTEX_CAPACITY: usize = 54;
+// Solid focus-blue handle fill (#2f7ee6).
+#[cfg(feature = "wgpu-probe")]
+pub(crate) const HANDLE_FILL_COLOR: [f32; 4] = [0.184, 0.494, 0.902, 1.0];
 
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn webgpu_vertex_buffer_usage() -> wgpu::BufferUsages {
@@ -3518,8 +3663,10 @@ mod tests {
             .take()
             .expect("move emits a transform delta");
         assert_eq!(delta.id, "o1");
-        assert!((delta.dx - 8.0).abs() < 1e-9);
-        assert!((delta.dy - 3.0).abs() < 1e-9);
+        assert_eq!(delta.kind, "translate");
+        // W2-04: the delta is a translation matrix; dx/dy are the translation column.
+        assert!((delta.matrix[0][2] - 8.0).abs() < 1e-9);
+        assert!((delta.matrix[1][2] - 3.0).abs() < 1e-9);
 
         // PointerUp clears the drag (the shell commits one undoable op).
         step_object_pointer(
@@ -3678,6 +3825,99 @@ mod tests {
         );
         assert_eq!(out.hover_affordance, None);
         assert!(out.transform_delta.is_some());
+    }
+
+    #[test]
+    fn handle_overlay_is_zoom_invariant_in_screen_px() {
+        // Same world bbox at two zooms: each handle quad's WORLD size scales 1/zoom,
+        // so its SCREEN size (world size * zoom) is constant HANDLE_SIZE_PX.
+        let world_bbox = WorldRect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 80.0,
+        };
+        for &zoom in &[1.0_f64, 4.0_f64] {
+            let verts = build_handle_overlay_vertices(&world_bbox, zoom);
+            // 9 quads (8 resize + rotate), 6 verts each.
+            assert_eq!(verts.len(), HANDLE_OVERLAY_VERTEX_CAPACITY);
+            // First quad = NW handle: verts 0 (top-left) and 2 (bottom-right) of the
+            // add_quad winding span the handle in world px.
+            let world_w = (verts[2].position[0] - verts[0].position[0]) as f64;
+            let screen_w = world_w * zoom;
+            assert!(
+                (screen_w - crate::hit_test_object::HANDLE_SIZE_PX).abs() < 1e-6,
+                "handle screen size must be constant HANDLE_SIZE_PX at zoom {zoom}, got {screen_w}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_down_on_handle_starts_resize_or_rotate_not_object() {
+        // 20px object at world origin; identity camera => screen == world. With it
+        // selected, a pointer-down on its NE corner must start a Resize (not Object),
+        // and the selection must NOT change.
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        // NE corner of a 20px rect at origin = world (20, 0).
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown {
+                pointer_id: 1,
+                screen: WorldPoint { x: 20.0, y: 0.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            Some("o1"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert!(
+            matches!(drag, Some(InputDragState::Resize { ref corner, .. }) if *corner == HoverAffordance::ResizeNe)
+        );
+        // Grabbing a handle does not re-pick selection.
+        assert!(out.selection.is_none());
+
+        // A move emits a resize delta scaling about the SW anchor.
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove {
+                pointer_id: 1,
+                screen: WorldPoint { x: 40.0, y: -20.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            Some("o1"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        let delta = out.transform_delta.take().expect("resize emits a delta");
+        assert_eq!(delta.kind, "resize");
+
+        // Rotate zone above the top-edge midpoint (x=10) starts a Rotate.
+        let mut drag2: Option<InputDragState> = None;
+        let mut out2 = ObjectInputOut::default();
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown {
+                pointer_id: 2,
+                screen: WorldPoint {
+                    x: 10.0,
+                    y: 0.0 - crate::hit_test_object::ROTATE_ZONE_OFFSET_PX,
+                },
+            },
+            &regions,
+            ActiveTool::Select,
+            Some("o1"),
+            &mut camera,
+            &mut drag2,
+            &mut out2,
+        );
+        assert!(matches!(drag2, Some(InputDragState::Rotate { .. })));
+        assert!(out2.selection.is_none());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import type { CameraState, DomOverlayRequest, ScenePatch, SceneSelection, WorldRect, WorldPoint } from "./scene";
+import type { CameraState, DomOverlayRequest, RenderTransform3x3, ScenePatch, SceneSelection, WorldRect, WorldPoint } from "./scene";
 
 export type RustCoreStatus = {
   available: boolean;
@@ -103,13 +103,16 @@ export type RustMarqueeResult = {
   ids: string[];
 };
 
-// FC-07: a cumulative object drag delta. dx/dy are world-px offsets from the
-// pointer-down world point (not per-move deltas); the shell authors one undoable
-// transform op from the final delta.
+// W2-04: a cumulative object transform delta. `matrix` is a ROW-MAJOR world-space
+// delta to PRE-MULTIPLY onto the object's existing transform (newWorld = matrix *
+// objTransform); it is cumulative from the fixed pointer-down anchor (not per-move).
+// `kind` names the gesture. The shell composes it non-destructively for preview and
+// authors one undoable op on pointer-up (W2-05); W2-11 pushes the composed matrix as
+// the per-object instance matrix.
 export type RustObjectTransformDelta = {
   id: string;
-  dx: number;
-  dy: number;
+  matrix: RenderTransform3x3;
+  kind: "translate" | "resize" | "rotate";
 };
 
 export type RustInputBatchResult = {

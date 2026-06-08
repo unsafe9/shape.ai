@@ -231,6 +231,114 @@ pub fn apply_3x3(m: &[[f64; 3]; 3], x: f64, y: f64) -> (f64, f64) {
     (ox / ow, oy / ow)
 }
 
+/// Multiply two row-major 3×3 matrices: `a * b`. Allocation-free fixed array.
+/// Used to compose a gesture's DELTA matrix to the LEFT of the object's existing
+/// world transform (W2-04): `new = delta * obj.transform`.
+pub fn mat3_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0; 3]; 3];
+    for (i, orow) in out.iter_mut().enumerate() {
+        for (j, cell) in orow.iter_mut().enumerate() {
+            *cell = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    out
+}
+
+/// Row-major translation matrix by `(dx, dy)`.
+pub fn translate_3x3(dx: f64, dy: f64) -> [[f64; 3]; 3] {
+    [[1.0, 0.0, dx], [0.0, 1.0, dy], [0.0, 0.0, 1.0]]
+}
+
+/// Row-major scale by `(sx, sy)` about the anchor `(ax, ay)`:
+/// `T(ax,ay) * S(sx,sy) * T(-ax,-ay)`, so the anchor point is fixed.
+pub fn scale_about_3x3(sx: f64, sy: f64, ax: f64, ay: f64) -> [[f64; 3]; 3] {
+    [
+        [sx, 0.0, ax - sx * ax],
+        [0.0, sy, ay - sy * ay],
+        [0.0, 0.0, 1.0],
+    ]
+}
+
+/// Row-major rotation by `theta` (radians, CCW in the +y-down screen frame) about
+/// the center `(cx, cy)`: `T(c) * R(theta) * T(-c)`.
+pub fn rotate_about_3x3(theta: f64, cx: f64, cy: f64) -> [[f64; 3]; 3] {
+    let (s, c) = theta.sin_cos();
+    [
+        [c, -s, cx - c * cx + s * cy],
+        [s, c, cy - s * cx - c * cy],
+        [0.0, 0.0, 1.0],
+    ]
+}
+
+/// W2-04 resize delta: a scale about the OPPOSITE anchor of the dragged handle
+/// (drag NE -> anchor SW). `world_bbox` is `(min_x, min_y, max_x, max_y)` in WORLD
+/// px; `corner` is the grabbed handle; `world_now`/`world_start` are the live and
+/// pointer-down WORLD points. Edge handles gate to one axis (N/S keep `sx=1`, E/W
+/// keep `sy=1`). A degenerate start extent yields scale 1 on that axis (no NaN).
+///
+/// Returns the identity matrix for a non-resize `corner` so callers can route the
+/// drag kind through one function.
+pub fn resize_delta_matrix(
+    world_bbox: (f64, f64, f64, f64),
+    corner: HoverAffordance,
+    world_now: (f64, f64),
+    world_start: (f64, f64),
+) -> [[f64; 3]; 3] {
+    let (min_x, min_y, max_x, max_y) = world_bbox;
+    // Anchor = the OPPOSITE corner/edge; scale_x/scale_y gate which axes move.
+    let (ax, ay, scale_x, scale_y) = match corner {
+        HoverAffordance::ResizeNw => (max_x, max_y, true, true),
+        HoverAffordance::ResizeNe => (min_x, max_y, true, true),
+        HoverAffordance::ResizeSe => (min_x, min_y, true, true),
+        HoverAffordance::ResizeSw => (max_x, min_y, true, true),
+        HoverAffordance::ResizeN => (min_x, max_y, false, true),
+        HoverAffordance::ResizeS => (min_x, min_y, false, true),
+        HoverAffordance::ResizeE => (min_x, min_y, true, false),
+        HoverAffordance::ResizeW => (max_x, min_y, true, false),
+        _ => return identity_3x3(),
+    };
+    let sx = if scale_x {
+        axis_scale(world_start.0, world_now.0, ax)
+    } else {
+        1.0
+    };
+    let sy = if scale_y {
+        axis_scale(world_start.1, world_now.1, ay)
+    } else {
+        1.0
+    };
+    scale_about_3x3(sx, sy, ax, ay)
+}
+
+/// Per-axis scale factor from the anchor: how much the pointer's distance to the
+/// anchor changed between the start and now. A near-zero start extent (pointer
+/// grabbed at the anchor) returns 1 to avoid a divide-by-zero blow-up.
+fn axis_scale(start: f64, now: f64, anchor: f64) -> f64 {
+    let start_extent = start - anchor;
+    if start_extent.abs() < f64::EPSILON {
+        return 1.0;
+    }
+    (now - anchor) / start_extent
+}
+
+/// W2-04 rotate delta: rotate about the bbox `center` by the angle swept from the
+/// pointer-down point to the live point (both WORLD px). `theta = atan2(now-c) -
+/// atan2(start-c)`.
+pub fn rotate_delta_matrix(
+    center: (f64, f64),
+    world_now: (f64, f64),
+    world_start: (f64, f64),
+) -> [[f64; 3]; 3] {
+    let a_now = (world_now.1 - center.1).atan2(world_now.0 - center.0);
+    let a_start = (world_start.1 - center.1).atan2(world_start.0 - center.0);
+    rotate_about_3x3(a_now - a_start, center.0, center.1)
+}
+
+/// The row-major 3×3 identity.
+pub fn identity_3x3() -> [[f64; 3]; 3] {
+    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+}
+
 /// Map a world (or screen-pre-camera) point into the object's local space by
 /// inverting its transform and projecting the point through the inverse
 /// (D8). Returns `None` when the transform is singular or the result is not
@@ -575,6 +683,94 @@ mod tests {
         // Interior and far-away points are over no handle.
         assert_eq!(handles.affordance_at(60.0, 60.0), None);
         assert_eq!(handles.affordance_at(500.0, 500.0), None);
+    }
+
+    #[test]
+    fn translate_matrix_is_pure_translation() {
+        let m = translate_3x3(8.0, 3.0);
+        assert!(approx_eq_mat(
+            &m,
+            &[[1.0, 0.0, 8.0], [0.0, 1.0, 3.0], [0.0, 0.0, 1.0]],
+            1e-12
+        ));
+    }
+
+    #[test]
+    fn scale_about_keeps_anchor_fixed() {
+        // Scale 2x about (10, 20): the anchor maps to itself; (11,21) -> (12,22).
+        let m = scale_about_3x3(2.0, 2.0, 10.0, 20.0);
+        let (ax, ay) = apply_3x3(&m, 10.0, 20.0);
+        assert!((ax - 10.0).abs() < 1e-12 && (ay - 20.0).abs() < 1e-12);
+        let (px, py) = apply_3x3(&m, 11.0, 21.0);
+        assert!((px - 12.0).abs() < 1e-12 && (py - 22.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resize_ne_drag_scales_about_sw_anchor() {
+        // 100x100 bbox at world origin: (min,min,max,max) = (0,0,100,100).
+        // Grab NE (top-right) at start (100, 0); drag to (200, -100) so the box's
+        // top-right doubles its distance from the SW anchor (0, 100): width 100->200,
+        // height 100->200 => scale 2x about (0, 100).
+        let bbox = (0.0, 0.0, 100.0, 100.0);
+        let m = resize_delta_matrix(
+            bbox,
+            HoverAffordance::ResizeNe,
+            (200.0, -100.0),
+            (100.0, 0.0),
+        );
+        let expected = scale_about_3x3(2.0, 2.0, 0.0, 100.0);
+        assert!(
+            approx_eq_mat(&m, &expected, 1e-9),
+            "NE drag should scale 2x about the SW anchor, got {m:?}"
+        );
+        // The SW anchor is fixed; the dragged NE corner lands on the pointer.
+        let (ax, ay) = apply_3x3(&m, 0.0, 100.0);
+        assert!((ax - 0.0).abs() < 1e-9 && (ay - 100.0).abs() < 1e-9);
+        let (nx, ny) = apply_3x3(&m, 100.0, 0.0);
+        assert!((nx - 200.0).abs() < 1e-9 && (ny + 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_edge_handle_gates_to_one_axis() {
+        // East edge handle scales only x (sy = 1). Anchor is the west edge (min_x).
+        let bbox = (0.0, 0.0, 100.0, 100.0);
+        let m = resize_delta_matrix(bbox, HoverAffordance::ResizeE, (200.0, 999.0), (100.0, 50.0));
+        let expected = scale_about_3x3(2.0, 1.0, 0.0, 0.0);
+        assert!(approx_eq_mat(&m, &expected, 1e-9), "E drag scales x only");
+    }
+
+    #[test]
+    fn resize_degenerate_start_extent_is_identity_scale() {
+        // Grabbing exactly at the anchor (zero start extent) must not divide by zero;
+        // the axis stays at scale 1.
+        let bbox = (0.0, 0.0, 100.0, 100.0);
+        // SE anchor is NW (0,0); start the pointer AT the anchor on x.
+        let m = resize_delta_matrix(bbox, HoverAffordance::ResizeSe, (50.0, 50.0), (0.0, 50.0));
+        // x axis: start_extent 0 -> sx = 1; y axis: (50-0)/(50-0) = 1.
+        assert!(approx_eq_mat(&m, &identity_3x3(), 1e-9));
+    }
+
+    #[test]
+    fn rotate_delta_is_rotation_about_center_by_swept_angle() {
+        // Center (0,0); pointer-down at (10, 0) (angle 0), now at (0, 10) (angle +pi/2
+        // in the +y-down frame). theta = pi/2.
+        let m = rotate_delta_matrix((0.0, 0.0), (0.0, 10.0), (10.0, 0.0));
+        let expected = rotate_about_3x3(std::f64::consts::FRAC_PI_2, 0.0, 0.0);
+        assert!(
+            approx_eq_mat(&m, &expected, 1e-9),
+            "90deg pointer sweep should rotate by pi/2, got {m:?}"
+        );
+    }
+
+    #[test]
+    fn mat3_mul_premultiplies_delta_onto_transform() {
+        // new = delta * obj: a translate delta pre-multiplied onto a scale transform
+        // applies the scale first, then the translation.
+        let obj = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]];
+        let delta = translate_3x3(5.0, 7.0);
+        let m = mat3_mul(&delta, &obj);
+        let expected = [[2.0, 0.0, 5.0], [0.0, 2.0, 7.0], [0.0, 0.0, 1.0]];
+        assert!(approx_eq_mat(&m, &expected, 1e-12));
     }
 
     #[test]

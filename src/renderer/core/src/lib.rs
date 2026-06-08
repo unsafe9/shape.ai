@@ -60,8 +60,10 @@ pub use curve_lod::{
 };
 #[allow(unused_imports)]
 pub use hit_test_object::{
-    apply_3x3, hit_test_object, invert_3x3, point_in_polygon, world_to_local, HoverAffordance,
-    PathSeg, ScreenRect, SelectionHandles, HANDLE_SIZE_PX, ROTATE_ZONE_OFFSET_PX,
+    apply_3x3, hit_test_object, identity_3x3, invert_3x3, mat3_mul, point_in_polygon,
+    resize_delta_matrix, rotate_about_3x3, rotate_delta_matrix, scale_about_3x3, translate_3x3,
+    world_to_local, HoverAffordance, PathSeg, ScreenRect, SelectionHandles, HANDLE_SIZE_PX,
+    ROTATE_ZONE_OFFSET_PX,
 };
 #[allow(unused_imports)]
 pub use outline::{derive_region, parse_path_string, Region, RegionCache};

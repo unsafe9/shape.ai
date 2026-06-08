@@ -225,6 +225,12 @@ impl ShapeWebGpuRenderer {
             usage: webgpu_vertex_buffer_usage(),
             mapped_at_creation: false,
         });
+        let handle_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shape.ai WebGPU selection-handle vertices"),
+            size: (HANDLE_OVERLAY_VERTEX_CAPACITY * std::mem::size_of::<GpuVertex>()) as u64,
+            usage: webgpu_vertex_buffer_usage(),
+            mapped_at_creation: false,
+        });
         let mut text_engine = TextEngine::new().map_err(|error| {
             JsValue::from_str(&format!("Rust text font loading failed: {error}"))
         })?;
@@ -357,6 +363,7 @@ impl ShapeWebGpuRenderer {
             _text_sampler: text_sampler,
             vertex_buffer,
             overlay_vertex_buffer,
+            handle_vertex_buffer,
             vertex_ranges: VertexRanges::default(),
             text_engine,
             text_layout_cache: TextLayoutCache::default(),
