@@ -40,6 +40,7 @@
   import {
     buildPrimitiveObject,
     buildPrimitiveObjectFromDrag,
+    buildSetStyleOp,
     MIN_DRAG_EXTENT_PX,
     textOverlayScreenRect,
     type DragSpan
@@ -83,8 +84,9 @@
   const PEN_EPSILON = 2.0;
   let penColor = $state("#1f2933");
   let penWidthPx = $state(2);
-  // D1/#5: the toolbar's always-visible selected color. AP1 wires onSelectColor
-  // to apply this to the selection via SetStyle; here it only holds the state.
+  // D1/#5: the toolbar's always-visible selected color. It is the default fill/
+  // stroke for the next NEW shape; recoloring a selected object authors a SetStyle
+  // op (applySelectedColor). The native picker passes a CSS hex through verbatim.
   let selectedColor = $state("#1f2933");
   // W2-08: draw-mode palette + brush sizes the sub-toolbar offers.
   const PEN_PALETTE = ["#1f2933", "#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#ffffff"];
@@ -599,7 +601,7 @@
       return;
     }
     const center = anchor ?? viewportCenterWorld();
-    const object = buildPrimitiveObject(kind, center, freshId(kind), nextOrderKey());
+    const object = buildPrimitiveObject(kind, center, freshId(kind), nextOrderKey(), selectedColor);
     authorOp({ kind: "insert-object", object });
     selection = { kind: "object", id: object.id };
     persistSelection(selection);
@@ -869,6 +871,18 @@
   function renameSelected(text: string): void {
     if (selection.kind !== "object") return;
     authorOp({ kind: "set-text", id: selection.id, text: { runs: [{ text }] } });
+  }
+
+  // AP1 (#5): adopt the toolbar's selected color, then recolor the current
+  // selection. Always hold the latest pick (it becomes the default for the next
+  // NEW shape); when a single object is selected, author a `set-style` op so the
+  // pick recolors it live through the existing op-apply path (D21 undo).
+  function applySelectedColor(color: string): void {
+    selectedColor = color;
+    if (selection.kind !== "object") return;
+    const object = scene.objects.find((o) => o.id === selection.id);
+    if (!object) return;
+    authorOp(buildSetStyleOp(object, color));
   }
 
   // ----- W2-10: inline text editing -----
@@ -1491,7 +1505,7 @@
           onSetTool={setActiveTool}
           onSetPenColor={(color) => (penColor = color)}
           onSetPenWidth={(width) => (penWidthPx = width)}
-          onSelectColor={(color) => (selectedColor = color)}
+          onSelectColor={applySelectedColor}
           onInsertPrimitive={insertPrimitive}
           onToggleTemplates={toggleTemplates}
           onZoomIn={() => zoomAtCenter(-160)}

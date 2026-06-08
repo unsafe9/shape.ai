@@ -14,6 +14,7 @@ import {
   GEOMETRY_QUANTUM_PER_PX,
   type Fill,
   type Object as SceneObject,
+  type ObjectOp,
   type Stroke,
   translateTransform
 } from "../../shared/object";
@@ -69,6 +70,20 @@ export type PrimitiveSpec = {
   size: { width: number; height: number };
 };
 
+// AP1 (#5): override a spec's fill/stroke paint colors with the toolbar's selected
+// color so a NEW shape is created in that color. Only the solid paint color changes
+// (width/opacity/rule are untouched); a spec field that is absent stays absent (a
+// line has no fill, the text primitive has neither). Returns the spec unchanged when
+// no color is selected, so the hardcoded defaults remain the fallback.
+function recolorSpec(spec: PrimitiveSpec, color: string | undefined): PrimitiveSpec {
+  if (!color) return spec;
+  return {
+    ...spec,
+    ...(spec.fill ? { fill: { ...spec.fill, paint: { kind: "solid", color } } } : {}),
+    ...(spec.stroke ? { stroke: { ...spec.stroke, paint: { kind: "solid", color } } } : {})
+  };
+}
+
 /** The default geometry/style for each primitive kind. */
 function primitiveSpec(kind: PrimitiveKindId): PrimitiveSpec {
   switch (kind) {
@@ -97,9 +112,10 @@ export function buildPrimitiveObject(
   kind: PrimitiveKindId,
   anchor: { x: number; y: number },
   id: string,
-  order: string
+  order: string,
+  color?: string
 ): SceneObject {
-  const spec = primitiveSpec(kind);
+  const spec = recolorSpec(primitiveSpec(kind), color);
   const tx = anchor.x - spec.size.width / 2;
   const ty = anchor.y - spec.size.height / 2;
   return {
@@ -112,6 +128,25 @@ export function buildPrimitiveObject(
     ...(spec.text ? { text: spec.text } : {}),
     ...(kind === "frame" ? { clip: true } : {})
   };
+}
+
+// AP1 (#5): author a `set-style` op recoloring an object to the toolbar's selected
+// color. Recolor only the style fields the object already carries — a filled shape
+// keeps its stroke color, a stroke-only line keeps being stroke-only — so a recolor
+// never adds a paint the object did not have. An object with neither fill nor stroke
+// (the borderless text primitive) gets a fill so the recolor is still visible. The
+// op rides the existing authorOp path; the inverse (the old style) comes from the
+// core, keeping undo correct (D21).
+export function buildSetStyleOp(object: SceneObject, color: string): ObjectOp {
+  const paint: Stroke["paint"] = { kind: "solid", color };
+  const op: { kind: "set-style"; id: string; fill?: { action: "set"; value: Fill }; stroke?: { action: "set"; value: Stroke } } = {
+    kind: "set-style",
+    id: object.id
+  };
+  if (object.fill) op.fill = { action: "set", value: { ...object.fill, paint } };
+  if (object.stroke) op.stroke = { action: "set", value: { ...object.stroke, paint } };
+  if (!object.fill && !object.stroke) op.fill = { action: "set", value: { paint, opacity: 1 } };
+  return op;
 }
 
 // W2-07: a drag span — the gesture's start corner and current/end corner (world
@@ -150,9 +185,10 @@ export function buildPrimitiveObjectFromDrag(
   kind: PrimitiveKindId,
   span: DragSpan,
   id: string,
-  order: string
+  order: string,
+  color?: string
 ): SceneObject {
-  const spec = primitiveSpec(kind);
+  const spec = recolorSpec(primitiveSpec(kind), color);
   const { d, tx, ty } = dragGeometry(kind, span);
   return {
     id,
