@@ -1482,12 +1482,25 @@ pub fn build_scene_geometry_themed_with_measure(
 
         let subpaths = flatten_object_subpaths(obj, scene.camera.zoom);
 
+        // W3-G7/#3: an OPEN-only path with NO explicit fill is NOT filled (Figma /
+        // macOS convention) — a freehand brush stroke commits as an open subpath
+        // with `fill: None`, and tessellating it as a chord region showed an ugly
+        // default-white fill. Closed shapes (rect/ellipse) and any explicit fill are
+        // unaffected. When skipped we still push a Fill/Shadow instance below so the
+        // per-object instance buffers stay index-aligned with `draws`.
+        let skip_fill =
+            obj.fill.is_none() && subpaths.iter().all(|(closed, _)| !closed);
+
         // ---- Fill: tessellate the closed region into the megabuffer --------
-        let fill_input: Vec<(bool, Vec<(f32, f32)>)> = subpaths
-            .iter()
-            .map(|(closed, pts)| (*closed, pts.clone()))
-            .collect();
-        let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
+        let mesh = if skip_fill {
+            crate::tessellate::Mesh::default()
+        } else {
+            let fill_input: Vec<(bool, Vec<(f32, f32)>)> = subpaths
+                .iter()
+                .map(|(closed, pts)| (*closed, pts.clone()))
+                .collect();
+            tessellate_fill(&fill_input, FillRuleKind::NonZero)
+        };
         // Silhouette flags travel index-aligned with the megabuffer's vertex array:
         // `push` appends this mesh's vertices, so we extend `fill_edges` with this
         // mesh's boundary flags in lockstep (D4 analytic fill AA).
@@ -2063,6 +2076,60 @@ mod tests {
         assert_eq!(geo.fill_instances[0].fill, [1.0, 0.0, 0.0, 1.0]);
         // Inline stroke #00ff00 -> green, full alpha.
         assert_eq!(geo.stroke_instances[0].stroke, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    /// W3-G7/#3: an OPEN-only path with NO explicit fill renders fill-less (no
+    /// default white chord region), while a CLOSED path with no fill keeps the
+    /// structural default fill. The per-object instance buffers stay index-aligned.
+    /// FAILS if open brush strokes still tessellate a fill (the ugly white region).
+    #[test]
+    fn open_path_without_fill_skips_fill_and_shadow() {
+        // A bare-bones object factory: identity transform, the given geometry, no
+        // inline fill, no stroke.
+        let fill_less = |id: &str, d: &str| RenderObject {
+            id: id.to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: identity(),
+            geometry_d: d.to_string(),
+            fill: None,
+            stroke: None,
+            text: None,
+            clip: false,
+        };
+
+        // (open) a freehand-style open polyline; (closed) a rect ending in Z.
+        let open = fill_less("brush", "M0 0 L80 40 L20 90");
+        let closed = fill_less("rect", "M0 0 L800 0 L800 800 L0 800 Z");
+        let scene = scene_with(vec![open, closed], None);
+        let geo = build_scene_geometry(&scene);
+
+        let open_draw = &geo.draws[0];
+        let closed_draw = &geo.draws[1];
+
+        // (a) Open + fill:None => NO fill region and NO shadow.
+        assert!(
+            open_draw.fill_range.is_empty(),
+            "open brush stroke must not tessellate a fill region"
+        );
+        assert!(
+            open_draw.shadow_range.is_empty(),
+            "an unfilled open stroke casts no shadow"
+        );
+        // It still strokes (an open path is a visible line).
+        assert!(!open_draw.stroke_range.is_empty(), "open stroke still draws a ribbon");
+
+        // (b) Closed + fill:None => the structural default fill STILL applies.
+        assert!(
+            !closed_draw.fill_range.is_empty(),
+            "a closed shape with no fill keeps the default white fill"
+        );
+        assert!(!closed_draw.shadow_range.is_empty(), "the filled rect casts a shadow");
+
+        // (c) Per-object instance buffers stay index-aligned with `draws`.
+        assert_eq!(geo.fill_instances.len(), geo.draws.len());
+        assert_eq!(geo.shadow_instances.len(), geo.draws.len());
+        assert_eq!(geo.stroke_instances.len(), geo.draws.len());
     }
 
     /// D4 analytic fill AA: the build populates `fill_edges` index-aligned with the
