@@ -51,6 +51,14 @@ pub enum TemplateCategory {
     General,
 }
 
+/// Theme token names the templates paint with (C1 contract, see `object::theme`).
+/// Templates style their frames/cards with semantic tokens so they track the
+/// active light/dark theme instead of baking a fixed hex.
+const TOKEN_SURFACE: &str = "surface";
+const TOKEN_SURFACE_MUTED: &str = "surface-muted";
+const TOKEN_DEFAULT_STROKE: &str = "default-stroke";
+const TOKEN_TEXT: &str = "text";
+
 /// One catalog entry: enough for the picker to list and trigger a template,
 /// without building any objects.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,19 +93,27 @@ pub struct ObjectTemplate {
 fn registry() -> Vec<ObjectTemplate> {
     vec![
         ObjectTemplate {
+            id: "todo_board",
+            label: "To-do Board",
+            category: TemplateCategory::Planning,
+            description:
+                "Three grouped columns — To do, In progress, Done — each holding starter task cards.",
+            build: build_todo_board,
+        },
+        ObjectTemplate {
             id: "decision_map",
             label: "Decision Map",
             category: TemplateCategory::Engineering,
             description:
-                "One decision point, competing options, and a sub-decision, wired with connectors.",
+                "A decision point branching to two options and their outcomes, wired with anchored connectors.",
             build: build_decision_map,
         },
         ObjectTemplate {
-            id: "todo_board",
-            label: "To-do Board",
-            category: TemplateCategory::Planning,
-            description: "Three columns — To do, In progress, Done — with starter task cards.",
-            build: build_todo_board,
+            id: "presentation",
+            label: "Presentation",
+            category: TemplateCategory::Presentation,
+            description: "A deck frame grouping a title slide and three content slides.",
+            build: build_presentation,
         },
         ObjectTemplate {
             id: "idea_board",
@@ -126,13 +142,6 @@ fn registry() -> Vec<ObjectTemplate> {
             category: TemplateCategory::Engineering,
             description: "Trace evidence and findings from a starting question.",
             build: build_investigation_map_stub,
-        },
-        ObjectTemplate {
-            id: "presentation",
-            label: "Presentation",
-            category: TemplateCategory::Presentation,
-            description: "A slide outline as a sequence of frames.",
-            build: build_presentation_stub,
         },
         ObjectTemplate {
             id: "dependency_diagram",
@@ -257,6 +266,23 @@ const fn px(p: i32) -> i32 {
     p * GEOMETRY_QUANTUM_PER_PX
 }
 
+/// A solid fill painted with a theme token (C1) — resolves light/dark at draw.
+fn token_fill(token: &str) -> Fill {
+    Fill { paint: Paint::Token { name: token.to_string() }, opacity: 1.0 }
+}
+
+/// A 1px-wide stroke painted with a theme token (C1).
+fn token_stroke(token: &str) -> Stroke {
+    Stroke {
+        paint: Paint::Token { name: token.to_string() },
+        width: px(1),
+        opacity: 1.0,
+        dash: Vec::new(),
+        cap: LineCap::Butt,
+        join: LineJoin::Round,
+    }
+}
+
 /// A closed rectangle from (0,0) to (w_px, h_px) in object-local quantized units.
 fn rect_geometry(w_px: i32, h_px: i32) -> Geometry {
     let w = px(w_px);
@@ -304,6 +330,55 @@ fn label(text: &str, color: Option<String>) -> Text {
     }
 }
 
+/// A top-left header label in the theme `text` token color, at `size_px`. Used
+/// for frame/slide titles, which sit at the top of their box rather than dead
+/// center. `bold` distinguishes a deck/slide heading from a body line.
+fn heading(text: &str, size_px: i32, bold: bool) -> Text {
+    Text {
+        runs: vec![TextRun {
+            text: text.to_string(),
+            color: Some(TOKEN_TEXT.to_string()),
+            size: Some(px(size_px)),
+            bold,
+            italic: false,
+            font: None,
+        }],
+        align: TextAlign::Start,
+        valign: TextVAlign::Top,
+    }
+}
+
+/// A token-styled rect placed at `anchor + (ox, oy)` px, optionally parented and
+/// optionally titled. `fill_token`/`stroke_token` are theme tokens (C1). The
+/// title (when present) sits top-left via [`heading`]; a frame with no title is
+/// a plain container. Returns the built object so the caller can wire children
+/// to its id.
+#[allow(clippy::too_many_arguments)]
+fn framed(
+    fill_token: &str,
+    stroke_token: &str,
+    title: Option<(&str, i32, bool)>,
+    parent: Option<&str>,
+    w_px: i32,
+    h_px: i32,
+    anchor_x: f64,
+    anchor_y: f64,
+    ox: f64,
+    oy: f64,
+    id_alloc: &mut dyn FnMut() -> String,
+    order_alloc: &mut dyn FnMut() -> String,
+) -> Object {
+    let mut obj = Object::new(id_alloc(), order_alloc(), rect_geometry(w_px, h_px));
+    obj.transform = Transform3x3::translate(anchor_x + ox, anchor_y + oy);
+    obj.fill = Some(token_fill(fill_token));
+    obj.stroke = Some(token_stroke(stroke_token));
+    obj.parent = parent.map(|p| p.to_string());
+    if let Some((t, size, bold)) = title {
+        obj.text = Some(heading(t, size, bold));
+    }
+    obj
+}
+
 /// Build one styled card: a `w x h` rect placed at `anchor + (ox, oy)` px, with
 /// the preset's inline fill/stroke and a centered label in the preset text color.
 fn card(
@@ -324,6 +399,28 @@ fn card(
     obj.fill = fill;
     obj.stroke = stroke;
     obj.text = Some(label(text, text_color));
+    obj
+}
+
+/// Like [`card`] but parented to `parent` (D3 grouping). The transform is still
+/// world-absolute (children carry absolute transforms, AP2); `parent` only wires
+/// containment so a parent drag cascades to the card.
+#[allow(clippy::too_many_arguments)]
+fn card_in(
+    preset: &str,
+    text: &str,
+    w_px: i32,
+    h_px: i32,
+    anchor_x: f64,
+    anchor_y: f64,
+    ox: f64,
+    oy: f64,
+    parent: &str,
+    id_alloc: &mut dyn FnMut() -> String,
+    order_alloc: &mut dyn FnMut() -> String,
+) -> Object {
+    let mut obj = card(preset, text, w_px, h_px, anchor_x, anchor_y, ox, oy, id_alloc, order_alloc);
+    obj.parent = Some(parent.to_string());
     obj
 }
 
@@ -365,8 +462,11 @@ fn center_of(w_px: i32, h_px: i32) -> LocalPoint {
 // Real templates (fully fleshed).
 // ---------------------------------------------------------------------------
 
-/// Decision Map: a decision point, two competing options, and a sub-decision,
-/// wired with three connectors. Each card uses its matching semantic preset.
+/// Decision Map: a decision point branching to two competing options, each
+/// leading to its own outcome, wired with four anchored connectors. Each card
+/// uses its matching semantic preset; the columns are tuned so no two cards
+/// overlap. This is the anchors showcase — every edge re-projects when a card
+/// moves (AP5).
 fn build_decision_map(
     ax: f64,
     ay: f64,
@@ -375,27 +475,35 @@ fn build_decision_map(
 ) -> Vec<Object> {
     const W: i32 = 200;
     const H: i32 = 110;
+    // Three columns (x), options/outcomes split across two rows (y). The gaps
+    // (320px column pitch, 240px row pitch) keep 200x110 cards clear of overlap.
     let decision = card(
-        "decision_point", "Decision point", W, H, ax, ay, 0.0, 160.0, id_alloc, order_alloc,
+        "decision_point", "Decision point", W, H, ax, ay, 0.0, 180.0, id_alloc, order_alloc,
     );
-    let option_a = card("option", "Option A", W, H, ax, ay, 320.0, 40.0, id_alloc, order_alloc);
+    let option_a = card("option", "Option A", W, H, ax, ay, 320.0, 60.0, id_alloc, order_alloc);
     let option_b =
-        card("option", "Option B", W, H, ax, ay, 320.0, 280.0, id_alloc, order_alloc);
-    let subdecision = card(
-        "subdecision", "Sub-decision", W, H, ax, ay, 640.0, 40.0, id_alloc, order_alloc,
+        card("option", "Option B", W, H, ax, ay, 320.0, 300.0, id_alloc, order_alloc);
+    let outcome_a = card(
+        "subdecision", "Outcome A", W, H, ax, ay, 640.0, 60.0, id_alloc, order_alloc,
+    );
+    let outcome_b = card(
+        "subdecision", "Outcome B", W, H, ax, ay, 640.0, 300.0, id_alloc, order_alloc,
     );
 
     let c = center_of(W, H);
     let e1 = connector(&decision, &option_a, c, c, id_alloc, order_alloc);
     let e2 = connector(&decision, &option_b, c, c, id_alloc, order_alloc);
-    let e3 = connector(&option_a, &subdecision, c, c, id_alloc, order_alloc);
+    let e3 = connector(&option_a, &outcome_a, c, c, id_alloc, order_alloc);
+    let e4 = connector(&option_b, &outcome_b, c, c, id_alloc, order_alloc);
 
-    vec![decision, option_a, option_b, subdecision, e1, e2, e3]
+    vec![decision, option_a, option_b, outcome_a, outcome_b, e1, e2, e3, e4]
 }
 
-/// To-do Board: three column frames (To do / In progress / Done) plus a starter
-/// task card in the first column. Columns use the neutral `default` preset;
-/// the task card uses the `task` preset.
+/// To-do Board: three grouped columns (To do / In progress / Done). Each column
+/// is a `surface-muted` frame (a real parent object) holding `task`-preset cards
+/// as children (D3 grouping). Children carry world-absolute transforms and a
+/// `parent` link to their column, so dragging a column cascades its cards (AP2).
+/// Emitted parents-first so the recipe stays well-formed when applied in order.
 fn build_todo_board(
     ax: f64,
     ay: f64,
@@ -404,14 +512,57 @@ fn build_todo_board(
 ) -> Vec<Object> {
     const COL_W: i32 = 240;
     const COL_H: i32 = 460;
-    let todo = card("default", "To do", COL_W, COL_H, ax, ay, 0.0, 0.0, id_alloc, order_alloc);
-    let doing = card(
-        "default", "In progress", COL_W, COL_H, ax, ay, 280.0, 0.0, id_alloc, order_alloc,
-    );
-    let done = card("default", "Done", COL_W, COL_H, ax, ay, 560.0, 0.0, id_alloc, order_alloc);
-    let first_task =
-        card("task", "First task", 200, 70, ax, ay, 20.0, 60.0, id_alloc, order_alloc);
-    vec![todo, doing, done, first_task]
+    const COL_PITCH: f64 = 280.0;
+    const CARD_W: i32 = 200;
+    const CARD_H: i32 = 70;
+    // Card inset within a column, and the y of the first/second card (below the
+    // column title) — 90px card pitch clears the 70px-tall cards.
+    const CARD_OX: f64 = 20.0;
+    const CARD_Y0: f64 = 60.0;
+    const CARD_PITCH: f64 = 90.0;
+
+    let columns = [("To do", 0.0), ("In progress", COL_PITCH), ("Done", COL_PITCH * 2.0)];
+    let cards: [(&str, &str); 3] =
+        [("To do", "First task"), ("In progress", "Working on it"), ("Done", "Shipped")];
+
+    let mut parents: Vec<Object> = Vec::with_capacity(columns.len());
+    let mut children: Vec<Object> = Vec::with_capacity(cards.len() * 2);
+    for (title, col_x) in columns {
+        let column = framed(
+            TOKEN_SURFACE_MUTED,
+            TOKEN_DEFAULT_STROKE,
+            Some((title, 14, true)),
+            None,
+            COL_W,
+            COL_H,
+            ax,
+            ay,
+            col_x,
+            0.0,
+            id_alloc,
+            order_alloc,
+        );
+        // Two starter cards per column, parented to the column frame.
+        let card_text = cards.iter().find(|(c, _)| *c == title).map(|(_, t)| *t).unwrap_or("Task");
+        for row in 0..2 {
+            let label = if row == 0 { card_text } else { "New task" };
+            children.push(card_in(
+                "task",
+                label,
+                CARD_W,
+                CARD_H,
+                ax,
+                ay,
+                col_x + CARD_OX,
+                CARD_Y0 + CARD_PITCH * f64::from(row),
+                &column.id,
+                id_alloc,
+                order_alloc,
+            ));
+        }
+        parents.push(column);
+    }
+    parents.into_iter().chain(children).collect()
 }
 
 /// Idea Board: a central prompt card surrounded by four idea cards. The prompt
@@ -445,6 +596,71 @@ fn build_wiki_note(
     let body =
         card("default", "Write your note here...", 420, 320, ax, ay, 0.0, 90.0, id_alloc, order_alloc);
     vec![title, body]
+}
+
+/// Presentation: a deck frame grouping four slide frames (a title slide and
+/// three content slides) laid out in a 2x2 grid. The deck is a `surface-muted`
+/// parent; each slide is a `surface` child frame with a top-left heading (D3
+/// grouping). Dragging the deck cascades all slides (AP2). Parents-first order.
+fn build_presentation(
+    ax: f64,
+    ay: f64,
+    id_alloc: &mut dyn FnMut() -> String,
+    order_alloc: &mut dyn FnMut() -> String,
+) -> Vec<Object> {
+    const PAD: f64 = 24.0;
+    const SLIDE_W: i32 = 280;
+    const SLIDE_H: i32 = 160;
+    const COL_PITCH: f64 = 304.0; // SLIDE_W + 24px gutter
+    const ROW_PITCH: f64 = 184.0; // SLIDE_H + 24px gutter
+    // Deck frame wraps the 2x2 grid plus padding on all sides.
+    const DECK_W: i32 = 2 * SLIDE_W + 24 + 2 * 24; // two slides + inner gutter + outer pad
+    const DECK_H: i32 = 2 * SLIDE_H + 24 + 2 * 24;
+
+    let deck = framed(
+        TOKEN_SURFACE_MUTED,
+        TOKEN_DEFAULT_STROKE,
+        Some(("Deck", 16, true)),
+        None,
+        DECK_W,
+        DECK_H,
+        ax,
+        ay,
+        0.0,
+        0.0,
+        id_alloc,
+        order_alloc,
+    );
+
+    let slides: [(&str, i32, i32); 4] = [
+        ("Title slide", 0, 0),
+        ("Agenda", 1, 0),
+        ("Content", 0, 1),
+        ("Summary", 1, 1),
+    ];
+    let mut objs: Vec<Object> = Vec::with_capacity(1 + slides.len());
+    let mut children: Vec<Object> = Vec::with_capacity(slides.len());
+    for (title, col, row) in slides {
+        let ox = PAD + COL_PITCH * f64::from(col);
+        let oy = PAD + ROW_PITCH * f64::from(row);
+        children.push(framed(
+            TOKEN_SURFACE,
+            TOKEN_DEFAULT_STROKE,
+            Some((title, 13, false)),
+            Some(&deck.id),
+            SLIDE_W,
+            SLIDE_H,
+            ax,
+            ay,
+            ox,
+            oy,
+            id_alloc,
+            order_alloc,
+        ));
+    }
+    objs.push(deck);
+    objs.extend(children);
+    objs
 }
 
 // ---------------------------------------------------------------------------
@@ -482,16 +698,6 @@ fn build_investigation_map_stub(
     order_alloc: &mut dyn FnMut() -> String,
 ) -> Vec<Object> {
     titled_rect("evidence", "Investigation Map", ax, ay, id_alloc, order_alloc)
-}
-
-/// Stub: presentation outline. Fleshing out is OB-future.
-fn build_presentation_stub(
-    ax: f64,
-    ay: f64,
-    id_alloc: &mut dyn FnMut() -> String,
-    order_alloc: &mut dyn FnMut() -> String,
-) -> Vec<Object> {
-    titled_rect("default", "Presentation", ax, ay, id_alloc, order_alloc)
 }
 
 /// Stub: dependency diagram. Fleshing out is OB-future.
@@ -586,10 +792,121 @@ mod tests {
     fn cards_are_offset_from_the_anchor() {
         allocators!(id_alloc, order_alloc);
         let objs = build_template("decision_map", 100.0, 50.0, &mut id_alloc, &mut order_alloc);
-        // the first card sits at anchor + (0,160) per the recipe.
+        // the first card sits at anchor + (0,180) per the recipe.
         let first = &objs[0];
         assert_eq!(first.transform.m[0][2], 100.0);
-        assert_eq!(first.transform.m[1][2], 50.0 + 160.0);
+        assert_eq!(first.transform.m[1][2], 50.0 + 180.0);
+    }
+
+    // -- TP1: groups + anchors + tuned positions on the lowered templates -----
+
+    /// Object-local pixel bounds of a `framed`/`card` rect, in world px. Cards are
+    /// authored as a (0,0)-(w,h) rect translated by the transform, so the world
+    /// box is `[tx, tx + w] x [ty, ty + h]`. Connectors (open geometry) are
+    /// excluded by the caller. Returns `None` if the geometry is not a closed box.
+    fn world_box(o: &Object) -> Option<(f64, f64, f64, f64)> {
+        let sp = o.geometry.subpaths.first()?;
+        if !sp.closed {
+            return None;
+        }
+        let (mut minx, mut miny, mut maxx, mut maxy) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for n in &sp.nodes {
+            minx = minx.min(n.x);
+            miny = miny.min(n.y);
+            maxx = maxx.max(n.x);
+            maxy = maxy.max(n.y);
+        }
+        let q = f64::from(GEOMETRY_QUANTUM_PER_PX);
+        let tx = o.transform.m[0][2];
+        let ty = o.transform.m[1][2];
+        Some((
+            tx + f64::from(minx) / q,
+            ty + f64::from(miny) / q,
+            tx + f64::from(maxx) / q,
+            ty + f64::from(maxy) / q,
+        ))
+    }
+
+    /// Do two world boxes overlap (strict interior intersection)?
+    fn boxes_overlap(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
+        a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+    }
+
+    #[test]
+    fn todo_board_is_grouped_with_parents_and_children() {
+        allocators!(id_alloc, order_alloc);
+        let objs = build_template("todo_board", 0.0, 0.0, &mut id_alloc, &mut order_alloc);
+        // Three column frames (no parent) + their child cards (parent set).
+        let parents: Vec<&Object> = objs.iter().filter(|o| o.parent.is_none()).collect();
+        let children: Vec<&Object> = objs.iter().filter(|o| o.parent.is_some()).collect();
+        assert_eq!(parents.len(), 3, "three grouped columns");
+        assert!(children.len() >= 3, "columns hold task cards");
+        // Every child points at a real parent in the same recipe (grouping wired).
+        let parent_ids: Vec<&str> = parents.iter().map(|o| o.id.as_str()).collect();
+        for c in &children {
+            let p = c.parent.as_deref().unwrap();
+            assert!(parent_ids.contains(&p), "child {} parent {p} not in recipe", c.id);
+        }
+        // Parents emitted before children, so the recipe applies in order.
+        let first_child = objs.iter().position(|o| o.parent.is_some()).unwrap();
+        assert!(
+            objs[..first_child].iter().all(|o| o.parent.is_none()),
+            "parents must precede children",
+        );
+        // Columns carry a theme-token fill (C1), not a baked hex.
+        assert!(parents.iter().all(|o| matches!(
+            o.fill.as_ref().map(|f| &f.paint),
+            Some(Paint::Token { .. })
+        )));
+    }
+
+    #[test]
+    fn presentation_groups_slides_under_a_deck() {
+        allocators!(id_alloc, order_alloc);
+        let objs = build_template("presentation", 0.0, 0.0, &mut id_alloc, &mut order_alloc);
+        let parents: Vec<&Object> = objs.iter().filter(|o| o.parent.is_none()).collect();
+        let children: Vec<&Object> = objs.iter().filter(|o| o.parent.is_some()).collect();
+        assert_eq!(parents.len(), 1, "one deck frame");
+        assert_eq!(children.len(), 4, "four slides under the deck");
+        let deck = parents[0];
+        assert!(children.iter().all(|c| c.parent.as_deref() == Some(deck.id.as_str())));
+        // No two slides overlap (tuned 2x2 grid).
+        let slide_boxes: Vec<(f64, f64, f64, f64)> =
+            children.iter().filter_map(|o| world_box(o)).collect();
+        assert_eq!(slide_boxes.len(), 4);
+        for i in 0..slide_boxes.len() {
+            for j in (i + 1)..slide_boxes.len() {
+                assert!(
+                    !boxes_overlap(slide_boxes[i], slide_boxes[j]),
+                    "slides {i} and {j} overlap",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decision_map_connectors_resolve_to_distinct_non_overlapping_cards() {
+        allocators!(id_alloc, order_alloc);
+        let objs = build_template("decision_map", 0.0, 0.0, &mut id_alloc, &mut order_alloc);
+        let cards: Vec<&Object> = objs.iter().filter(|o| o.anchors.is_empty()).collect();
+        let connectors: Vec<&Object> = objs.iter().filter(|o| o.anchors.len() == 2).collect();
+        assert_eq!(cards.len(), 5, "decision point + 2 options + 2 outcomes");
+        assert!(connectors.len() >= 4, "four anchored connectors");
+        let card_ids: Vec<&str> = cards.iter().map(|o| o.id.as_str()).collect();
+        // Every connector anchors to two *distinct* real cards in the recipe.
+        for e in &connectors {
+            let (a, b) = (e.anchors[0].target.as_str(), e.anchors[1].target.as_str());
+            assert_ne!(a, b, "connector endpoints must differ");
+            assert!(card_ids.contains(&a) && card_ids.contains(&b), "anchors resolve to cards");
+        }
+        // No two cards overlap (tuned columns/rows).
+        let boxes: Vec<(f64, f64, f64, f64)> = cards.iter().filter_map(|o| world_box(o)).collect();
+        assert_eq!(boxes.len(), 5);
+        for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                assert!(!boxes_overlap(boxes[i], boxes[j]), "cards {i} and {j} overlap");
+            }
+        }
     }
 
     #[test]

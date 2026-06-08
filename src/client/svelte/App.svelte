@@ -1008,9 +1008,9 @@
 
   // W2-09: the templates the scroll-popup offers. Ids map to buildObjectTemplate.
   const TEMPLATES: TemplatePopupItem[] = [
-    { id: "todo_board", title: "Todo board", desc: "Columns of cards for tracking work" },
-    { id: "decision_map", title: "Decision map", desc: "Branching options around a choice" },
-    { id: "presentation", title: "Presentation", desc: "Stacked slides for a deck" }
+    { id: "todo_board", title: "Todo board", desc: "Grouped To do / In progress / Done columns" },
+    { id: "decision_map", title: "Decision map", desc: "Options and outcomes wired with connectors" },
+    { id: "presentation", title: "Presentation", desc: "A deck grouping title and content slides" }
   ];
 
   function toggleTemplates(): void {
