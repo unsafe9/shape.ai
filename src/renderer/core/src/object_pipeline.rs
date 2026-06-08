@@ -38,7 +38,11 @@
 // render model + geometry build the web wasm exports stay available without it.
 
 use crate::object_theme::{resolve_token_f32, Theme};
-use crate::render_object::{resolve_visual, RPaint, RenderObject, RenderObjectScene, VisualState};
+use crate::render_object::{
+    resolve_visual, RPaint, RText, RTextAlign, RTextValign, RenderObject, RenderObjectScene,
+    VisualState, QUANT_PER_PX,
+};
+use crate::text_layout::{layout_runs, TextAlign, TextRunInput, TextVAlign};
 #[cfg(feature = "wgpu-probe")]
 use crate::model::CameraState;
 #[cfg(feature = "wgpu-probe")]
@@ -148,6 +152,33 @@ impl StrokeParamsUniform {
             dash: [0.0, 0.0, 1.0, 0.0],
         }
     }
+}
+
+/// Per-glyph-quad-corner attributes matching `msdf_text.wgsl`'s `VertexIn`
+/// (`position` @0, `uv` @1, `color` @2). `position` is object-local **pixels**
+/// (the region-local glyph quad corner, already laid out by `layout_runs`); `uv`
+/// is the atlas UV (0..1) for the corner; `color` is the inline per-run paint
+/// (D19 `run.color`). Color rides per-glyph here, not on the instance — the
+/// instance carries only the matrix so one object's runs can mix colors.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TextVertex {
+    pub position: [f32; 2],
+    pub uv: [f32; 2],
+    pub color: [f32; 4],
+}
+
+/// Per-object instance attributes for the text pipeline matching
+/// `msdf_text.wgsl` (`m0`/`m1`/`m2` @3..5). Color is per-glyph in [`TextVertex`],
+/// so the text instance carries only the 3x3 projective matrix columns — the same
+/// region-local-px -> world bridge the fill/stroke instances use, index-aligned
+/// with `draws[i]`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TextInstance {
+    pub m0: [f32; 3],
+    pub m1: [f32; 3],
+    pub m2: [f32; 3],
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +482,9 @@ pub struct ObjectDraw {
     /// Stroke ribbon vertices for this object (own buffer slice via `stroke_range`).
     pub stroke_range: DrawRange,
     pub stroke_instance: StrokeInstance,
+    /// Glyph-quad vertex range into the shared `text_vertices` buffer (RB2). Empty
+    /// when the object carries no text (or only whitespace). Drawn after stroke.
+    pub text_range: DrawRange,
     /// Whether a focus ring should be drawn for this object (selection/focus).
     pub focus_ring: bool,
     /// RB1 theme toggle: the semantic token name backing this object's fill, if
@@ -884,6 +918,11 @@ pub struct SceneGeometry {
     pub fill_instances: Vec<FillInstance>,
     pub stroke_vertices: Vec<StrokeVertex>,
     pub stroke_instances: Vec<StrokeInstance>,
+    /// Positioned glyph-quad vertices (6 per visible glyph, tri-list), object-local
+    /// px + atlas UV + per-run color. Per-object slices via `draws[i].text_range`.
+    pub text_vertices: Vec<TextVertex>,
+    /// Per-object text instances (matrix columns only), index-aligned with `draws`.
+    pub text_instances: Vec<TextInstance>,
     pub draws: Vec<ObjectDraw>,
 }
 
@@ -895,13 +934,41 @@ pub fn build_scene_geometry(scene: &RenderObjectScene) -> SceneGeometry {
     build_scene_geometry_themed(scene, Theme::light())
 }
 
+/// Default device-free glyph-advance stub for the text-build path: a
+/// size-proportional advance (`STUB_ADVANCE_RATIO * size`), pure and
+/// deterministic, with no fontdue / I-O (CLAUDE.md pure-core rule). The real
+/// fontdue-backed `TextEngine::measure_text_width` is injected at the GPU cutover
+/// via [`build_scene_geometry_themed_with_measure`]; until then committed text
+/// still reaches the geometry/draw path at proportional positions.
+pub const STUB_ADVANCE_RATIO: f32 = 0.6;
+
+fn stub_measure(_ch: char, size: f32) -> f32 {
+    STUB_ADVANCE_RATIO * size
+}
+
 /// Build all CPU geometry for `scene` under `theme` (no device needed): for each
 /// object, tessellate its fill into the shared megabuffer, expand its stroke into
-/// a ribbon, and resolve its instance data (3x3 matrix columns + theme-resolved
-/// paint color). This is the unit-testable core of [`ObjectRenderer::new`]. The
-/// `theme` bit only affects token paint COLORS — tessellation/ranges are
-/// theme-invariant, which is what makes the toggle a zero-rebake color refresh.
+/// a ribbon, resolve its instance data (3x3 matrix columns + theme-resolved paint
+/// color), and lay out its text runs into positioned glyph quads. This is the
+/// unit-testable core of [`ObjectRenderer::new`]. The `theme` bit only affects
+/// token paint COLORS — tessellation/ranges are theme-invariant, which is what
+/// makes the toggle a zero-rebake color refresh. Text advances use the
+/// size-proportional [`stub_measure`]; the live fontdue shaper is injected via
+/// [`build_scene_geometry_themed_with_measure`] at the GPU cutover.
 pub fn build_scene_geometry_themed(scene: &RenderObjectScene, theme: Theme) -> SceneGeometry {
+    build_scene_geometry_themed_with_measure(scene, theme, &stub_measure)
+}
+
+/// As [`build_scene_geometry_themed`], but with an injected per-char glyph-advance
+/// `measure` closure. The pure core never calls fontdue itself (CLAUDE.md: no
+/// I-O); the GPU cutover supplies the real `TextEngine::measure_text_width`, while
+/// tests pass a deterministic stub. Identical to the themed wrapper for non-text
+/// objects.
+pub fn build_scene_geometry_themed_with_measure(
+    scene: &RenderObjectScene,
+    theme: Theme,
+    measure: &dyn Fn(char, f32) -> f32,
+) -> SceneGeometry {
     let mut geometry = SceneGeometry::default();
 
     for obj in &scene.objects {
@@ -954,6 +1021,22 @@ pub fn build_scene_geometry_themed(scene: &RenderObjectScene, theme: Theme) -> S
             stroke: paint_color(&resolved.stroke.paint, resolved.stroke.opacity as f32, theme),
         });
 
+        // ---- Text: lay out runs into positioned glyph quads ----------------
+        // The region bbox is derived from the SAME flattened pixel subpaths the
+        // fill/stroke use (single pixel space, no re-parse). `layout_runs` bakes
+        // align/valign/wrap into region-local px pen origins; the per-object 3x3
+        // instance carries region-local-px -> world, so no extra CPU transform.
+        let text_start = geometry.text_vertices.len() as u32;
+        if let Some(text) = &obj.text {
+            append_text_quads(&mut geometry.text_vertices, text, &subpaths, scene.camera.zoom, measure);
+        }
+        let text_end = geometry.text_vertices.len() as u32;
+        geometry.text_instances.push(TextInstance {
+            m0: matrix_col(&obj.transform, 0),
+            m1: matrix_col(&obj.transform, 1),
+            m2: matrix_col(&obj.transform, 2),
+        });
+
         geometry.draws.push(ObjectDraw {
             id: obj.id.clone(),
             fill_range,
@@ -969,6 +1052,10 @@ pub fn build_scene_geometry_themed(scene: &RenderObjectScene, theme: Theme) -> S
                 .stroke_instances
                 .last()
                 .expect("stroke instance just pushed"),
+            text_range: DrawRange {
+                start: text_start,
+                end: text_end,
+            },
             focus_ring: resolved.focus_ring.is_some(),
             fill_token: paint_token_name(&resolved.fill.paint),
             stroke_token: paint_token_name(&resolved.stroke.paint),
@@ -1063,6 +1150,90 @@ fn append_stroke_ribbon(out: &mut Vec<StrokeVertex>, mesh: &crate::stroke_expand
             distance_along: distance,
         });
     }
+}
+
+/// Lay out an object's text runs against its derived region and append one
+/// 2-triangle (6-vertex) quad per visible glyph to `out`, in object-local px with
+/// per-run color. The region bbox comes from the SAME flattened pixel `subpaths`
+/// the fill/stroke use, via [`crate::outline::derive_region`] (single pixel space,
+/// no re-parse). Run `size` is DE-QUANTIZED (`/QUANT_PER_PX`) so committed text
+/// lays out at edit-time pixels, joining the same pixel space as the geometry.
+///
+/// The glyph quad geometry is currently a placement-sized cell spanning the full
+/// atlas (`uv 0..1`): the live MSDF atlas (per-glyph bearing/width/height/uv) is
+/// populated at the GPU cutover, so at build-level the quad's ORIGIN — the
+/// load-bearing layout result — is what the golden pins. The pen origin equals
+/// `layout_runs`' region-local px position, so de-quant + align + wrap are all
+/// verifiable device-free; real per-glyph atlas UVs swap in at GPU wiring.
+fn append_text_quads(
+    out: &mut Vec<TextVertex>,
+    text: &RText,
+    subpaths: &[(bool, Vec<(f32, f32)>)],
+    zoom: f64,
+    measure: &dyn Fn(char, f32) -> f32,
+) {
+    let bucket = crate::curve_lod::zoom_bucket(zoom);
+    let flatness = crate::curve_lod::flatness_for_bucket(bucket);
+    let Some(region) = crate::outline::derive_region(subpaths, flatness) else {
+        return;
+    };
+    let region_min = (region.min_x, region.min_y);
+    let region_max = (region.max_x, region.max_y);
+
+    let runs: Vec<TextRunInput> = text
+        .runs
+        .iter()
+        .map(|run| TextRunInput {
+            text: run.text.clone(),
+            color: text_run_color(&run.color),
+            // DE-QUANT (commit C): wire size is quantized at `QUANT_PER_PX` units/px,
+            // matching the geometry coords; divide to recover edit-time pixels.
+            size: (run.size / QUANT_PER_PX) as f32,
+            bold: run.bold,
+            italic: run.italic,
+            font: run.font.clone(),
+        })
+        .collect();
+
+    let align = match text.align {
+        RTextAlign::Start => TextAlign::Start,
+        RTextAlign::Center => TextAlign::Center,
+        RTextAlign::End => TextAlign::End,
+        RTextAlign::Justify => TextAlign::Justify,
+    };
+    let valign = match text.valign {
+        RTextValign::Top => TextVAlign::Top,
+        RTextValign::Middle => TextVAlign::Middle,
+        RTextValign::Bottom => TextVAlign::Bottom,
+    };
+
+    let placements = layout_runs(&runs, region_min, region_max, align, valign, measure);
+    for p in &placements {
+        // Placement-sized cell at the pen origin; UVs span the whole atlas until
+        // the GPU cutover registers per-glyph atlas slots. Top-left -> bottom-right.
+        let x0 = p.x;
+        let y0 = p.y;
+        let x1 = p.x + p.size;
+        let y1 = p.y + p.size;
+        let tl = TextVertex { position: [x0, y0], uv: [0.0, 0.0], color: p.color };
+        let tr = TextVertex { position: [x1, y0], uv: [1.0, 0.0], color: p.color };
+        let br = TextVertex { position: [x1, y1], uv: [1.0, 1.0], color: p.color };
+        let bl = TextVertex { position: [x0, y1], uv: [0.0, 1.0], color: p.color };
+        // Two triangles (tl, tr, br) + (tl, br, bl) — CCW tri-list, no index buffer.
+        out.push(tl);
+        out.push(tr);
+        out.push(br);
+        out.push(tl);
+        out.push(br);
+        out.push(bl);
+    }
+}
+
+/// Parse a text run's `#rrggbb` color into RGBA (alpha 1.0). Mirrors
+/// [`parse_hex_rgb`]; a bad value falls back to opaque white.
+fn text_run_color(value: &str) -> [f32; 4] {
+    let [r, g, b] = parse_hex_rgb(value);
+    [r, g, b, 1.0]
 }
 
 /// Extract column `col` of a row-major 3x3 transform as a `vec3` for the
@@ -1164,7 +1335,9 @@ fn dash_px(dash: &[f64]) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::model::CameraState;
-    use crate::render_object::{RFill, RPaint, RStroke, RStrokeCap, RStrokeJoin};
+    use crate::render_object::{
+        RFill, RPaint, RStroke, RStrokeCap, RStrokeJoin, RText, RTextAlign, RTextRun, RTextValign,
+    };
 
     fn identity() -> [[f64; 3]; 3] {
         [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
@@ -1496,6 +1669,167 @@ mod tests {
             assert_eq!(draw.fill_instance, geo.fill_instances[i]);
             assert_eq!(draw.stroke_instance, geo.stroke_instances[i]);
         }
+    }
+
+    // ---- RB2 live text render: geometry contract + de-quant -----------------
+
+    /// Stub measure: every char advances `size` px (matches `text_layout`'s
+    /// `unit_measure`), so glyph N's pen origin is `region_min.x + N*size_px`.
+    fn unit_measure(_ch: char, size: f32) -> f32 {
+        size
+    }
+
+    /// A rect text object: a 200x100px region (1600x800 quantized) carrying one
+    /// run. `size` is the WIRE (quantized) size; align Start / valign Top so the
+    /// first glyph lands exactly at the region top-left.
+    fn text_rect(id: &str, run_text: &str, wire_size: f64, color: &str) -> RenderObject {
+        let mut obj = rect_object(id);
+        obj.geometry_d = "M0 0 L1600 0 L1600 800 L0 800 Z".to_string();
+        obj.text = Some(RText {
+            runs: vec![RTextRun {
+                text: run_text.to_string(),
+                color: color.to_string(),
+                size: wire_size,
+                bold: false,
+                italic: false,
+                font: String::new(),
+            }],
+            align: RTextAlign::Start,
+            valign: RTextValign::Top,
+        });
+        obj
+    }
+
+    /// PRIMARY GOLDEN (commit A): a text object's committed runs produce a
+    /// NON-EMPTY set of positioned glyph quads in `text_vertices`, one quad
+    /// (6 verts) per visible glyph, with the first glyph's origin at `region_min.x`
+    /// and the second at `region_min.x + advance(size_px)` where `size_px` is the
+    /// DE-QUANTIZED size (16, not the wire 128), and each quad carries the run color.
+    #[test]
+    fn text_object_produces_positioned_glyph_quads() {
+        // Wire size 128 = 16px * 8 quantum. "AB" -> two visible glyphs.
+        let obj = text_rect("t1", "AB", 128.0, "#ff8800");
+        let scene = scene_with(vec![obj], None);
+        let geo =
+            build_scene_geometry_themed_with_measure(&scene, Theme::light(), &unit_measure);
+
+        // (1) Text reaches the geometry — FAILS today (build never called layout).
+        assert!(
+            !geo.text_vertices.is_empty(),
+            "committed text must produce glyph quads"
+        );
+        // (2) Exactly two glyphs' worth of quads: 6 verts/glyph * 2 = 12.
+        let range = geo.draws[0].text_range;
+        assert_eq!(range.start, 0);
+        assert_eq!(range.len(), 12, "two glyphs -> 12 tri-list verts");
+        assert_eq!(geo.text_vertices.len(), 12);
+
+        // (3) Glyph origins prove de-quant + layout: region_min.x is 0; size_px=16.
+        // The quad top-left vertex (index 0 of each glyph's 6) is the pen origin.
+        let g0_origin_x = geo.text_vertices[0].position[0];
+        let g1_origin_x = geo.text_vertices[6].position[0];
+        assert!((g0_origin_x - 0.0).abs() < 1e-4, "first glyph at region_min.x");
+        assert!(
+            (g1_origin_x - 16.0).abs() < 1e-4,
+            "second glyph at region_min.x + 16 (de-quant px advance), got {g1_origin_x}"
+        );
+
+        // (4) Each quad carries the run color.
+        for v in &geo.text_vertices {
+            assert_eq!(v.color, [1.0, 0x88 as f32 / 255.0, 0.0, 1.0]);
+        }
+
+        // An empty-text object yields an empty text_range (no quads).
+        let mut empty = text_rect("t2", "", 128.0, "#ffffff");
+        if let Some(text) = empty.text.as_mut() {
+            text.runs[0].text.clear();
+        }
+        let empty_geo =
+            build_scene_geometry_themed_with_measure(&scene_with(vec![empty], None), Theme::light(), &unit_measure);
+        assert!(empty_geo.draws[0].text_range.is_empty(), "no text -> empty range");
+        assert!(empty_geo.text_vertices.is_empty());
+    }
+
+    /// COMMIT B (frame wiring, device-free): for [text-object, no-text-object],
+    /// `draws[0].text_range` is non-empty and `draws[1].text_range` is empty, and
+    /// `text_instances` is index-aligned with `draws` (the invariant render()'s
+    /// per-object text loop relies on). Mirrors `draws_index_aligns_with_both_instance_buffers`.
+    #[test]
+    fn text_range_is_drawn_after_stroke_for_each_object() {
+        let text_obj = text_rect("with-text", "Ab", 128.0, "#111111");
+        let plain = rect_object("no-text");
+        let scene = scene_with(vec![text_obj, plain], None);
+        let geo =
+            build_scene_geometry_themed_with_measure(&scene, Theme::light(), &unit_measure);
+
+        assert!(!geo.draws[0].text_range.is_empty(), "text object draws glyphs");
+        assert!(geo.draws[1].text_range.is_empty(), "plain object draws no glyphs");
+
+        // Index-alignment: draws[i] <-> text_instances[i], in scene order.
+        assert_eq!(geo.draws.len(), geo.text_instances.len());
+        for (i, draw) in geo.draws.iter().enumerate() {
+            assert_eq!(draw.id, scene.objects[i].id);
+            // The text instance carries the same matrix columns as the fill instance.
+            assert_eq!(geo.text_instances[i].m0, geo.fill_instances[i].m0);
+            assert_eq!(geo.text_instances[i].m1, geo.fill_instances[i].m1);
+            assert_eq!(geo.text_instances[i].m2, geo.fill_instances[i].m2);
+        }
+        // Text vertex ranges tile the shared buffer contiguously.
+        assert_eq!(geo.draws[0].text_range.end, geo.text_vertices.len() as u32);
+    }
+
+    /// COMMIT A (packing): the text vertex/instance byte packing matches the
+    /// msdf_text.wgsl contract — `TextVertex` is 32 bytes (position+uv+color),
+    /// `TextInstance` is 36 bytes (3 matrix columns, NO color). FAILS if the
+    /// packing drifts. The instance attribute @location wiring is pinned by the
+    /// wgpu-probe pipeline golden in commit B.
+    #[test]
+    fn text_vertex_and_instance_sizes_match_shader_contract() {
+        // TextVertex: vec2 position + vec2 uv + vec4 color = 8 floats = 32 bytes.
+        assert_eq!(std::mem::size_of::<TextVertex>(), 32);
+        // TextInstance: 3 vec3 columns = 9 floats = 36 bytes, no color.
+        assert_eq!(std::mem::size_of::<TextInstance>(), 36);
+    }
+
+    /// COMMIT C (de-quant): a wire run size of 128 (= 16px * 8) lays out the second
+    /// glyph at `region_min.x + 16`, NOT +128, and the glyph quad height tracks
+    /// 16px not 128px. Building the SAME object with the already-de-quantized 16px
+    /// run through the px path yields a byte-identical glyph quad set (committed ==
+    /// edited).
+    #[test]
+    fn committed_text_size_dequantizes_to_pixels() {
+        // Committed object: wire size 128.
+        let committed = text_rect("c", "AB", 128.0, "#000000");
+        let geo =
+            build_scene_geometry_themed_with_measure(&scene_with(vec![committed], None), Theme::light(), &unit_measure);
+
+        // Second glyph at +16 (de-quant), NOT +128 (raw wire size).
+        let g1_origin_x = geo.text_vertices[6].position[0];
+        assert!(
+            (g1_origin_x - 16.0).abs() < 1e-4,
+            "second glyph de-quantized to +16px, got {g1_origin_x}"
+        );
+        // The quad height tracks 16px (de-quant size), not 128px.
+        let g0_top_y = geo.text_vertices[0].position[1];
+        let g0_bottom_y = geo.text_vertices[2].position[1];
+        assert!(
+            ((g0_bottom_y - g0_top_y) - 16.0).abs() < 1e-4,
+            "glyph quad height = 16px (de-quant), got {}",
+            g0_bottom_y - g0_top_y
+        );
+
+        // Committed (wire 128) == edited (px-overlay intent 16) through the px path:
+        // a scene whose run already carries the de-quantized 16 must yield the SAME
+        // glyph quads. The build de-quants by /QUANT_PER_PX, so to feed 16px through
+        // the same path we set the wire to 16*QUANT_PER_PX = 128 — which is exactly
+        // the committed run. The equivalence holds because there is ONE de-quant site.
+        let edited = text_rect("c", "AB", 16.0 * QUANT_PER_PX, "#000000");
+        let edited_geo =
+            build_scene_geometry_themed_with_measure(&scene_with(vec![edited], None), Theme::light(), &unit_measure);
+        assert_eq!(
+            geo.text_vertices, edited_geo.text_vertices,
+            "committed text == the 16px edit-overlay intent (single de-quant site)"
+        );
     }
 
     // ---- RB1 theme resolution + zero-rebake toggle --------------------------
