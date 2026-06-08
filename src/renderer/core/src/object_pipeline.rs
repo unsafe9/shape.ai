@@ -116,9 +116,9 @@ pub struct FillInstance {
 
 /// Per-vertex drop-shadow attributes matching `object_shadow.wgsl`'s `VertexIn`
 /// (`position` @0, `feather` @1). Positions are object-local **pixels** (the
-/// region bbox expanded by the blur radius and offset by the drop-shadow offset);
-/// `feather` is the per-vertex 0..1 blur falloff (0 at the shadow core, 1 at the
-/// soft outer edge) the FS turns into the soft Gaussian-ish tail.
+/// object's own fill silhouette translated by the drop-shadow offset); `feather`
+/// is the per-vertex 0..1 blur falloff, uniformly `0` for the flat offset
+/// silhouette (the FS falloff is then 1) — a soft blur is the GPU-cutover residual.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowVertex {
@@ -752,12 +752,10 @@ pub struct ObjectDraw {
 /// translucent (dark mode) with the theme bit (zero-rebake color refresh, P4).
 const SHADOW_TOKEN: &str = "shadow";
 
-/// RB3 drop-shadow geometry constants (object-local px). The shadow is the region
-/// bbox offset down-right by [`SHADOW_OFFSET_PX`] and expanded by
-/// [`SHADOW_BLUR_PX`] on every side; the expanded margin carries the per-vertex
-/// `feather` blur falloff (0 at the core rect, 1 at the outer edge).
+/// RB3 drop-shadow geometry constant (object-local px). The shadow is the
+/// object's OWN fill silhouette translated down-right by [`SHADOW_OFFSET_PX`]; a
+/// soft blur is the GPU-cutover residual, not a CPU feather ring.
 const SHADOW_OFFSET_PX: f32 = 2.0;
-const SHADOW_BLUR_PX: f32 = 6.0;
 
 /// Owns the CPU-built object draw data and the GPU buffers it uploads to, and
 /// records the object render pass.
@@ -1498,13 +1496,14 @@ pub fn build_scene_geometry_themed_with_measure(
             fill: paint_color(&resolved.fill.paint, resolved.fill.opacity as f32, theme),
         });
 
-        // ---- Shadow: a feathered quad beneath the object (RB3 #11) ---------
-        // The shadow rect is the object's region bbox (same flattened pixel subpaths
-        // as fill/stroke) offset + expanded by the blur radius. Its color is the
-        // theme `shadow` token, NEVER hardcoded — so a theme flip is a per-instance
-        // color refresh, the geometry stays put (zero rebake, P4).
+        // ---- Shadow: an offset copy of the fill silhouette (RB3 #11) -------
+        // The shadow REUSES the object's own fill `mesh` (the exact, hole-aware,
+        // concavity-correct region triangulation), translated down-right by the
+        // drop offset and drawn beneath the fill. Its color is the theme `shadow`
+        // token, NEVER hardcoded — so a theme flip is a per-instance color refresh,
+        // the geometry stays put (zero rebake, P4). No extra tessellation.
         let shadow_start = geometry.shadow_vertices.len() as u32;
-        append_shadow_quad(&mut geometry.shadow_vertices, &subpaths, scene.camera.zoom);
+        append_shadow_quad(&mut geometry.shadow_vertices, &mesh);
         let shadow_end = geometry.shadow_vertices.len() as u32;
         geometry.shadow_instances.push(ShadowInstance {
             m0: matrix_col(&obj.transform, 0),
@@ -1658,150 +1657,30 @@ fn flatten_object_subpaths(obj: &RenderObject, zoom: f64) -> Vec<(bool, Vec<(f32
     out
 }
 
-/// Append one object's drop-shadow geometry (RB3 #11) to `out`: a soft macOS-
-/// style blurred silhouette beneath the object. The shadow follows the object's
-/// **actual region outline** (the flattened boundary polygon from
-/// [`crate::outline::derive_region`], derived from the SAME flattened pixel
-/// `subpaths` as fill/stroke/text — single pixel space, no re-parse), shifted
-/// down-right by [`SHADOW_OFFSET_PX`]. It is built as two parts: a solid core fan
-/// over the offset outline (every vertex `feather = 0` -> full shadow alpha) plus a
-/// feather ring extruded [`SHADOW_BLUR_PX`] outward along each edge's outward
-/// normal (inner edge `feather = 0`, outer edge `feather = 1` -> the FS fades the
-/// alpha to 0). So a non-rectangular object (ellipse/freehand/open) casts a shadow
-/// matching its shape, not a rectangle. Baked once with the geometry (zero
-/// per-frame re-tessellation; theme flip only refreshes the instance color).
+/// Append one object's drop-shadow geometry (RB3 #11) to `out`: a clean OFFSET
+/// SILHOUETTE beneath the object. The shadow REUSES the object's OWN fill `mesh`
+/// (the exact region triangulation lyon already produced for the fill — concave,
+/// curved, and hole-aware for free), expanding each indexed triangle into a flat
+/// triangle list with every vertex translated down-right by [`SHADOW_OFFSET_PX`]
+/// and `feather = 0` (a flat, fully-opaque silhouette in the FS). So ANY geometry
+/// (convex/concave/curved/open) casts a shadow matching its EXACT shape, with no
+/// faceting — the old per-edge feather ring + centroid fan self-intersected on
+/// curves and concavities and is gone. Baked once with the geometry (zero
+/// per-frame re-tessellation: this is just a triangle-list copy of an
+/// already-tessellated mesh with a constant offset). A soft blur stays the
+/// GPU-cutover residual.
 ///
-/// A degenerate outline (`< 3` vertices — e.g. an open polyline that collapses to a
-/// segment) has no silhouette interior, so it falls back to the offset AABB
-/// 9-patch. Objects with no boundable region (degenerate geometry) emit nothing,
-/// so their `shadow_range` stays empty.
-fn append_shadow_quad(
-    out: &mut Vec<ShadowVertex>,
-    subpaths: &[(bool, Vec<(f32, f32)>)],
-    zoom: f64,
-) {
-    let bucket = crate::curve_lod::zoom_bucket(zoom);
-    let flatness = crate::curve_lod::flatness_for_bucket(bucket);
-    let Some(region) = crate::outline::derive_region(subpaths, flatness) else {
-        return;
-    };
-
-    // A real silhouette needs a fillable interior; a degenerate outline (open
-    // segment / collinear) has none, so keep the offset-AABB 9-patch for it.
-    if region.outline.len() < 3 {
-        append_shadow_aabb_9patch(out, &region);
-        return;
+/// An empty fill mesh (an open polyline / no fillable interior) casts nothing, so
+/// the object's `shadow_range` stays empty — matching the fill's "no boundable
+/// region emits nothing" contract.
+fn append_shadow_quad(out: &mut Vec<ShadowVertex>, mesh: &crate::tessellate::Mesh) {
+    for &index in &mesh.indices {
+        let p = mesh.vertices[index as usize];
+        out.push(ShadowVertex {
+            position: [p[0] + SHADOW_OFFSET_PX, p[1] + SHADOW_OFFSET_PX],
+            feather: 0.0,
+        });
     }
-
-    // The offset silhouette (down-right by the drop-shadow offset), wound CCW so
-    // the outward normal of edge (a -> b) is the right-hand perpendicular.
-    let mut poly: Vec<[f32; 2]> = region
-        .outline
-        .iter()
-        .map(|&(x, y)| [x + SHADOW_OFFSET_PX, y + SHADOW_OFFSET_PX])
-        .collect();
-    if polygon_signed_area(&poly) < 0.0 {
-        poly.reverse();
-    }
-
-    // Core fan: feather 0 across the whole silhouette interior. The centroid keeps
-    // the fan valid for non-convex outlines far better than a fixed vertex.
-    let cx = poly.iter().map(|p| p[0]).sum::<f32>() / poly.len() as f32;
-    let cy = poly.iter().map(|p| p[1]).sum::<f32>() / poly.len() as f32;
-    let center = ShadowVertex { position: [cx, cy], feather: 0.0 };
-    let n = poly.len();
-    for i in 0..n {
-        let a = ShadowVertex { position: poly[i], feather: 0.0 };
-        let b = ShadowVertex { position: poly[(i + 1) % n], feather: 0.0 };
-        out.push(center);
-        out.push(a);
-        out.push(b);
-    }
-
-    // Feather ring: extrude each edge outward by the blur radius along its outward
-    // normal. Inner edge feather 0 (joins the solid core), outer edge feather 1.
-    for i in 0..n {
-        let a = poly[i];
-        let b = poly[(i + 1) % n];
-        let ex = b[0] - a[0];
-        let ey = b[1] - a[1];
-        let len = (ex * ex + ey * ey).sqrt();
-        if len <= f32::EPSILON {
-            continue;
-        }
-        // Right-hand normal of a CCW polygon points outward.
-        let nx = ey / len * SHADOW_BLUR_PX;
-        let ny = -ex / len * SHADOW_BLUR_PX;
-        let ai = ShadowVertex { position: a, feather: 0.0 };
-        let bi = ShadowVertex { position: b, feather: 0.0 };
-        let ao = ShadowVertex { position: [a[0] + nx, a[1] + ny], feather: 1.0 };
-        let bo = ShadowVertex { position: [b[0] + nx, b[1] + ny], feather: 1.0 };
-        out.push(ai);
-        out.push(bi);
-        out.push(bo);
-        out.push(ai);
-        out.push(bo);
-        out.push(ao);
-    }
-}
-
-/// The legacy offset-AABB 9-patch shadow, kept as the fallback for a degenerate
-/// outline (no fillable interior). Core rect = region bbox shifted by
-/// [`SHADOW_OFFSET_PX`]; an outer ring expanded by [`SHADOW_BLUR_PX`] ramps
-/// `feather` 0 -> 1.
-fn append_shadow_aabb_9patch(out: &mut Vec<ShadowVertex>, region: &crate::outline::Region) {
-    let cx0 = region.min_x + SHADOW_OFFSET_PX;
-    let cy0 = region.min_y + SHADOW_OFFSET_PX;
-    let cx1 = region.max_x + SHADOW_OFFSET_PX;
-    let cy1 = region.max_y + SHADOW_OFFSET_PX;
-    let ox0 = cx0 - SHADOW_BLUR_PX;
-    let oy0 = cy0 - SHADOW_BLUR_PX;
-    let ox1 = cx1 + SHADOW_BLUR_PX;
-    let oy1 = cy1 + SHADOW_BLUR_PX;
-
-    let xs = [ox0, cx0, cx1, ox1];
-    let ys = [oy0, cy0, cy1, oy1];
-    let fx = [1.0f32, 0.0, 0.0, 1.0];
-    let fy = [1.0f32, 0.0, 0.0, 1.0];
-
-    for r in 0..3 {
-        for c in 0..3 {
-            let x0 = xs[c];
-            let x1 = xs[c + 1];
-            let y0 = ys[r];
-            let y1 = ys[r + 1];
-            let f00 = fx[c].max(fy[r]);
-            let f10 = fx[c + 1].max(fy[r]);
-            let f11 = fx[c + 1].max(fy[r + 1]);
-            let f01 = fx[c].max(fy[r + 1]);
-            let tl = ShadowVertex { position: [x0, y0], feather: f00 };
-            let tr = ShadowVertex { position: [x1, y0], feather: f10 };
-            let br = ShadowVertex { position: [x1, y1], feather: f11 };
-            let bl = ShadowVertex { position: [x0, y1], feather: f01 };
-            out.push(tl);
-            out.push(tr);
-            out.push(br);
-            out.push(tl);
-            out.push(br);
-            out.push(bl);
-        }
-    }
-}
-
-/// Shoelace signed area of a closed polygon (`> 0` CCW in a y-down pixel space's
-/// math convention). Used only to normalize the shadow silhouette winding so each
-/// edge's right-hand normal points outward.
-fn polygon_signed_area(poly: &[[f32; 2]]) -> f32 {
-    if poly.len() < 3 {
-        return 0.0;
-    }
-    let mut sum = 0.0_f32;
-    for i in 0..poly.len() {
-        let a = poly[i];
-        let b = poly[(i + 1) % poly.len()];
-        sum += a[0] * b[1] - b[0] * a[1];
-    }
-    sum * 0.5
 }
 
 /// Append a stroke ribbon `mesh` (triangle-list of `[x,y]` positions) as
@@ -2962,7 +2841,7 @@ mod tests {
 
         assert_eq!(light.draws.len(), 2);
         assert_eq!(light.shadow_instances.len(), 2);
-        // (1) Every object emits a non-empty shadow primitive (the 9-patch quad).
+        // (1) Every object emits a non-empty shadow primitive (the offset silhouette).
         for draw in &light.draws {
             assert!(
                 !draw.shadow_range.is_empty(),
@@ -3018,32 +2897,103 @@ mod tests {
         }
     }
 
-    /// The outline shadow has a SOLID core (feather 0) AND a soft outer edge
-    /// (feather 1): a real blurred silhouette, not a flat block. Fails if the
-    /// feather collapses to a single value (no falloff to approximate the blur).
+    /// The shadow is a FLAT offset silhouette of the object's OWN fill mesh: every
+    /// vertex `feather == 0`, and the shadow triangle list is exactly the fill
+    /// triangulation (count == fill `triangle_count * 3`), translated by the drop
+    /// offset. Fails if the old feather ring (`feather == 1` verts) or centroid fan
+    /// (extra non-fill triangles) is reintroduced.
     #[test]
-    fn shadow_quad_has_solid_core_and_feathered_edge() {
+    fn shadow_quad_is_flat_offset_copy_of_fill_mesh() {
         let scene = scene_with(vec![rect_object("o1")], None);
         let geo = build_scene_geometry(&scene);
         let verts = &geo.shadow_vertices;
         assert!(!verts.is_empty());
-        // Outline-following: a 4-vertex rect outline = 4 core fan tris (12 verts)
-        // + 4 feather-ring quads (24 verts) = 36 tri-list verts.
-        assert_eq!(verts.len(), 36, "rect outline shadow = 4 core tris + 4 ring quads");
 
-        let min_f = verts.iter().map(|v| v.feather).fold(f32::INFINITY, f32::min);
-        let max_f = verts.iter().map(|v| v.feather).fold(f32::NEG_INFINITY, f32::max);
-        assert!((min_f - 0.0).abs() < 1e-6, "core verts feather to 0 (solid)");
-        assert!((max_f - 1.0).abs() < 1e-6, "outer ring verts feather to 1 (soft)");
+        // The shadow vertex count equals the fill mesh's triangle list (3 verts/tri).
+        let subpaths = flatten_object_subpaths(&scene.objects[0], scene.camera.zoom);
+        let fill_input: Vec<(bool, Vec<(f32, f32)>)> =
+            subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();
+        let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
+        assert!(!mesh.indices.is_empty());
+        assert_eq!(
+            verts.len(),
+            mesh.indices.len(),
+            "offset-silhouette shadow == fill triangle list (no core fan / feather ring)"
+        );
+
+        // Flat silhouette: NO feather ramp at all (the FS falloff is uniformly 1).
+        assert!(
+            verts.iter().all(|v| v.feather == 0.0),
+            "offset-silhouette shadow is flat (feather 0); the feather ring is gone"
+        );
     }
 
-    /// RB3 EXACT OUTLINE (the GPU-cutover residual): a non-rectangular object casts
-    /// a shadow that follows its real path silhouette, NOT the axis-aligned bbox. We
-    /// build an ellipse (four cubic arcs) and assert the shadow's SOLID-CORE
-    /// (feather-0) vertices hug the curve — none of them sit in a bbox CORNER region,
-    /// which the curve never reaches. The old AABB 9-patch placed core vertices
-    /// exactly on the offset bbox corners, so this assertion FAILS against the
-    /// pre-change behavior.
+    /// CONCAVE shape (an arrowhead with a reflex vertex): the shadow is the EXACT
+    /// offset copy of the object's own fill triangulation — every triangle
+    /// translated by the drop offset, as a multiset (triangle order is an impl
+    /// detail). This FAILS on the old centroid-fan + feather-ring build, which
+    /// emitted a centroid apex and `feather == 1` ring verts that are NOT in the
+    /// offset fill mesh, self-intersecting into the faceted gray mess the user saw.
+    #[test]
+    fn shadow_is_exact_offset_copy_of_fill_mesh_for_concave_shape() {
+        // A concave arrowhead: the reflex vertex at (300,400) is what makes a
+        // centroid fan invalid (the centroid lies outside the silhouette).
+        let mut obj = rect_object("arrow");
+        obj.geometry_d = "M0 0 L800 400 L0 800 L300 400 Z".to_string();
+        let scene = scene_with(vec![obj], None);
+        let geo = build_scene_geometry(&scene);
+
+        // Recompute the object's own fill mesh the same way the pipeline does.
+        let subpaths = flatten_object_subpaths(&scene.objects[0], scene.camera.zoom);
+        let fill_input: Vec<(bool, Vec<(f32, f32)>)> =
+            subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();
+        let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
+        assert!(!mesh.indices.is_empty(), "concave arrow has a fillable interior");
+
+        // (1) Flat silhouette: every vertex feather == 0 (no ring/falloff).
+        assert!(
+            geo.shadow_vertices.iter().all(|v| v.feather == 0.0),
+            "offset-silhouette shadow is flat (feather 0); the feather ring is gone"
+        );
+
+        // (2) Shadow vertex set == fill mesh triangles, each translated by the drop
+        // offset. Compare as multisets — triangle emission order is an impl detail.
+        let mut expected: Vec<[f32; 2]> = mesh
+            .indices
+            .iter()
+            .map(|&i| mesh.vertices[i as usize])
+            .map(|p| [p[0] + SHADOW_OFFSET_PX, p[1] + SHADOW_OFFSET_PX])
+            .collect();
+        let mut got: Vec<[f32; 2]> = geo.shadow_vertices.iter().map(|v| v.position).collect();
+        let key = |v: &[f32; 2]| (v[0].to_bits(), v[1].to_bits());
+        expected.sort_by_key(key);
+        got.sort_by_key(key);
+        assert_eq!(
+            got, expected,
+            "shadow == fill triangulation translated by the drop offset (exact, no faceting)"
+        );
+
+        // (3) Regression guard against the centroid fan: NO shadow vertex sits at
+        // the offset polygon CENTROID (the old core-fan apex), which for this
+        // concave shape lies outside the silhouette and produced overlapping facets.
+        let outline: Vec<(f32, f32)> = subpaths[0].1.clone();
+        let cx = outline.iter().map(|p| p.0).sum::<f32>() / outline.len() as f32 + SHADOW_OFFSET_PX;
+        let cy = outline.iter().map(|p| p.1).sum::<f32>() / outline.len() as f32 + SHADOW_OFFSET_PX;
+        assert!(
+            !geo
+                .shadow_vertices
+                .iter()
+                .any(|v| (v.position[0] - cx).abs() < 1e-3 && (v.position[1] - cy).abs() < 1e-3),
+            "no shadow vertex sits at the outline centroid (the old core-fan apex)"
+        );
+    }
+
+    /// RB3 EXACT OUTLINE: a non-rectangular object casts a shadow that follows its
+    /// real path silhouette, NOT the axis-aligned bbox. We build an ellipse (four
+    /// cubic arcs) and assert the offset fill-mesh shadow vertices hug the curve —
+    /// none sit in a bbox CORNER region, which the curve never reaches. A 4-corner
+    /// AABB quad would place vertices exactly on the offset bbox corners, so this
+    /// assertion FAILS for a bbox shadow.
     #[test]
     fn nonrectangular_shadow_follows_path_outline_not_aabb() {
         // An ellipse centered at (400,400), rx=ry=400 quantized units (50px @ 8/px),
@@ -3059,7 +3009,7 @@ mod tests {
 
         // Region bbox in pixels (geometry de-quantizes at 8 units/px): ~0..100.
         // Offset down-right by SHADOW_OFFSET_PX, the four bbox corners are the
-        // points the OLD AABB shadow's core touched.
+        // points a bbox-quad shadow would touch.
         let region = crate::outline::derive_region(
             &flatten_object_subpaths(&scene.objects[0], 1.0),
             crate::curve_lod::flatness_for_bucket(crate::curve_lod::zoom_bucket(1.0)),
@@ -3076,33 +3026,32 @@ mod tests {
             [min_x, max_y],
         ];
 
-        // No SOLID-CORE (feather 0) shadow vertex may coincide with a bbox corner:
-        // the ellipse silhouette pulls inward at every corner. Distance margin is a
-        // generous fraction of the radius so a flattened-curve vertex near (but not
-        // at) a corner still counts as "off the corner".
+        // No shadow vertex may coincide with a bbox corner: the ellipse silhouette
+        // (and its interior triangulation) pulls inward at every corner. Distance
+        // margin is a generous fraction of the radius so a flattened-curve vertex
+        // near (but not at) a corner still counts as "off the corner".
         let corner_margin = (max_x - min_x) * 0.1;
-        for v in verts.iter().filter(|v| v.feather == 0.0) {
+        for v in verts.iter() {
             for c in &bbox_corners {
                 let d = ((v.position[0] - c[0]).powi(2) + (v.position[1] - c[1]).powi(2)).sqrt();
                 assert!(
                     d > corner_margin,
-                    "core shadow vertex {:?} sits on bbox corner {:?} (AABB shadow, not outline)",
+                    "shadow vertex {:?} sits on bbox corner {:?} (bbox shadow, not silhouette)",
                     v.position,
                     c
                 );
             }
         }
 
-        // And the silhouette is genuinely curved: the offset-outline core spans many
+        // And the silhouette is genuinely curved: the offset fill mesh spans many
         // more than a rect's 4 vertices, so the shadow is not a 4-corner quad.
-        let core_positions: std::collections::BTreeSet<[u32; 2]> = verts
+        let positions: std::collections::BTreeSet<[u32; 2]> = verts
             .iter()
-            .filter(|v| v.feather == 0.0)
             .map(|v| [v.position[0].to_bits(), v.position[1].to_bits()])
             .collect();
         assert!(
-            core_positions.len() > 8,
-            "ellipse outline shadow has many curved core vertices, not 4 bbox corners"
+            positions.len() > 8,
+            "ellipse silhouette shadow has many curved vertices, not 4 bbox corners"
         );
     }
 

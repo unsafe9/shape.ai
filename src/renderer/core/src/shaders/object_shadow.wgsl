@@ -1,18 +1,19 @@
 // OB-3 object drop-shadow shader (RB3 #11 + D2 + D7 projective transform).
 //
-// A soft macOS-style drop shadow drawn BENEATH every object's fill. The shadow is
-// a feathered quad covering the object's region bbox, expanded by a blur radius
-// and offset by the drop-shadow offset on the CPU (see `object_pipeline.rs`). The
-// shadow COLOR is the theme `shadow` token (RB1) carried inline per-instance, so a
-// theme flip is a per-instance color refresh, never a re-tessellation.
+// A drop shadow drawn BENEATH every object's fill. The shadow is the object's OWN
+// fill silhouette (the exact region triangulation) translated by the drop-shadow
+// offset on the CPU (see `object_pipeline.rs`) — a clean offset copy for any
+// geometry, with no faceting. The shadow COLOR is the theme `shadow` token (RB1)
+// carried inline per-instance, so a theme flip is a per-instance color refresh,
+// never a re-tessellation. A soft blur is the GPU-cutover residual.
 //
 // Pipeline contract (compiled by wgpu at the OB-4 cutover; structurally validated
 // only here — there is no device in the CPU test environment). Shares the camera
 // uniform + projective per-object matrix convention with `object_fill.wgsl`.
 //
-//   - `feather` is a per-vertex 0..1 term: 0 at the inner (solid) edge of the
-//     shadow's core, 1 at the outer soft edge. The FS turns it into a smooth blur
-//     falloff, approximating a Gaussian drop shadow without a separate blur pass.
+//   - `feather` is a per-vertex 0..1 term, uniformly 0 for the flat offset
+//     silhouette (the FS falloff is then 1 -> a flat translucent shadow). The slot
+//     stays so a real soft-blur pass can ramp it at the GPU cutover.
 
 struct View {
   camera: vec4<f32>,
