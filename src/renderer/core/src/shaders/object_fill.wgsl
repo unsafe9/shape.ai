@@ -26,11 +26,12 @@ struct View {
 @group(0) @binding(0)
 var<uniform> view: View;
 
-// Per-vertex: object-local position (CSS px) and a signed edge-distance helper.
-// `edge` is a per-vertex scalar that is +1 at the triangle's silhouette edge
-// vertex and 0 at interior vertices; interpolated, |edge| approaches 0 at the
-// shape boundary, giving us a cheap analytic coverage term without a full SDF.
-// Tessellation (lyon) fills this on the CPU; interior fans get edge = 0.
+// Per-vertex: object-local position (CSS px) and a silhouette coverage helper.
+// `edge` is a per-vertex scalar that is 1 at a boundary (silhouette) vertex and 0
+// at interior vertices; interpolated, it rises from 0 across the interior toward 1
+// at the shape boundary, giving us a cheap analytic coverage term without a full
+// SDF. The CPU build fills this from the mesh topology (`Mesh::boundary_flags`);
+// interior fans get edge = 0.
 struct VertexIn {
   @location(0) position: vec2<f32>,
   @location(1) edge: f32,
@@ -81,11 +82,13 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-  // OB3.R8 analytic anti-aliasing. `edge` is a signed distance proxy that is ~0
-  // at the silhouette boundary and grows toward the interior; fwidth gives the
-  // per-pixel screen-space rate of change so the soft band is exactly one pixel
-  // wide at any zoom (the projective divide already varies edge non-linearly
-  // across the primitive, which fwidth tracks for free).
+  // OB3.R8 analytic anti-aliasing. `edge` rises from 0 in the interior to 1 at the
+  // silhouette boundary; fwidth gives the per-pixel screen-space rate of change so
+  // the soft band is exactly one pixel wide at any zoom (the projective divide
+  // already varies edge non-linearly across the primitive, which fwidth tracks for
+  // free). Coverage stays 1 across the opaque interior and fades only in the last
+  // pixel before `edge` reaches 1 — so an all-zero-edge mesh (no boundary data)
+  // degrades gracefully to a fully opaque fill.
   //
   // MSAA is the simpler alternative: enabling a multisampled color target and
   // dropping this coverage term would hand antialiasing to fixed-function
@@ -93,6 +96,6 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
   // paying for a multisampled attachment, and so dashed strokes/text can share
   // the same distance-based treatment.
   let aa = fwidth(input.edge);
-  let coverage = smoothstep(0.0, aa, input.edge);
+  let coverage = 1.0 - smoothstep(1.0 - aa, 1.0, input.edge);
   return vec4<f32>(input.fill.rgb, input.fill.a * coverage);
 }

@@ -58,6 +58,41 @@ impl Mesh {
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
     }
+
+    /// Per-vertex silhouette flags for analytic fill AA (OB3.R8 / D4): `1.0` for a
+    /// boundary (silhouette) vertex, `0.0` for an interior one, index-aligned with
+    /// [`vertices`](Mesh::vertices).
+    ///
+    /// A triangle edge that belongs to exactly one triangle lies on the mesh
+    /// silhouette; an edge shared by two triangles is interior. Every endpoint of a
+    /// silhouette edge is a boundary vertex. The shader treats this normalized
+    /// "distance" (1 at the boundary, 0 inside) as the analytic-AA coverage helper
+    /// — it fades the last screen pixel before the silhouette, so interior fans
+    /// (all `0.0`) stay fully opaque. Pure topology over the tessellated index
+    /// buffer: no float thresholds, no allocation on the GPU hot path (built once
+    /// with the mesh).
+    pub fn boundary_flags(&self) -> Vec<f32> {
+        let mut flags = vec![0.0f32; self.vertices.len()];
+        // Count how many triangles each undirected edge (min,max vertex index)
+        // borders. A count of 1 means a silhouette edge. A BTreeMap keeps this
+        // randomness-free (CLAUDE.md pure-core rule) and deterministic.
+        let mut edge_counts: std::collections::BTreeMap<(u32, u32), u32> =
+            std::collections::BTreeMap::new();
+        for tri in self.indices.chunks_exact(3) {
+            let (a, b, c) = (tri[0], tri[1], tri[2]);
+            for (p, q) in [(a, b), (b, c), (c, a)] {
+                let key = if p <= q { (p, q) } else { (q, p) };
+                *edge_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+        for (&(p, q), &count) in &edge_counts {
+            if count == 1 {
+                flags[p as usize] = 1.0;
+                flags[q as usize] = 1.0;
+            }
+        }
+        flags
+    }
 }
 
 /// Which winding rule decides what counts as "inside" when a contour set
@@ -932,6 +967,48 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
         assert_eq!(mega.range_count(), 1);
+    }
+
+    /// Analytic-AA boundary detection (D4): a vertex on a silhouette edge (one
+    /// bordering triangle) flags 1.0; a purely interior vertex stays 0.0. A square
+    /// fanned from a center point gives a known interior vertex (the center, all of
+    /// whose spoke edges are shared by two triangles) and four boundary corners (on
+    /// the perimeter edges, each bordering a single triangle). Fails if the flags
+    /// stay all-zero or if the interior center is wrongly marked.
+    #[test]
+    fn boundary_flags_mark_silhouette_not_interior() {
+        let mesh = Mesh {
+            // 0..3 = corners, 4 = center.
+            vertices: vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [1.0, 1.0]],
+            indices: vec![0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4],
+        };
+        let flags = mesh.boundary_flags();
+        assert_eq!(flags.len(), mesh.vertices.len());
+        // Every perimeter corner is a boundary vertex.
+        assert_eq!(&flags[0..4], &[1.0, 1.0, 1.0, 1.0], "corners are silhouette");
+        // The fan center borders only shared spokes -> interior.
+        assert_eq!(flags[4], 0.0, "fan center stays interior");
+        assert!(flags.iter().any(|&e| e != 0.0), "not all-zero");
+    }
+
+    /// A real lyon-tessellated fill flags silhouette vertices (so the FS can AA the
+    /// edge) without marking the whole mesh — interior fans stay 0.0.
+    #[test]
+    fn boundary_flags_on_tessellated_fill_is_mixed() {
+        // A plus/cross polygon tessellates with both boundary and interior verts.
+        let cross = vec![(
+            true,
+            vec![
+                (1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (3.0, 1.0), (3.0, 2.0),
+                (2.0, 2.0), (2.0, 3.0), (1.0, 3.0), (1.0, 2.0), (0.0, 2.0),
+                (0.0, 1.0), (1.0, 1.0),
+            ],
+        )];
+        let mesh = tessellate_fill(&cross, FillRuleKind::NonZero);
+        assert!(!mesh.is_empty(), "cross must tessellate");
+        let flags = mesh.boundary_flags();
+        assert_eq!(flags.len(), mesh.vertices.len());
+        assert!(flags.iter().any(|&e| e != 0.0), "some boundary vertices flagged");
     }
 
     /// `should_merge` routes small meshes into the megabuffer and large ones away.

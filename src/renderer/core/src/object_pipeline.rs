@@ -91,9 +91,10 @@ impl ObjectMatrixUniform {
 
 /// Per-vertex fill attributes matching `object_fill.wgsl`'s `VertexIn`
 /// (`position` @0, `edge` @1). Positions are object-local **pixels**
-/// (`tessellate::Mesh` vertices); `edge` is the analytic-AA silhouette helper
-/// (0 at interior fans for the first cutover — lyon does not emit a silhouette
-/// flag, so the FS coverage term degrades gracefully to opaque interior).
+/// (`tessellate::Mesh` vertices); `edge` is the analytic-AA silhouette flag (D4):
+/// `1.0` on a boundary vertex, `0.0` interior (from `Mesh::boundary_flags`), which
+/// the FS fades over the last screen pixel before the silhouette. All-zero edges
+/// (no boundary data) degrade gracefully to opaque interior fill.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FillVertex {
@@ -859,13 +860,15 @@ impl ObjectRenderer {
 
         // Widen the merged megabuffer positions (`[f32;2]`) to the pipeline's
         // `FillVertex` layout (`position` + `edge`). The analytic-AA `edge` helper
-        // is 0 for the first cutover: lyon does not flag silhouette vertices, so
-        // the FS coverage term reduces to opaque interior fill.
+        // is the per-vertex silhouette flag built with the mesh topology (1 on the
+        // boundary, 0 interior; D4) — `fill_edges` is index-aligned with the
+        // megabuffer vertices, so the zip is a pure widening with no per-frame work.
         let fill_vertices: Vec<FillVertex> = build
             .fill
             .vertices
             .iter()
-            .map(|&position| FillVertex { position, edge: 0.0 })
+            .zip(&build.fill_edges)
+            .map(|(&position, &edge)| FillVertex { position, edge })
             .collect();
 
         let fill_vertex_buffer = create_vertex_buffer(device, "object fill vertices", &fill_vertices);
@@ -1381,6 +1384,11 @@ fn create_index_buffer(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu
 #[derive(Clone, Debug, Default)]
 pub struct SceneGeometry {
     pub fill: MegaBuffer,
+    /// Per-vertex analytic-AA silhouette flags (D4), index-aligned with
+    /// `fill.vertices`: `1.0` on a boundary (silhouette) vertex, `0.0` interior.
+    /// Built once with the mesh topology; `ObjectRenderer::new` widens it into each
+    /// `FillVertex.edge` so the FS fades the silhouette pixel (zero per-frame work).
+    pub fill_edges: Vec<f32>,
     pub fill_instances: Vec<FillInstance>,
     /// RB3 drop-shadow quad vertices (6 per object with a boundable region,
     /// tri-list), object-local px + per-vertex feather. Per-object slices via
@@ -1456,6 +1464,10 @@ pub fn build_scene_geometry_themed_with_measure(
             .map(|(closed, pts)| (*closed, pts.clone()))
             .collect();
         let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
+        // Silhouette flags travel index-aligned with the megabuffer's vertex array:
+        // `push` appends this mesh's vertices, so we extend `fill_edges` with this
+        // mesh's boundary flags in lockstep (D4 analytic fill AA).
+        geometry.fill_edges.extend_from_slice(&mesh.boundary_flags());
         let fill_range = geometry.fill.push(&mesh);
         geometry.fill_instances.push(FillInstance {
             m0: matrix_col(&obj.transform, 0),
@@ -2024,6 +2036,41 @@ mod tests {
         assert_eq!(geo.fill_instances[0].fill, [1.0, 0.0, 0.0, 1.0]);
         // Inline stroke #00ff00 -> green, full alpha.
         assert_eq!(geo.stroke_instances[0].stroke, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    /// D4 analytic fill AA: the build populates `fill_edges` index-aligned with the
+    /// megabuffer vertices, flags the rect's silhouette (perimeter) vertices non-zero
+    /// so the FS can fade the edge, and never marks an off-perimeter vertex. Fails if
+    /// `edge` stays all-zero (the pre-D4 placeholder) or flags an interior vertex.
+    #[test]
+    fn build_populates_fill_edge_on_silhouette_vertices() {
+        let scene = scene_with(vec![rect_object("o1")], None);
+        let geo = build_scene_geometry(&scene);
+
+        // Edge flags are index-aligned with the merged fill vertices.
+        assert_eq!(
+            geo.fill_edges.len(),
+            geo.fill.vertices.len(),
+            "one edge flag per fill vertex"
+        );
+        // The placeholder shipped all-zero edges (fully transparent on GPU); the
+        // tessellated rect must now flag its silhouette.
+        assert!(
+            geo.fill_edges.iter().any(|&e| e != 0.0),
+            "rect silhouette vertices must be flagged non-zero"
+        );
+        // Every flagged vertex sits on the 100px-square perimeter (x or y is 0/100);
+        // an interior vertex (if lyon emitted one) would stay 0.0.
+        for (&[x, y], &edge) in geo.fill.vertices.iter().zip(&geo.fill_edges) {
+            if edge != 0.0 {
+                let on_perimeter =
+                    x == 0.0 || x == 100.0 || y == 0.0 || y == 100.0;
+                assert!(
+                    on_perimeter,
+                    "flagged vertex ({x},{y}) must lie on the rect boundary"
+                );
+            }
+        }
     }
 
     #[test]
