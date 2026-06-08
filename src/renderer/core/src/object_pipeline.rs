@@ -470,6 +470,13 @@ pub struct ObjectRenderer {
     draws: Vec<ObjectDraw>,
     fill_index_count: u32,
     stroke_vertex_count: u32,
+    /// RA1: per-object live preview WORLD transform (`delta * base`) for objects
+    /// under an in-flight drag. Mirrors what `set_preview_transform` wrote to the
+    /// GPU instance buffer so the CPU side (selection handles / region bounds) can
+    /// track the dragged bbox without re-tessellation. Cleared on commit/snap-back.
+    /// A `Vec` (not a hashed map) keeps the pure core free of randomness; at most a
+    /// handful of objects are ever previewed at once.
+    preview_transforms: Vec<(String, [[f64; 3]; 3])>,
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -597,6 +604,7 @@ impl ObjectRenderer {
             fill_index_count: build.fill.indices.len() as u32,
             stroke_vertex_count: build.stroke_vertices.len() as u32,
             draws: build.draws,
+            preview_transforms: Vec::new(),
         }
     }
 
@@ -633,7 +641,7 @@ impl ObjectRenderer {
     /// `StrokeInstance` at offset `i * size_of::<…>()`. The baked color sits past
     /// byte 36, so it is preserved. Returns false if `id` is absent.
     pub fn set_preview_transform(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         id: &str,
         delta: &[[f64; 3]; 3],
@@ -649,6 +657,13 @@ impl ObjectRenderer {
         let stroke_offset = (i * std::mem::size_of::<StrokeInstance>()) as u64;
         queue.write_buffer(&self.fill_instance_buffer, fill_offset, bytes);
         queue.write_buffer(&self.stroke_instance_buffer, stroke_offset, bytes);
+        // RA1: mirror the composed WORLD transform on the CPU side so selection
+        // handles / region bounds track the dragged bbox (read-only, no rebake).
+        let world = crate::hit_test_object::mat3_mul(delta, base);
+        match self.preview_transforms.iter_mut().find(|(pid, _)| pid == id) {
+            Some(entry) => entry.1 = world,
+            None => self.preview_transforms.push((id.to_string(), world)),
+        }
         true
     }
 
@@ -656,8 +671,25 @@ impl ObjectRenderer {
     /// transform (`delta = identity`), i.e. drop the live preview. Used by the
     /// shell as a defensive snap-back on commit-failure before the canonical scene
     /// rebake lands. Returns false if `id` is absent.
-    pub fn clear_preview_transform(&self, queue: &wgpu::Queue, id: &str, base: &[[f64; 3]; 3]) -> bool {
-        self.set_preview_transform(queue, id, &crate::hit_test_object::identity_3x3(), base)
+    pub fn clear_preview_transform(&mut self, queue: &wgpu::Queue, id: &str, base: &[[f64; 3]; 3]) -> bool {
+        let written =
+            self.set_preview_transform(queue, id, &crate::hit_test_object::identity_3x3(), base);
+        // RA1: drop the CPU preview so handles fall back to the canonical region.
+        self.preview_transforms.retain(|(pid, _)| pid != id);
+        written
+    }
+
+    /// RA1: the live preview WORLD transform (`delta * base`) for `id`, or `None`
+    /// when the object has no in-flight drag preview. The composed transform is the
+    /// one `set_preview_transform` pushed to the instance buffer, so a caller can
+    /// substitute it for the canonical `region.transform` to lay out selection
+    /// handles / region bounds against the PREVIEWED bbox during a drag — a pure
+    /// transform read, no re-tessellation.
+    pub fn preview_transform(&self, id: &str) -> Option<[[f64; 3]; 3]> {
+        self.preview_transforms
+            .iter()
+            .find(|(pid, _)| pid == id)
+            .map(|(_, world)| *world)
     }
 
     /// Record the object draw pass into `encoder` targeting `view`. Each object

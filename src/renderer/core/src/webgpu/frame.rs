@@ -257,9 +257,20 @@ impl ShapeWebGpuRenderer {
             .object_scene
             .as_ref()
             .and_then(|scene| scene.selection.clone());
-        let Some((_, world_bbox)) =
-            selection_handles(&self.object_regions, &self.camera, selection.as_deref())
-        else {
+        // RA1: while a transform drag is in flight the renderer holds the dragged
+        // object's live preview transform; feed it so the handles track the previewed
+        // bbox every frame instead of snapping only on commit (zero-rebake read).
+        let preview = selection.as_deref().and_then(|id| {
+            self.object_renderer
+                .as_ref()
+                .and_then(|renderer| renderer.preview_transform(id))
+        });
+        let Some((_, world_bbox)) = selection_handles(
+            &self.object_regions,
+            &self.camera,
+            selection.as_deref(),
+            preview.as_ref(),
+        ) else {
             return 0;
         };
         let vertices = build_handle_overlay_vertices(&world_bbox, self.camera.zoom);

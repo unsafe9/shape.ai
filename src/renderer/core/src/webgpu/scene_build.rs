@@ -1993,15 +1993,21 @@ pub(crate) fn hit_object_in_regions(
 /// hit-test, and the GPU handle render (W2-04) on one source of truth: all three
 /// read the same screen-space handles built from the same world bbox. `None` when
 /// nothing is selected or the selected region has no finite world bounds.
+///
+/// RA1: `preview` is the selected object's live drag transform (`delta * base`) when
+/// a transform gesture is in flight; the handles then lay out from the PREVIEWED
+/// bbox so they track the dragged object frame-by-frame instead of snapping only on
+/// commit. `None` lays them out from the canonical region transform.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn selection_handles(
     regions: &[ObjectRegion],
     camera: &CameraState,
     selection: Option<&str>,
+    preview: Option<&[[f64; 3]; 3]>,
 ) -> Option<(SelectionHandles, WorldRect)> {
     let id = selection?;
     let region = regions.iter().find(|region| region.id == id)?;
-    let world_bbox = region_world_bounds(region)?;
+    let world_bbox = region_world_bounds(region, preview)?;
     let screen_rect = world_rect_to_screen_rect(&world_bbox, camera);
     let handles = SelectionHandles::from_screen_bbox(&ScreenRect {
         x: screen_rect.x,
@@ -2019,7 +2025,7 @@ pub(crate) fn hover_affordance_at(
     selection: Option<&str>,
     screen: WorldPoint,
 ) -> HoverAffordance {
-    if let Some((handles, _)) = selection_handles(regions, camera, selection) {
+    if let Some((handles, _)) = selection_handles(regions, camera, selection, None) {
         if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
             return affordance;
         }
@@ -2072,7 +2078,7 @@ pub(crate) fn step_object_pointer(
             // selection starts a transform gesture (no selection change). Uses the
             // SHARED handle layout so what is grabbed == what hover reports == what
             // is drawn. Priority matches hover: handles > body > empty.
-            if let Some((handles, world_bbox)) = selection_handles(regions, camera, selection) {
+            if let Some((handles, world_bbox)) = selection_handles(regions, camera, selection, None) {
                 if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
                     let object_id = selection.expect("selection_handles requires a selection");
                     let start = screen_to_world(screen, camera);
@@ -2268,7 +2274,7 @@ pub(crate) fn object_regions_in_marquee(regions: &[ObjectRegion], rect: &WorldRe
     regions
         .iter()
         .filter_map(|region| {
-            let bounds = region_world_bounds(region)?;
+            let bounds = region_world_bounds(region, None)?;
             rects_intersect(&bounds, rect).then(|| region.id.clone())
         })
         .collect()
@@ -2280,7 +2286,7 @@ pub(crate) fn object_regions_in_marquee(regions: &[ObjectRegion], rect: &WorldRe
 pub(crate) fn object_regions_world_bounds(regions: &[ObjectRegion]) -> Option<WorldRect> {
     let mut acc: Option<WorldRect> = None;
     for region in regions {
-        let Some(bounds) = region_world_bounds(region) else {
+        let Some(bounds) = region_world_bounds(region, None) else {
             continue;
         };
         acc = Some(match acc {
@@ -2294,15 +2300,24 @@ pub(crate) fn object_regions_world_bounds(regions: &[ObjectRegion]) -> Option<Wo
 /// World-space AABB of one object's region: transform each local outline vertex
 /// through the object's projective matrix (D7/D8) and take the extent. `None` when
 /// the outline is empty or every vertex maps to a non-finite world point.
+///
+/// RA1: when `preview` is `Some`, the supplied live drag transform (`delta * base`)
+/// substitutes for the canonical `region.transform`, so the bounds (and the
+/// selection handles laid out from them) track the dragged bbox during an in-flight
+/// transform without a region rebuild — the outline is read unchanged.
 #[cfg(feature = "wgpu-probe")]
-pub(crate) fn region_world_bounds(region: &ObjectRegion) -> Option<WorldRect> {
+pub(crate) fn region_world_bounds(
+    region: &ObjectRegion,
+    preview: Option<&[[f64; 3]; 3]>,
+) -> Option<WorldRect> {
     use crate::hit_test_object::apply_3x3;
+    let transform = preview.unwrap_or(&region.transform);
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;
     let mut max_y = f64::NEG_INFINITY;
     for &(lx, ly) in &region.outline {
-        let (wx, wy) = apply_3x3(&region.transform, lx as f64, ly as f64);
+        let (wx, wy) = apply_3x3(transform, lx as f64, ly as f64);
         if !wx.is_finite() || !wy.is_finite() {
             continue;
         }
@@ -2359,7 +2374,7 @@ pub(crate) fn nearest_outline_point(
     for region in regions {
         // Broad-phase: skip when the query point is outside the region's world AABB
         // expanded by the tolerance.
-        let Some(bounds) = region_world_bounds(region) else {
+        let Some(bounds) = region_world_bounds(region, None) else {
             continue;
         };
         if world.x < bounds.x - tol_world
@@ -4265,6 +4280,44 @@ mod tests {
         );
         assert!(matches!(drag2, Some(InputDragState::Rotate { .. })));
         assert!(out2.selection.is_none());
+    }
+
+    #[test]
+    fn selection_handles_follow_live_preview_transform() {
+        // RA1 (#1): a 20px rect at world origin, identity camera (screen == world).
+        // Canonical bbox is [0,20]², so the SE resize handle centers at world (20,20).
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+        let camera = identity_camera();
+
+        // No preview -> handles read the canonical region transform.
+        let (handles, bbox) = selection_handles(&regions, &camera, Some("o1"), None)
+            .expect("canonical handles");
+        assert!((bbox.x - 0.0).abs() < 1e-9 && (bbox.y - 0.0).abs() < 1e-9);
+        assert!((bbox.width - 20.0).abs() < 1e-9 && (bbox.height - 20.0).abs() < 1e-9);
+        let se_cx = handles.se.x + handles.se.width / 2.0;
+        let se_cy = handles.se.y + handles.se.height / 2.0;
+        assert!((se_cx - 20.0).abs() < 1e-9 && (se_cy - 20.0).abs() < 1e-9, "({se_cx},{se_cy})");
+
+        // A live drag pushes a preview WORLD transform translating +100,+50. The
+        // handles MUST track the previewed bbox [100,120]×[50,70]; the SE handle then
+        // centers at world (120,70). Fails if handles still read the canonical region.
+        let preview = [[1.0, 0.0, 100.0], [0.0, 1.0, 50.0], [0.0, 0.0, 1.0]];
+        let (phandles, pbbox) = selection_handles(&regions, &camera, Some("o1"), Some(&preview))
+            .expect("previewed handles");
+        assert!(
+            (pbbox.x - 100.0).abs() < 1e-9 && (pbbox.y - 50.0).abs() < 1e-9,
+            "previewed bbox origin tracks the drag: ({},{})",
+            pbbox.x,
+            pbbox.y
+        );
+        assert!((pbbox.width - 20.0).abs() < 1e-9 && (pbbox.height - 20.0).abs() < 1e-9);
+        let pse_cx = phandles.se.x + phandles.se.width / 2.0;
+        let pse_cy = phandles.se.y + phandles.se.height / 2.0;
+        assert!(
+            (pse_cx - 120.0).abs() < 1e-9 && (pse_cy - 70.0).abs() < 1e-9,
+            "SE handle tracks the PREVIEWED corner, not canonical: ({pse_cx},{pse_cy})"
+        );
     }
 
     #[test]

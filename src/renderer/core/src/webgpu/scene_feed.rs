@@ -135,7 +135,7 @@ impl ShapeWebGpuRenderer {
         else {
             return Ok(());
         };
-        if let Some(renderer) = self.object_renderer.as_ref() {
+        if let Some(renderer) = self.object_renderer.as_mut() {
             renderer.set_preview_transform(&self.queue, id, &delta, &base);
         }
         Ok(())
@@ -154,7 +154,7 @@ impl ShapeWebGpuRenderer {
         else {
             return Ok(());
         };
-        if let Some(renderer) = self.object_renderer.as_ref() {
+        if let Some(renderer) = self.object_renderer.as_mut() {
             renderer.clear_preview_transform(&self.queue, id, &base);
         }
         Ok(())
