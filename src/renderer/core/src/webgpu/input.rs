@@ -183,9 +183,12 @@ impl ShapeWebGpuRenderer {
     /// COORD SPACE: `world_x`/`world_y` are WORLD coordinates (NOT screen) — W2-07
     /// already has the world point under the cursor. `tol_px` is a screen-pixel
     /// tolerance radius, converted to world via `tol_px / zoom.max(0.025)` (the same
-    /// zoom floor `screen_to_world` uses). Returns `{ snapped, x, y, targetId }`:
-    /// on a hit, `snapped = true` with the nearest WORLD point and the object id;
-    /// otherwise `snapped = false`, `x = y = 0`, `targetId = null`.
+    /// zoom floor `screen_to_world` uses). `exclude_ids_json` is a JSON array of
+    /// region ids to skip (W3-G6 #6: the transient create-preview / snap-indicator,
+    /// which ride the same feed and would otherwise self-snap under the cursor).
+    /// Returns `{ snapped, x, y, targetId }`: on a hit, `snapped = true` with the
+    /// nearest WORLD point and the object id; otherwise `snapped = false`,
+    /// `x = y = 0`, `targetId = null`.
     #[wasm_bindgen(js_name = nearestOutlinePoint)]
     pub fn nearest_outline_point(
         &self,
@@ -193,8 +196,12 @@ impl ShapeWebGpuRenderer {
         world_y: f64,
         tol_px: f64,
         zoom: f64,
+        exclude_ids_json: &str,
     ) -> Result<JsValue, JsValue> {
         let tol_world = tol_px / zoom.max(0.025);
+        let exclude = serde_json::from_str::<Vec<String>>(exclude_ids_json)
+            .map_err(|error| JsValue::from_str(&format!("Invalid exclude ids: {error}")))?;
+        let exclude_refs: Vec<&str> = exclude.iter().map(String::as_str).collect();
         let result = nearest_outline_point(
             &self.object_regions,
             WorldPoint {
@@ -202,6 +209,7 @@ impl ShapeWebGpuRenderer {
                 y: world_y,
             },
             tol_world,
+            &exclude_refs,
         );
         let payload = match result {
             Some((id, x, y)) => CoreNearestOutlinePoint {

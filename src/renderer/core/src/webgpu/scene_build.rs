@@ -2421,6 +2421,7 @@ pub(crate) fn nearest_outline_point(
     regions: &[ObjectRegion],
     world: WorldPoint,
     tol_world: f64,
+    exclude: &[&str],
 ) -> Option<(String, f64, f64)> {
     use crate::hit_test_object::{apply_3x3, world_to_local};
     use crate::outline::nearest_point_on_polyline;
@@ -2428,6 +2429,12 @@ pub(crate) fn nearest_outline_point(
     let tol2 = tol_world * tol_world;
     let mut best: Option<(&str, f64, f64, f64)> = None; // (id, world_x, world_y, d2)
     for region in regions {
+        // W3-G6 (#6): skip transient preview regions (create-preview / snap-indicator
+        // fed via buildFeedScene) so a create-drag snaps to a REAL object's edge
+        // instead of self-snapping to the preview's own corner under the cursor.
+        if exclude.contains(&region.id.as_str()) {
+            continue;
+        }
         // Broad-phase: skip when the query point is outside the region's world AABB
         // expanded by the tolerance.
         let Some(bounds) = region_world_bounds(region, None) else {
@@ -3917,13 +3924,13 @@ mod tests {
 
         // Just outside the right edge at mid-height -> snaps to (20, 10).
         let (id, x, y) =
-            nearest_outline_point(&regions, WorldPoint { x: 22.0, y: 10.0 }, 5.0).expect("snap");
+            nearest_outline_point(&regions, WorldPoint { x: 22.0, y: 10.0 }, 5.0, &[]).expect("snap");
         assert_eq!(id, "r");
         assert!((x - 20.0).abs() < 1e-3 && (y - 10.0).abs() < 1e-3, "({x}, {y})");
 
         // Near a corner (outside both edges) -> clamps to the corner (20, 20).
         let (_, cx, cy) =
-            nearest_outline_point(&regions, WorldPoint { x: 23.0, y: 23.0 }, 6.0).expect("corner");
+            nearest_outline_point(&regions, WorldPoint { x: 23.0, y: 23.0 }, 6.0, &[]).expect("corner");
         assert!((cx - 20.0).abs() < 1e-3 && (cy - 20.0).abs() < 1e-3, "({cx}, {cy})");
     }
 
@@ -3937,7 +3944,7 @@ mod tests {
         assert_eq!(regions.len(), 1, "ellipse derives a region");
 
         let (id, x, y) =
-            nearest_outline_point(&regions, WorldPoint { x: 203.0, y: 100.0 }, 6.0).expect("snap");
+            nearest_outline_point(&regions, WorldPoint { x: 203.0, y: 100.0 }, 6.0, &[]).expect("snap");
         assert_eq!(id, "e");
         // Within the flatten tolerance (0.5px chord error) of the analytic point.
         assert!((x - 200.0).abs() < 0.6, "x {x} ~ 200");
@@ -3952,7 +3959,7 @@ mod tests {
         let regions = derive_object_regions(&scene);
 
         let (id, x, y) =
-            nearest_outline_point(&regions, WorldPoint { x: 20.0, y: 3.0 }, 5.0).expect("snap");
+            nearest_outline_point(&regions, WorldPoint { x: 20.0, y: 3.0 }, 5.0, &[]).expect("snap");
         assert_eq!(id, "l");
         assert!((x - 20.0).abs() < 1e-3 && (y - 0.0).abs() < 1e-3, "({x}, {y})");
 
@@ -3960,7 +3967,7 @@ mod tests {
         // a non-existent edge than the drawn segment. The endpoints are (0,0) and
         // (40,0), so the whole snap surface is the single segment itself.
         let (_, x2, y2) =
-            nearest_outline_point(&regions, WorldPoint { x: -3.0, y: 0.0 }, 5.0).expect("endpoint");
+            nearest_outline_point(&regions, WorldPoint { x: -3.0, y: 0.0 }, 5.0, &[]).expect("endpoint");
         assert!((x2 - 0.0).abs() < 1e-3 && (y2 - 0.0).abs() < 1e-3, "({x2}, {y2})");
     }
 
@@ -3972,12 +3979,51 @@ mod tests {
         let regions = derive_object_regions(&scene);
 
         // Just inside tolerance (4px away, tol 5) -> snaps.
-        let inside = nearest_outline_point(&regions, WorldPoint { x: 24.0, y: 10.0 }, 5.0);
+        let inside = nearest_outline_point(&regions, WorldPoint { x: 24.0, y: 10.0 }, 5.0, &[]);
         assert!(matches!(inside, Some((ref id, _, _)) if id == "r"), "{inside:?}");
 
         // Just beyond tolerance (4px away, tol 3) -> no snap.
-        let beyond = nearest_outline_point(&regions, WorldPoint { x: 24.0, y: 10.0 }, 3.0);
+        let beyond = nearest_outline_point(&regions, WorldPoint { x: 24.0, y: 10.0 }, 3.0, &[]);
         assert!(beyond.is_none(), "{beyond:?}");
+    }
+
+    // W3-G6 (#6): the live create-drag feeds a transient "create-preview" region
+    // whose dragged corner sits UNDER the cursor — so an unexcluded snap query
+    // self-snaps to that preview (distance ~0) and the canonical filter then drops
+    // it, leaving no anchor. Excluding the preview id must surface the nearest REAL
+    // object's edge instead, which the shell keeps (firing the ring + AP5 anchor).
+    #[test]
+    fn nearest_outline_excludes_transient_create_preview() {
+        // Real rect "r" at world (0,0), right edge x=20. Plus a transient preview
+        // rect "create-preview" at world (2,-10) whose bottom-right corner lands at
+        // world (22,10) — exactly the query point under the cursor.
+        let scene = object_scene(vec![
+            rect_object("r", 0.0, 0.0, 20),
+            rect_object("create-preview", 2.0, -10.0, 20),
+        ]);
+        let regions = derive_object_regions(&scene);
+        let query = WorldPoint { x: 22.0, y: 10.0 };
+
+        // Documents the break: with no exclusion the preview corner (dist ~0) wins.
+        let unexcluded =
+            nearest_outline_point(&regions, query, 5.0, &[]).expect("preview self-snap");
+        assert_eq!(unexcluded.0, "create-preview");
+
+        // The fix: excluding the preview surfaces the REAL rect's right edge at
+        // (20, 10), 2px from the cursor.
+        let (id, x, y) = nearest_outline_point(&regions, query, 5.0, &["create-preview"])
+            .expect("real edge snap");
+        assert_eq!(id, "r");
+        assert!((x - 20.0).abs() < 1e-3 && (y - 10.0).abs() < 1e-3, "({x}, {y})");
+
+        // Far from BOTH (excluded preview included) -> no snap at all.
+        let far = nearest_outline_point(
+            &regions,
+            WorldPoint { x: 200.0, y: 200.0 },
+            5.0,
+            &["create-preview"],
+        );
+        assert!(far.is_none(), "{far:?}");
     }
 
     #[test]

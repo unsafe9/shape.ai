@@ -58,17 +58,34 @@ function mockRenderer(camera: { x: number; y: number; zoom: number }): RustWebGp
     },
     // The real W2-06 contract: WORLD query in, snapped WORLD point + targetId out.
     // `tolPx` is converted to world via the camera zoom, exactly like the renderer.
-    nearestOutlinePoint(worldX: number, worldY: number, tolPx: number, zoom: number) {
+    nearestOutlinePoint(worldX: number, worldY: number, tolPx: number, zoom: number, excludeIdsJson: string) {
       const tolWorld = tolPx / Math.max(0.025, zoom);
       const nearestX = Math.min(OUTLINE_X1, Math.max(OUTLINE_X0, worldX));
       const dx = worldX - nearestX;
       const dy = worldY - OUTLINE_Y;
       const within = dx * dx + dy * dy <= tolWorld * tolWorld;
       return within
-        ? { snapped: true, x: nearestX, y: OUTLINE_Y, targetId: TARGET_ID }
+        ? { snapped: true, x: nearestX, y: OUTLINE_Y, targetId: snapTargetFor(excludeIdsJson) }
         : { snapped: false, x: 0, y: 0, targetId: null };
     }
   } as unknown as RustWebGpuRenderer;
+}
+
+// W3-G6 (#6): mirror the renderer's exclude-ids contract — the transient
+// "create-preview" region (fed under the cursor) wins every snap until the engine
+// asks the core to exclude it. The mock surfaces the preview id when the engine
+// fails to pass the exclude list, and the REAL target only once "create-preview"
+// is excluded. A regression where the engine drops the exclude arg yields the
+// phantom preview target and fails the integration assertion below.
+const PREVIEW_ID = "create-preview";
+function snapTargetFor(excludeIdsJson: string): string {
+  let excluded: string[] = [];
+  try {
+    excluded = JSON.parse(excludeIdsJson ?? "[]");
+  } catch {
+    excluded = [];
+  }
+  return excluded.includes(PREVIEW_ID) ? TARGET_ID : PREVIEW_ID;
 }
 
 // A mock canvas that captures the engine's listeners so the test can fire DOM-shape
@@ -146,10 +163,31 @@ describe("create-drag outline snap (W3-G5 #6)", () => {
     expect(create).not.toBeNull();
     expect(create!.phase).toBe("move");
     expect(create!.snapped).toBe(true);
+    // The REAL object's id — NOT the transient preview. The mock returns the preview
+    // id unless the engine forwards "create-preview" in the exclude list, so this
+    // assertion fails on any code that drops the exclude arg (the live W3-G6 bug).
     expect(create!.targetId).toBe(TARGET_ID);
     // The emitted end position is the SNAPPED outline point, not the raw pointer.
     expect(create!.world.x).toBeCloseTo(200, 6);
     expect(create!.world.y).toBeCloseTo(OUTLINE_Y, 6);
+  });
+
+  it("excludes the transient create-preview from the snap query (no phantom self-snap)", () => {
+    // W3-G6 (#6): the renderer's region set includes the create-preview whose corner
+    // sits under the cursor. The engine must ask the core to exclude it so the snap
+    // lands on a REAL object's edge. The mock encodes that contract: it returns the
+    // preview id when the engine omits the exclude list. A real-edge targetId here
+    // proves the engine passed "create-preview" through to nearestOutlinePoint.
+    const { fire, events } = makeEngine(camera);
+    fire("mousedown", { button: 0, altKey: false, clientX: toScreen(0, 0).clientX, clientY: toScreen(0, 0).clientY });
+    const onOutline = toScreen(200, OUTLINE_Y);
+    fire("mousemove", { button: 0, altKey: false, clientX: onOutline.clientX, clientY: onOutline.clientY });
+
+    const create = lastCreate(events);
+    expect(create).not.toBeNull();
+    expect(create!.snapped).toBe(true);
+    expect(create!.targetId).toBe(TARGET_ID);
+    expect(create!.targetId).not.toBe(PREVIEW_ID);
   });
 
   it("emits snapped=false + null targetId when the create-move is far from any outline", () => {

@@ -139,6 +139,12 @@ const MOUSE_POINTER_ID = -1;
 // query (nearestOutlinePoint), which converts it to world via the camera zoom.
 const CREATE_SNAP_TOLERANCE_PX = 8;
 
+// W3-G6 (#6): the transient preview regions buildFeedScene appends to the renderer
+// feed (the create rubber-band + its snap-indicator + the pen-stroke preview). The
+// create-drag snap query MUST exclude these, or the preview corner sitting under
+// the cursor self-snaps at distance ~0 and occludes every real object's edge.
+const SNAP_EXCLUDE_IDS_JSON = JSON.stringify(["create-preview", "create-snap-indicator", "draw-preview"]);
+
 export class ShapeCanvasEngine {
   private canvas: HTMLCanvasElement;
   private overlayRoot: HTMLElement;
@@ -1177,7 +1183,7 @@ export class ShapeCanvasEngine {
     const renderer = this.webGpuRenderer;
     if (!renderer || typeof renderer.nearestOutlinePoint !== "function") return null;
     try {
-      const result = renderer.nearestOutlinePoint(world.x, world.y, CREATE_SNAP_TOLERANCE_PX, this.camera.zoom);
+      const result = renderer.nearestOutlinePoint(world.x, world.y, CREATE_SNAP_TOLERANCE_PX, this.camera.zoom, SNAP_EXCLUDE_IDS_JSON);
       this.rustBoundaryCalls += 1;
       return result.snapped ? { x: result.x, y: result.y, targetId: result.targetId } : null;
     } catch (error) {
