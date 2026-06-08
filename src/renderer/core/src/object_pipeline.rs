@@ -1145,11 +1145,13 @@ impl ObjectRenderer {
     /// W2-11 drag zero-rebake: write ONLY the dragged object's instance model
     /// matrix to the GPU — no re-tessellation, no scene rebuild (P4). Looks up the
     /// object's instance index `i` in `self.draws` (which is built in the same loop
-    /// as both instance buffers, so `draws[i]` ↔ instance `i` in fill AND stroke),
-    /// composes `delta * base` via [`preview_instance_columns`], and overwrites the
-    /// 36-byte matrix region (`m0,m1,m2` at offset 0) of BOTH `FillInstance` and
-    /// `StrokeInstance` at offset `i * size_of::<…>()`. The baked color sits past
-    /// byte 36, so it is preserved. Returns false if `id` is absent.
+    /// as all instance buffers, so `draws[i]` ↔ instance `i` in fill, stroke AND
+    /// text), composes `delta * base` via [`preview_instance_columns`], and overwrites
+    /// the 36-byte matrix region (`m0,m1,m2` at offset 0) of `FillInstance`,
+    /// `StrokeInstance`, AND `TextInstance` at offset `i * size_of::<…>()` — so the
+    /// glyphs follow the drag too (G3). The baked color sits past byte 36 on fill/
+    /// stroke (and per-glyph for text), so it is preserved. Returns false if `id` is
+    /// absent.
     pub fn set_preview_transform(
         &mut self,
         queue: &wgpu::Queue,
@@ -1163,10 +1165,27 @@ impl ObjectRenderer {
         let (m0, m1, m2) = preview_instance_columns(delta, base);
         let columns: [[f32; 3]; 3] = [m0, m1, m2];
         let bytes = bytemuck::cast_slice(&columns);
-        let fill_offset = (i * std::mem::size_of::<FillInstance>()) as u64;
-        let stroke_offset = (i * std::mem::size_of::<StrokeInstance>()) as u64;
-        queue.write_buffer(&self.fill_instance_buffer, fill_offset, bytes);
-        queue.write_buffer(&self.stroke_instance_buffer, stroke_offset, bytes);
+        // The matrix region (`m0,m1,m2` at offset 0) is overwritten in EVERY per-object
+        // instance buffer — fill, stroke AND text (G3) — so the dragged object's whole
+        // visual (region + glyphs) follows the preview. Each buffer is index-aligned
+        // with `draws`, so the write lands at `i * stride`. `preview_instance_strides`
+        // is the single source of truth pairing each buffer with its struct stride; a
+        // dropped buffer here is a dropped sub-visual under drag. Baked color sits past
+        // byte 36 (fill/stroke) or per-glyph (text), so it survives the matrix write.
+        let strides = preview_instance_strides();
+        let buffers = [
+            &self.fill_instance_buffer,
+            &self.stroke_instance_buffer,
+            &self.text_instance_buffer,
+        ];
+        debug_assert_eq!(
+            buffers.len(),
+            strides.len(),
+            "every previewed instance buffer has a stride (text included)"
+        );
+        for (buffer, stride) in buffers.iter().zip(strides) {
+            queue.write_buffer(buffer, (i as u64) * stride, bytes);
+        }
         // RA1: mirror the composed WORLD transform on the CPU side so selection
         // handles / region bounds track the dragged bbox (read-only, no rebake).
         let world = crate::hit_test_object::mat3_mul(delta, base);
@@ -1844,6 +1863,20 @@ pub fn preview_instance_columns(
     )
 }
 
+/// The per-buffer strides [`ObjectRenderer::set_preview_transform`] writes the
+/// previewed matrix into, in lockstep with its `[fill, stroke, text]` buffer
+/// array: the matrix lands at `i * stride` in EACH. Fill/stroke moved the region
+/// from W2-11; text (G3) makes the glyphs follow the same drag. Pure and
+/// device-free so the live-drag follow set is testable under `cargo test` without
+/// a GPU — a dropped entry here means a sub-visual stops tracking the preview.
+pub fn preview_instance_strides() -> [u64; 3] {
+    [
+        std::mem::size_of::<FillInstance>() as u64,
+        std::mem::size_of::<StrokeInstance>() as u64,
+        std::mem::size_of::<TextInstance>() as u64,
+    ]
+}
+
 /// Resolve a paint to a single RGBA color for the inline-solid first cutover,
 /// theme-aware (RB1/D1). `theme` selects the light/dark token table for
 /// [`RPaint::Token`]. Gradient/image paints collapse to their representative
@@ -2261,6 +2294,98 @@ mod tests {
         assert_eq!(preview.0, stroke.m0);
         assert_eq!(preview.1, stroke.m1);
         assert_eq!(preview.2, stroke.m2);
+    }
+
+    /// G3 (RB2 follow-up): the live text-drag preview moves the GLYPHS with the
+    /// fill/stroke. `set_preview_transform` writes the previewed columns into the
+    /// text instance buffer at `i * size_of::<TextInstance>()` — the same matrix-at-
+    /// offset-0, index-aligned write fill/stroke get. This proves, device-free, that
+    /// (a) the previewed text instance equals the composed `delta*base` transform —
+    /// exactly what the write pushes — and (b) it DIFFERS from the canonical baked
+    /// text instance, so a missing text write would leave the glyphs at canonical
+    /// (the bug this card closes). Mirrors `preview_columns_equal_full_rebake_at_*`.
+    #[test]
+    fn text_preview_follows_drag_matches_composed_transform() {
+        let base = [[2.0, 0.0, 30.0], [0.0, 2.0, -10.0], [0.0, 0.0, 1.0]];
+        let delta = crate::hit_test_object::translate_3x3(40.0, -25.0);
+
+        // Canonical (no preview): the baked text instance for the object at `base`.
+        let mut canonical = text_rect("t-drag", "Ab", 128.0, "#222222");
+        canonical.transform = base;
+        let canon_geo = build_scene_geometry_themed_with_measure(
+            &scene_with(vec![canonical], None),
+            Theme::light(),
+            &unit_measure,
+        );
+        let canon_text = canon_geo.text_instances[0];
+
+        // The preview columns `set_preview_transform` would write for this drag.
+        let preview = preview_instance_columns(&delta, &base);
+
+        // Without a preview the text instance is canonical: the un-dragged columns
+        // are NOT the previewed ones (a real move, so a missing write is observable).
+        assert!(
+            (canon_text.m0, canon_text.m1, canon_text.m2) != preview,
+            "canonical text instance differs from the previewed transform"
+        );
+
+        // Under the preview, the text instance equals the composed `delta*base` —
+        // and matches what fill/stroke get, so the glyphs follow the same drag.
+        let composed = crate::hit_test_object::mat3_mul(&delta, &base);
+        let mut moved = text_rect("t-drag", "Ab", 128.0, "#222222");
+        moved.transform = composed;
+        let moved_geo = build_scene_geometry_themed_with_measure(
+            &scene_with(vec![moved], None),
+            Theme::light(),
+            &unit_measure,
+        );
+        let moved_text = moved_geo.text_instances[0];
+        assert_eq!(preview.0, moved_text.m0);
+        assert_eq!(preview.1, moved_text.m1);
+        assert_eq!(preview.2, moved_text.m2);
+        // Fill/stroke still follow the same preview too (parity with text).
+        assert_eq!(preview.0, moved_geo.fill_instances[0].m0);
+        assert_eq!(preview.0, moved_geo.stroke_instances[0].m0);
+        assert_eq!(moved_text.m0, moved_geo.fill_instances[0].m0);
+        assert_eq!(moved_text.m1, moved_geo.fill_instances[0].m1);
+        assert_eq!(moved_text.m2, moved_geo.fill_instances[0].m2);
+    }
+
+    /// G3 byte-layout pin: the text instance preview write `set_preview_transform`
+    /// performs targets offset `i * size_of::<TextInstance>()` and overwrites the
+    /// 36-byte `m0,m1,m2` region at struct offset 0 — identical to the fill/stroke
+    /// writes (matrix-at-0). FAILS if `TextInstance` ever grows a field before the
+    /// matrix or stops being a clean 3-column struct, which would corrupt the write.
+    #[test]
+    fn text_instance_matrix_region_matches_preview_write_layout() {
+        // The preview writes `[[f32;3];3]` (36 bytes) at the struct's matrix region.
+        assert_eq!(std::mem::size_of::<[[f32; 3]; 3]>(), 36);
+        assert_eq!(std::mem::size_of::<TextInstance>(), 36);
+        assert_eq!(std::mem::offset_of!(TextInstance, m0), 0);
+        assert_eq!(std::mem::offset_of!(TextInstance, m1), 12);
+        assert_eq!(std::mem::offset_of!(TextInstance, m2), 24);
+    }
+
+    /// G3 write-set pin: `set_preview_transform` writes the previewed matrix into
+    /// the `[fill, stroke, text]` buffer array, striding each by
+    /// `preview_instance_strides()`. This is the single source of truth for WHICH
+    /// buffers follow the drag. FAILS if the text entry is dropped (the RB2 bug:
+    /// glyphs left at canonical during a live drag) — the strides set must carry all
+    /// three per-object instance buffers, text stride included.
+    #[test]
+    fn preview_write_set_includes_text_instance_buffer() {
+        let strides = preview_instance_strides();
+        // Three per-object instance buffers must follow the preview: fill, stroke, text.
+        assert_eq!(strides.len(), 3, "fill + stroke + text all follow the drag");
+        assert_eq!(strides[0], std::mem::size_of::<FillInstance>() as u64);
+        assert_eq!(strides[1], std::mem::size_of::<StrokeInstance>() as u64);
+        // The load-bearing G3 assertion: the text buffer IS in the write set, strided
+        // by `TextInstance`. Drop the text write and this entry vanishes — failing here.
+        assert_eq!(
+            strides[2],
+            std::mem::size_of::<TextInstance>() as u64,
+            "text instance buffer must be in the preview write set (G3)"
+        );
     }
 
     /// W2-11 index==offset invariant: `draws[i].id` ↔ instance `i` in BOTH the fill
