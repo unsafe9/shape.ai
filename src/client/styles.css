@@ -262,14 +262,15 @@ p {
   pointer-events: none;
 }
 
+/* EN1 (#4): the input canvas is the topmost pointer-capturing surface (z-index 2,
+ * above the affordance-cursor wrapper). It must INHERIT the cursor so the hover
+ * affordance set on `.renderer-scene-surface[data-affordance=...]` shows through;
+ * a hardcoded `cursor: grab` here (the pre-W2-03 pan surface) was overriding every
+ * resize/rotate/move affordance with grab. */
 .renderer-input-canvas {
   z-index: 2;
-  cursor: grab;
+  cursor: inherit;
   touch-action: none;
-}
-
-.renderer-input-canvas:active {
-  cursor: grabbing;
 }
 
 .renderer-overlay-root {

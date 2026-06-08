@@ -22,6 +22,15 @@ import type {
   RustWebGpuFrameStats,
   RustWebGpuRenderer
 } from "./wasmLoader";
+import {
+  COARSE_ROTATE_SNAP_DEG,
+  isAdditiveSelect,
+  isCoarseRotate,
+  isPanGesture,
+  isPartialErase,
+  isSnapBypass
+} from "../lib/gestureBindings";
+import { detectMac } from "../lib/shortcuts";
 
 /** W2-03: the active pointer tool. One unified "select" Move/Select pointer
  *  (picks/drags/marquees), "draw" (freehand capture, FC-11), "create" (W2-07
@@ -31,12 +40,12 @@ import type {
 export type ActiveTool = "select" | "draw" | "create" | "erase";
 
 // W2-03: a pointer-down is a pan gesture (not a pick/marquee) when the Space key
-// is held OR the middle mouse button is used. Pure so the shell test can pin the
-// classification without a renderer. `button` follows the DOM MouseEvent values
-// (0=left, 1=middle, 2=right); only left+Space or middle pans.
+// is held OR the middle mouse button is used. EN1: the binding (Space / middle
+// button) is the C2 `pan-space`/`pan-middle` gesture, routed through the single
+// source in gestureBindings (no magic literal here). Pure so the shell test can
+// pin the classification without a renderer.
 export function isPanIntent(intent: { spaceHeld: boolean; button: number }): boolean {
-  if (intent.button === 1) return true;
-  return intent.button === 0 && intent.spaceHeld;
+  return isPanGesture(intent);
 }
 
 // W2-04/W2-05: the gesture that produced a transform delta. Mirrors the Rust
@@ -44,11 +53,12 @@ export function isPanIntent(intent: { spaceHeld: boolean; button: number }): boo
 export type TransformKind = "translate" | "resize" | "rotate";
 
 // W2-07: whether a shape drag-create phase should run the outline snap query. Snap
-// is bypassed when the Alt modifier is held (request 4: "modifier nullifies snap")
-// or on the terminal `cancel` phase (no preview to snap). Pure so the shell test
-// can pin the decision without a renderer.
+// is bypassed when the snap-bypass gesture (C2 `no-snap-alt`: Alt held) is active
+// — routed through the single source in gestureBindings — or on the terminal
+// `cancel` phase (no preview to snap). Pure so the shell test can pin the decision
+// without a renderer.
 export function shouldQuerySnap(intent: { altHeld: boolean; phase: "start" | "move" | "end" | "cancel" }): boolean {
-  return !intent.altHeld && intent.phase !== "cancel";
+  return !isSnapBypass({ altKey: intent.altHeld }) && intent.phase !== "cancel";
 }
 
 export type EngineEvent =
@@ -170,6 +180,15 @@ export class ShapeCanvasEngine {
   // erasing along the drag (a bare hover never erases). Set on erase down, cleared
   // on up/cancel.
   private eraseDragActive = false;
+  // EN1 (#3): the previous eraser sample's screen point, so each move runs RA3's
+  // swept hit-test over the segment (prev -> curr) and erases every crossed object
+  // — a fast drag that skips between samples still erases what the segment passes
+  // through. Set on erase down, advanced each move, cleared on up/cancel.
+  private lastEraseScreen: WorldPoint | null = null;
+  // EN1 (#2): Shift held at the latest pointer/mouse event, mirroring the C2
+  // coarse-rotate gesture (`coarse-rotate-shift`). When a rotate transform delta
+  // arrives with Shift held, the engine re-snaps it to the catalog step (15°).
+  private shiftHeld = false;
 
   constructor(options: ShapeCanvasEngineOptions) {
     this.canvas = options.canvas;
@@ -532,6 +551,7 @@ export class ShapeCanvasEngine {
 
   private onPointerDown = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    this.shiftHeld = event.shiftKey;
     // W2-03: Space-hold pans even under the draw tool; arm the core pan path first.
     const pan = isPanIntent({ spaceHeld: this.spaceHeld, button: event.button });
     if (this.activeTool === "draw" && !pan) {
@@ -546,12 +566,15 @@ export class ShapeCanvasEngine {
     }
     if (this.activeTool === "erase" && !pan) {
       this.eraseDragActive = true;
+      this.lastEraseScreen = this.eventPoint(event);
       this.emitErase(event);
       this.canvas.setPointerCapture(event.pointerId);
       return;
     }
     if (pan) this.armPanGesture();
-    this.lastPointerAdditive = event.shiftKey || event.metaKey;
+    // EN1: additive-select (C2 `additive-select-shift`/`-mod`) — Shift or the
+    // platform primary modifier (Cmd/Ctrl) held at pick time, via the single source.
+    this.lastPointerAdditive = isAdditiveSelect(event, detectMac());
     this.beginInputGesture();
     const screen = this.eventPoint(event);
     this.sendInputBatch([{ kind: "pointer-down", pointerId: event.pointerId, screen }]);
@@ -560,6 +583,7 @@ export class ShapeCanvasEngine {
 
   private onPointerMove = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    this.shiftHeld = event.shiftKey;
     // W2-03: a Space-armed pan stays on the pan path for the whole gesture, even
     // under the draw tool, so the move feeds the core pan instead of the stroke.
     if (this.activeTool === "draw" && !this.panGestureActive) {
@@ -571,7 +595,7 @@ export class ShapeCanvasEngine {
       return;
     }
     if (this.activeTool === "erase" && !this.panGestureActive && this.eraseDragActive) {
-      this.emitErase(event);
+      this.emitSweptErase(event);
       return;
     }
     this.sendInputBatch([{ kind: "pointer-move", pointerId: event.pointerId, screen: this.eventPoint(event) }]);
@@ -599,6 +623,7 @@ export class ShapeCanvasEngine {
     }
     if (this.activeTool === "erase" && !this.panGestureActive) {
       this.eraseDragActive = false;
+      this.lastEraseScreen = null;
       try {
         this.canvas.releasePointerCapture(event.pointerId);
       } catch {
@@ -646,6 +671,7 @@ export class ShapeCanvasEngine {
     }
     if (this.activeTool === "erase" && !this.panGestureActive) {
       this.eraseDragActive = false;
+      this.lastEraseScreen = null;
       try {
         this.canvas.releasePointerCapture(event.pointerId);
       } catch {
@@ -660,6 +686,7 @@ export class ShapeCanvasEngine {
   };
 
   private onMouseDown = (event: MouseEvent) => {
+    this.shiftHeld = event.shiftKey;
     // W2-03: left (0) drives select/draw; middle (1) is a pan gesture. Right (2)
     // is the context menu (handled in the shell) — ignore it here.
     const pan = isPanIntent({ spaceHeld: this.spaceHeld, button: event.button });
@@ -680,12 +707,15 @@ export class ShapeCanvasEngine {
     if (this.activeTool === "erase" && !pan) {
       this.mouseDragActive = true;
       this.eraseDragActive = true;
+      this.lastEraseScreen = this.eventPoint(event);
       this.bindMouseFallbackMove();
       this.emitErase(event);
       return;
     }
     if (pan) this.armPanGesture();
-    this.lastPointerAdditive = event.shiftKey || event.metaKey;
+    // EN1: additive-select (C2 `additive-select-shift`/`-mod`) — Shift or the
+    // platform primary modifier (Cmd/Ctrl) held at pick time, via the single source.
+    this.lastPointerAdditive = isAdditiveSelect(event, detectMac());
     this.beginInputGesture();
     this.mouseDragActive = true;
     this.bindMouseFallbackMove();
@@ -695,6 +725,7 @@ export class ShapeCanvasEngine {
   private onMouseMove = (event: MouseEvent) => {
     if (!this.mouseDragActive) return;
     event.preventDefault();
+    this.shiftHeld = event.shiftKey;
     if (this.activeTool === "draw" && !this.panGestureActive) {
       this.emitDraw("move", event);
       return;
@@ -704,7 +735,7 @@ export class ShapeCanvasEngine {
       return;
     }
     if (this.activeTool === "erase" && !this.panGestureActive && this.eraseDragActive) {
-      this.emitErase(event);
+      this.emitSweptErase(event);
       return;
     }
     this.sendInputBatch([{ kind: "pointer-move", pointerId: MOUSE_POINTER_ID, screen: this.eventPoint(event) }]);
@@ -725,6 +756,7 @@ export class ShapeCanvasEngine {
     }
     if (this.activeTool === "erase" && !this.panGestureActive) {
       this.eraseDragActive = false;
+      this.lastEraseScreen = null;
       return;
     }
     this.sendInputBatch([
@@ -1013,7 +1045,16 @@ export class ShapeCanvasEngine {
       // W2-05: the cumulative delta is a full world-space matrix + gesture kind
       // (translate/resize/rotate). Remember it and emit a non-destructive preview;
       // the shell composes the matrix onto the object and commits on pointer-up.
-      const { id, matrix, kind } = result.objectTransformDelta;
+      const { id, kind } = result.objectTransformDelta;
+      // EN1 (#2): the C2 coarse-rotate gesture (`coarse-rotate-shift`) — Shift held
+      // during a rotate quantizes the sweep to the catalog step (15°). Applied
+      // shell-side to the returned rotate matrix (RA2c semantics): extract the swept
+      // angle + center, re-snap, rebuild. Non-rotate deltas and a released Shift pass
+      // through unchanged.
+      const matrix =
+        kind === "rotate" && isCoarseRotate({ shiftKey: this.shiftHeld })
+          ? snapRotateDeltaMatrix(result.objectTransformDelta.matrix, COARSE_ROTATE_SNAP_DEG)
+          : result.objectTransformDelta.matrix;
       this.objectDrag = { id, matrix, kind };
       // W2-11 drag zero-rebake: push the cumulative delta straight to the GPU
       // instance matrix (no Svelte round-trip, lowest latency, no re-tessellation).
@@ -1063,15 +1104,57 @@ export class ShapeCanvasEngine {
 
   // W2-08: emit an erase touch for the stroke under the cursor. The object id
   // comes from the core's object hit-test (hit-test stays in the core, boundary);
-  // a touch over empty canvas (no hit) emits nothing. `partial` is the Alt
-  // modifier (default = whole-stroke delete, modifier = partial subpath cut). The
-  // shell authors the delete / edit-geometry op from the event.
+  // a touch over empty canvas (no hit) emits nothing. `partial` is the C2
+  // partial-erase gesture (`partial-erase-alt`: Alt held — whole-stroke delete by
+  // default, partial subpath cut with the modifier), routed through the single
+  // gesture source. The shell authors the delete / edit-geometry op from the event.
   private emitErase(event: MouseEvent | PointerEvent) {
     const screen = this.eventPoint(event);
     const id = this.objectHitTest(screen);
     if (!id) return;
     const world = screenToWorld(screen, this.camera);
-    this.onEvent({ type: "erase", id, world, partial: event.altKey });
+    this.onEvent({ type: "erase", id, world, partial: isPartialErase(event) });
+  }
+
+  // EN1 (#3): emit one erase touch for EVERY object the eraser crossed since the
+  // previous sample. RA3's swept hit-test (`sweptEraseAt`) returns each object the
+  // segment (prev -> curr SCREEN samples) passes through, so a fast drag that skips
+  // between samples still erases the whole swept path — not just the object under
+  // the latest sample. Falls back to the single-sample `emitErase` when no prior
+  // sample exists or the swept method is unavailable (older wasm build). The world
+  // point + `partial` mirror `emitErase`.
+  private emitSweptErase(event: MouseEvent | PointerEvent) {
+    const curr = this.eventPoint(event);
+    const prev = this.lastEraseScreen;
+    this.lastEraseScreen = curr;
+    const ids = prev ? this.sweptEraseHitTest(prev, curr) : null;
+    if (!ids) {
+      this.emitErase(event);
+      return;
+    }
+    const world = screenToWorld(curr, this.camera);
+    const partial = isPartialErase(event);
+    for (const id of ids) this.onEvent({ type: "erase", id, world, partial });
+  }
+
+  // EN1 (#3): RA3 swept hit-test boundary — the ids of every object crossed by the
+  // eraser between two consecutive SCREEN samples. Feature-detected: a wasm build
+  // predating `sweptEraseAt` returns null so the caller falls back to the
+  // single-sample pick.
+  private sweptEraseHitTest(prev: WorldPoint, curr: WorldPoint): string[] | null {
+    const renderer = this.webGpuRenderer;
+    if (!renderer || typeof renderer.sweptEraseAt !== "function") return null;
+    try {
+      const ids = renderer.sweptEraseAt(prev.x, prev.y, curr.x, curr.y);
+      this.rustBoundaryCalls += 1;
+      return ids ?? [];
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust sweptEraseAt failed: ${error.message}` : "Rust sweptEraseAt failed"
+      });
+      return null;
+    }
   }
 
   // W2-07: snap a world point to the nearest object outline anchor via the W2-06
@@ -1213,6 +1296,38 @@ const IDENTITY_MATRIX: RenderTransform3x3 = [
 
 function isIdentityMatrix(m: RenderTransform3x3): boolean {
   return m.every((row, i) => row.every((v, j) => v === IDENTITY_MATRIX[i][j]));
+}
+
+// EN1 (#2) coarse-rotate: re-quantize a core-returned rotate-delta matrix to the
+// nearest `snapDeg`-degree step, mirroring RA2c's `rotate_delta_matrix_snapped`
+// shell-side. The core builds the delta as `rotate_about_3x3(theta, cx, cy)` =
+// `[[c,-s, cx-c*cx+s*cy],[s,c, cy-s*cx-c*cy],[0,0,1]]`, so the swept angle is
+// `theta = atan2(s, c)` and the center solves `(I - R) c = t` (det = 2(1-c), the
+// rotation part is recovered from the rotated translation column). A zero-angle
+// delta (nothing to snap) and a singular `I - R` (theta == 0) both return the
+// matrix unchanged. Pure; the GEOMETRY truth (sin/cos) stays standard math.
+export function snapRotateDeltaMatrix(m: RenderTransform3x3, snapDeg: number): RenderTransform3x3 {
+  const cos = m[0][0];
+  const sin = m[1][0];
+  const theta = Math.atan2(sin, cos);
+  const step = (snapDeg * Math.PI) / 180;
+  const snapped = Math.round(theta / step) * step;
+  // (I - R) c = t, with R = [[cos,-sin],[sin,cos]] and t the translation column.
+  // det(I - R) = (1-cos)^2 + sin^2 = 2(1-cos); zero only at theta == 0.
+  const det = 2 * (1 - cos);
+  if (Math.abs(det) < 1e-12) return m;
+  const tx = m[0][2];
+  const ty = m[1][2];
+  // c = (I - R)^-1 t; (I - R) = [[1-cos, sin],[-sin, 1-cos]].
+  const cx = ((1 - cos) * tx - sin * ty) / det;
+  const cy = (sin * tx + (1 - cos) * ty) / det;
+  const sc = Math.sin(snapped);
+  const cc = Math.cos(snapped);
+  return [
+    [cc, -sc, cx - cc * cx + sc * cy],
+    [sc, cc, cy - sc * cx - cc * cy],
+    [0, 0, 1]
+  ];
 }
 
 function readMemoryBytes(): number | null {

@@ -225,6 +225,11 @@ export type RustWebGpuRenderer = {
   // the top-most object under the screen point (no mutation). Optional so a wasm
   // build predating it is treated as "no object" by the engine.
   hitTestObject?(screenX: number, screenY: number): string | null;
+  // RA3/EN1: pure swept erase pick — every object crossed by the eraser between two
+  // consecutive SCREEN samples (prev -> curr), top-down order, so a fast drag erases
+  // the whole swept path. No selection/camera/drag mutation. Optional so a wasm build
+  // predating it falls back to the single-sample `hitTestObject` in the engine.
+  sweptEraseAt?(prevX: number, prevY: number, currX: number, currY: number): string[];
   // W2-06: nearest point on any object outline to a WORLD query point, for shape
   // drag-create anchor snapping (W2-07 consumes this). `tolPx` is a screen-pixel
   // radius converted to world via `zoom` internally; the inputs are WORLD coords

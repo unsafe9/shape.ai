@@ -26,6 +26,7 @@
   import type { PeerPresence } from "../lib/peers";
   import type { ConnectionStatus } from "../lib/wsTransport";
   import type { ActiveTool, TransformKind } from "../renderer/engine";
+  import { cursorAffordance as deriveCursorAffordance } from "../lib/cursor";
   import type { HoverAffordance } from "../renderer/wasmLoader";
   import {
     loadSceneCore,
@@ -174,12 +175,11 @@
   let host: ShapeCanvasHost | null = null;
   let canvasWrap: HTMLDivElement;
 
-  // W2-03: the cursor affordance reflected onto the canvas wrapper. Space-hold
-  // shows the pan grab cursor; the draw tool keeps its own crosshair (no override);
-  // otherwise the core's per-move hover classification drives it (CSS in styles.css).
-  const cursorAffordance = $derived(
-    spaceHeld ? "pan" : activeTool === "draw" || activeTool === "create" || activeTool === "erase" ? null : affordance
-  );
+  // W2-03/EN1: the cursor affordance reflected onto the canvas wrapper. Space-hold
+  // shows the pan grab cursor; the crosshair tools keep their own cursor (no
+  // override); otherwise the core's per-move hover classification drives it. The
+  // mapping lives in `lib/cursor` (single source the CSS in styles.css mirrors).
+  const cursorAffordance = $derived(deriveCursorAffordance(spaceHeld, activeTool, affordance));
 
   // W2-10: the on-screen rect for the inline text-edit overlay, recomputed whenever
   // the edited object, its transform, or the camera changes (so the overlay tracks
