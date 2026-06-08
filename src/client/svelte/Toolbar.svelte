@@ -7,6 +7,7 @@
     Maximize2,
     Minus,
     Minus as LineIcon,
+    Eraser,
     MousePointer2,
     Pencil,
     Plus,
@@ -35,6 +36,12 @@
     // W2-07: the armed drag-create shape (rect/ellipse/line), or null. Highlights
     // the active shape button while the create tool is armed.
     createKind: DragCreateShape | null;
+    // W2-08: draw-mode brush state the contextual sub-toolbar drives (only shown
+    // while the pen/eraser tool is active). Pure UI chrome — the parent owns state.
+    penColor: string;
+    penWidthPx: number;
+    penPalette: string[];
+    penWidths: number[];
     busy: boolean;
     templateOpen: boolean;
     diagnosticsOpen: boolean;
@@ -46,6 +53,9 @@
     connectionStatus: ConnectionStatus;
     canvasBusy: boolean;
     onSetTool: (tool: ActiveTool) => void;
+    // W2-08: draw-mode sub-toolbar setters.
+    onSetPenColor: (color: string) => void;
+    onSetPenWidth: (widthPx: number) => void;
     onInsertPrimitive: (kind: PrimitiveKindId) => void;
     onToggleTemplates: () => void;
     onZoomIn: () => void;
@@ -64,6 +74,10 @@
   let {
     activeTool,
     createKind,
+    penColor,
+    penWidthPx,
+    penPalette,
+    penWidths,
     busy,
     templateOpen,
     diagnosticsOpen,
@@ -73,6 +87,8 @@
     connectionStatus,
     canvasBusy,
     onSetTool,
+    onSetPenColor,
+    onSetPenWidth,
     onInsertPrimitive,
     onToggleTemplates,
     onZoomIn,
@@ -155,6 +171,51 @@
   </div>
 {/if}
 
+<!-- W2-08: contextual draw-mode sub-toolbar (brush size + color + eraser hint).
+     Only shown while the pen/eraser tool is active; thin UI chrome that drives the
+     reactive brush state in the parent. -->
+{#if activeTool === "draw" || activeTool === "erase"}
+  <div class="toolbar-draw" role="toolbar" tabindex="-1" aria-label="Draw settings" onpointerdown={(event) => event.stopPropagation()}>
+    <div class="toolbar-group" aria-label="Brush size">
+      <span class="toolbar-group-label">Size</span>
+      <div class="toolbar-group-buttons">
+        {#each penWidths as width (width)}
+          <button
+            class="icon-button brush-size {penWidthPx === width ? 'is-active' : ''}"
+            type="button"
+            title={`${width}px`}
+            aria-label={`Brush ${width}px`}
+            aria-pressed={penWidthPx === width}
+            onclick={() => onSetPenWidth(width)}
+          >
+            <span class="brush-dot" style={`width:${Math.min(16, width * 2)}px;height:${Math.min(16, width * 2)}px;`}></span>
+          </button>
+        {/each}
+      </div>
+    </div>
+
+    <div class="toolbar-sep" aria-hidden="true"></div>
+
+    <div class="toolbar-group" aria-label="Brush color">
+      <span class="toolbar-group-label">Color</span>
+      <div class="toolbar-group-buttons">
+        {#each penPalette as color (color)}
+          <button
+            class="icon-button swatch {penColor === color ? 'is-active' : ''}"
+            type="button"
+            title={color}
+            aria-label={`Color ${color}`}
+            aria-pressed={penColor === color}
+            onclick={() => onSetPenColor(color)}
+          >
+            <span class="swatch-fill" style={`background:${color};`}></span>
+          </button>
+        {/each}
+      </div>
+    </div>
+  </div>
+{/if}
+
 <!-- Bottom-center toolbar: the sole persistent floating UI. -->
 <div class="toolbar-remote" role="toolbar" tabindex="-1" aria-label="Canvas toolbar" onpointerdown={(event) => event.stopPropagation()}>
   <!-- W2-03: one unified Move/Select pointer (picks/drags/marquees). Pan rides
@@ -177,7 +238,8 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <!-- Draw: the Pen is a tool toggle (free-draw), not an inserter. -->
+  <!-- Draw: the Pen is a tool toggle (free-draw), not an inserter. The Eraser is
+       a sibling draw-mode tool (whole-stroke delete, or partial cut with Alt). -->
   <div class="toolbar-group" aria-label="Draw">
     <span class="toolbar-group-label">Draw</span>
     <div class="toolbar-group-buttons">
@@ -190,6 +252,16 @@
         onclick={() => onSetTool("draw")}
       >
         <Pencil size={16} />
+      </button>
+      <button
+        class="icon-button {activeTool === 'erase' ? 'is-active' : ''}"
+        type="button"
+        title="Eraser (hold Alt to partial-erase)"
+        aria-label="Eraser tool"
+        aria-pressed={activeTool === "erase"}
+        onclick={() => onSetTool("erase")}
+      >
+        <Eraser size={16} />
       </button>
     </div>
   </div>

@@ -24,10 +24,11 @@ import type {
 } from "./wasmLoader";
 
 /** W2-03: the active pointer tool. One unified "select" Move/Select pointer
- *  (picks/drags/marquees), "draw" (freehand capture, FC-11), and "create" (W2-07
- *  drag-to-create shapes). Pan is no longer a separate tool — it rides
- *  Space-hold/middle-button/wheel (see {@link isPanIntent}). */
-export type ActiveTool = "select" | "draw" | "create";
+ *  (picks/drags/marquees), "draw" (freehand capture, FC-11), "create" (W2-07
+ *  drag-to-create shapes), and "erase" (W2-08 whole/partial stroke eraser). Pan
+ *  is no longer a separate tool — it rides Space-hold/middle-button/wheel (see
+ *  {@link isPanIntent}). */
+export type ActiveTool = "select" | "draw" | "create" | "erase";
 
 // W2-03: a pointer-down is a pan gesture (not a pick/marquee) when the Space key
 // is held OR the middle mouse button is used. Pure so the shell test can pin the
@@ -88,6 +89,13 @@ export type EngineEvent =
   // already snapped to the nearest object outline anchor when within tolerance
   // (`snapped` true) unless the snap-bypass modifier (Alt) was held.
   | { type: "create"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint; snapped: boolean }
+  // W2-08: eraser. While the erase tool is active, a pointer/mouse down/move over a
+  // stroke emits an erase touch carrying the hit object id + the touch in world
+  // space, plus whether the partial-erase modifier (Alt) was held (default = whole-
+  // stroke delete, modifier = partial subpath cut). The id comes from the core's
+  // object hit-test, so hit-test stays in the core (boundary); the shell authors
+  // the delete/edit-geometry op.
+  | { type: "erase"; id: string; world: WorldPoint; partial: boolean }
   // W2-03: the hover affordance under the cursor (from result.hoverAffordance on a
   // no-drag pointer move). The shell maps it to a CSS cursor.
   | { type: "affordance"; affordance: HoverAffordance }
@@ -158,6 +166,10 @@ export class ShapeCanvasEngine {
   // up. The pan state machine itself stays in the Rust core (boundary).
   private spaceHeld = false;
   private panGestureActive = false;
+  // W2-08: true while the erase tool's pointer is held down, so a move keeps
+  // erasing along the drag (a bare hover never erases). Set on erase down, cleared
+  // on up/cancel.
+  private eraseDragActive = false;
 
   constructor(options: ShapeCanvasEngineOptions) {
     this.canvas = options.canvas;
@@ -531,6 +543,12 @@ export class ShapeCanvasEngine {
       this.canvas.setPointerCapture(event.pointerId);
       return;
     }
+    if (this.activeTool === "erase" && !pan) {
+      this.eraseDragActive = true;
+      this.emitErase(event);
+      this.canvas.setPointerCapture(event.pointerId);
+      return;
+    }
     if (pan) this.armPanGesture();
     this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
@@ -551,6 +569,10 @@ export class ShapeCanvasEngine {
       this.emitCreate("move", event);
       return;
     }
+    if (this.activeTool === "erase" && !this.panGestureActive && this.eraseDragActive) {
+      this.emitErase(event);
+      return;
+    }
     this.sendInputBatch([{ kind: "pointer-move", pointerId: event.pointerId, screen: this.eventPoint(event) }]);
   };
 
@@ -567,6 +589,15 @@ export class ShapeCanvasEngine {
     }
     if (this.activeTool === "create" && !this.panGestureActive) {
       this.emitCreate("end", event);
+      try {
+        this.canvas.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released after cancellation.
+      }
+      return;
+    }
+    if (this.activeTool === "erase" && !this.panGestureActive) {
+      this.eraseDragActive = false;
       try {
         this.canvas.releasePointerCapture(event.pointerId);
       } catch {
@@ -612,6 +643,15 @@ export class ShapeCanvasEngine {
       }
       return;
     }
+    if (this.activeTool === "erase" && !this.panGestureActive) {
+      this.eraseDragActive = false;
+      try {
+        this.canvas.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released.
+      }
+      return;
+    }
     this.sendInputBatch([{ kind: "pointer-cancel", pointerId: event.pointerId }]);
     this.objectDrag = null;
     this.disarmPanGesture();
@@ -636,6 +676,13 @@ export class ShapeCanvasEngine {
       this.emitCreate("start", event);
       return;
     }
+    if (this.activeTool === "erase" && !pan) {
+      this.mouseDragActive = true;
+      this.eraseDragActive = true;
+      this.bindMouseFallbackMove();
+      this.emitErase(event);
+      return;
+    }
     if (pan) this.armPanGesture();
     this.lastPointerAdditive = event.shiftKey || event.metaKey;
     this.beginInputGesture();
@@ -655,6 +702,10 @@ export class ShapeCanvasEngine {
       this.emitCreate("move", event);
       return;
     }
+    if (this.activeTool === "erase" && !this.panGestureActive && this.eraseDragActive) {
+      this.emitErase(event);
+      return;
+    }
     this.sendInputBatch([{ kind: "pointer-move", pointerId: MOUSE_POINTER_ID, screen: this.eventPoint(event) }]);
   };
 
@@ -669,6 +720,10 @@ export class ShapeCanvasEngine {
     }
     if (this.activeTool === "create" && !this.panGestureActive) {
       this.emitCreate("end", event);
+      return;
+    }
+    if (this.activeTool === "erase" && !this.panGestureActive) {
+      this.eraseDragActive = false;
       return;
     }
     this.sendInputBatch([
@@ -998,6 +1053,19 @@ export class ShapeCanvasEngine {
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(raw) : null;
     const world = snap ?? raw;
     this.onEvent({ type: "create", phase, world, snapped: snap !== null });
+  }
+
+  // W2-08: emit an erase touch for the stroke under the cursor. The object id
+  // comes from the core's object hit-test (hit-test stays in the core, boundary);
+  // a touch over empty canvas (no hit) emits nothing. `partial` is the Alt
+  // modifier (default = whole-stroke delete, modifier = partial subpath cut). The
+  // shell authors the delete / edit-geometry op from the event.
+  private emitErase(event: MouseEvent | PointerEvent) {
+    const screen = this.eventPoint(event);
+    const id = this.objectHitTest(screen);
+    if (!id) return;
+    const world = screenToWorld(screen, this.camera);
+    this.onEvent({ type: "erase", id, world, partial: event.altKey });
   }
 
   // W2-07: snap a world point to the nearest object outline anchor via the W2-06

@@ -191,10 +191,12 @@ p {
   touch-action: none;
 }
 
-/* W2-03/W2-07 tool cursors: draw + shape drag-create use a crosshair, the unified
- * Move pointer's cursor is driven by the hover affordance below. */
+/* W2-03/W2-07/W2-08 tool cursors: draw + shape drag-create + erase use a
+ * crosshair, the unified Move pointer's cursor is driven by the hover affordance
+ * below. */
 .renderer-scene-surface[data-tool="draw"],
-.renderer-scene-surface[data-tool="create"] {
+.renderer-scene-surface[data-tool="create"],
+.renderer-scene-surface[data-tool="erase"] {
   cursor: crosshair;
 }
 
@@ -1619,6 +1621,38 @@ p {
   align-self: stretch;
   background: var(--line);
   margin: 0 4px;
+}
+
+/* W2-08 — draw-mode sub-toolbar (brush size + color), floats above the remote. */
+.toolbar-draw {
+  position: absolute;
+  left: 50%;
+  bottom: 92px;
+  z-index: 13;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid rgb(255 255 255 / 0.72);
+  border-radius: 18px;
+  background: rgb(255 255 255 / 0.78);
+  box-shadow: var(--shadow-float);
+  backdrop-filter: var(--glass-blur);
+}
+
+.icon-button.brush-size .brush-dot {
+  display: inline-block;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.icon-button.swatch .swatch-fill {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid rgb(0 0 0 / 0.18);
 }
 
 /* ---------------------------------------------------------------------------

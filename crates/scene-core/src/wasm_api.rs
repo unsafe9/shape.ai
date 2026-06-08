@@ -49,7 +49,7 @@ fn parse<T: serde::de::DeserializeOwned>(label: &str, json: &str) -> Result<T, S
 
 use crate::object::apply::apply_object_op as apply_object_op_pure;
 use crate::object::commands::object_command_catalog_json;
-use crate::object::drawing::{Brush, DrawingSession};
+use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush, DrawingSession};
 use crate::object::model::{Geometry, ObjectScene};
 use crate::object::op::ObjectOp;
 use crate::object::region::{OutlineDeriver, StubOutlineDeriver};
@@ -189,6 +189,30 @@ pub fn freehand_to_object(
     session.end_stroke(epsilon);
     let object = session.commit(id.to_string(), order.to_string(), origin_x, origin_y);
     ok_json(&object)
+}
+
+/// `split_subpath_at(geometry_json, x, y, radius) -> Geometry | {error}`.
+///
+/// Partial erase (W2-08/D4): cut a stroke's geometry at a touched point. `x`/`y`/
+/// `radius` are object-local quantized coords (the shell converts the world touch
+/// into the object's local space). The node nearest the touch within `radius` is
+/// removed, splitting its subpath into two open subpaths; degenerate (<2-node)
+/// flanks drop. Returns the new geometry, or `{error}` when the touch missed
+/// every node (nothing to cut) or the input was malformed — the shell then leaves
+/// the stroke unchanged. This is a SIMPLE split, NOT a geometric boolean.
+#[wasm_bindgen]
+pub fn split_subpath_at(geometry_json: &str, x: i32, y: i32, radius: i32) -> String {
+    let mut geometry: Geometry = match parse("geometry", geometry_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = geometry.ensure_parsed() {
+        return error_json(&format!("geometry parse failed: {e}"));
+    }
+    match split_subpath_at_pure(&geometry, x, y, radius) {
+        Some(cut) => ok_json(&cut),
+        None => error_json("erase touch hit no stroke node"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +382,24 @@ mod tests {
     fn freehand_rejects_too_few_points() {
         let json = freehand_to_object("[[0,0]]", "#000000", 1.0, 1.0, "d", "a0");
         assert!(json.contains("\"error\""), "single point is an error");
+    }
+
+    #[test]
+    fn split_subpath_at_cuts_geometry_into_two_open_subpaths() {
+        // A 5-node open polyline; cutting near the middle node yields a geometry
+        // whose path-string has two `M` subpaths and no `Z` (both open).
+        let geometry = r#"{"d":"M 0 0 L 80 0 L 160 0 L 240 0 L 320 0"}"#;
+        let out = split_subpath_at(geometry, 161, 1, 16);
+        let cut: Geometry = serde_json::from_str(&out).expect("cut returns a Geometry");
+        assert_eq!(cut.path_string.matches('M').count(), 2, "two subpaths");
+        assert!(!cut.path_string.contains('Z'), "both pieces are open");
+    }
+
+    #[test]
+    fn split_subpath_at_errors_when_touch_misses() {
+        let geometry = r#"{"d":"M 0 0 L 80 0"}"#;
+        let out = split_subpath_at(geometry, 5000, 5000, 16);
+        assert!(out.contains("\"error\""), "a missed touch is an error");
     }
 
     // --- WasmUndoStack bridge (FC-15) ---

@@ -168,6 +168,69 @@ pub fn fit_beziers(points: &[(f64, f64)]) -> Vec<PathNode> {
 }
 
 // ---------------------------------------------------------------------------
+// Partial erase — subpath split/cut at a touched point (D4, W2-08).
+// ---------------------------------------------------------------------------
+
+/// Cut a stroke's geometry at a touched point: the node nearest `(x, y)` within
+/// `radius` (all in object-local quantized units) is removed, splitting its
+/// subpath into two open subpaths (`[0..i]` and `[i+1..]`). A produced piece
+/// with fewer than 2 nodes has no extent and is dropped, so erasing the only/
+/// final segment can leave the object empty (the caller deletes it then). Other
+/// subpaths pass through untouched.
+///
+/// This is a SIMPLE split — it removes the closest node, not a full geometric
+/// boolean. Returns `None` when no node lies within `radius` (the touch missed
+/// every node, so there is nothing to cut). Pure: no IO/time/rng.
+pub fn split_subpath_at(geometry: &Geometry, x: i32, y: i32, radius: i32) -> Option<Geometry> {
+    let radius_sq = i64::from(radius) * i64::from(radius);
+    let mut best: Option<(usize, usize, i64)> = None; // (subpath, node, dist_sq)
+    for (si, sp) in geometry.subpaths.iter().enumerate() {
+        for (ni, node) in sp.nodes.iter().enumerate() {
+            let dx = i64::from(node.x) - i64::from(x);
+            let dy = i64::from(node.y) - i64::from(y);
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq <= radius_sq && best.is_none_or(|(_, _, b)| dist_sq < b) {
+                best = Some((si, ni, dist_sq));
+            }
+        }
+    }
+    let (target_si, target_ni, _) = best?;
+
+    let mut out: Vec<SubPath> = Vec::with_capacity(geometry.subpaths.len() + 1);
+    for (si, sp) in geometry.subpaths.iter().enumerate() {
+        if si != target_si {
+            out.push(sp.clone());
+            continue;
+        }
+        // Split this subpath around the removed node, dropping degenerate pieces.
+        // A closed subpath opens once it is cut (the cut breaks the loop).
+        let left = &sp.nodes[..target_ni];
+        let right = &sp.nodes[target_ni + 1..];
+        if left.len() >= 2 {
+            out.push(open_subpath(left));
+        }
+        if right.len() >= 2 {
+            out.push(open_subpath(right));
+        }
+    }
+    Some(Geometry::from_subpaths(out, geometry.fill_rule))
+}
+
+/// An open subpath from a node slice. The cut endpoints lose the dangling handle
+/// that pointed at the removed node so the open ends render cleanly (the first
+/// node drops its in-handle, the last drops its out-handle).
+fn open_subpath(nodes: &[PathNode]) -> SubPath {
+    let mut nodes = nodes.to_vec();
+    if let Some(first) = nodes.first_mut() {
+        first.in_handle = None;
+    }
+    if let Some(last) = nodes.last_mut() {
+        last.out_handle = None;
+    }
+    SubPath { closed: false, nodes }
+}
+
+// ---------------------------------------------------------------------------
 // Brush + pressure (D2 per-node width slot).
 // ---------------------------------------------------------------------------
 
@@ -449,6 +512,88 @@ mod tests {
         // Out-of-range pressure clamps.
         assert_eq!(pressure_to_width(2.0, 10.0), 80);
         assert_eq!(pressure_to_width(-1.0, 10.0), 0);
+    }
+
+    #[test]
+    fn split_subpath_cuts_at_nearest_node_into_two_open_pieces() {
+        // A 5-node polyline; cutting at the middle node (index 2) drops it and
+        // leaves two open pieces: nodes [0,1] and [3,4].
+        let geometry = Geometry::from_subpaths(
+            vec![SubPath {
+                closed: false,
+                nodes: vec![
+                    PathNode::corner(0, 0),
+                    PathNode::corner(10, 0),
+                    PathNode::corner(20, 0),
+                    PathNode::corner(30, 0),
+                    PathNode::corner(40, 0),
+                ],
+            }],
+            FillRule::NonZero,
+        );
+        let cut = split_subpath_at(&geometry, 21, 1, 8).expect("a node is within radius");
+        assert_eq!(cut.subpaths.len(), 2);
+        assert!(cut.subpaths.iter().all(|sp| !sp.closed), "pieces are open");
+        assert_eq!(cut.subpaths[0].nodes.len(), 2);
+        assert_eq!(cut.subpaths[1].nodes.len(), 2);
+        assert_eq!((cut.subpaths[0].nodes[0].x, cut.subpaths[0].nodes[1].x), (0, 10));
+        assert_eq!((cut.subpaths[1].nodes[0].x, cut.subpaths[1].nodes[1].x), (30, 40));
+    }
+
+    #[test]
+    fn split_subpath_drops_degenerate_endpoint_pieces() {
+        // Cutting the first node leaves no left piece and a 2-node right piece.
+        let geometry = Geometry::from_subpaths(
+            vec![SubPath {
+                closed: false,
+                nodes: vec![PathNode::corner(0, 0), PathNode::corner(10, 0), PathNode::corner(20, 0)],
+            }],
+            FillRule::NonZero,
+        );
+        let cut = split_subpath_at(&geometry, 0, 0, 8).expect("the first node is within radius");
+        assert_eq!(cut.subpaths.len(), 1);
+        assert_eq!(cut.subpaths[0].nodes.len(), 2);
+        assert_eq!(cut.subpaths[0].nodes[0].x, 10);
+    }
+
+    #[test]
+    fn split_subpath_returns_none_when_touch_misses_all_nodes() {
+        let geometry = Geometry::from_subpaths(
+            vec![SubPath {
+                closed: false,
+                nodes: vec![PathNode::corner(0, 0), PathNode::corner(10, 0)],
+            }],
+            FillRule::NonZero,
+        );
+        assert!(split_subpath_at(&geometry, 500, 500, 8).is_none());
+    }
+
+    #[test]
+    fn split_subpath_leaves_other_subpaths_untouched() {
+        // A two-subpath object; cutting the middle node of the second subpath
+        // leaves the first whole. The second's two flanks are each a single node
+        // (degenerate), so they drop — only the untouched first subpath remains.
+        let geometry = Geometry::from_subpaths(
+            vec![
+                SubPath {
+                    closed: false,
+                    nodes: vec![PathNode::corner(0, 0), PathNode::corner(10, 0)],
+                },
+                SubPath {
+                    closed: false,
+                    nodes: vec![
+                        PathNode::corner(0, 50),
+                        PathNode::corner(10, 50),
+                        PathNode::corner(20, 50),
+                    ],
+                },
+            ],
+            FillRule::NonZero,
+        );
+        let cut = split_subpath_at(&geometry, 10, 50, 8).expect("middle node within radius");
+        assert_eq!(cut.subpaths.len(), 1);
+        assert_eq!(cut.subpaths[0].nodes.len(), 2);
+        assert_eq!((cut.subpaths[0].nodes[0].y, cut.subpaths[0].nodes[1].y), (0, 0));
     }
 
     #[test]

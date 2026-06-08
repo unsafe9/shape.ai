@@ -68,7 +68,18 @@
   //       preview object so the stroke is visible before it commits. On pointer-up
   //       the points lower to a committed `Object` via the wasm core. -----
   let drawPoints = $state<{ x: number; y: number }[] | null>(null);
-  const PEN = { color: "#1f2933", widthPx: 2, epsilon: 2.0 };
+  // W2-08: pen brush settings are now reactive state the draw-mode sub-toolbar
+  // drives (color + width); epsilon (RDP simplification) stays a constant. The
+  // freehand commit + the live preview both read the current brush.
+  const PEN_EPSILON = 2.0;
+  let penColor = $state("#1f2933");
+  let penWidthPx = $state(2);
+  // W2-08: draw-mode palette + brush sizes the sub-toolbar offers.
+  const PEN_PALETTE = ["#1f2933", "#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#ffffff"];
+  const PEN_WIDTHS = [1, 2, 4, 8];
+  // W2-08: partial-erase cut radius in object-local quantized units (~12 logical
+  // px). A node within this radius of the touch is removed when the stroke is cut.
+  const ERASE_RADIUS_QUANTIZED = 12 * GEOMETRY_QUANTUM_PER_PX;
 
   // ----- W2-07: shape drag-create. Arming a shape tool sets `createKind`; the
   //       pointer down-drag-up rubber-bands a bbox accumulated in `createDrag`
@@ -130,7 +141,9 @@
   // W2-03: the cursor affordance reflected onto the canvas wrapper. Space-hold
   // shows the pan grab cursor; the draw tool keeps its own crosshair (no override);
   // otherwise the core's per-move hover classification drives it (CSS in styles.css).
-  const cursorAffordance = $derived(spaceHeld ? "pan" : activeTool === "draw" || activeTool === "create" ? null : affordance);
+  const cursorAffordance = $derived(
+    spaceHeld ? "pan" : activeTool === "draw" || activeTool === "create" || activeTool === "erase" ? null : affordance
+  );
 
   const readyState = $derived(rendererHealth?.state ?? "wasm-unavailable");
   const rendererDetail = $derived(rendererHealth?.detail ?? "Detecting Rust/WASM package.");
@@ -195,6 +208,8 @@
     onDraw: (phase, world) => handleDraw(phase, world),
     // W2-07: shape drag-create rubber-band + commit + select-after-create.
     onCreate: (phase, world, snapped) => handleCreate(phase, world, snapped),
+    // W2-08: eraser touch — whole-stroke delete or partial subpath cut.
+    onErase: (id, world, partial) => handleErase(id, world, partial),
     // W2-03: the core's per-move hover classification drives the canvas cursor.
     onAffordance: (next) => (affordance = next)
   };
@@ -617,8 +632,42 @@
     // phase === "end": commit the stroke to an object (>=2 points have extent).
     drawPoints = null;
     if (points.length < 2 || !sceneCore) return;
-    const object = sceneCore.freehandToObject(points, PEN.color, PEN.widthPx, PEN.epsilon, freshId("draw"), nextOrderKey());
+    const object = sceneCore.freehandToObject(points, penColor, penWidthPx, PEN_EPSILON, freshId("draw"), nextOrderKey());
     authorOp({ kind: "insert-object", object });
+    // Request 6: select the freshly-drawn stroke after creating it. The pen tool
+    // stays sticky in "draw" so the next stroke draws immediately.
+    selectObject({ kind: "object", id: object.id });
+  }
+
+  // W2-08: erase the stroke under the cursor. Default = whole-stroke delete (a
+  // `delete` op). The partial modifier cuts the stroke's subpath at the touched
+  // region via the scene-core split: convert the world touch into the object's
+  // local quantized space, split the geometry, then author an `edit-geometry` op
+  // (or delete the object when the cut leaves it empty). Both ride the single
+  // op-apply path, so undo (D21) captures the inverse. A drag erases continuously.
+  function handleErase(id: string, world: { x: number; y: number }, partial: boolean): void {
+    const target = scene.objects.find((o) => o.id === id);
+    if (!target) return;
+    if (!partial || !sceneCore) {
+      authorOp({ kind: "delete", id });
+      if (selection.kind === "object" && selection.id === id) selectObject({ kind: "canvas" });
+      return;
+    }
+    const local = worldToObjectLocalQuantized(target, world);
+    if (!local) {
+      authorOp({ kind: "delete", id });
+      return;
+    }
+    const cut = sceneCore.splitSubpathAt(target.geometry, local.x, local.y, ERASE_RADIUS_QUANTIZED);
+    // No node within the erase radius: the touch missed; leave the stroke whole.
+    if (!cut) return;
+    // The cut removed every renderable piece — delete the now-empty object.
+    if (cut.d.trim().length === 0) {
+      authorOp({ kind: "delete", id });
+      if (selection.kind === "object" && selection.id === id) selectObject({ kind: "canvas" });
+      return;
+    }
+    authorOp({ kind: "edit-geometry", id, geometry: cut });
   }
 
   function deleteSelection(): void {
@@ -1130,6 +1179,27 @@
     return out;
   }
 
+  // W2-08: map a world point into an object's local quantized geometry space
+  // (inverse affine transform, then quantize by GEOMETRY_QUANTUM_PER_PX). Returns
+  // null when the transform is non-invertible (degenerate scale). Used to place
+  // the partial-erase cut in the same coordinate space as the stored geometry.
+  function worldToObjectLocalQuantized(object: SceneObject, world: { x: number; y: number }): { x: number; y: number } | null {
+    const t = object.transform ?? IDENTITY_TRANSFORM;
+    const a = t[0][0];
+    const b = t[0][1];
+    const c = t[1][0];
+    const d = t[1][1];
+    const e = t[0][2];
+    const f = t[1][2];
+    const det = a * d - b * c;
+    if (Math.abs(det) < 1e-9) return null;
+    const dx = world.x - e;
+    const dy = world.y - f;
+    const localX = (d * dx - b * dy) / det;
+    const localY = (-c * dx + a * dy) / det;
+    return { x: Math.round(localX * GEOMETRY_QUANTUM_PER_PX), y: Math.round(localY * GEOMETRY_QUANTUM_PER_PX) };
+  }
+
   // FC-08/FC-11: the renderer feed. Start from the canonical scene, apply a live
   // drag-preview shift, and append a transient pen-stroke preview — neither mutates
   // the canonical `scene` nor runs op-apply (geometry-vocabulary construction only).
@@ -1199,7 +1269,7 @@
       id: "draw-preview",
       order: nextOrderKey(),
       geometry: { d },
-      stroke: { paint: { kind: "solid", color: PEN.color }, width: PEN.widthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
+      stroke: { paint: { kind: "solid", color: penColor }, width: penWidthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
     };
   }
 
@@ -1303,6 +1373,10 @@
         <Toolbar
           {activeTool}
           {createKind}
+          {penColor}
+          {penWidthPx}
+          penPalette={PEN_PALETTE}
+          penWidths={PEN_WIDTHS}
           {busy}
           {templateOpen}
           {diagnosticsOpen}
@@ -1312,6 +1386,8 @@
           {connectionStatus}
           {canvasBusy}
           onSetTool={setActiveTool}
+          onSetPenColor={(color) => (penColor = color)}
+          onSetPenWidth={(width) => (penWidthPx = width)}
           onInsertPrimitive={insertPrimitive}
           onToggleTemplates={toggleTemplates}
           onZoomIn={() => zoomAtCenter(-160)}

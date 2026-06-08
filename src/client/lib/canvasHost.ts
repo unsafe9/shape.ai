@@ -73,6 +73,10 @@ export type ShapeCanvasHostCallbacks = {
   // to the nearest outline anchor when `snapped`); the shell rubber-bands a bbox
   // preview and commits a sized primitive on `end`.
   onCreate: (phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snapped: boolean) => void;
+  // W2-08: eraser touch over a stroke. `id` is the hit object; `partial` is the
+  // partial-erase modifier (default = whole-stroke delete, modifier = subpath
+  // cut). The shell authors the delete / edit-geometry op from `world` + `id`.
+  onErase: (id: string, world: { x: number; y: number }, partial: boolean) => void;
   // W2-03: hover affordance under the cursor (empty/body/resize-*/rotate). The
   // shell maps it to a CSS cursor.
   onAffordance: (affordance: HoverAffordance) => void;
@@ -392,6 +396,11 @@ export class ShapeCanvasHost {
     // W2-07: shape drag-create phase routes to the shell's create controller.
     if (event.type === "create") {
       this.callbacks.onCreate(event.phase, event.world, event.snapped);
+      return;
+    }
+    // W2-08: eraser touch routes to the shell's erase controller.
+    if (event.type === "erase") {
+      this.callbacks.onErase(event.id, event.world, event.partial);
       return;
     }
     // W2-03: hover affordance routes to the shell's cursor.

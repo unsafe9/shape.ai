@@ -74,6 +74,7 @@ type SceneCoreModule = {
     id: string,
     order: string
   ) => string;
+  split_subpath_at: (geometryJson: string, x: number, y: number, radius: number) => string;
   WasmUndoStack: new (actorId: string) => WasmUndoStack;
 };
 
@@ -145,6 +146,15 @@ export type SceneCore = {
     id: string,
     order: string
   ): SceneObject;
+  /** W2-08: partial erase — cut a stroke's geometry at an object-local quantized
+   *  touch point + radius. Returns the new geometry (two open subpaths around the
+   *  removed node), or null when the touch missed every node (nothing to cut). */
+  splitSubpathAt(
+    geometry: SceneObject["geometry"],
+    x: number,
+    y: number,
+    radius: number
+  ): SceneObject["geometry"] | null;
   /** FC-15: create a per-actor undo/redo stack backed by the core (D21). */
   createUndoStack(actorId: string): UndoStack;
 };
@@ -255,6 +265,16 @@ export async function loadSceneCore(): Promise<SceneCore> {
           order
         )
       );
+    },
+    splitSubpathAt(geometry, x, y, radius) {
+      // A missed touch comes back as `{error}` (nothing to cut); treat that as a
+      // no-op (null) rather than a thrown failure — only a malformed input throws.
+      const raw = mod.split_subpath_at(JSON.stringify(geometry), x, y, radius);
+      const value = JSON.parse(raw) as SceneObject["geometry"] | { error: string };
+      if (value && typeof value === "object" && "error" in value && typeof value.error === "string") {
+        return null;
+      }
+      return value as SceneObject["geometry"];
     },
     createUndoStack(actorId) {
       const inner = new mod.WasmUndoStack(actorId);
