@@ -21,6 +21,7 @@
   } from "lucide-svelte";
   import type { ActiveTool } from "../renderer/engine";
   import { toolbarShapeKinds, toggleColorPopup, toggleStrokePopup, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
+  import { THEME_DEFAULT_COLOR } from "../lib/objectPrimitives";
   import type { CanvasSummary } from "../lib/sceneClient";
   import type { ConnectionStatus } from "../lib/wsTransport";
   import type { Object as SceneObject } from "../../shared/object";
@@ -44,6 +45,9 @@
     // D1/#5: always-visible toolbar color. AP1 applies this to the selection via
     // SetStyle; the toolbar owns only the swatch palette + native-picker UI.
     selectedColor: string;
+    // S2 (#5): dark-mode flag so the theme-default swatch renders contrasting
+    // (white in dark, black in light) instead of the raw sentinel string.
+    dark: boolean;
     busy: boolean;
     templateOpen: boolean;
     diagnosticsOpen: boolean;
@@ -82,6 +86,7 @@
     penPalette,
     penWidths,
     selectedColor,
+    dark,
     busy,
     templateOpen,
     diagnosticsOpen,
@@ -156,6 +161,17 @@
   function toggleStrokePopupOpen(): void {
     strokePopupOpen = toggleStrokePopup(strokePopupOpen);
   }
+
+  // S2 (#5): the theme-default swatch authors a Paint::Token, not a hex; render it
+  // contrasting (white in dark, black in light) with a "Theme default" label so the
+  // sentinel string never reaches the UI. Every other swatch renders its hex as-is.
+  function swatchFill(color: string): string {
+    return color === THEME_DEFAULT_COLOR ? (dark ? "#ffffff" : "#000000") : color;
+  }
+  function swatchLabel(color: string): string {
+    return color === THEME_DEFAULT_COLOR ? "Theme default" : color;
+  }
+
   $effect(() => {
     if (!strokePopupOpen) return;
     const onPointerDown = (event: PointerEvent) => {
@@ -345,12 +361,12 @@
             <button
               class="icon-button swatch {penColor === color ? 'is-active' : ''}"
               type="button"
-              title={color}
-              aria-label={`Color ${color}`}
+              title={swatchLabel(color)}
+              aria-label={`Color ${swatchLabel(color)}`}
               aria-pressed={penColor === color}
               onclick={() => onSetPenColor(color)}
             >
-              <span class="swatch-fill" style={`background:${color};`}></span>
+              <span class="swatch-fill" style={`background:${swatchFill(color)};`}></span>
             </button>
           {/each}
         </div>
@@ -377,7 +393,7 @@
         onclick={toggleColorPopupOpen}
       >
         <span class="color-trigger-rainbow"></span>
-        <span class="color-trigger-current" style={`background:${selectedColor};`}></span>
+        <span class="color-trigger-current" style={`background:${swatchFill(selectedColor)};`}></span>
       </button>
     </div>
     {#if colorPopupOpen}
@@ -387,21 +403,21 @@
             <button
               class="icon-button swatch {selectedColor === color ? 'is-active' : ''}"
               type="button"
-              title={color}
-              aria-label={`Color ${color}`}
+              title={swatchLabel(color)}
+              aria-label={`Color ${swatchLabel(color)}`}
               aria-pressed={selectedColor === color}
               onclick={() => onSelectColor(color)}
             >
-              <span class="swatch-fill" style={`background:${color};`}></span>
+              <span class="swatch-fill" style={`background:${swatchFill(color)};`}></span>
             </button>
           {/each}
         </div>
         <label class="color-popup-picker" title="Custom color" aria-label="Custom color">
-          <span class="swatch-fill" style={`background:${selectedColor};`}></span>
+          <span class="swatch-fill" style={`background:${swatchFill(selectedColor)};`}></span>
           <span class="color-popup-picker-label">Custom</span>
           <input
             type="color"
-            value={selectedColor}
+            value={swatchFill(selectedColor)}
             oninput={(event) => onSelectColor((event.currentTarget as HTMLInputElement).value)}
           />
         </label>

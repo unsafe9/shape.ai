@@ -68,7 +68,10 @@ export type GradientStop = { offset: number; color: string };
 export type Paint =
   | { kind: "solid"; color: string }
   | { kind: "gradient"; stops: GradientStop[]; angle: number }
-  | { kind: "image"; contentRef: string };
+  | { kind: "image"; contentRef: string }
+  // S2 (#5): a semantic theme token resolved to RGBA by the renderer (light/dark
+  // aware). Matches the core's `Paint::Token { name }` wire form.
+  | { kind: "token"; name: string };
 
 export type Fill = {
   paint: Paint;

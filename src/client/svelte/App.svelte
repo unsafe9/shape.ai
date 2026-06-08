@@ -41,7 +41,9 @@
     buildPrimitiveObjectFromDrag,
     buildSetStyleOp,
     MIN_DRAG_EXTENT_PX,
+    paintForColor,
     textOverlayScreenRect,
+    THEME_DEFAULT_COLOR,
     type DragSpan
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
@@ -90,14 +92,17 @@
   // drives (color + width); epsilon (RDP simplification) stays a constant. The
   // freehand commit + the live preview both read the current brush.
   const PEN_EPSILON = 2.0;
-  let penColor = $state("#1f2933");
+  // S2 (#5): default to the theme-default sentinel so new strokes follow the theme
+  // (authored as a Paint::Token "text" that flips black-ish<->white-ish per theme).
+  let penColor = $state(THEME_DEFAULT_COLOR);
   let penWidthPx = $state(2);
   // D1/#5: the toolbar's always-visible selected color. It is the default fill/
   // stroke for the next NEW shape; recoloring a selected object authors a SetStyle
   // op (applySelectedColor). The native picker passes a CSS hex through verbatim.
-  let selectedColor = $state("#1f2933");
-  // W2-08: draw-mode palette + brush sizes the sub-toolbar offers.
-  const PEN_PALETTE = ["#1f2933", "#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#ffffff"];
+  let selectedColor = $state(THEME_DEFAULT_COLOR);
+  // W2-08: draw-mode palette + brush sizes the sub-toolbar offers. S2 (#5): the
+  // first entry is the theme-default token sentinel, then the fixed hex swatches.
+  const PEN_PALETTE = [THEME_DEFAULT_COLOR, "#1f2933", "#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#ffffff"];
   const PEN_WIDTHS = [1, 2, 4, 8];
   // W2-08: partial-erase cut radius in object-local quantized units (~12 logical
   // px). A node within this radius of the touch is removed when the stroke is cut.
@@ -724,8 +729,8 @@
     const dy = Math.abs(span.end.y - span.start.y);
     const tooSmall = kind === "line" ? dx < MIN_DRAG_EXTENT_PX && dy < MIN_DRAG_EXTENT_PX : dx < MIN_DRAG_EXTENT_PX || dy < MIN_DRAG_EXTENT_PX;
     const object = tooSmall
-      ? buildPrimitiveObject(kind, span.start, freshId(kind), nextOrderKey())
-      : buildPrimitiveObjectFromDrag(kind, span, freshId(kind), nextOrderKey());
+      ? buildPrimitiveObject(kind, span.start, freshId(kind), nextOrderKey(), selectedColor)
+      : buildPrimitiveObjectFromDrag(kind, span, freshId(kind), nextOrderKey(), selectedColor);
     // AP5 (#14): a snapped drag-create binds the dragged endpoint to the target's
     // outline with a persistent D5 anchor (Alt-create bypasses snap upstream, so
     // `snapTarget` is null and no anchor is authored). The endpoint then reprojects
@@ -766,7 +771,12 @@
     // phase === "end": commit the stroke to an object (>=2 points have extent).
     drawPoints = null;
     if (points.length < 2 || !sceneCore) return;
-    const object = sceneCore.freehandToObject(points, penColor, penWidthPx, PEN_EPSILON, freshId("draw"), nextOrderKey());
+    // S2 (#5): freehandToObject is a hex API, so the theme-default sentinel can't be
+    // passed through it — lower with a placeholder hex, then swap the stroke paint to
+    // the "text" token so the stroke flips with the theme like every other authored color.
+    const strokeHex = penColor === THEME_DEFAULT_COLOR ? "#000000" : penColor;
+    const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, PEN_EPSILON, freshId("draw"), nextOrderKey());
+    if (penColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = paintForColor(penColor);
     authorOp({ kind: "insert-object", object });
     // Request 6: select the freshly-drawn stroke after creating it. The pen tool
     // stays sticky in "draw" so the next stroke draws immediately.
@@ -1511,7 +1521,7 @@
       id: "draw-preview",
       order: nextOrderKey(),
       geometry: { d },
-      stroke: { paint: { kind: "solid", color: penColor }, width: penWidthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
+      stroke: { paint: paintForColor(penColor), width: penWidthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
     };
   }
 
@@ -1620,6 +1630,7 @@
           penPalette={PEN_PALETTE}
           penWidths={PEN_WIDTHS}
           {selectedColor}
+          dark={theme === "dark"}
           {busy}
           {templateOpen}
           {diagnosticsOpen}
