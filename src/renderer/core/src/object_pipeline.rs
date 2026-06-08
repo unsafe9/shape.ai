@@ -46,7 +46,9 @@ use crate::text_layout::{layout_runs, TextAlign, TextRunInput, TextVAlign};
 #[cfg(feature = "wgpu-probe")]
 use crate::model::CameraState;
 #[cfg(feature = "wgpu-probe")]
-use crate::shaders::{OBJECT_FILL_WGSL, OBJECT_STROKE_WGSL};
+use crate::shaders::{MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_STROKE_WGSL};
+#[cfg(feature = "wgpu-probe")]
+use crate::text_layout::MsdfAtlasPlan;
 use crate::stroke_expand::{dash_segments, expand_stroke, Cap, Join};
 use crate::tessellate::{
     parse_path, quantized_to_px, tessellate_fill, DrawRange, FillRuleKind, MegaBuffer,
@@ -181,6 +183,15 @@ pub struct TextInstance {
     pub m2: [f32; 3],
 }
 
+/// `msdf_text.wgsl`'s `TextUniform` (binding 3): MSDF atlas params the
+/// `screenPxRange` AA reads. `atlas = vec4(distance_range, atlas_w, atlas_h, _)`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TextUniform {
+    /// `vec4(distance_range_texels, atlas_width, atlas_height, _)`.
+    pub atlas: [f32; 4],
+}
+
 // ---------------------------------------------------------------------------
 // Pipelines
 // ---------------------------------------------------------------------------
@@ -192,8 +203,10 @@ pub struct TextInstance {
 pub struct ObjectPipeline {
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     pub stroke_bind_group_layout: wgpu::BindGroupLayout,
+    pub text_bind_group_layout: wgpu::BindGroupLayout,
     pub fill_pipeline: wgpu::RenderPipeline,
     pub stroke_pipeline: wgpu::RenderPipeline,
+    pub text_pipeline: wgpu::RenderPipeline,
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -214,6 +227,10 @@ impl ObjectPipeline {
         let stroke_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shape.ai object stroke shader"),
             source: wgpu::ShaderSource::Wgsl(OBJECT_STROKE_WGSL.into()),
+        });
+        let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shape.ai object text shader"),
+            source: wgpu::ShaderSource::Wgsl(MSDF_TEXT_WGSL.into()),
         });
 
         // group(0) binding(0): the affine camera uniform, shared by both shaders.
@@ -250,6 +267,53 @@ impl ObjectPipeline {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // The text pipeline's group(0): b0 view uniform (VERTEX, the shared camera),
+        // b1 MSDF atlas texture (FRAGMENT), b2 sampler (FRAGMENT), b3 text params
+        // uniform (FRAGMENT, atlas distance_range + dimensions). Matches
+        // `msdf_text.wgsl`'s group(0) bindings exactly.
+        let text_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shape.ai object text bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
@@ -396,11 +460,76 @@ impl ObjectPipeline {
             cache: None,
         });
 
+        // ---- Text pipeline ------------------------------------------------
+        // slot0: TextVertex (position @0, uv @1, color @2); slot1: instance-step
+        // matrix columns m0/m1/m2 @3..5. Matches `msdf_text.wgsl`'s VertexIn.
+        let text_vertex_attrs = [
+            // @location(0) position: vec2<f32>
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            // @location(1) uv: vec2<f32>
+            wgpu::VertexAttribute {
+                offset: std::mem::size_of::<[f32; 2]>() as u64,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            // @location(2) color: vec4<f32>
+            wgpu::VertexAttribute {
+                offset: (std::mem::size_of::<[f32; 2]>() * 2) as u64,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+        ];
+        let text_instance_attrs = text_instance_attributes();
+        let text_buffers = [
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<TextVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &text_vertex_attrs,
+            },
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<TextInstance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &text_instance_attrs,
+            },
+        ];
+        let text_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shape.ai object text pipeline layout"),
+            bind_group_layouts: &[Some(&text_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shape.ai object text pipeline"),
+            layout: Some(&text_layout),
+            vertex: wgpu::VertexState {
+                module: &text_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &text_buffers,
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &text_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &color_targets,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         ObjectPipeline {
             camera_bind_group_layout,
             stroke_bind_group_layout,
+            text_bind_group_layout,
             fill_pipeline,
             stroke_pipeline,
+            text_pipeline,
         }
     }
 }
@@ -464,6 +593,31 @@ fn stroke_instance_attributes() -> [wgpu::VertexAttribute; 4] {
     ]
 }
 
+/// Instance-step vertex attributes for the text pipeline (`m0`/`m1`/`m2` columns
+/// at locations 3..5, NO color — color is per-glyph in [`TextVertex`]), packed to
+/// match [`TextInstance`] and `msdf_text.wgsl`'s @location(3..5) contract.
+#[cfg(feature = "wgpu-probe")]
+fn text_instance_attributes() -> [wgpu::VertexAttribute; 3] {
+    let vec3 = std::mem::size_of::<[f32; 3]>() as u64;
+    [
+        wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 3,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: vec3,
+            shader_location: 4,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: vec3 * 2,
+            shader_location: 5,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // CPU scene build
 // ---------------------------------------------------------------------------
@@ -510,9 +664,15 @@ pub struct ObjectRenderer {
     pub fill_instance_buffer: wgpu::Buffer,
     pub stroke_vertex_buffer: wgpu::Buffer,
     pub stroke_instance_buffer: wgpu::Buffer,
+    pub text_vertex_buffer: wgpu::Buffer,
+    pub text_instance_buffer: wgpu::Buffer,
+    pub text_params_buffer: wgpu::Buffer,
+    pub msdf_atlas_texture: wgpu::Texture,
+    pub text_bind_group: wgpu::BindGroup,
     draws: Vec<ObjectDraw>,
     fill_index_count: u32,
     stroke_vertex_count: u32,
+    text_vertex_count: u32,
     /// RB1: the active light/dark theme. Sources the canvas clear color and is
     /// the bit [`ObjectRenderer::set_theme`] flips. Held so token-backed instance
     /// colors re-resolve on a toggle without re-tessellation (P4).
@@ -606,6 +766,10 @@ impl ObjectRenderer {
             create_vertex_buffer(device, "object stroke vertices", &build.stroke_vertices);
         let stroke_instance_buffer =
             create_vertex_buffer(device, "object stroke instances", &build.stroke_instances);
+        let text_vertex_buffer =
+            create_vertex_buffer(device, "object text vertices", &build.text_vertices);
+        let text_instance_buffer =
+            create_vertex_buffer(device, "object text instances", &build.text_instances);
 
         if !fill_vertices.is_empty() {
             queue.write_buffer(&fill_vertex_buffer, 0, bytemuck::cast_slice(&fill_vertices));
@@ -638,6 +802,104 @@ impl ObjectRenderer {
                 bytemuck::cast_slice(&build.stroke_instances),
             );
         }
+        if !build.text_vertices.is_empty() {
+            queue.write_buffer(
+                &text_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&build.text_vertices),
+            );
+        }
+        if !build.text_instances.is_empty() {
+            queue.write_buffer(
+                &text_instance_buffer,
+                0,
+                bytemuck::cast_slice(&build.text_instances),
+            );
+        }
+
+        // ---- MSDF text atlas + params + bind group ------------------------
+        // The atlas is generated CPU-side by MsdfAtlasPlan (single-channel SDF
+        // replicated to RGB). The live atlas is populated from real fontdue glyph
+        // coverage at the GPU cutover (alongside the injected measure); here it is
+        // an empty plan giving a valid, uploadable RGBA8 texture + distance_range.
+        let atlas_plan = MsdfAtlasPlan::new(256, 256, 4.0);
+        let msdf_atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shape.ai object msdf atlas"),
+            size: wgpu::Extent3d {
+                width: atlas_plan.atlas_width,
+                height: atlas_plan.atlas_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &msdf_atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            atlas_plan.pixels(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas_plan.atlas_width * 4),
+                rows_per_image: Some(atlas_plan.atlas_height),
+            },
+            wgpu::Extent3d {
+                width: atlas_plan.atlas_width,
+                height: atlas_plan.atlas_height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let msdf_atlas_view = msdf_atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let msdf_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shape.ai object msdf sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let text_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shape.ai object text params uniform"),
+            size: std::mem::size_of::<TextUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let text_params = TextUniform {
+            atlas: [
+                atlas_plan.distance_range,
+                atlas_plan.atlas_width as f32,
+                atlas_plan.atlas_height as f32,
+                0.0,
+            ],
+        };
+        queue.write_buffer(&text_params_buffer, 0, bytemuck::cast_slice(&[text_params]));
+        let text_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shape.ai object text bind group"),
+            layout: &pipeline.text_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&msdf_atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&msdf_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: text_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
 
         ObjectRenderer {
             uniform_buffer,
@@ -649,8 +911,14 @@ impl ObjectRenderer {
             fill_instance_buffer,
             stroke_vertex_buffer,
             stroke_instance_buffer,
+            text_vertex_buffer,
+            text_instance_buffer,
+            text_params_buffer,
+            msdf_atlas_texture,
+            text_bind_group,
             fill_index_count: build.fill.indices.len() as u32,
             stroke_vertex_count: build.stroke_vertices.len() as u32,
+            text_vertex_count: build.text_vertices.len() as u32,
             draws: build.draws,
             theme,
             preview_transforms: Vec::new(),
@@ -866,6 +1134,27 @@ impl ObjectRenderer {
                 );
             }
         }
+
+        // Text pass: one instanced draw per object over its glyph-quad range, drawn
+        // OVER fill+stroke (the pass already loads, never clears, between sub-passes).
+        // Each object's glyphs ride its own per-object matrix instance (index `i`),
+        // index-aligned with `draws` exactly like the fill/stroke loops.
+        if self.text_vertex_count > 0 {
+            pass.set_pipeline(&pipeline.text_pipeline);
+            pass.set_bind_group(0, &self.text_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.text_vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.text_instance_buffer.slice(..));
+            for (instance, draw) in self.draws.iter().enumerate() {
+                if draw.text_range.is_empty() {
+                    continue;
+                }
+                let instance = instance as u32;
+                pass.draw(
+                    draw.text_range.start..draw.text_range.end,
+                    instance..instance + 1,
+                );
+            }
+        }
     }
 
     /// Number of fill indices uploaded for the loaded scene (diagnostics).
@@ -876,6 +1165,11 @@ impl ObjectRenderer {
     /// Number of stroke ribbon vertices uploaded for the loaded scene (diagnostics).
     pub fn stroke_vertex_count(&self) -> u32 {
         self.stroke_vertex_count
+    }
+
+    /// Number of text glyph-quad vertices uploaded for the loaded scene (diagnostics).
+    pub fn text_vertex_count(&self) -> u32 {
+        self.text_vertex_count
     }
 }
 
@@ -1789,6 +2083,28 @@ mod tests {
         assert_eq!(std::mem::size_of::<TextVertex>(), 32);
         // TextInstance: 3 vec3 columns = 9 floats = 36 bytes, no color.
         assert_eq!(std::mem::size_of::<TextInstance>(), 36);
+    }
+
+    /// COMMIT B (packing vs shader): the text instance attribute offsets/locations
+    /// match msdf_text.wgsl's @location(3..5) instance-step matrix columns —
+    /// m0@offset0/loc3, m1@12/loc4, m2@24/loc5. FAILS if the instance packing drifts
+    /// from the shader's expected per-object matrix layout.
+    #[cfg(feature = "wgpu-probe")]
+    #[test]
+    fn text_pipeline_layout_matches_msdf_shader_contract() {
+        assert_eq!(std::mem::size_of::<TextVertex>(), 32);
+        let attrs = text_instance_attributes();
+        assert_eq!(attrs[0].offset, 0);
+        assert_eq!(attrs[0].shader_location, 3);
+        assert_eq!(attrs[1].offset, 12);
+        assert_eq!(attrs[1].shader_location, 4);
+        assert_eq!(attrs[2].offset, 24);
+        assert_eq!(attrs[2].shader_location, 5);
+        // TextVertex attribute formats: position Float32x2 @0, uv Float32x2 @8,
+        // color Float32x4 @16 — pinned via byte offsets implicit in the 32B size.
+        assert_eq!(std::mem::offset_of!(TextVertex, position), 0);
+        assert_eq!(std::mem::offset_of!(TextVertex, uv), 8);
+        assert_eq!(std::mem::offset_of!(TextVertex, color), 16);
     }
 
     /// COMMIT C (de-quant): a wire run size of 128 (= 16px * 8) lays out the second
