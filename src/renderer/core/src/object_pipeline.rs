@@ -37,6 +37,7 @@
 // gated behind `wgpu-probe` (the feature that pulls in `wgpu`), so the object
 // render model + geometry build the web wasm exports stay available without it.
 
+use crate::object_theme::{resolve_token_f32, Theme};
 use crate::render_object::{resolve_visual, RPaint, RenderObject, RenderObjectScene, VisualState};
 #[cfg(feature = "wgpu-probe")]
 use crate::model::CameraState;
@@ -452,6 +453,14 @@ pub struct ObjectDraw {
     pub stroke_instance: StrokeInstance,
     /// Whether a focus ring should be drawn for this object (selection/focus).
     pub focus_ring: bool,
+    /// RB1 theme toggle: the semantic token name backing this object's fill, if
+    /// the fill is a [`RPaint::Token`]. `Some` => the fill color re-resolves on a
+    /// theme flip; `None` (raw hex / gradient / image) is theme-invariant. Lets
+    /// [`ObjectRenderer::set_theme`] write ONLY token-backed instance colors
+    /// (zero re-tessellation, P4).
+    pub fill_token: Option<String>,
+    /// RB1 theme toggle: the token name backing this object's stroke, if any.
+    pub stroke_token: Option<String>,
 }
 
 /// Owns the CPU-built object draw data and the GPU buffers it uploads to, and
@@ -470,6 +479,10 @@ pub struct ObjectRenderer {
     draws: Vec<ObjectDraw>,
     fill_index_count: u32,
     stroke_vertex_count: u32,
+    /// RB1: the active light/dark theme. Sources the canvas clear color and is
+    /// the bit [`ObjectRenderer::set_theme`] flips. Held so token-backed instance
+    /// colors re-resolve on a toggle without re-tessellation (P4).
+    theme: Theme,
     /// RA1: per-object live preview WORLD transform (`delta * base`) for objects
     /// under an in-flight drag. Mirrors what `set_preview_transform` wrote to the
     /// GPU instance buffer so the CPU side (selection handles / region bounds) can
@@ -492,8 +505,9 @@ impl ObjectRenderer {
         scene: &RenderObjectScene,
         pixel_width: f32,
         pixel_height: f32,
+        theme: Theme,
     ) -> Self {
-        let build = build_scene_geometry(scene);
+        let build = build_scene_geometry_themed(scene, theme);
 
         let uniform = ObjectMatrixUniform::from_scene(scene, pixel_width, pixel_height);
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -604,6 +618,7 @@ impl ObjectRenderer {
             fill_index_count: build.fill.indices.len() as u32,
             stroke_vertex_count: build.stroke_vertices.len() as u32,
             draws: build.draws,
+            theme,
             preview_transforms: Vec::new(),
         }
     }
@@ -630,6 +645,50 @@ impl ObjectRenderer {
             viewport: [pixel_width, pixel_height, 0.0, 0.0],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
+    }
+
+    /// The active light/dark theme.
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+
+    /// RB1 ZERO-REBAKE THEME TOGGLE (D1/D2/P4): flip the renderer's theme bit and
+    /// re-resolve ONLY the token-backed instance colors, writing the 16-byte color
+    /// slot (offset 36, past the `m0,m1,m2` matrix) of each affected
+    /// `FillInstance`/`StrokeInstance` — the exact per-instance write path W2-11
+    /// uses for the drag matrix. Tessellation (the fill megabuffer, stroke ribbon
+    /// vertices, and every `draws` range) is NEVER touched: a theme flip is a
+    /// color refresh, not a rebuild. Objects whose paint is raw hex / gradient /
+    /// image are theme-invariant and skipped. The canvas clear color tracks
+    /// `self.theme` in [`ObjectRenderer::render`], so no buffer write is needed
+    /// for the backdrop. No-op (returns the unchanged bit) if `dark` already
+    /// matches the current theme.
+    pub fn set_theme(&mut self, queue: &wgpu::Queue, dark: bool) -> Theme {
+        if self.theme.dark == dark {
+            return self.theme;
+        }
+        self.theme = Theme { dark };
+        for (i, draw) in self.draws.iter_mut().enumerate() {
+            if let Some(name) = draw.fill_token.as_deref() {
+                let color = resolve_token_f32(name, dark).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                draw.fill_instance.fill = color;
+                let offset = (i * std::mem::size_of::<FillInstance>()
+                    + std::mem::offset_of!(FillInstance, fill)) as u64;
+                queue.write_buffer(&self.fill_instance_buffer, offset, bytemuck::cast_slice(&color));
+            }
+            if let Some(name) = draw.stroke_token.as_deref() {
+                let color = resolve_token_f32(name, dark).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                draw.stroke_instance.stroke = color;
+                let offset = (i * std::mem::size_of::<StrokeInstance>()
+                    + std::mem::offset_of!(StrokeInstance, stroke)) as u64;
+                queue.write_buffer(
+                    &self.stroke_instance_buffer,
+                    offset,
+                    bytemuck::cast_slice(&color),
+                );
+            }
+        }
+        self.theme
     }
 
     /// W2-11 drag zero-rebake: write ONLY the dragged object's instance model
@@ -705,11 +764,14 @@ impl ObjectRenderer {
         clear: bool,
     ) {
         let load = if clear {
+            // RB1: the canvas backdrop is the `canvas-bg` token in the active
+            // theme — flips light/dark with `self.theme`, no buffer write needed.
+            let [r, g, b, a] = self.theme.canvas_bg();
             wgpu::LoadOp::Clear(wgpu::Color {
-                r: 0.972,
-                g: 0.982,
-                b: 0.992,
-                a: 1.0,
+                r: r as f64,
+                g: g as f64,
+                b: b as f64,
+                a: a as f64,
             })
         } else {
             wgpu::LoadOp::Load
@@ -825,11 +887,21 @@ pub struct SceneGeometry {
     pub draws: Vec<ObjectDraw>,
 }
 
-/// Build all CPU geometry for `scene` (no device needed): for each object,
-/// tessellate its fill into the shared megabuffer, expand its stroke into a
-/// ribbon, and resolve its instance data (3x3 matrix columns + paint color).
-/// This is the unit-testable core of [`ObjectRenderer::new`].
+/// Build all CPU geometry for `scene` in light mode (no device needed). Thin
+/// wrapper over [`build_scene_geometry_themed`] for callers that don't carry a
+/// theme yet (the web geometry-summary export + light-mode tests). Token paints
+/// resolve against the light table here.
 pub fn build_scene_geometry(scene: &RenderObjectScene) -> SceneGeometry {
+    build_scene_geometry_themed(scene, Theme::light())
+}
+
+/// Build all CPU geometry for `scene` under `theme` (no device needed): for each
+/// object, tessellate its fill into the shared megabuffer, expand its stroke into
+/// a ribbon, and resolve its instance data (3x3 matrix columns + theme-resolved
+/// paint color). This is the unit-testable core of [`ObjectRenderer::new`]. The
+/// `theme` bit only affects token paint COLORS — tessellation/ranges are
+/// theme-invariant, which is what makes the toggle a zero-rebake color refresh.
+pub fn build_scene_geometry_themed(scene: &RenderObjectScene, theme: Theme) -> SceneGeometry {
     let mut geometry = SceneGeometry::default();
 
     for obj in &scene.objects {
@@ -849,7 +921,7 @@ pub fn build_scene_geometry(scene: &RenderObjectScene) -> SceneGeometry {
             m0: matrix_col(&obj.transform, 0),
             m1: matrix_col(&obj.transform, 1),
             m2: matrix_col(&obj.transform, 2),
-            fill: paint_color(&resolved.fill.paint, resolved.fill.opacity as f32),
+            fill: paint_color(&resolved.fill.paint, resolved.fill.opacity as f32, theme),
         });
 
         // ---- Stroke: expand each (dashed) subpath into a ribbon ------------
@@ -879,7 +951,7 @@ pub fn build_scene_geometry(scene: &RenderObjectScene) -> SceneGeometry {
             m0: matrix_col(&obj.transform, 0),
             m1: matrix_col(&obj.transform, 1),
             m2: matrix_col(&obj.transform, 2),
-            stroke: paint_color(&resolved.stroke.paint, resolved.stroke.opacity as f32),
+            stroke: paint_color(&resolved.stroke.paint, resolved.stroke.opacity as f32, theme),
         });
 
         geometry.draws.push(ObjectDraw {
@@ -898,6 +970,8 @@ pub fn build_scene_geometry(scene: &RenderObjectScene) -> SceneGeometry {
                 .last()
                 .expect("stroke instance just pushed"),
             focus_ring: resolved.focus_ring.is_some(),
+            fill_token: paint_token_name(&resolved.fill.paint),
+            stroke_token: paint_token_name(&resolved.stroke.paint),
         });
     }
 
@@ -1021,19 +1095,47 @@ pub fn preview_instance_columns(
     )
 }
 
-/// Resolve a paint to a single RGBA color for the inline-solid first cutover.
-/// Gradient/image paints collapse to their representative color (first stop /
-/// neutral) here; richer paints get their own bind group later (D7 note).
-fn paint_color(paint: &RPaint, opacity: f32) -> [f32; 4] {
-    let rgb = match paint {
-        RPaint::Solid { color } => parse_hex_rgb(color),
-        RPaint::Gradient { stops, .. } => stops
-            .first()
-            .map(|stop| parse_hex_rgb(&stop.color))
-            .unwrap_or([1.0, 1.0, 1.0]),
-        RPaint::Image { .. } => [1.0, 1.0, 1.0],
-    };
-    [rgb[0], rgb[1], rgb[2], opacity.clamp(0.0, 1.0)]
+/// Resolve a paint to a single RGBA color for the inline-solid first cutover,
+/// theme-aware (RB1/D1). `theme` selects the light/dark token table for
+/// [`RPaint::Token`]. Gradient/image paints collapse to their representative
+/// color (first stop / neutral) here; richer paints get their own bind group
+/// later (D7 note).
+///
+/// A token carries its own alpha (e.g. translucent `shadow`); the per-paint
+/// `opacity` multiplies it. Solid/gradient hex paints have no inherent alpha, so
+/// `opacity` becomes the alpha directly (unchanged from the inline-solid path).
+fn paint_color(paint: &RPaint, opacity: f32, theme: Theme) -> [f32; 4] {
+    let opacity = opacity.clamp(0.0, 1.0);
+    match paint {
+        RPaint::Solid { color } => {
+            let rgb = parse_hex_rgb(color);
+            [rgb[0], rgb[1], rgb[2], opacity]
+        }
+        RPaint::Token { name } => {
+            // Unknown token names fall back to opaque white so a bad token never
+            // poisons the draw (mirrors `parse_hex_rgb`).
+            let [r, g, b, a] = resolve_token_f32(name, theme.dark).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            [r, g, b, a * opacity]
+        }
+        RPaint::Gradient { stops, .. } => {
+            let rgb = stops
+                .first()
+                .map(|stop| parse_hex_rgb(&stop.color))
+                .unwrap_or([1.0, 1.0, 1.0]);
+            [rgb[0], rgb[1], rgb[2], opacity]
+        }
+        RPaint::Image { .. } => [1.0, 1.0, 1.0, opacity],
+    }
+}
+
+/// The token name backing a paint, if it is an [`RPaint::Token`]. Used to mark
+/// an [`ObjectDraw`] as token-backed so a theme toggle can re-resolve ONLY those
+/// instances' colors (zero-rebake, P4) — non-token paints are theme-invariant.
+fn paint_token_name(paint: &RPaint) -> Option<String> {
+    match paint {
+        RPaint::Token { name } => Some(name.clone()),
+        _ => None,
+    }
 }
 
 /// Parse a `#rrggbb` hex color into linear-ish 0..1 RGB. A malformed value falls
@@ -1394,5 +1496,158 @@ mod tests {
             assert_eq!(draw.fill_instance, geo.fill_instances[i]);
             assert_eq!(draw.stroke_instance, geo.stroke_instances[i]);
         }
+    }
+
+    // ---- RB1 theme resolution + zero-rebake toggle --------------------------
+
+    /// A rect whose fill + stroke are semantic theme TOKENS (not raw hex), so its
+    /// instance colors re-resolve when the theme bit flips.
+    fn token_rect(id: &str) -> RenderObject {
+        let mut obj = rect_object(id);
+        obj.fill = Some(RFill {
+            paint: RPaint::Token {
+                name: "default-fill".to_string(),
+            },
+            opacity: 1.0,
+        });
+        obj.stroke = Some(RStroke {
+            paint: RPaint::Token {
+                name: "default-stroke".to_string(),
+            },
+            width: 4.0,
+            opacity: 1.0,
+            dash: Vec::new(),
+            cap: RStrokeCap::Butt,
+            join: RStrokeJoin::Miter,
+        });
+        obj
+    }
+
+    /// (c) `RPaint::Token` serde round-trips on the `{"kind":"token","name":...}`
+    /// wire form and the renderer resolves the name to the theme table value.
+    #[test]
+    fn rpaint_token_serde_roundtrips_and_resolves_to_table() {
+        let paint = RPaint::Token {
+            name: "selection-ring".to_string(),
+        };
+        let json = serde_json::to_string(&paint).unwrap();
+        assert_eq!(json, r#"{"kind":"token","name":"selection-ring"}"#);
+        let back: RPaint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, paint);
+
+        // Resolution matches the renderer token table (and flips with the bit).
+        let light = paint_color(&paint, 1.0, Theme::light());
+        let dark = paint_color(&paint, 1.0, Theme::dark());
+        assert_eq!(light, crate::object_theme::resolve_token_f32("selection-ring", false).unwrap());
+        assert_eq!(dark, crate::object_theme::resolve_token_f32("selection-ring", true).unwrap());
+        assert_ne!(light, dark, "selection-ring flips light vs dark");
+    }
+
+    /// (a) The SAME scene yields DIFFERENT chrome/instance RGBA when the theme bit
+    /// flips: token-backed fill/stroke colors change, and the canvas clear color
+    /// (`canvas-bg`) differs light vs dark.
+    #[test]
+    fn theme_flip_changes_token_instance_and_clear_rgba() {
+        let scene = scene_with(vec![token_rect("o1")], None);
+        let light = build_scene_geometry_themed(&scene, Theme::light());
+        let dark = build_scene_geometry_themed(&scene, Theme::dark());
+
+        // Token fill/stroke instance colors differ between themes.
+        assert_ne!(
+            light.fill_instances[0].fill, dark.fill_instances[0].fill,
+            "default-fill token re-resolves on theme flip"
+        );
+        assert_ne!(
+            light.stroke_instances[0].stroke, dark.stroke_instances[0].stroke,
+            "default-stroke token re-resolves on theme flip"
+        );
+        // And they equal the table values for each mode.
+        assert_eq!(
+            light.fill_instances[0].fill,
+            crate::object_theme::resolve_token_f32("default-fill", false).unwrap()
+        );
+        assert_eq!(
+            dark.fill_instances[0].fill,
+            crate::object_theme::resolve_token_f32("default-fill", true).unwrap()
+        );
+        // Canvas clear (chrome) flips light vs dark.
+        assert_ne!(Theme::light().canvas_bg(), Theme::dark().canvas_bg());
+    }
+
+    /// (b) ZERO-REBAKE: flipping the theme must NOT re-tessellate. Across a theme
+    /// flip the fill megabuffer vertices/indices, the stroke ribbon vertices, and
+    /// EVERY per-object draw RANGE are byte-identical — only token instance COLORS
+    /// (past the matrix) move. This is the falsifiable "no rebake on toggle" gate.
+    #[test]
+    fn theme_flip_leaves_tessellation_byte_identical_zero_rebake() {
+        let scene = scene_with(vec![token_rect("a"), token_rect("b")], None);
+        let light = build_scene_geometry_themed(&scene, Theme::light());
+        let dark = build_scene_geometry_themed(&scene, Theme::dark());
+
+        // Tessellation (the expensive product) is untouched by the theme bit.
+        assert_eq!(light.fill.vertices, dark.fill.vertices, "fill verts unchanged");
+        assert_eq!(light.fill.indices, dark.fill.indices, "fill indices unchanged");
+        assert_eq!(
+            light.stroke_vertices, dark.stroke_vertices,
+            "stroke ribbon verts unchanged"
+        );
+        // Per-object draw ranges + matrix columns are identical; ONLY the color
+        // slot differs, so a real GPU toggle is a per-instance color write, not a
+        // rebuild.
+        assert_eq!(light.draws.len(), dark.draws.len());
+        for (l, d) in light.draws.iter().zip(dark.draws.iter()) {
+            assert_eq!(l.fill_range, d.fill_range, "fill range stable across theme");
+            assert_eq!(l.stroke_range, d.stroke_range, "stroke range stable across theme");
+            assert_eq!(l.fill_instance.m0, d.fill_instance.m0);
+            assert_eq!(l.fill_instance.m1, d.fill_instance.m1);
+            assert_eq!(l.fill_instance.m2, d.fill_instance.m2);
+            assert_eq!(l.fill_token, d.fill_token, "token name is theme-invariant");
+            // The color is the one thing that moves.
+            assert_ne!(l.fill_instance.fill, d.fill_instance.fill);
+        }
+    }
+
+    /// Raw-hex / gradient paints are theme-INVARIANT: no token name is recorded,
+    /// so `set_theme` skips them (nothing to re-resolve). Guards against a theme
+    /// flip silently recoloring user-picked explicit colors.
+    #[test]
+    fn raw_hex_paint_is_theme_invariant() {
+        let scene = scene_with(vec![rect_object("o1")], None); // #ff0000 / #00ff00 hex
+        let light = build_scene_geometry_themed(&scene, Theme::light());
+        let dark = build_scene_geometry_themed(&scene, Theme::dark());
+        assert_eq!(light.draws[0].fill_token, None);
+        assert_eq!(light.draws[0].stroke_token, None);
+        assert_eq!(light.fill_instances[0].fill, dark.fill_instances[0].fill);
+        assert_eq!(light.stroke_instances[0].stroke, dark.stroke_instances[0].stroke);
+    }
+
+    /// The byte offset `set_theme` writes (the color slot, past `m0,m1,m2`) is the
+    /// 36-byte matrix boundary the W2-11 preview write also assumes. Pin both the
+    /// `offset_of!` the toggle uses AND that the matrix region sits strictly
+    /// before it, so a layout change can't make `set_theme` clobber the matrix.
+    #[test]
+    fn theme_color_write_targets_the_color_slot_past_the_matrix() {
+        assert_eq!(std::mem::offset_of!(FillInstance, fill), 36);
+        assert_eq!(std::mem::offset_of!(StrokeInstance, stroke), 36);
+        // m0,m1,m2 = three vec3 = 36 bytes, so the color write at offset 36 never
+        // overlaps the matrix the drag preview writes at offset 0.
+        assert_eq!(std::mem::offset_of!(FillInstance, m0), 0);
+        assert!(std::mem::offset_of!(FillInstance, fill) >= 3 * std::mem::size_of::<[f32; 3]>());
+    }
+
+    /// A token paint's per-paint `opacity` multiplies the token's own alpha
+    /// (e.g. the translucent `shadow` token), so RB3's shadow paint can fade
+    /// without losing the token's baseline translucency.
+    #[test]
+    fn token_opacity_multiplies_token_alpha() {
+        let shadow = RPaint::Token {
+            name: "shadow".to_string(),
+        };
+        let full = paint_color(&shadow, 1.0, Theme::light());
+        let half = paint_color(&shadow, 0.5, Theme::light());
+        // shadow light = 00000040 -> alpha 0x40/255.
+        let base_a = 0x40 as f32 / 255.0;
+        assert!((full[3] - base_a).abs() < 1e-6);
+        assert!((half[3] - base_a * 0.5).abs() < 1e-6);
     }
 }

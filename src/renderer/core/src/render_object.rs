@@ -110,6 +110,12 @@ pub enum RPaint {
     Solid {
         color: String,
     },
+    /// Semantic theme token (C1/D1): a kebab-case token name resolved to RGBA at
+    /// draw time via the renderer's light/dark theme tables (see
+    /// [`crate::object_theme`]). Wire form: `{"kind":"token","name":"<kebab>"}`.
+    Token {
+        name: String,
+    },
     Gradient {
         stops: Vec<RGradientStop>,
         /// Gradient angle in degrees.

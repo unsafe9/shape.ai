@@ -16,6 +16,7 @@ mod hit_test_object;
 #[allow(dead_code)]
 mod outline;
 mod object_pipeline;
+mod object_theme;
 mod render_object;
 mod shaders;
 mod stroke_expand;
@@ -67,6 +68,8 @@ pub use hit_test_object::{
     world_to_local, HoverAffordance, PathSeg, ScreenRect, SelectionHandles, HANDLE_SIZE_PX,
     ROTATE_ZONE_OFFSET_PX,
 };
+#[allow(unused_imports)]
+pub use object_theme::{resolve_token, resolve_token_f32, Theme, ThemeToken, ALL_TOKENS};
 #[allow(unused_imports)]
 pub use outline::{derive_region, parse_path_string, Region, RegionCache};
 #[allow(unused_imports)]

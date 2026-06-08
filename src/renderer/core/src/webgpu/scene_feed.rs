@@ -85,6 +85,9 @@ impl ShapeWebGpuRenderer {
             &scene,
             self.width as f32,
             self.height as f32,
+            // RB1: load in light mode; AP4 threads the persisted dark/light bit and
+            // flips it via `ObjectRenderer::set_theme` (zero-rebake toggle).
+            crate::object_theme::Theme::light(),
         );
         let counts = ObjectSceneLoadResult {
             objects: scene.objects.len(),
