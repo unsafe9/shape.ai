@@ -752,14 +752,12 @@ pub struct ObjectDraw {
 /// translucent (dark mode) with the theme bit (zero-rebake color refresh, P4).
 const SHADOW_TOKEN: &str = "shadow";
 
-/// W3-G7/#2 soft drop-shadow constants (object-local px). The shadow is a stack of
-/// [`SHADOW_TIERS`] silhouette copies of the object's OWN fill, each grown about
-/// the bbox center by [`SHADOW_SPREAD`] per tier and dropped down-right toward
-/// [`SHADOW_OFFSET_PX`], giving a soft all-sides macOS-window halo with a slight
-/// downward bias. The small offset keeps the halo near-symmetric.
+/// W3-G8/A drop-shadow constants (object-local px). The shadow is a SINGLE offset
+/// silhouette copy of the object's OWN fill, dropped down by [`SHADOW_OFFSET_PX`].
+/// Softness no longer comes from stacked tiers — the offscreen separable-Gaussian
+/// blur pass (see [`crate::shadow_blur`]) provides the uniform feather. The small
+/// offset gives the macOS-style slight downward drop while staying near-symmetric.
 const SHADOW_OFFSET_PX: f32 = 2.0;
-const SHADOW_TIERS: usize = 5;
-const SHADOW_SPREAD: f32 = 0.06;
 
 /// Owns the CPU-built object draw data and the GPU buffers it uploads to, and
 /// records the object render pass.
@@ -1269,26 +1267,11 @@ impl ObjectRenderer {
             multiview_mask: None,
         });
 
-        // Shadow pass: one instanced draw per object over its feathered shadow quad,
-        // recorded FIRST so it sits beneath the fill+stroke. Each object's shadow
-        // rides its own per-object matrix instance (index `i`), index-aligned with
-        // `draws` exactly like the fill/stroke loops.
-        if self.shadow_vertex_count > 0 {
-            pass.set_pipeline(&pipeline.shadow_pipeline);
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.shadow_vertex_buffer.slice(..));
-            pass.set_vertex_buffer(1, self.shadow_instance_buffer.slice(..));
-            for (instance, draw) in self.draws.iter().enumerate() {
-                if draw.shadow_range.is_empty() {
-                    continue;
-                }
-                let instance = instance as u32;
-                pass.draw(
-                    draw.shadow_range.start..draw.shadow_range.end,
-                    instance..instance + 1,
-                );
-            }
-        }
+        // W3-G8/A: the drop shadow is NO LONGER drawn here. It is rendered once to an
+        // offscreen mask ([`render_shadow_mask`]), separable-Gaussian-blurred, and
+        // composited UNDER the fill in the visible pass before this `render` runs
+        // (see `frame.rs`). This pass now starts with the fill so the blurred shadow
+        // it composited stays beneath fill/stroke/text.
 
         // Fill pass: one indexed instanced draw per object, all sharing the merged
         // megabuffer vertex/index buffers and the per-object instance buffer.
@@ -1348,6 +1331,56 @@ impl ObjectRenderer {
                     instance..instance + 1,
                 );
             }
+        }
+    }
+
+    /// W3-G8/A: record the drop-shadow silhouette ONLY into an offscreen `mask`
+    /// view, clearing it to transparent first. This is the input to the separable
+    /// Gaussian blur ([`crate::shadow_blur::ShadowBlur`]). Each object's shadow
+    /// rides its own per-object matrix instance (index `i`), index-aligned with
+    /// `draws` exactly like the fill/stroke loops, so the projective transform path
+    /// places the silhouette identically to the fill. Records nothing (a single
+    /// transparent clear) when no object casts a shadow, so the blurred mask stays
+    /// empty and the composite is invisible.
+    pub fn render_shadow_mask(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &ObjectPipeline,
+        mask: &wgpu::TextureView,
+    ) {
+        let color_attachments = [Some(wgpu::RenderPassColorAttachment {
+            view: mask,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shape.ai shadow mask pass"),
+            color_attachments: &color_attachments,
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        if self.shadow_vertex_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&pipeline.shadow_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.shadow_vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.shadow_instance_buffer.slice(..));
+        for (instance, draw) in self.draws.iter().enumerate() {
+            if draw.shadow_range.is_empty() {
+                continue;
+            }
+            let instance = instance as u32;
+            pass.draw(
+                draw.shadow_range.start..draw.shadow_range.end,
+                instance..instance + 1,
+            );
         }
     }
 
@@ -1674,22 +1707,17 @@ fn flatten_object_subpaths(obj: &RenderObject, zoom: f64) -> Vec<(bool, Vec<(f32
     out
 }
 
-/// Append one object's soft drop-shadow geometry (W3-G7/#2) to `out`: a stack of
-/// [`SHADOW_TIERS`] translucent silhouettes beneath the object, giving the gentle
-/// all-sides halo of a macOS window shadow. Each tier REUSES the object's OWN fill
-/// `mesh` (the exact region triangulation lyon already produced — concave, curved,
-/// hole-aware for free), so there is no extra tessellation: this is just
-/// `SHADOW_TIERS` triangle-list copies of an already-tessellated mesh.
+/// Append one object's drop-shadow geometry (W3-G8/A) to `out`: a SINGLE
+/// translucent silhouette copy of the object's OWN fill `mesh` (the exact region
+/// triangulation lyon already produced — concave, curved, hole-aware for free),
+/// translated down by [`SHADOW_OFFSET_PX`]. There is no extra tessellation: this is
+/// one triangle-list copy of an already-tessellated mesh.
 ///
-/// For tier `k` in `0..SHADOW_TIERS`, every fill vertex is scaled about the mesh
-/// bbox center by `1 + k*SHADOW_SPREAD` (the outer tiers grow a soft halo on all
-/// sides), translated by a small down-right drop ramped from ~0 at the core to
-/// [`SHADOW_OFFSET_PX`], and tagged `feather = k/(SHADOW_TIERS-1)`. The FS ramps
-/// alpha by `(1-feather)^2`, so the core tier reads solid-ish and the outer tiers
-/// fade — stacked src-over copies accumulate near the core and thin at the rim, a
-/// cheap blur that works on ANY geometry (unlike the removed self-intersecting
-/// feather ring). The small offset keeps the halo near-symmetric with a slight
-/// downward bias.
+/// Softness is NOT baked here. The silhouette is rendered ONCE to an offscreen
+/// target and a separable Gaussian blur ([`crate::shadow_blur`]) feathers it
+/// uniformly before it composites under the fill — a true blur, not a stacked-tier
+/// approximation. `feather` is emitted `0` (the slot stays for the shader contract;
+/// the offscreen blur owns softness now).
 ///
 /// An empty fill mesh (an open polyline / no fillable interior) casts nothing, so
 /// the object's `shadow_range` stays empty — matching the fill's "no boundable
@@ -1698,32 +1726,12 @@ fn append_shadow_quad(out: &mut Vec<ShadowVertex>, mesh: &crate::tessellate::Mes
     if mesh.indices.is_empty() {
         return;
     }
-    // Mesh bbox center — the scale anchor so every tier grows symmetrically.
-    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
-    let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
     for &index in &mesh.indices {
         let p = mesh.vertices[index as usize];
-        min_x = min_x.min(p[0]);
-        min_y = min_y.min(p[1]);
-        max_x = max_x.max(p[0]);
-        max_y = max_y.max(p[1]);
-    }
-    let cx = (min_x + max_x) * 0.5;
-    let cy = (min_y + max_y) * 0.5;
-    let last = (SHADOW_TIERS - 1).max(1) as f32;
-    for k in 0..SHADOW_TIERS {
-        let kf = k as f32;
-        let scale = 1.0 + kf * SHADOW_SPREAD;
-        let t = kf / last;
-        let drop = SHADOW_OFFSET_PX * t;
-        let feather = kf / last;
-        for &index in &mesh.indices {
-            let p = mesh.vertices[index as usize];
-            out.push(ShadowVertex {
-                position: [cx + (p[0] - cx) * scale + drop, cy + (p[1] - cy) * scale + drop],
-                feather,
-            });
-        }
+        out.push(ShadowVertex {
+            position: [p[0], p[1] + SHADOW_OFFSET_PX],
+            feather: 0.0,
+        });
     }
 }
 
@@ -3047,13 +3055,13 @@ mod tests {
         }
     }
 
-    /// W3-G7/#2 SOFT shadow: the shadow STACKS `SHADOW_TIERS` silhouette copies of
-    /// the object's OWN fill mesh (count == fill triangle list * SHADOW_TIERS) and
-    /// ramps `feather` across tiers — the values include BOTH 0 (solid core) and a
-    /// value > 0 (faint outer halo). FAILS if the shadow collapses back to a single
-    /// flat tier (count == 1:1 with the fill, all feather == 0).
+    /// W3-G8/A: the shadow is now a SINGLE offset silhouette copy of the object's
+    /// OWN fill mesh (count == fill triangle list, NOT *N) — softness comes from the
+    /// offscreen Gaussian blur, not stacked tiers. The vertex count is exactly the
+    /// fill index count and every `feather` is 0. FAILS if the old multi-tier stack
+    /// returns (count == fill-list * tiers, or any feather > 0).
     #[test]
-    fn shadow_quad_is_soft_stacked_silhouette_of_fill_mesh() {
+    fn shadow_quad_is_single_offset_silhouette_of_fill_mesh() {
         let scene = scene_with(vec![rect_object("o1")], None);
         let geo = build_scene_geometry(&scene);
         let verts = &geo.shadow_vertices;
@@ -3066,32 +3074,27 @@ mod tests {
         let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
         assert!(!mesh.indices.is_empty());
 
-        // (1) Stacking: SHADOW_TIERS copies of the fill triangle list.
+        // (1) Single tier: ONE copy of the fill triangle list, never a *N stack.
         assert_eq!(
             verts.len(),
-            mesh.indices.len() * SHADOW_TIERS,
-            "soft shadow stacks SHADOW_TIERS copies of the fill triangle list"
+            mesh.indices.len(),
+            "shadow is a single offset silhouette (one copy of the fill triangle list)"
         );
 
-        // (2) Soft ramp: feather spans the core (0) and at least one faint tier (>0).
+        // (2) Flat feather: the blur owns softness now, so the silhouette is flat.
         assert!(
-            verts.iter().any(|v| v.feather == 0.0),
-            "the core tier is solid-ish (feather 0)"
-        );
-        assert!(
-            verts.iter().any(|v| v.feather > 0.0),
-            "an outer tier is faint (feather > 0) — not a single flat tier"
+            verts.iter().all(|v| v.feather == 0.0),
+            "single silhouette tier carries feather 0 (no baked-in ramp)"
         );
     }
 
-    /// CONCAVE shape (an arrowhead with a reflex vertex): each shadow tier is the
-    /// EXACT silhouette of the object's own fill triangulation (no centroid fan,
-    /// no per-edge feather ring), grown about the bbox center per tier. The core
-    /// tier (k=0, scale 1, drop 0) is an EXACT copy of the fill mesh, and no tier
-    /// emits a centroid apex. FAILS on the old centroid-fan build, which placed an
-    /// apex outside this concave silhouette and self-intersected into facets.
+    /// CONCAVE shape (an arrowhead with a reflex vertex): the shadow is the EXACT
+    /// silhouette of the object's own fill triangulation (no centroid fan, no
+    /// per-edge feather ring), translated by the drop offset. FAILS on the old
+    /// centroid-fan build, which placed an apex outside this concave silhouette and
+    /// self-intersected into facets.
     #[test]
-    fn shadow_stack_is_exact_silhouette_of_fill_mesh_for_concave_shape() {
+    fn shadow_is_exact_silhouette_of_fill_mesh_for_concave_shape() {
         // A concave arrowhead: the reflex vertex at (300,400) is what makes a
         // centroid fan invalid (the centroid lies outside the silhouette).
         let mut obj = rect_object("arrow");
@@ -3106,40 +3109,44 @@ mod tests {
         let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
         assert!(!mesh.indices.is_empty(), "concave arrow has a fillable interior");
 
-        // (1) Stacking: SHADOW_TIERS copies of the fill triangle list.
+        // (1) Single tier: ONE copy of the fill triangle list.
         assert_eq!(
             geo.shadow_vertices.len(),
-            mesh.indices.len() * SHADOW_TIERS,
-            "soft shadow stacks SHADOW_TIERS copies of the fill triangle list"
+            mesh.indices.len(),
+            "shadow is a single offset silhouette (one copy of the fill triangle list)"
         );
 
-        // (2) The core tier (the first fill-triangle-list span) is an EXACT,
-        // unoffset copy of the fill mesh — same silhouette, never a centroid fan.
+        // (2) The silhouette is an EXACT copy of the fill mesh translated by the
+        // drop offset (+SHADOW_OFFSET_PX in y) — same silhouette, never a centroid
+        // fan. Undo the offset and compare against the un-offset fill triangulation.
         let n = mesh.indices.len();
         let mut expected: Vec<[f32; 2]> = mesh
             .indices
             .iter()
             .map(|&i| mesh.vertices[i as usize])
             .collect();
-        let mut got: Vec<[f32; 2]> = geo.shadow_vertices[..n].iter().map(|v| v.position).collect();
+        let mut got: Vec<[f32; 2]> = geo.shadow_vertices[..n]
+            .iter()
+            .map(|v| [v.position[0], v.position[1] - SHADOW_OFFSET_PX])
+            .collect();
         let key = |v: &[f32; 2]| (v[0].to_bits(), v[1].to_bits());
         expected.sort_by_key(key);
         got.sort_by_key(key);
         assert_eq!(
             got, expected,
-            "core shadow tier == fill triangulation exactly (no faceting, no centroid fan)"
+            "shadow == fill triangulation exactly (no faceting, no centroid fan)"
         );
         assert!(
             geo.shadow_vertices[..n].iter().all(|v| v.feather == 0.0),
-            "the core tier reads solid (feather 0)"
+            "the silhouette reads flat (feather 0)"
         );
 
         // (3) Regression guard against the centroid fan: NO shadow vertex sits at
-        // the outline CENTROID (the old core-fan apex), which for this concave shape
-        // lies outside the silhouette and produced overlapping facets.
+        // the (offset) outline CENTROID (the old core-fan apex), which for this
+        // concave shape lies outside the silhouette and produced overlapping facets.
         let outline: Vec<(f32, f32)> = subpaths[0].1.clone();
         let cx = outline.iter().map(|p| p.0).sum::<f32>() / outline.len() as f32;
-        let cy = outline.iter().map(|p| p.1).sum::<f32>() / outline.len() as f32;
+        let cy = outline.iter().map(|p| p.1).sum::<f32>() / outline.len() as f32 + SHADOW_OFFSET_PX;
         assert!(
             !geo
                 .shadow_vertices
@@ -3167,9 +3174,8 @@ mod tests {
         let geo = build_scene_geometry(&scene);
         assert!(!geo.shadow_vertices.is_empty(), "ellipse casts a shadow");
 
-        // The core tier (k=0: scale 1, drop 0) is the canonical un-grown silhouette;
-        // check IT against the un-offset region bbox corners. The grown halo tiers
-        // deliberately push outward, so the bbox-corner assertion belongs to the core.
+        // The single offset silhouette is the whole shadow; check it against the
+        // region bbox corners (the drop offset is small vs the corner margin below).
         let subpaths = flatten_object_subpaths(&scene.objects[0], 1.0);
         let fill_input: Vec<(bool, Vec<(f32, f32)>)> =
             subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();

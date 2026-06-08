@@ -59,7 +59,20 @@ impl ShapeWebGpuRenderer {
                 self.width as f32,
                 self.height as f32,
             );
-            renderer.render(&mut encoder, &view, pipeline, true);
+            // W3-G8/A real drop-shadow blur: render the shadow silhouette ONCE into
+            // the offscreen mask, separable-Gaussian-blur it (H then V), then
+            // composite the blurred result onto the surface FIRST (it also clears the
+            // surface to the canvas-bg), so the fill/stroke/text pass below draws on
+            // top of the shadow. This whole block is an isolated underlay: the
+            // `render(clear=false)` call still runs the fill/stroke/text regardless,
+            // so a shadow fault degrades to "no shadow", never a blank canvas.
+            let theme = renderer.theme();
+            self.shadow_blur.set_tint(&self.queue, theme.shadow());
+            renderer.render_shadow_mask(&mut encoder, pipeline, self.shadow_blur.mask_view());
+            self.shadow_blur.record_blur(&mut encoder);
+            self.shadow_blur.record_composite(&mut encoder, &view, theme.canvas_bg());
+            // Fill/stroke/text load over the cleared + shadow-composited surface.
+            renderer.render(&mut encoder, &view, pipeline, false);
             // W3-G7/#1: per-object outline highlight for the multi-select set, drawn
             // on top of the object pass with the world-space pipeline (LoadOp::Load
             // preserves the fill/stroke output). Single selection draws no outline
