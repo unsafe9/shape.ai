@@ -27,7 +27,6 @@ pub mod object_mcp;
 pub mod object_store;
 pub mod registry;
 pub mod sync;
-pub mod template_store;
 pub mod ws;
 
 pub use app::{build_router, build_router_with_mcp};

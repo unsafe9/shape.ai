@@ -15,7 +15,6 @@ pub mod fractional;
 pub mod lww;
 pub mod model;
 pub mod object;
-pub mod templates;
 pub mod tool;
 pub mod wire;
 
@@ -28,12 +27,5 @@ pub use canvas::{new_canvas, Canvas, CanvasId, CanvasSummary};
 pub use fractional::{cmp_keys, generate_key_between, generate_n_keys_between};
 pub use lww::{lww_merge_property, LwwEntry, LwwToken, PropertyStore};
 pub use model::{Bounds, ExportType, ObjectMeta, Point, WorldPoint};
-pub use templates::{
-    adr_template, catalog, decision_map_template, dependency_diagram_template, idea_board_template,
-    investigation_map_template, presentation_template, registry, server_architecture_template,
-    todo_board_template, wiki_note_template, RecipeEdge, RecipeFrame, RecipeLayout, RecipeShape,
-    RecipeSize, SuggestedTag, TemplateCategory, TemplateContract, TemplateExports,
-    TemplateMetadata, TemplatePromptHints, TemplateRecipe, TemplateTags,
-};
 pub use tool::{default_tool, ActiveTool};
 pub use wire::{Channel, ClientMessage, OpId, Region, ServerMessage, WireOp};

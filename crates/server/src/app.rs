@@ -58,7 +58,7 @@ pub fn build_router(config: &Config) -> Router {
 ///   bridged to the per-canvas object actor.
 /// - `POST/GET/DELETE /mcp` — the streamable-HTTP object MCP transport.
 /// - `GET/POST/DELETE /api/canvases` — canvas CRUD until WS-native canvas ops.
-/// - `GET/POST/DELETE /api/templates` — the template catalog.
+/// - `GET /api/templates` — the builtin object-template catalog.
 ///
 /// `canvases` is the shared canvas actor registry the MCP tools and the WS
 /// transport drive. The base [`build_router`] is registry-free so the HTTP-only
@@ -76,17 +76,13 @@ pub fn build_router_with_mcp(config: &Config, canvases: CanvasRegistry) -> Route
     let canvas_api = Router::new()
         .route("/api/canvases", get(list_canvases).post(create_canvas))
         .route("/api/canvases/:id", delete(delete_canvas))
-        .with_state(canvases.clone());
-
-    // Template library: builtins are seeded once into the shared store on router
-    // build; the cockpit reads/writes the catalog through these routes.
-    if let Err(error) = canvases.seed_templates() {
-        tracing::warn!(%error, "failed to seed builtin templates");
-    }
-    let template_api = Router::new()
-        .route("/api/templates", get(list_templates).post(create_template))
-        .route("/api/templates/:id", delete(delete_template))
         .with_state(canvases);
+
+    // Template catalog: object templates are code-defined builtin recipes
+    // (`object::templates`), not stored documents, so the catalog is read-only
+    // and needs no shared state — the picker lists ids/labels/categories and the
+    // client lowers a chosen template to ops via the wasm bridge / a feature frame.
+    let template_api = Router::new().route("/api/templates", get(list_templates));
 
     build_router(config)
         .merge(ws)
@@ -143,36 +139,12 @@ async fn delete_canvas(
     }
 }
 
-/// `GET /api/templates` — list every stored template (seeded builtins minus
-/// tombstoned + user templates).
-async fn list_templates(State(canvases): State<CanvasRegistry>) -> Json<Value> {
-    Json(json!({ "templates": canvases.list_templates() }))
-}
-
-/// `POST /api/templates` — create (or overwrite) a user template from a
-/// `TemplateContract` body. 400 on a malformed contract.
-async fn create_template(
-    State(canvases): State<CanvasRegistry>,
-    body: Json<shape_scene_core::TemplateContract>,
-) -> Result<Json<Value>, StatusCode> {
-    let Json(contract) = body;
-    canvases
-        .create_template(&contract)
-        .map(|()| Json(json!({ "template": contract })))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-/// `DELETE /api/templates/:id` — delete a template, tombstoning it so a deleted
-/// builtin is not re-seeded. 404 when no template Record existed.
-async fn delete_template(
-    State(canvases): State<CanvasRegistry>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, StatusCode> {
-    match canvases.delete_template(&id) {
-        Ok(true) => Ok(Json(json!({ "deleted": id }))),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
+/// `GET /api/templates` — the builtin object-template catalog (id, label,
+/// category, description), in picker display order. Object templates are pure
+/// builder recipes in `shape_scene_core::object::templates`, so this is a static
+/// read-only list with no persistence.
+async fn list_templates() -> Json<Value> {
+    Json(json!({ "templates": shape_scene_core::object::object_template_catalog() }))
 }
 
 /// Liveness: the server is up and identifies itself.

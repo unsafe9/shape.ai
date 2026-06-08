@@ -393,36 +393,6 @@ impl CanvasRegistry {
         Ok(removed)
     }
 
-    // ----- Templates (CC3.2) --------------------------------------------------
-
-    /// Seed the builtin templates once (idempotent). Safe to call on every
-    /// startup; the seed guard makes a second call a no-op. Returns how many
-    /// builtins were written on this call.
-    pub fn seed_templates(&self) -> anyhow::Result<usize> {
-        let mut store = self.store.lock().expect("storage mutex poisoned");
-        crate::template_store::seed_builtins(&mut *store)
-    }
-
-    /// Create (or overwrite) a user template from `contract`.
-    pub fn create_template(&self, contract: &shape_scene_core::TemplateContract) -> anyhow::Result<()> {
-        let mut store = self.store.lock().expect("storage mutex poisoned");
-        crate::template_store::create_template(&mut *store, contract)
-    }
-
-    /// List every stored template (seeded builtins minus tombstoned + user
-    /// templates), id-sorted.
-    pub fn list_templates(&self) -> Vec<shape_scene_core::TemplateContract> {
-        let store = self.store.lock().expect("storage mutex poisoned");
-        crate::template_store::list_templates(&*store)
-    }
-
-    /// Delete a template by id (writes a tombstone so a deleted builtin is not
-    /// re-seeded). Returns whether a template Record existed.
-    pub fn delete_template(&self, template_id: &str) -> anyhow::Result<bool> {
-        let mut store = self.store.lock().expect("storage mutex poisoned");
-        crate::template_store::delete_template(&mut *store, template_id)
-    }
-
     // ----- Presence (MG-3) ----------------------------------------------------
 
     /// A receiver on `canvas_id`'s presence channel (MG-3 ephemeral fan-out),
