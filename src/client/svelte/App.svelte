@@ -30,6 +30,7 @@
   import {
     loadSceneCore,
     type ObjectCommand,
+    type ObjectGesture,
     type SceneCore,
     type UndoStack
   } from "../scene/sceneCoreWasm";
@@ -141,6 +142,7 @@
   let sceneClientReady = false;
   let sceneCore: SceneCore | null = null;
   let commandCatalog = $state<ObjectCommand[]>([]);
+  let gestureCatalog = $state<ObjectGesture[]>([]);
   let canvases = $state<CanvasSummary[]>([]);
   let connectionStatus = $state<ConnectionStatus>("offline");
   let canvasBusy = $state(false);
@@ -249,6 +251,7 @@
     try {
       sceneCore = await loadSceneCore();
       commandCatalog = sceneCore.objectCommandCatalog();
+      gestureCatalog = sceneCore.objectGestureCatalog();
       undoStack = sceneCore.createUndoStack(userIdentity());
     } catch {
       sceneCore = null;
@@ -1546,7 +1549,7 @@
       {/if}
 
       {#if settingsOpen}
-        <SettingsModal catalog={commandCatalog} onClose={() => (settingsOpen = false)} />
+        <SettingsModal catalog={commandCatalog} gestures={gestureCatalog} onClose={() => (settingsOpen = false)} />
       {/if}
 
       {#if busy || status !== "Ready"}

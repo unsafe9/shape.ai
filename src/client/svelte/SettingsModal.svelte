@@ -1,18 +1,23 @@
 <script lang="ts">
   import { Keyboard, X } from "lucide-svelte";
   import { detectMac, formatShortcut } from "../lib/shortcuts";
-  import type { ObjectCommand } from "../scene/sceneCoreWasm";
+  import { formatGestureTrigger } from "../lib/gestures";
+  import type { ObjectCommand, ObjectGesture } from "../scene/sceneCoreWasm";
 
   // CC5.1 / U4 — settings overlay (Cmd+,). Shows the READ-ONLY shortcut list from
   // the object command catalog (the wasm core's `object_command_catalog()`, P1 —
   // no TS mirror). Each row pairs a command (id/label) with its binding
   // (defaultShortcut); editing is out of scope.
+  //
+  // SM1 (#2): a second section lists the hold-key gesture catalog (the wasm core's
+  // `object_gesture_catalog()`, C2) — registering a gesture once self-documents it.
   type Props = {
     catalog: ObjectCommand[];
+    gestures: ObjectGesture[];
     onClose: () => void;
   };
 
-  let { catalog, onClose }: Props = $props();
+  let { catalog, gestures, onClose }: Props = $props();
 
   const isMac = detectMac();
 
@@ -75,6 +80,21 @@
           </ul>
         </section>
       {/each}
+
+      {#if gestures.length > 0}
+        <section class="settings-section settings-gestures">
+          <h3>Gestures</h3>
+          <ul>
+            {#each gestures as gesture (gesture.id)}
+              <li>
+                <span class="settings-command-label">{gesture.label}</span>
+                <kbd class="settings-command-binding">{formatGestureTrigger(gesture.trigger, isMac)}</kbd>
+                <span class="settings-gesture-description">{gesture.description}</span>
+              </li>
+            {/each}
+          </ul>
+        </section>
+      {/if}
     </div>
   </div>
 </div>

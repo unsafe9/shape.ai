@@ -38,6 +38,28 @@ export type ObjectCommand = {
   [extra: string]: unknown;
 };
 
+/**
+ * The hold-key trigger for a gesture (C2). Exactly one of `key`/`button`/
+ * `modifier` is populated, the one matching `input`; `degrees` carries an
+ * optional numeric parameter (e.g. the coarse-rotate step).
+ */
+export type HoldTrigger = {
+  input: "key" | "button" | "modifier";
+  key?: string;
+  button?: string;
+  modifier?: string;
+  degrees?: number;
+};
+
+/** A row of the object gesture catalog (press-and-hold input gestures, C2). */
+export type ObjectGesture = {
+  id: string;
+  label: string;
+  category: string;
+  trigger: HoldTrigger;
+  description: string;
+};
+
 /** A derived outline/region for an object's geometry (OB1.3, reference stub). */
 export type DerivedRegion = Record<string, unknown>;
 
@@ -60,6 +82,7 @@ type SceneCoreModule = {
   apply_object_op: (sceneJson: string, opJson: string) => string;
   derive_region: (geometryJson: string, flatness: number) => string;
   object_command_catalog: () => string;
+  object_gesture_catalog: () => string;
   build_object_template: (
     templateId: string,
     anchorX: number,
@@ -129,6 +152,7 @@ export type SceneCore = {
   applyObjectOp(scene: ObjectScene, op: ObjectOp): ObjectApplyResult;
   deriveRegion(geometry: SceneObject["geometry"], flatness: number): DerivedRegion;
   objectCommandCatalog(): ObjectCommand[];
+  objectGestureCatalog(): ObjectGesture[];
   buildObjectTemplate(
     templateId: string,
     anchorX: number,
@@ -245,6 +269,12 @@ export async function loadSceneCore(): Promise<SceneCore> {
       return parseBridge<ObjectCommand[]>(
         "object_command_catalog",
         mod.object_command_catalog()
+      );
+    },
+    objectGestureCatalog() {
+      return parseBridge<ObjectGesture[]>(
+        "object_gesture_catalog",
+        mod.object_gesture_catalog()
       );
     },
     buildObjectTemplate(templateId, anchorX, anchorY, idPrefix) {

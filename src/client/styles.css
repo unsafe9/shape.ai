@@ -1925,3 +1925,20 @@ p {
 .settings-command-unbound {
   color: var(--muted);
 }
+
+/* SM1 (#2): the gesture catalog row carries a third (description) line, so it
+   spans both grid columns and stacks label/binding/description. */
+.settings-gestures {
+  grid-column: 1 / -1;
+}
+
+.settings-gestures li {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.settings-gesture-description {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+}
