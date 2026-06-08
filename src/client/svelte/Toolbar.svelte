@@ -10,6 +10,7 @@
     Eraser,
     MousePointer2,
     Pencil,
+    PenTool,
     Plus,
     Scan,
     Square,
@@ -19,7 +20,7 @@
     WifiOff
   } from "lucide-svelte";
   import type { ActiveTool } from "../renderer/engine";
-  import { toolbarShapeKinds, toggleColorPopup, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
+  import { toolbarShapeKinds, toggleColorPopup, toggleStrokePopup, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import type { CanvasSummary } from "../lib/sceneClient";
   import type { ConnectionStatus } from "../lib/wsTransport";
   import type { Object as SceneObject } from "../../shared/object";
@@ -146,6 +147,30 @@
       window.removeEventListener("keydown", onKeyDown);
     };
   });
+
+  // S1 (#4): the Stroke control mirrors the color control — a single button that
+  // toggles a popup holding the brush size + color (the old auto draw sub-toolbar's
+  // contents). Independent open state so it never fights the color popup.
+  let strokePopupOpen = $state(false);
+  let strokeControl = $state<HTMLDivElement | null>(null);
+  function toggleStrokePopupOpen(): void {
+    strokePopupOpen = toggleStrokePopup(strokePopupOpen);
+  }
+  $effect(() => {
+    if (!strokePopupOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (strokeControl && !strokeControl.contains(event.target as Node)) strokePopupOpen = false;
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") strokePopupOpen = false;
+    };
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  });
 </script>
 
 <!-- Canvas switcher + connection status (top-left chrome). -->
@@ -201,51 +226,6 @@
     <button class="icon-button danger" type="button" title="Delete object" aria-label="Delete object" onclick={onDeleteSelected}>
       <Trash2 size={14} />
     </button>
-  </div>
-{/if}
-
-<!-- W2-08: contextual draw-mode sub-toolbar (brush size + color + eraser hint).
-     Only shown while the pen/eraser tool is active; thin UI chrome that drives the
-     reactive brush state in the parent. -->
-{#if activeTool === "draw" || activeTool === "erase"}
-  <div class="toolbar-draw" role="toolbar" tabindex="-1" aria-label="Draw settings" onpointerdown={(event) => event.stopPropagation()}>
-    <div class="toolbar-group" aria-label="Brush size">
-      <span class="toolbar-group-label">Size</span>
-      <div class="toolbar-group-buttons">
-        {#each penWidths as width (width)}
-          <button
-            class="icon-button brush-size {penWidthPx === width ? 'is-active' : ''}"
-            type="button"
-            title={`${width}px`}
-            aria-label={`Brush ${width}px`}
-            aria-pressed={penWidthPx === width}
-            onclick={() => onSetPenWidth(width)}
-          >
-            <span class="brush-dot" style={`width:${Math.min(16, width * 2)}px;height:${Math.min(16, width * 2)}px;`}></span>
-          </button>
-        {/each}
-      </div>
-    </div>
-
-    <div class="toolbar-sep" aria-hidden="true"></div>
-
-    <div class="toolbar-group" aria-label="Brush color">
-      <span class="toolbar-group-label">Color</span>
-      <div class="toolbar-group-buttons">
-        {#each penPalette as color (color)}
-          <button
-            class="icon-button swatch {penColor === color ? 'is-active' : ''}"
-            type="button"
-            title={color}
-            aria-label={`Color ${color}`}
-            aria-pressed={penColor === color}
-            onclick={() => onSetPenColor(color)}
-          >
-            <span class="swatch-fill" style={`background:${color};`}></span>
-          </button>
-        {/each}
-      </div>
-    </div>
   </div>
 {/if}
 
@@ -319,6 +299,63 @@
         </button>
       {/each}
     </div>
+  </div>
+
+  <div class="toolbar-sep" aria-hidden="true"></div>
+
+  <!-- S1 (#4): the Stroke button toggles a popup with the brush size + color
+       (the old auto draw sub-toolbar's contents). Always visible, sibling left of
+       Color. The popup stops pointerdown so the canvas never sees the click. -->
+  <div class="toolbar-group" aria-label="Stroke" bind:this={strokeControl}>
+    <span class="toolbar-group-label">Stroke</span>
+    <div class="toolbar-group-buttons">
+      <button
+        class="icon-button {strokePopupOpen ? 'is-active' : ''}"
+        type="button"
+        title="Stroke"
+        aria-label="Stroke"
+        aria-haspopup="dialog"
+        aria-expanded={strokePopupOpen}
+        onclick={toggleStrokePopupOpen}
+      >
+        <PenTool size={16} />
+      </button>
+    </div>
+    {#if strokePopupOpen}
+      <div class="color-popup" role="dialog" aria-label="Stroke settings" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="toolbar-group" aria-label="Brush size">
+          <span class="toolbar-group-label">Size</span>
+          <div class="toolbar-group-buttons">
+            {#each penWidths as width (width)}
+              <button
+                class="icon-button brush-size {penWidthPx === width ? 'is-active' : ''}"
+                type="button"
+                title={`${width}px`}
+                aria-label={`Brush ${width}px`}
+                aria-pressed={penWidthPx === width}
+                onclick={() => onSetPenWidth(width)}
+              >
+                <span class="brush-dot" style={`width:${Math.min(16, width * 2)}px;height:${Math.min(16, width * 2)}px;`}></span>
+              </button>
+            {/each}
+          </div>
+        </div>
+        <div class="color-popup-swatches">
+          {#each penPalette as color (color)}
+            <button
+              class="icon-button swatch {penColor === color ? 'is-active' : ''}"
+              type="button"
+              title={color}
+              aria-label={`Color ${color}`}
+              aria-pressed={penColor === color}
+              onclick={() => onSetPenColor(color)}
+            >
+              <span class="swatch-fill" style={`background:${color};`}></span>
+            </button>
+          {/each}
+        </div>
+      </div>
+    {/if}
   </div>
 
   <div class="toolbar-sep" aria-hidden="true"></div>

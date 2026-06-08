@@ -51,4 +51,14 @@ export function toggleColorPopup(open: boolean): boolean {
   return !open;
 }
 
+/**
+ * S1 (#4): the Stroke control is a single button that TOGGLES a popup holding the
+ * brush size + color, replacing the auto draw sub-toolbar. Pure (mirrors
+ * {@link toggleColorPopup}) so the toolbar test can pin the open->close-on-re-click
+ * behavior without a Svelte mount; independent of the color popup's open state.
+ */
+export function toggleStrokePopup(open: boolean): boolean {
+  return !open;
+}
+
 export const primitiveOrder: PrimitiveKindId[] = ["rectangle", "ellipse", "line", "text", "frame"];
