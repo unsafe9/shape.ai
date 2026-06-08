@@ -50,6 +50,11 @@ pub struct WebGpuFrameStats {
     pub group_compaction_count: usize,
     pub group_slot_count: usize,
     pub group_slot_free_count: usize,
+    // FC-09: object draw-path diagnostics, populated when an object scene is loaded.
+    pub object_count: usize,
+    pub object_fill_index_count: usize,
+    pub object_stroke_vertex_count: usize,
+    pub object_draw_count: usize,
     pub backend: String,
 }
 
@@ -126,6 +131,19 @@ pub struct CoreMarqueeResult {
     pub ids: Vec<String>,
 }
 
+/// FC-07: a cumulative object drag delta. `id` is the dragged object; `dx`/`dy`
+/// are world-px offsets from the pointer-down world point (not per-move deltas).
+/// The shell authors one undoable transform op from the final delta and re-feeds
+/// the object scene; the renderer never mutates the object transform itself.
+#[cfg(feature = "wgpu-probe")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectTransformDelta {
+    pub id: String,
+    pub dx: f64,
+    pub dy: f64,
+}
+
 #[cfg(feature = "wgpu-probe")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,6 +154,11 @@ pub struct CoreInputBatchResult {
     pub patches: Vec<RenderScenePatch>,
     pub overlay: Option<CoreOverlayRequest>,
     pub marquee: Option<CoreMarqueeResult>,
+    // FC-07: object-path input results, non-null only when an object scene is loaded
+    // and the corresponding event occurred. The legacy fields above stay populated.
+    pub object_selection: Option<String>,
+    pub object_transform_delta: Option<ObjectTransformDelta>,
+    pub object_marquee_ids: Option<Vec<String>>,
 }
 
 #[cfg(feature = "wgpu-probe")]

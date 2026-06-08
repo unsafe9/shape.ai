@@ -39,6 +39,8 @@
 
 use crate::render_object::{resolve_visual, RPaint, RenderObject, RenderObjectScene, VisualState};
 #[cfg(feature = "wgpu-probe")]
+use crate::model::CameraState;
+#[cfg(feature = "wgpu-probe")]
 use crate::shaders::{OBJECT_FILL_WGSL, OBJECT_STROKE_WGSL};
 use crate::stroke_expand::{dash_segments, expand_stroke, Cap, Join};
 use crate::tessellate::{
@@ -601,6 +603,25 @@ impl ObjectRenderer {
     /// Number of objects with recorded draw data.
     pub fn object_count(&self) -> usize {
         self.draws.len()
+    }
+
+    /// Rebuild the camera uniform from the live camera + device-pixel viewport and
+    /// re-upload it (FC-06). Called every frame so pan/zoom moves objects without a
+    /// scene reload — the per-object instance matrices stay put while the shared
+    /// affine camera in this uniform tracks `self.camera`. Packing is byte-identical
+    /// to [`ObjectMatrixUniform::from_scene`].
+    pub fn update_camera(
+        &self,
+        queue: &wgpu::Queue,
+        camera: &CameraState,
+        pixel_width: f32,
+        pixel_height: f32,
+    ) {
+        let uniform = ObjectMatrixUniform {
+            camera: [camera.x as f32, camera.y as f32, camera.zoom as f32, 0.0],
+            viewport: [pixel_width, pixel_height, 0.0, 0.0],
+        };
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
     }
 
     /// Record the object draw pass into `encoder` targeting `view`. Each object

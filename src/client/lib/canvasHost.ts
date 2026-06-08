@@ -239,13 +239,14 @@ export class ShapeCanvasHost {
    * Push the canonical `ObjectScene` to the renderer. Projects it to the
    * renderer-core `RenderObjectScene`, then:
    *  - if a live `ShapeWebGpuRenderer` with `loadObjectScene` is present, uploads
-   *    the object geometry to the GPU (and draws it via `drawObjects`), and
+   *    the object geometry to the GPU (the RAF `renderFrame` loop then draws it),
+   *    and
    *  - always builds the CPU geometry through the crate's `buildObjectSceneGeometry`
    *    for the returned counts.
    *
    * Returns the geometry build (counts + raw), or null when no build entry is
    * available. The live GPU PASS only runs in a real browser (no WebGPU device in
-   * CI); see file header for the flagged live-pixels gap.
+   * CI).
    */
   loadObjectScene(scene: ObjectScene, selection: ObjectSelection): ObjectGeometryBuild {
     this.lastObjectScene = scene;
@@ -265,16 +266,17 @@ export class ShapeCanvasHost {
     }
   }
 
-  /** Upload + draw the object scene through the live renderer when available. The
-   *  live GPU pass needs a WebGPU device (browser-only); a no-op without one. */
+  /** Upload the object scene to the live renderer when available (browser-only;
+   *  a no-op without a WebGPU device). FC-05: this only UPLOADS the geometry; the
+   *  RAF `renderFrame` loop is the sole frame driver and records the object pass
+   *  itself, so calling `drawObjects` here would double-acquire the swapchain. */
   private uploadObjectSceneToRenderer(sceneJson: string): void {
     const renderer = this.webGpuRenderer;
     if (!renderer || typeof renderer.loadObjectScene !== "function") return;
     try {
       renderer.loadObjectScene(sceneJson);
-      renderer.drawObjects?.();
     } catch (error) {
-      this.callbacks.onStatus(errorMessage(error, "Object scene draw failed."));
+      this.callbacks.onStatus(errorMessage(error, "Object scene upload failed."));
     }
   }
 

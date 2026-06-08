@@ -56,6 +56,12 @@ export type RustWebGpuFrameStats = {
   groupCompactionCount: number;
   groupSlotCount: number;
   groupSlotFreeCount: number;
+  // FC-09: object draw-path diagnostics. Nullable so a wasm build (or test mock)
+  // predating these fields still typechecks; read defensively as "no objects".
+  objectCount?: number | null;
+  objectFillIndexCount?: number | null;
+  objectStrokeVertexCount?: number | null;
+  objectDrawCount?: number | null;
   backend: string;
 };
 
@@ -97,6 +103,15 @@ export type RustMarqueeResult = {
   ids: string[];
 };
 
+// FC-07: a cumulative object drag delta. dx/dy are world-px offsets from the
+// pointer-down world point (not per-move deltas); the shell authors one undoable
+// transform op from the final delta.
+export type RustObjectTransformDelta = {
+  id: string;
+  dx: number;
+  dy: number;
+};
+
 export type RustInputBatchResult = {
   camera: CameraState;
   hit: RustHitResult | null;
@@ -106,6 +121,11 @@ export type RustInputBatchResult = {
   // CC2.3: optional so a wasm build (or test mock) predating the field still
   // typechecks; the engine reads it defensively as "no marquee".
   marquee?: RustMarqueeResult | null;
+  // FC-07: object-path input results, optional/non-null only when an object scene
+  // is loaded and the matching event occurred.
+  objectSelection?: string | null;
+  objectTransformDelta?: RustObjectTransformDelta | null;
+  objectMarqueeIds?: string[] | null;
 };
 
 export type RustDebugSnapshot = {

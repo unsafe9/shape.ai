@@ -195,6 +195,10 @@ export type FrameStats = {
   rustGroupCompactions: number | null;
   rustGroupSlots: number | null;
   rustFreeGroupSlots: number | null;
+  rustObjectCount: number | null;
+  rustObjectFillIndices: number | null;
+  rustObjectStrokeVertices: number | null;
+  rustObjectDraws: number | null;
   rustCameraX: number | null;
   rustCameraY: number | null;
   rustCameraZoom: number | null;

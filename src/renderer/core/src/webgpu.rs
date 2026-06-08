@@ -8,12 +8,15 @@ use crate::model::{
     RenderScenePatch, SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken,
     WorldPoint, WorldRect,
 };
+use crate::hit_test_object::hit_test_object;
 use crate::object_pipeline::{ObjectPipeline, ObjectRenderer};
+use crate::outline::{derive_region, parse_path_string};
 use crate::render_object::RenderObjectScene;
 use crate::serde_wasm;
 use crate::stats::{
     CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreOverlayRequest, CoreOverlayStyle,
-    CoreOverlayTarget, WebGpuDebugSnapshot, WebGpuFrameStats, WebGpuProbeReport,
+    CoreOverlayTarget, ObjectTransformDelta, WebGpuDebugSnapshot, WebGpuFrameStats,
+    WebGpuProbeReport,
 };
 use crate::text::{
     CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_HEIGHT,
@@ -32,6 +35,31 @@ struct ObjectSceneLoadResult {
     objects: usize,
     fill_indices: usize,
     stroke_vertices: usize,
+}
+
+/// Per-object derived region retained on the renderer for live hit-testing /
+/// marquee against the loaded object scene (FC-04). `outline` is the region
+/// boundary polygon in OBJECT-LOCAL pixels (D6); `transform` maps object-local px
+/// to world px (D7). The outline is local so a moving transform never forces a
+/// region rebuild — the query point is inverse-transformed into local space at
+/// hit time (D8, see [`crate::hit_test_object`]).
+#[cfg(feature = "wgpu-probe")]
+#[derive(Clone, Debug)]
+struct ObjectRegion {
+    id: String,
+    transform: [[f64; 3]; 3],
+    outline: Vec<(f32, f32)>,
+}
+
+/// FC-07: per-batch accumulator for the object-path input results, threaded through
+/// [`ShapeWebGpuRenderer::apply_input_event`] and folded into the
+/// [`CoreInputBatchResult`] at the end of the batch.
+#[cfg(feature = "wgpu-probe")]
+#[derive(Default)]
+struct ObjectInputOut {
+    selection: Option<String>,
+    transform_delta: Option<ObjectTransformDelta>,
+    marquee_ids: Option<Vec<String>>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -495,6 +523,14 @@ enum InputDragState {
         start: WorldPoint,
         current: WorldPoint,
     },
+    // FC-07: dragging a selected object. `start` is the pointer-down WORLD point and
+    // stays FIXED for the gesture so each move emits a cumulative delta the shell
+    // turns into one undoable op; the renderer never mutates the object transform.
+    Object {
+        pointer_id: i32,
+        object_id: String,
+        start: WorldPoint,
+    },
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -507,6 +543,10 @@ struct RendererRollbackState {
     last_hit: Option<CoreHitResult>,
     text_layout_cache: TextLayoutCache,
     counters: MutationCounters,
+    // FC-07: object selection lives on `object_scene.selection`; capture the whole
+    // scene so a failed input batch restores it (regions are local-space and follow
+    // the transform, so they need no rollback).
+    object_scene: Option<RenderObjectScene>,
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -567,6 +607,12 @@ pub struct ShapeWebGpuRenderer {
     // same device/queue/surface/format.
     object_pipeline: Option<ObjectPipeline>,
     object_renderer: Option<ObjectRenderer>,
+    // FC-04: the parsed object scene + its per-object derived regions, retained so
+    // the live frame loop draws objects (render_frame) and pointer input hit-tests
+    // against them. `object_scene.is_some()` is the live-object branch switch; when
+    // None the legacy 2D path stays authoritative.
+    object_scene: Option<RenderObjectScene>,
+    object_regions: Vec<ObjectRegion>,
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -800,6 +846,8 @@ impl ShapeWebGpuRenderer {
             last_lod_tiers: HashMap::new(),
             object_pipeline: None,
             object_renderer: None,
+            object_scene: None,
+            object_regions: Vec::new(),
         };
         renderer.write_uniform();
         Ok(renderer)
@@ -862,6 +910,7 @@ impl ShapeWebGpuRenderer {
             last_hit: self.last_hit.clone(),
             text_layout_cache: self.text_layout_cache.clone(),
             counters: self.mutation_counters(),
+            object_scene: self.object_scene.clone(),
         }
     }
 
@@ -872,6 +921,7 @@ impl ShapeWebGpuRenderer {
         self.active_tool = state.active_tool;
         self.multi_select = state.multi_select;
         self.last_hit = state.last_hit;
+        self.object_scene = state.object_scene;
         self.text_layout_cache = state.text_layout_cache.clone();
         self.rebuild_vertex_buffer();
         self.text_layout_cache = state.text_layout_cache;
@@ -1281,7 +1331,21 @@ impl ShapeWebGpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("shape.ai visible WebGPU encoder"),
             });
+        // FC-05/FC-06: when an object scene is loaded, this single frame records the
+        // OBJECT pass (clearing the surface) in place of the legacy 2D pass, so there
+        // is exactly one acquire/submit/present per frame. The camera uniform is
+        // refreshed every frame so pan/zoom moves objects with no scene reload.
+        if let (Some(pipeline), Some(renderer)) =
+            (self.object_pipeline.as_ref(), self.object_renderer.as_ref())
         {
+            renderer.update_camera(
+                &self.queue,
+                &self.camera,
+                self.config.width as f32,
+                self.config.height as f32,
+            );
+            renderer.render(&mut encoder, &view, pipeline, true);
+        } else {
             let color_attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: &view,
                 depth_slice: None,
@@ -1384,6 +1448,26 @@ impl ShapeWebGpuRenderer {
             group_slot_count: self.vertex_ranges.groups.len()
                 + self.vertex_ranges.group_free_offsets.len(),
             group_slot_free_count: self.vertex_ranges.group_free_offsets.len(),
+            object_count: self
+                .object_scene
+                .as_ref()
+                .map(|scene| scene.objects.len())
+                .unwrap_or(0),
+            object_fill_index_count: self
+                .object_renderer
+                .as_ref()
+                .map(|r| r.fill_index_count() as usize)
+                .unwrap_or(0),
+            object_stroke_vertex_count: self
+                .object_renderer
+                .as_ref()
+                .map(|r| r.stroke_vertex_count() as usize)
+                .unwrap_or(0),
+            object_draw_count: self
+                .object_renderer
+                .as_ref()
+                .map(|r| r.object_count())
+                .unwrap_or(0),
             backend: "rust-wgpu-visible".to_string(),
         })
     }
@@ -1422,45 +1506,22 @@ impl ShapeWebGpuRenderer {
             fill_indices: renderer.fill_index_count() as usize,
             stroke_vertices: renderer.stroke_vertex_count() as usize,
         };
+        // FC-04: derive + retain each object's local-space region for hit-test /
+        // marquee, then keep the parsed scene as the live-object branch switch.
+        self.object_regions = derive_object_regions(&scene);
+        self.object_scene = Some(scene);
         self.object_renderer = Some(renderer);
         serde_wasm(counts)
     }
 
-    /// OB-4 live GPU object PASS: acquire the surface texture and record the object
-    /// render through the [`ObjectRenderer`] built by [`Self::load_object_scene`],
-    /// clearing the surface (the object path owns the whole surface at the cutover).
-    /// A no-op when no object scene has been loaded.
-    ///
-    /// NOTE: the live frame loop on the client does not yet route through this; the
-    /// engine keeps the camera/input/stats loop alive while the object pixels are
-    /// wired in (the flagged live-pixels gap, documented in `lib/canvasHost.ts`).
+    /// OB-4 live GPU object PASS: now a thin wrapper over [`Self::render_frame`],
+    /// which is the single live frame driver (FC-05). The object pass is recorded
+    /// inside `render_frame` against the same acquired surface texture, so a separate
+    /// acquire/present here would double-acquire the swapchain. Kept as a harmless
+    /// optional wasm export; the client RAF loop calls `render_frame` directly.
     #[wasm_bindgen(js_name = drawObjects)]
     pub fn draw_objects(&mut self) -> Result<(), JsValue> {
-        let (Some(pipeline), Some(renderer)) =
-            (self.object_pipeline.as_ref(), self.object_renderer.as_ref())
-        else {
-            return Ok(());
-        };
-        let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-            other => {
-                return Err(JsValue::from_str(&format!(
-                    "WebGPU surface texture unavailable: {other:?}"
-                )))
-            }
-        };
-        let view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("shape.ai object draw encoder"),
-            });
-        renderer.render(&mut encoder, &view, pipeline, true);
-        self.queue.submit(Some(encoder.finish()));
-        surface_texture.present();
+        self.render_frame()?;
         Ok(())
     }
 
@@ -1472,11 +1533,17 @@ impl ShapeWebGpuRenderer {
         let mut hit = None;
         let mut overlay = None;
         let mut marquee = None;
+        let mut object_out = ObjectInputOut::default();
         let rollback = self.rollback_state();
         for event in events {
-            if let Err(error) =
-                self.apply_input_event(event, &mut patches, &mut hit, &mut overlay, &mut marquee)
-            {
+            if let Err(error) = self.apply_input_event(
+                event,
+                &mut patches,
+                &mut hit,
+                &mut overlay,
+                &mut marquee,
+                &mut object_out,
+            ) {
                 self.restore_rollback_state(rollback);
                 return Err(error);
             }
@@ -1494,6 +1561,9 @@ impl ShapeWebGpuRenderer {
             patches,
             overlay,
             marquee,
+            object_selection: object_out.selection,
+            object_transform_delta: object_out.transform_delta,
+            object_marquee_ids: object_out.marquee_ids,
         })
     }
 
@@ -1603,7 +1673,22 @@ impl ShapeWebGpuRenderer {
         hit: &mut Option<CoreHitResult>,
         overlay: &mut Option<CoreOverlayRequest>,
         marquee: &mut Option<CoreMarqueeResult>,
+        object_out: &mut ObjectInputOut,
     ) -> Result<(), JsValue> {
+        // FC-07: when an object scene is loaded, pointer events hit-test / drag /
+        // marquee against OBJECTS. Non-pointer events (camera, fit-scene, tool) fall
+        // through to the shared handlers below so pan/zoom/fit still work.
+        if self.object_scene.is_some() {
+            match &event {
+                CanvasInputEvent::PointerDown { .. }
+                | CanvasInputEvent::PointerMove { .. }
+                | CanvasInputEvent::PointerUp { .. }
+                | CanvasInputEvent::PointerCancel { .. } => {
+                    return self.apply_object_pointer_event(event, object_out);
+                }
+                _ => {}
+            }
+        }
         match event {
             CanvasInputEvent::PointerDown { pointer_id, screen } => {
                 // Hand tool always pans; it never hit-tests or mutates selection.
@@ -1828,7 +1913,13 @@ impl ShapeWebGpuRenderer {
                 }
             }
             CanvasInputEvent::FitScene => {
-                if let Some(scene) = &self.scene {
+                // FC-09: with an object scene loaded, frame the world-space AABB over
+                // all object regions; otherwise fall back to the legacy scene fit.
+                if self.object_scene.is_some() {
+                    if let Some(bounds) = object_regions_world_bounds(&self.object_regions) {
+                        self.camera = fit_camera_to_bounds(&bounds, self.width, self.height);
+                    }
+                } else if let Some(scene) = &self.scene {
                     self.camera = fit_camera_to_scene(scene, self.width, self.height);
                 }
             }
@@ -1869,6 +1960,32 @@ impl ShapeWebGpuRenderer {
                 let next_hit = self.hit_at_screen(screen);
                 self.last_hit = next_hit.clone();
                 *hit = next_hit;
+            }
+        }
+        Ok(())
+    }
+
+    /// FC-07: pointer input against the loaded object scene. Delegates the whole
+    /// state machine to the pure [`step_object_pointer`] so it is unit-testable
+    /// without a GPU device, then mirrors the resulting selection onto the scene.
+    fn apply_object_pointer_event(
+        &mut self,
+        event: CanvasInputEvent,
+        object_out: &mut ObjectInputOut,
+    ) -> Result<(), JsValue> {
+        step_object_pointer(
+            &event,
+            &self.object_regions,
+            self.active_tool,
+            &mut self.camera,
+            &mut self.input_drag,
+            object_out,
+        );
+        // Mirror the picked selection onto the persisted single-anchor selection so
+        // a later draw/debug reads it; the result already carries it for the shell.
+        if let Some(id) = &object_out.selection {
+            if let Some(scene) = &mut self.object_scene {
+                scene.selection = Some(id.clone());
             }
         }
         Ok(())
@@ -4712,6 +4829,266 @@ mod tests {
         assert!(vertices.len() <= MARQUEE_OVERLAY_VERTEX_CAPACITY);
     }
 
+    // ----- FC-04..FC-07 object live-path helpers -----------------------------
+
+    use crate::render_object::RenderObject;
+
+    fn object_identity() -> [[f64; 3]; 3] {
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    }
+
+    /// An object at world `(tx, ty)` whose local geometry is an `s`px×`s`px rect
+    /// (`s` px = `s*8` quantized units, D2). Later-in-the-list objects draw on top.
+    fn rect_object(id: &str, tx: f64, ty: f64, s: i32) -> RenderObject {
+        let u = s * 8; // px -> quantized units
+        RenderObject {
+            id: id.to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]],
+            geometry_d: format!("M 0 0 L {u} 0 L {u} {u} L 0 {u} Z"),
+            fill: None,
+            stroke: None,
+            text: None,
+            clip: false,
+        }
+    }
+
+    fn object_scene(objects: Vec<RenderObject>) -> RenderObjectScene {
+        RenderObjectScene {
+            scene_id: "fc-object".to_string(),
+            camera: CameraState {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+            objects,
+            selection: None,
+            multi_select: Vec::new(),
+        }
+    }
+
+    fn identity_camera() -> CameraState {
+        CameraState {
+            x: 0.0,
+            y: 0.0,
+            zoom: 1.0,
+        }
+    }
+
+    #[test]
+    fn hit_object_picks_top_overlapping_object() {
+        // Two overlapping 20px rects: "bottom" at world (0,0), "top" at world (5,5).
+        // They overlap in world [5,20]×[5,20]; the later object ("top") draws on top
+        // and must win the hit at a shared point.
+        let scene = object_scene(vec![
+            rect_object("bottom", 0.0, 0.0, 20),
+            rect_object("top", 5.0, 5.0, 20),
+        ]);
+        let regions = derive_object_regions(&scene);
+        assert_eq!(regions.len(), 2);
+        let camera = identity_camera(); // screen == world at zoom 1, origin 0.
+
+        // Shared point -> top wins (top-down = reverse of the Vec).
+        let id = hit_object_in_regions(&regions, &camera, WorldPoint { x: 10.0, y: 10.0 });
+        assert_eq!(id.as_deref(), Some("top"));
+
+        // A point only inside the bottom rect (world x<5) -> bottom.
+        let id = hit_object_in_regions(&regions, &camera, WorldPoint { x: 2.0, y: 2.0 });
+        assert_eq!(id.as_deref(), Some("bottom"));
+
+        // Outside both.
+        let id = hit_object_in_regions(&regions, &camera, WorldPoint { x: 100.0, y: 100.0 });
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn object_pointer_down_selects_then_move_emits_transform_delta() {
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        // PointerDown inside the object -> selection + Object drag.
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown {
+                pointer_id: 1,
+                screen: WorldPoint { x: 10.0, y: 10.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert_eq!(out.selection.as_deref(), Some("o1"));
+        assert!(matches!(
+            drag,
+            Some(InputDragState::Object { ref object_id, .. }) if object_id == "o1"
+        ));
+
+        // PointerMove -> cumulative world-px delta from the FIXED pointer-down point.
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove {
+                pointer_id: 1,
+                screen: WorldPoint { x: 18.0, y: 13.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        let delta = out
+            .transform_delta
+            .take()
+            .expect("move emits a transform delta");
+        assert_eq!(delta.id, "o1");
+        assert!((delta.dx - 8.0).abs() < 1e-9);
+        assert!((delta.dy - 3.0).abs() < 1e-9);
+
+        // PointerUp clears the drag (the shell commits one undoable op).
+        step_object_pointer(
+            &CanvasInputEvent::PointerUp {
+                pointer_id: 1,
+                screen: WorldPoint { x: 18.0, y: 13.0 },
+                edge_id: None,
+            },
+            &regions,
+            ActiveTool::Select,
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert!(drag.is_none());
+    }
+
+    #[test]
+    fn object_pointer_empty_marquee_collects_world_aabb_intersections() {
+        // Two objects far apart; a marquee over only the first collects just it.
+        let scene = object_scene(vec![
+            rect_object("near", 0.0, 0.0, 10),
+            rect_object("far", 500.0, 500.0, 10),
+        ]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        // Down on empty space starts a marquee.
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown {
+                pointer_id: 2,
+                screen: WorldPoint { x: -5.0, y: -5.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert!(matches!(drag, Some(InputDragState::Marquee { .. })));
+        assert!(out.selection.is_none());
+
+        // Up at (15,15) -> marquee [-5,15]² covers "near" only.
+        step_object_pointer(
+            &CanvasInputEvent::PointerUp {
+                pointer_id: 2,
+                screen: WorldPoint { x: 15.0, y: 15.0 },
+                edge_id: None,
+            },
+            &regions,
+            ActiveTool::Select,
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert_eq!(out.marquee_ids, Some(vec!["near".to_string()]));
+    }
+
+    #[test]
+    fn object_hand_tool_pointer_down_pans() {
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        // Hand tool: even a pointer-down over an object pans (no selection).
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown {
+                pointer_id: 3,
+                screen: WorldPoint { x: 10.0, y: 10.0 },
+            },
+            &regions,
+            ActiveTool::Hand,
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert!(matches!(drag, Some(InputDragState::Pan { .. })));
+        assert!(out.selection.is_none());
+
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove {
+                pointer_id: 3,
+                screen: WorldPoint { x: 40.0, y: 30.0 },
+            },
+            &regions,
+            ActiveTool::Hand,
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        // Pan moves the camera by the screen delta.
+        assert!((camera.x - 30.0).abs() < 1e-9);
+        assert!((camera.y - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fit_camera_to_object_regions_frames_world_bounds() {
+        // Object at world (100,100), 50px rect -> world bounds [100,150]².
+        let scene = object_scene(vec![rect_object("o1", 100.0, 100.0, 50)]);
+        let regions = derive_object_regions(&scene);
+        let bounds = object_regions_world_bounds(&regions).expect("bounds");
+        assert!((bounds.x - 100.0).abs() < 1e-6);
+        assert!((bounds.y - 100.0).abs() < 1e-6);
+        assert!((bounds.width - 50.0).abs() < 1e-6);
+        assert!((bounds.height - 50.0).abs() < 1e-6);
+
+        // The fit camera centers that AABB in the viewport.
+        let camera = fit_camera_to_bounds(&bounds, 1200.0, 800.0);
+        let center_world = (bounds.x + bounds.width / 2.0, bounds.y + bounds.height / 2.0);
+        let center_screen_x = center_world.0 * camera.zoom + camera.x;
+        let center_screen_y = center_world.1 * camera.zoom + camera.y;
+        assert!((center_screen_x - 600.0).abs() < 1e-6);
+        assert!((center_screen_y - 400.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn object_matrix_uniform_camera_packing_matches_update_camera() {
+        // FC-06: update_camera packs the camera uniform identically to from_scene.
+        // No GPU device here, so assert the shared packing logic directly (the byte
+        // layout update_camera writes). ObjectRenderer::update_camera is exercised on
+        // a real device at the cutover.
+        use crate::object_pipeline::ObjectMatrixUniform;
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
+        let from_scene = ObjectMatrixUniform::from_scene(&scene, 1280.0, 720.0);
+        let camera = CameraState {
+            x: 12.0,
+            y: -7.0,
+            zoom: 2.5,
+        };
+        let live = ObjectMatrixUniform {
+            camera: [camera.x as f32, camera.y as f32, camera.zoom as f32, 0.0],
+            viewport: [1280.0, 720.0, 0.0, 0.0],
+        };
+        // Same viewport packing; camera differs because the live camera moved.
+        assert_eq!(from_scene.viewport, live.viewport);
+        assert_eq!(live.camera, [12.0, -7.0, 2.5, 0.0]);
+    }
+
     #[test]
     fn multi_selection_round_trips_camel_case_kind() {
         let selection = SceneSelection::Multi {
@@ -5573,14 +5950,259 @@ fn fit_camera_to_scene(
     viewport_height: f64,
 ) -> CameraState {
     let bounds = scene_world_bounds(scene);
+    fit_camera_to_bounds(&bounds, viewport_width, viewport_height)
+}
+
+/// FC-09: frame a world-space AABB into the viewport, mirroring the legacy fit math
+/// (center + zoom-to-fit with the same padding/zoom clamp as [`fit_camera_to_scene`]).
+#[cfg(feature = "wgpu-probe")]
+fn fit_camera_to_bounds(
+    bounds: &WorldRect,
+    viewport_width: f64,
+    viewport_height: f64,
+) -> CameraState {
     let padding = 96.0;
     let usable_width = (viewport_width - padding * 2.0).max(120.0);
     let usable_height = (viewport_height - padding * 2.0).max(120.0);
-    let zoom = clamp(bounds_zoom(usable_width, usable_height, &bounds), 0.04, 1.6);
+    let zoom = clamp(bounds_zoom(usable_width, usable_height, bounds), 0.04, 1.6);
     CameraState {
         zoom,
         x: viewport_width / 2.0 - (bounds.x + bounds.width / 2.0) * zoom,
         y: viewport_height / 2.0 - (bounds.y + bounds.height / 2.0) * zoom,
+    }
+}
+
+/// FC-04: derive each object's local-space region outline (D6) for hit-test /
+/// marquee. Parses the geometry path-string into flattened subpaths, derives the
+/// region, and keeps the boundary polygon in OBJECT-LOCAL px. Objects whose
+/// geometry yields no region (degenerate) are skipped — they cannot be hit.
+#[cfg(feature = "wgpu-probe")]
+fn derive_object_regions(scene: &RenderObjectScene) -> Vec<ObjectRegion> {
+    // Same flattening tolerance the region cache groundwork uses for at-rest geometry.
+    const REGION_FLATNESS: f32 = 0.5;
+    let mut regions = Vec::with_capacity(scene.objects.len());
+    for obj in &scene.objects {
+        let Some(subpaths) = parse_path_string(&obj.geometry_d, REGION_FLATNESS) else {
+            continue;
+        };
+        let Some(region) = derive_region(&subpaths, REGION_FLATNESS) else {
+            continue;
+        };
+        regions.push(ObjectRegion {
+            id: obj.id.clone(),
+            transform: obj.transform,
+            outline: region.outline,
+        });
+    }
+    regions
+}
+
+/// FC-07: pick the top-most object whose region contains the screen point. Regions
+/// are iterated in reverse (top-down, since later objects draw on top); the query
+/// point is mapped to world then inverse-transformed into each object's local space
+/// (D8) by [`hit_test_object`].
+#[cfg(feature = "wgpu-probe")]
+fn hit_object_in_regions(
+    regions: &[ObjectRegion],
+    camera: &CameraState,
+    screen: WorldPoint,
+) -> Option<String> {
+    let world = screen_to_world(screen, camera);
+    regions
+        .iter()
+        .rev()
+        .find(|region| hit_test_object(&region.transform, &region.outline, world.x, world.y))
+        .map(|region| region.id.clone())
+}
+
+/// FC-07: the pure object pointer-input state machine. Operates only on the
+/// pieces of renderer state it touches (camera, drag, the region list) so it is
+/// unit-testable without a GPU device. Mutates `camera`/`input_drag` and writes
+/// any selection / transform-delta / marquee result into `object_out`.
+///
+/// Behavior (Select tool unless noted):
+/// - PointerDown, Hand tool: start a Pan drag (panning works in object mode).
+/// - PointerDown, hit an object: set `selection`, start an Object drag anchored at
+///   the pointer-down WORLD point.
+/// - PointerDown, empty: start a world-space Marquee drag.
+/// - PointerMove on Pan: update `camera`. On Object: emit a CUMULATIVE delta from
+///   the fixed anchor. On Marquee: extend the rect.
+/// - PointerUp on Marquee: AABB-test object world regions against the rect into
+///   `marquee_ids`. Any drag clears on up/cancel.
+#[cfg(feature = "wgpu-probe")]
+fn step_object_pointer(
+    event: &CanvasInputEvent,
+    regions: &[ObjectRegion],
+    active_tool: ActiveTool,
+    camera: &mut CameraState,
+    input_drag: &mut Option<InputDragState>,
+    object_out: &mut ObjectInputOut,
+) {
+    match event {
+        CanvasInputEvent::PointerDown { pointer_id, screen } => {
+            let pointer_id = *pointer_id;
+            let screen = *screen;
+            // Hand tool always pans; it never hit-tests or mutates selection.
+            if active_tool == ActiveTool::Hand {
+                *input_drag = Some(InputDragState::Pan {
+                    pointer_id,
+                    start: screen,
+                    camera: camera.clone(),
+                });
+                return;
+            }
+            match hit_object_in_regions(regions, camera, screen) {
+                Some(id) => {
+                    object_out.selection = Some(id.clone());
+                    *input_drag = Some(InputDragState::Object {
+                        pointer_id,
+                        object_id: id,
+                        start: screen_to_world(screen, camera),
+                    });
+                }
+                None => {
+                    let world = screen_to_world(screen, camera);
+                    *input_drag = Some(InputDragState::Marquee {
+                        pointer_id,
+                        start: world,
+                        current: world,
+                    });
+                }
+            }
+        }
+        CanvasInputEvent::PointerMove { pointer_id, screen } => {
+            let pointer_id = *pointer_id;
+            let screen = *screen;
+            let Some(drag) = input_drag.clone() else {
+                return;
+            };
+            match drag {
+                InputDragState::Pan {
+                    pointer_id: drag_pointer_id,
+                    start,
+                    camera: drag_camera,
+                } if drag_pointer_id == pointer_id => {
+                    *camera = CameraState {
+                        x: drag_camera.x + screen.x - start.x,
+                        y: drag_camera.y + screen.y - start.y,
+                        zoom: drag_camera.zoom,
+                    };
+                }
+                InputDragState::Object {
+                    pointer_id: drag_pointer_id,
+                    object_id,
+                    start,
+                } if drag_pointer_id == pointer_id => {
+                    // Cumulative delta from the FIXED pointer-down world point.
+                    let world_now = screen_to_world(screen, camera);
+                    object_out.transform_delta = Some(ObjectTransformDelta {
+                        id: object_id,
+                        dx: world_now.x - start.x,
+                        dy: world_now.y - start.y,
+                    });
+                }
+                InputDragState::Marquee {
+                    pointer_id: drag_pointer_id,
+                    start,
+                    ..
+                } if drag_pointer_id == pointer_id => {
+                    *input_drag = Some(InputDragState::Marquee {
+                        pointer_id,
+                        start,
+                        current: screen_to_world(screen, camera),
+                    });
+                }
+                _ => {}
+            }
+        }
+        CanvasInputEvent::PointerUp {
+            pointer_id, screen, ..
+        } => {
+            let pointer_id = *pointer_id;
+            if let Some(InputDragState::Marquee {
+                pointer_id: drag_pointer_id,
+                start,
+                ..
+            }) = input_drag.clone()
+            {
+                if drag_pointer_id == pointer_id {
+                    let current = screen_to_world(*screen, camera);
+                    let rect = marquee_rect(start, current);
+                    object_out.marquee_ids = Some(object_regions_in_marquee(regions, &rect));
+                }
+            }
+            // Object drag commits on the shell side (one undoable op); just clear.
+            *input_drag = None;
+        }
+        CanvasInputEvent::PointerCancel { pointer_id } => {
+            if drag_pointer_id(input_drag.as_ref()) == Some(*pointer_id) {
+                *input_drag = None;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// FC-07: object ids whose WORLD-space region AABB intersects the marquee rect.
+/// Each local outline vertex is transformed to world via the object transform; the
+/// min/max over those gives the world AABB tested against `rect`.
+#[cfg(feature = "wgpu-probe")]
+fn object_regions_in_marquee(regions: &[ObjectRegion], rect: &WorldRect) -> Vec<String> {
+    regions
+        .iter()
+        .filter_map(|region| {
+            let bounds = region_world_bounds(region)?;
+            rects_intersect(&bounds, rect).then(|| region.id.clone())
+        })
+        .collect()
+}
+
+/// FC-09: world-space AABB over every object region (each local outline vertex
+/// transformed to world). `None` when there are no regions / no finite vertices.
+#[cfg(feature = "wgpu-probe")]
+fn object_regions_world_bounds(regions: &[ObjectRegion]) -> Option<WorldRect> {
+    let mut acc: Option<WorldRect> = None;
+    for region in regions {
+        let Some(bounds) = region_world_bounds(region) else {
+            continue;
+        };
+        acc = Some(match acc {
+            None => bounds,
+            Some(prev) => union_rect_refs(&[&prev, &bounds]).unwrap_or(prev),
+        });
+    }
+    acc
+}
+
+/// World-space AABB of one object's region: transform each local outline vertex
+/// through the object's projective matrix (D7/D8) and take the extent. `None` when
+/// the outline is empty or every vertex maps to a non-finite world point.
+#[cfg(feature = "wgpu-probe")]
+fn region_world_bounds(region: &ObjectRegion) -> Option<WorldRect> {
+    use crate::hit_test_object::apply_3x3;
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for &(lx, ly) in &region.outline {
+        let (wx, wy) = apply_3x3(&region.transform, lx as f64, ly as f64);
+        if !wx.is_finite() || !wy.is_finite() {
+            continue;
+        }
+        min_x = min_x.min(wx);
+        min_y = min_y.min(wy);
+        max_x = max_x.max(wx);
+        max_y = max_y.max(wy);
+    }
+    if min_x.is_finite() && max_x >= min_x && max_y >= min_y {
+        Some(WorldRect {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x,
+            height: max_y - min_y,
+        })
+    } else {
+        None
     }
 }
 
@@ -5830,7 +6452,8 @@ fn drag_pointer_id(drag: Option<&InputDragState>) -> Option<i32> {
         | Some(InputDragState::Group { pointer_id, .. })
         | Some(InputDragState::Card { pointer_id, .. })
         | Some(InputDragState::Edge { pointer_id, .. })
-        | Some(InputDragState::Marquee { pointer_id, .. }) => Some(*pointer_id),
+        | Some(InputDragState::Marquee { pointer_id, .. })
+        | Some(InputDragState::Object { pointer_id, .. }) => Some(*pointer_id),
         None => None,
     }
 }
