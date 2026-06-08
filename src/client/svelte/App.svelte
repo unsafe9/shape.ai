@@ -6,6 +6,7 @@
   import {
     emptyObjectScene,
     translateTransform,
+    IDENTITY_TRANSFORM,
     GEOMETRY_QUANTUM_PER_PX,
     type Object as SceneObject,
     type ObjectOp,
@@ -49,6 +50,14 @@
   //       object shifted, so the commit op on pointer-up captures the correct
   //       inverse (original transform), keeping undo correct (D21). -----
   let dragPreview = $state<{ id: string; dx: number; dy: number } | null>(null);
+
+  // FC-16: in the connected path authorOp's scene update is async (it arrives via
+  // commitClientScene), so clearing dragPreview the instant the commit op is
+  // authored would let `feedScene` briefly revert to the pre-drag canonical scene
+  // — the object snaps back to its start then jumps to final. Instead remember the
+  // committed {id, transform} and clear dragPreview inside commitClientScene once
+  // the next canonical scene reflects that object's committed transform.
+  let pendingCommit: { id: string; transform: SceneObject["transform"] } | null = null;
 
   // ----- FC-11: freehand pen. While the draw tool is active, the in-progress
   //       stroke's world points accumulate here; `feedScene` appends a transient
@@ -126,19 +135,24 @@
       // The canonical scene was never mutated during the drag, so op-apply
       // captures the correct inverse (original transform), satisfying D21 undo.
       const src = scene.objects.find((o) => o.id === id);
-      if (src) authorOp({ kind: "set-transform", id, transform: shiftTransform(src.transform, dx, dy) });
-      dragPreview = null;
+      if (!src) return void (dragPreview = null);
+      const transform = shiftTransform(src.transform, dx, dy);
+      // FC-16: pre-connect authorOp applies synchronously (scene is already the
+      // committed scene on return), so the preview can clear immediately. In the
+      // connected path the scene update is async — hold the preview until
+      // commitClientScene sees the committed transform land (no snap-back).
+      const wasConnected = sceneClientReady && sceneClient !== null;
+      if (wasConnected) pendingCommit = { id, transform };
+      authorOp({ kind: "set-transform", id, transform });
+      if (!wasConnected) dragPreview = null;
     },
     onMarquee: (ids) => {
-      if (ids.length >= 2) selection = { kind: "multi", ids };
-      else if (ids.length === 1) selection = { kind: "object", id: ids[0] };
-      else selection = { kind: "canvas" };
-      persistSelection(selection);
+      // FC-16: route the marquee result through the same validation as
+      // onSelectObject (validSelection drops stale ids and collapses the kind).
+      const next: ObjectSelection =
+        ids.length >= 2 ? { kind: "multi", ids } : ids.length === 1 ? { kind: "object", id: ids[0] } : { kind: "canvas" };
+      selectObject(next);
     },
-    // FC-08/FC-13: a right-click pick result; the shell builds the context menu
-    // target from it. The right-click flow itself is driven synchronously in
-    // handleContextMenuRequest, so this is the engine-event entry for the same.
-    onContextPick: (id) => handleContextPick(contextTargetFromPick(id)),
     // FC-11: freehand pen capture. Accumulate world points across start/move; on
     // end, lower the stroke to an object via the wasm core and author an
     // insert-object op (the tool stays sticky in "draw"); cancel discards.
@@ -330,6 +344,15 @@
   function commitClientScene(next: ObjectScene): void {
     scene = next;
     selection = validSelection(next, selection);
+    // FC-16: once the canonical scene reflects the committed drag transform, drop
+    // the preview so `feedScene` falls back to the canonical scene with no flash.
+    if (pendingCommit) {
+      const committed = next.objects.find((o) => o.id === pendingCommit!.id);
+      if (committed && transformsEqual(committed.transform, pendingCommit.transform)) {
+        pendingCommit = null;
+        dragPreview = null;
+      }
+    }
   }
 
   function handleFeatureResponse(response: FeatureResponse): void {
@@ -919,6 +942,14 @@
   function transformOrigin(transform: SceneObject["transform"]): [number, number] {
     if (!transform) return [0, 0];
     return [transform[0][2], transform[1][2]];
+  }
+
+  // FC-16: structural equality of two (possibly absent) 3x3 transforms. An absent
+  // transform is the identity, so it compares equal to an explicit identity.
+  function transformsEqual(a: SceneObject["transform"], b: SceneObject["transform"]): boolean {
+    const m = a ?? IDENTITY_TRANSFORM;
+    const n = b ?? IDENTITY_TRANSFORM;
+    return m.every((row, i) => row.every((v, j) => v === n[i][j]));
   }
 
   function shiftTransform(transform: SceneObject["transform"], dx: number, dy: number): SceneObject["transform"] {

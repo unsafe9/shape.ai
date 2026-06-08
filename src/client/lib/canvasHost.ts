@@ -55,12 +55,15 @@ export type ShapeCanvasHostCallbacks = {
   // the pointer-down that picked an object; `onTransformPreview` on each drag move
   // (cumulative world-px delta — a non-destructive preview); `onTransformCommit`
   // once on pointer-up when the drag moved (the single undoable op); `onMarquee` on
-  // an empty-start drag's pointer-up; `onContextPick` carries the right-click pick.
+  // an empty-start drag's pointer-up.
   onSelectObject: (id: string) => void;
   onTransformPreview: (id: string, dx: number, dy: number) => void;
   onTransformCommit: (id: string, dx: number, dy: number) => void;
   onMarquee: (ids: string[]) => void;
-  onContextPick: (id: string | null) => void;
+  // FC-16: optional — no engine event routes to it. The right-click context pick
+  // runs synchronously via `hitTestObjectAt` in the shell, not through an engine
+  // event, so a host that omits this loses nothing.
+  onContextPick?: (id: string | null) => void;
   // FC-11: freehand pen capture phases (world px). The shell accumulates the
   // points across start/move and commits the stroke to an object on `end`.
   onDraw: (phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }) => void;
