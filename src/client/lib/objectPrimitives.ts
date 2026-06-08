@@ -203,7 +203,7 @@ export function textOverlayScreenRect(object: SceneObject, camera: CameraState):
 // quantized integers (GEOMETRY_QUANTUM_PER_PX per px); reading every numeric pair
 // covers M/L/C control points — a conservative enclosing box for the overlay.
 function pathLocalBbox(d: string): { minX: number; minY: number; maxX: number; maxY: number } | null {
-  const nums = d.match(/-?\d+(?:\.\d+)?/g);
+  const nums = d?.match(/-?\d+(?:\.\d+)?/g);
   if (!nums || nums.length < 2) return null;
   let minX = Infinity;
   let minY = Infinity;

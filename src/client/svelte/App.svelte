@@ -253,8 +253,10 @@
   }
 
   // Push the object scene into the renderer whenever it or the selection changes.
-  // FC-08: feeds `feedScene` (the canonical scene, or a drag-preview clone) so a
-  // live drag previews without mutating the canonical state.
+  // W2-11: feeds `feedScene` (the canonical scene plus any transient NEW-object
+  // preview — pen stroke / shape drag-create). A live drag of an EXISTING object no
+  // longer rides this feed; its transform is pushed straight to the GPU instance
+  // matrix (engine.setObjectPreviewTransform) without mutating the canonical state.
   $effect(() => {
     const current = feedScene;
     const sel = selection;
@@ -688,8 +690,10 @@
     const cut = sceneCore.splitSubpathAt(target.geometry, local.x, local.y, ERASE_RADIUS_QUANTIZED);
     // No node within the erase radius: the touch missed; leave the stroke whole.
     if (!cut) return;
-    // The cut removed every renderable piece — delete the now-empty object.
-    if (cut.d.trim().length === 0) {
+    // The cut removed every renderable piece — delete the now-empty object. The
+    // core omits `d` entirely when the geometry is empty (skip_serializing_if), so
+    // guard the undefined case before trimming.
+    if ((cut.d ?? "").trim().length === 0) {
       authorOp({ kind: "delete", id });
       if (selection.kind === "object" && selection.id === id) selectObject({ kind: "canvas" });
       return;
