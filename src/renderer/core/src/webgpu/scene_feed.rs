@@ -125,6 +125,10 @@ impl ShapeWebGpuRenderer {
     /// `render_frame` loop then draws from the updated instance buffer on the next
     /// tick, so no explicit redraw is needed. No-op if the object scene is unloaded
     /// or the id is absent.
+    ///
+    /// W3-G8/B: when `id` is part of the canonical `multi_select` set, the SAME world
+    /// delta is applied to EVERY member (each against its own base), so the whole
+    /// selection previews together during a group drag.
     #[wasm_bindgen(js_name = setObjectPreviewTransform)]
     pub fn set_object_preview_transform(
         &mut self,
@@ -133,16 +137,24 @@ impl ShapeWebGpuRenderer {
     ) -> Result<(), JsValue> {
         let delta: [[f64; 3]; 3] = serde_json::from_str(matrix_json)
             .map_err(|error| JsValue::from_str(&format!("Invalid preview matrix: {error}")))?;
-        let Some(base) = self
-            .object_scene
-            .as_ref()
-            .and_then(|scene| scene.objects.iter().find(|o| o.id == id))
-            .map(|o| o.transform)
-        else {
+        let Some(scene) = self.object_scene.as_ref() else {
             return Ok(());
         };
+        let targets = preview_target_ids(scene, id);
+        let bases: Vec<(String, [[f64; 3]; 3])> = targets
+            .into_iter()
+            .filter_map(|target| {
+                scene
+                    .objects
+                    .iter()
+                    .find(|o| o.id == target)
+                    .map(|o| (target, o.transform))
+            })
+            .collect();
         if let Some(renderer) = self.object_renderer.as_mut() {
-            renderer.set_preview_transform(&self.queue, id, &delta, &base);
+            for (target, base) in &bases {
+                renderer.set_preview_transform(&self.queue, target, &delta, base);
+            }
         }
         Ok(())
     }
@@ -150,22 +162,53 @@ impl ShapeWebGpuRenderer {
     /// W2-11: revert the dragged object's instance matrix to its canonical baked
     /// transform (`delta = identity`), dropping the live preview. No-op if the
     /// object scene is unloaded or the id is absent.
+    ///
+    /// W3-G8/B: symmetric with the multi-member preview — a cancelled/failed group
+    /// drag reverts EVERY member of the `multi_select` set, not just the picked id.
     #[wasm_bindgen(js_name = clearObjectPreview)]
     pub fn clear_object_preview(&mut self, id: &str) -> Result<(), JsValue> {
-        let Some(base) = self
-            .object_scene
-            .as_ref()
-            .and_then(|scene| scene.objects.iter().find(|o| o.id == id))
-            .map(|o| o.transform)
-        else {
+        let Some(scene) = self.object_scene.as_ref() else {
             return Ok(());
         };
+        let targets = preview_target_ids(scene, id);
+        let bases: Vec<(String, [[f64; 3]; 3])> = targets
+            .into_iter()
+            .filter_map(|target| {
+                scene
+                    .objects
+                    .iter()
+                    .find(|o| o.id == target)
+                    .map(|o| (target, o.transform))
+            })
+            .collect();
         if let Some(renderer) = self.object_renderer.as_mut() {
-            renderer.clear_preview_transform(&self.queue, id, &base);
+            for (target, base) in &bases {
+                renderer.clear_preview_transform(&self.queue, target, base);
+            }
         }
         Ok(())
     }
 
+}
+
+/// W3-G8/B: the set of object ids that should preview together when `dragged` is
+/// dragged. If `dragged` is a member of the scene's `multi_select` set, the whole
+/// set previews together (deduped, canonical order preserved); otherwise just the
+/// dragged id — so dragging a non-member is a fresh single drag even when a
+/// multi-select exists. Pure (no device/GPU), so it is host-testable under
+/// `wgpu-probe` without the wasm32-gated GPU glue around it.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn preview_target_ids(scene: &RenderObjectScene, dragged: &str) -> Vec<String> {
+    if !scene.multi_select.iter().any(|id| id == dragged) {
+        return vec![dragged.to_string()];
+    }
+    let mut targets: Vec<String> = Vec::with_capacity(scene.multi_select.len());
+    for id in &scene.multi_select {
+        if !targets.iter().any(|seen| seen == id) {
+            targets.push(id.clone());
+        }
+    }
+    targets
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -1557,4 +1600,44 @@ impl ShapeWebGpuRenderer {
         );
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_target_ids;
+    use crate::model::CameraState;
+    use crate::render_object::RenderObjectScene;
+
+    fn scene_with_multi_select(multi_select: Vec<&str>) -> RenderObjectScene {
+        RenderObjectScene {
+            scene_id: "test".to_string(),
+            camera: CameraState {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+            objects: Vec::new(),
+            selection: None,
+            multi_select: multi_select.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn dragging_a_member_previews_the_whole_set_in_canonical_order() {
+        let scene = scene_with_multi_select(vec!["a", "b", "c"]);
+        // The bug returned only ["b"]; the fix previews every member together.
+        assert_eq!(preview_target_ids(&scene, "b"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn dragging_a_non_member_previews_only_itself() {
+        let scene = scene_with_multi_select(vec!["a", "b", "c"]);
+        assert_eq!(preview_target_ids(&scene, "z"), vec!["z"]);
+    }
+
+    #[test]
+    fn empty_multi_select_previews_only_the_dragged_id() {
+        let scene = scene_with_multi_select(Vec::new());
+        assert_eq!(preview_target_ids(&scene, "a"), vec!["a"]);
+    }
 }
