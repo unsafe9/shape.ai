@@ -4125,6 +4125,101 @@ mod tests {
     }
 
     #[test]
+    fn object_marquee_over_two_filled_rects_yields_multi_ids() {
+        // BUG A (W3-G6/#1): a drag that STARTS on empty canvas in the gap between two
+        // FILLED rects must (a) start a Marquee — RA3's bbox fallback must NOT re-grab
+        // a filled body's empty bbox and turn the gesture into an Object move — and
+        // (b) on pointer-up collect BOTH ids so the shell forms a >=2 Multi selection.
+        // Two 20px filled rects: "a" at world (0,0) [0..20], "b" at world (30,0)
+        // [30..50]. The down anchor (-5,-5) sits on empty canvas top-left of both; the
+        // marquee rect is span(down-anchor, up-point) — the in-flight move is irrelevant
+        // to the final rect, so the anchor + up corner must straddle BOTH bodies.
+        let scene = object_scene(vec![
+            rect_object("a", 0.0, 0.0, 20),
+            rect_object("b", 30.0, 0.0, 20),
+        ]);
+        let regions = derive_object_regions(&scene);
+        // Both regions are closed fills (so RA3 uses the polygon test, not the bbox).
+        assert!(regions.iter().all(|r| r.closed), "filled rects derive closed regions");
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        // Down on empty canvas -> must start a Marquee, not an Object drag.
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown { pointer_id: 7, screen: WorldPoint { x: -5.0, y: -5.0 } },
+            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+        );
+        assert!(matches!(drag, Some(InputDragState::Marquee { .. })),
+            "empty-canvas down starts a Marquee, not an Object move");
+        assert!(out.selection.is_none(), "empty-canvas down selects nothing");
+
+        // Drag across both bodies (the move only grows the live overlay).
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove { pointer_id: 7, screen: WorldPoint { x: 55.0, y: 25.0 } },
+            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+        );
+        // Up at (55,25): rect [-5,55] x [-5,25] (anchor + up corner) covers BOTH.
+        step_object_pointer(
+            &CanvasInputEvent::PointerUp { pointer_id: 7, screen: WorldPoint { x: 55.0, y: 25.0 }, edge_id: None },
+            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+        );
+        let mut ids = out.marquee_ids.take().expect("pointer-up on a Marquee yields ids");
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()],
+            "marquee over two filled rects collects BOTH ids (>=2 => Multi)");
+    }
+
+    #[test]
+    fn object_pointer_down_in_concave_fill_notch_starts_marquee() {
+        // BUG A (W3-G6/#1) — RA3 guard: a point inside a FILLED concave object's
+        // bounding box but OUTSIDE its polygon (the notch) must MISS the body, so a
+        // drag there starts a Marquee. An L lying on its back: local px outline
+        // (0,0)(20,0)(20,20)(10,20)(10,10)(0,10) (units = px*8). Filled region = the
+        // full bottom strip y in 0..10 plus the right column x in 10..20, y in 10..20.
+        // Its AABB is 0..20 square, but the upper-LEFT quadrant (5,15) is empty notch.
+        let l_shape = RenderObject {
+            id: "l".to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            geometry_d: "M 0 0 L 160 0 L 160 160 L 80 160 L 80 80 L 0 80 Z".to_string(),
+            fill: None,
+            stroke: None,
+            text: None,
+            clip: false,
+        };
+        let scene = object_scene(vec![l_shape]);
+        let regions = derive_object_regions(&scene);
+        assert!(regions[0].closed, "the L-shape derives a closed fill region");
+        let camera = identity_camera();
+
+        // The notch point is inside the local AABB but outside the polygon: a hit-test
+        // there must MISS (so it can start a marquee, not grab the body).
+        assert_eq!(
+            hit_object_in_regions(&regions, &camera, WorldPoint { x: 5.0, y: 15.0 }),
+            None,
+            "a filled concave body's empty notch must NOT grab (RA3 keeps marquee reachable)"
+        );
+
+        // Driving the real pointer state machine: a down in the notch starts a Marquee.
+        let mut camera = camera;
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown { pointer_id: 8, screen: WorldPoint { x: 5.0, y: 15.0 } },
+            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+        );
+        assert!(matches!(drag, Some(InputDragState::Marquee { .. })),
+            "notch down starts a Marquee, not an Object move");
+        assert!(out.selection.is_none());
+
+        // Sanity: a down ON the filled arm (5,5) DOES grab the body (not a marquee).
+        let id = hit_object_in_regions(&regions, &camera, WorldPoint { x: 5.0, y: 5.0 });
+        assert_eq!(id.as_deref(), Some("l"), "the filled arm still grabs the body");
+    }
+
+    #[test]
     fn object_mode_marquee_drag_yields_overlay_geometry_from_shared_source() {
         // RA2a (#7): the in-flight object-mode marquee drag must produce drawable
         // overlay geometry from the shared `marquee_overlay_for_drag` source the
