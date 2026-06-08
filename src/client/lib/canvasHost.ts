@@ -71,8 +71,15 @@ export type ShapeCanvasHostCallbacks = {
   onDraw: (phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }) => void;
   // W2-07: shape drag-create phases. `world` is the dragged corner (already snapped
   // to the nearest outline anchor when `snapped`); the shell rubber-bands a bbox
-  // preview and commits a sized primitive on `end`.
-  onCreate: (phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snapped: boolean) => void;
+  // preview and commits a sized primitive on `end`. AP5 (#14): `targetId` is the
+  // object whose outline was snapped to (null when not snapped), so the shell can
+  // author a persistent anchor binding the created endpoint to it.
+  onCreate: (
+    phase: "start" | "move" | "end" | "cancel",
+    world: { x: number; y: number },
+    snapped: boolean,
+    targetId: string | null
+  ) => void;
   // W2-08: eraser touch over a stroke. `id` is the hit object; `partial` is the
   // partial-erase modifier (default = whole-stroke delete, modifier = subpath
   // cut). The shell authors the delete / edit-geometry op from `world` + `id`.
@@ -410,7 +417,7 @@ export class ShapeCanvasHost {
     }
     // W2-07: shape drag-create phase routes to the shell's create controller.
     if (event.type === "create") {
-      this.callbacks.onCreate(event.phase, event.world, event.snapped);
+      this.callbacks.onCreate(event.phase, event.world, event.snapped, event.targetId);
       return;
     }
     // W2-08: eraser touch routes to the shell's erase controller.

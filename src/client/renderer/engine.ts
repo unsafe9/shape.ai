@@ -97,8 +97,10 @@ export type EngineEvent =
   // down-drag-up rubber-band a bbox; the shell renders a transient preview and
   // commits a sized primitive on `end`. `world` is the pointer in world space,
   // already snapped to the nearest object outline anchor when within tolerance
-  // (`snapped` true) unless the snap-bypass modifier (Alt) was held.
-  | { type: "create"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint; snapped: boolean }
+  // (`snapped` true) unless the snap-bypass modifier (Alt) was held. AP5 (#14):
+  // `targetId` is the object whose outline the corner snapped to (null when not
+  // snapped), so the shell can author a persistent anchor binding the endpoint.
+  | { type: "create"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint; snapped: boolean; targetId: string | null }
   // W2-08: eraser. While the erase tool is active, a pointer/mouse down/move over a
   // stroke emits an erase touch carrying the hit object id + the touch in world
   // space, plus whether the partial-erase modifier (Alt) was held (default = whole-
@@ -1098,8 +1100,8 @@ export class ShapeCanvasEngine {
   private emitCreate(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
     const raw = screenToWorld(this.eventPoint(event), this.camera);
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(raw) : null;
-    const world = snap ?? raw;
-    this.onEvent({ type: "create", phase, world, snapped: snap !== null });
+    const world = snap ? { x: snap.x, y: snap.y } : raw;
+    this.onEvent({ type: "create", phase, world, snapped: snap !== null, targetId: snap?.targetId ?? null });
   }
 
   // W2-08: emit an erase touch for the stroke under the cursor. The object id
@@ -1158,15 +1160,16 @@ export class ShapeCanvasEngine {
   }
 
   // W2-07: snap a world point to the nearest object outline anchor via the W2-06
-  // core query. Returns the snapped WORLD point when within tolerance, else null.
-  // Feature-detected: a wasm build predating the method never snaps.
-  private querySnap(world: WorldPoint): WorldPoint | null {
+  // core query. Returns the snapped WORLD point plus the target object id (AP5
+  // #14: the object whose outline was snapped to) when within tolerance, else
+  // null. Feature-detected: a wasm build predating the method never snaps.
+  private querySnap(world: WorldPoint): { x: number; y: number; targetId: string | null } | null {
     const renderer = this.webGpuRenderer;
     if (!renderer || typeof renderer.nearestOutlinePoint !== "function") return null;
     try {
       const result = renderer.nearestOutlinePoint(world.x, world.y, CREATE_SNAP_TOLERANCE_PX, this.camera.zoom);
       this.rustBoundaryCalls += 1;
-      return result.snapped ? { x: result.x, y: result.y } : null;
+      return result.snapped ? { x: result.x, y: result.y, targetId: result.targetId } : null;
     } catch (error) {
       this.onEvent({
         type: "status",

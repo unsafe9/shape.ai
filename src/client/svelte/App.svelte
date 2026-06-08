@@ -46,6 +46,7 @@
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import { cascadeTransformOps } from "../lib/transformCascade";
+  import { synthesizeCreateAnchors } from "../lib/anchorCreate";
   import { doubleClickAction, ungroupEnabled, popOutOp } from "../lib/grouping";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
@@ -109,7 +110,10 @@
   //       the rubber-band shows before it commits; on pointer-up the span lowers to
   //       a sized primitive via an insert-object op, then the object is selected. -----
   let createKind = $state<DragCreateShape | null>(null);
-  let createDrag = $state<{ span: DragSpan; snapped: boolean } | null>(null);
+  // AP5 (#14): `target` is the id of the object whose outline the dragged corner
+  // snapped to (null when not snapped); it is captured per phase so the commit can
+  // synthesize a persistent anchor binding the created endpoint to that target.
+  let createDrag = $state<{ span: DragSpan; snapped: boolean; target: string | null } | null>(null);
 
   // ----- W2-10: inline text editing. `textEdit` holds the id of the object being
   //       edited and its in-progress value; a contenteditable overlay is positioned
@@ -284,7 +288,7 @@
     // insert-object op (the tool stays sticky in "draw"); cancel discards.
     onDraw: (phase, world) => handleDraw(phase, world),
     // W2-07: shape drag-create rubber-band + commit + select-after-create.
-    onCreate: (phase, world, snapped) => handleCreate(phase, world, snapped),
+    onCreate: (phase, world, snapped, targetId) => handleCreate(phase, world, snapped, targetId),
     // W2-08: eraser touch — whole-stroke delete or partial subpath cut.
     onErase: (id, world, partial) => handleErase(id, world, partial),
     // W2-03: the core's per-move hover classification drives the canvas cursor.
@@ -661,11 +665,11 @@
   // commits a primitive sized to the drag span and selects it; `cancel` discards.
   // A drag that never reaches MIN_DRAG_EXTENT_PX is treated as a click: it drops a
   // default fixed-size shape at the start point (so a single click still creates).
-  function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snapped: boolean): void {
+  function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snapped: boolean, targetId: string | null): void {
     const kind = createKind;
     if (!kind) return;
     if (phase === "start") {
-      createDrag = { span: { start: world, end: world }, snapped };
+      createDrag = { span: { start: world, end: world }, snapped, target: targetId };
       return;
     }
     if (phase === "cancel") {
@@ -674,11 +678,12 @@
     }
     if (!createDrag) return;
     if (phase === "move") {
-      createDrag = { span: { start: createDrag.span.start, end: world }, snapped };
+      createDrag = { span: { start: createDrag.span.start, end: world }, snapped, target: targetId };
       return;
     }
     // phase === "end": commit a sized primitive (or a default at a click).
     const span: DragSpan = { start: createDrag.span.start, end: world };
+    const snapTarget = targetId;
     createDrag = null;
     const dx = Math.abs(span.end.x - span.start.x);
     const dy = Math.abs(span.end.y - span.start.y);
@@ -686,6 +691,15 @@
     const object = tooSmall
       ? buildPrimitiveObject(kind, span.start, freshId(kind), nextOrderKey())
       : buildPrimitiveObjectFromDrag(kind, span, freshId(kind), nextOrderKey());
+    // AP5 (#14): a snapped drag-create binds the dragged endpoint to the target's
+    // outline with a persistent D5 anchor (Alt-create bypasses snap upstream, so
+    // `snapTarget` is null and no anchor is authored). The endpoint then reprojects
+    // through the target's transform, so the new object moves WITH the target.
+    if (!tooSmall && snapTarget) {
+      const target = scene.objects.find((o) => o.id === snapTarget);
+      const anchors = synthesizeCreateAnchors(object, target, span.end);
+      if (anchors) object.anchors = anchors;
+    }
     authorOp({ kind: "insert-object", object });
     // Select-after-create (request 6) and return to the select tool so the new
     // object can be moved/resized immediately.
