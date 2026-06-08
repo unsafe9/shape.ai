@@ -24,6 +24,7 @@ pub mod model;
 pub mod op;
 pub mod region;
 pub mod templates;
+pub mod theme;
 pub mod undo;
 pub mod validate;
 
@@ -50,6 +51,7 @@ pub use model::{
     TagDef, Text, TextAlign, TextRun, TextVAlign, Transform3x3, Warp, GEOMETRY_QUANTUM_PER_PX,
 };
 pub use op::{FeatureRequest, FeatureResponse, FieldEdit, ObjectOp};
+pub use theme::{resolve_token, Token, ALL_TOKENS};
 pub use region::{LocalBounds, OutlineDeriver, Region, RegionError, StubOutlineDeriver};
 
 #[cfg(test)]
@@ -188,6 +190,16 @@ mod tests {
         let deriver = StubOutlineDeriver;
         let g = Geometry::default();
         assert_eq!(deriver.derive_region(&g, 1), Err(RegionError::Empty));
+    }
+
+    #[test]
+    fn paint_token_round_trips_through_json() {
+        use super::model::Paint;
+        let paint = Paint::Token { name: "selection-ring".into() };
+        let json = serde_json::to_string(&paint).expect("serialize");
+        assert_eq!(json, r#"{"kind":"token","name":"selection-ring"}"#);
+        let back: Paint = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, paint);
     }
 
     #[test]
