@@ -89,6 +89,10 @@ export type EngineEvent =
   | { type: "object-transform-preview"; id: string; matrix: RenderTransform3x3; kind: TransformKind }
   | { type: "object-transform-commit"; id: string; matrix: RenderTransform3x3; kind: TransformKind }
   | { type: "object-marquee"; ids: string[] }
+  // RA2b: a double-click landed on an object. The shell drills into a container
+  // (hasChildren) or enters inline text edit on a leaf. Missed double-clicks emit
+  // nothing (the core returns null), so this event only rides a real object hit.
+  | { type: "object-double-click"; id: string; hasChildren: boolean }
   // FC-11: freehand pen capture. While the draw tool is active, pointer/mouse
   // down/move/up emit draw phases instead of the select/marquee path; the shell
   // accumulates the world points and commits the stroke to an object on `end`.
@@ -1067,6 +1071,12 @@ export class ShapeCanvasEngine {
     }
     if (result.objectMarqueeIds != null) {
       this.onEvent({ type: "object-marquee", ids: result.objectMarqueeIds });
+    }
+    // RA2b: a double-click that hit an object drills in (container) or edits a leaf;
+    // a missed double-click is null and emits nothing.
+    if (result.objectDoubleClick) {
+      const { id, hasChildren } = result.objectDoubleClick;
+      this.onEvent({ type: "object-double-click", id, hasChildren });
     }
     // W2-03: surface the hover affordance so the shell can set the cursor. The core
     // computes it per no-drag move; older wasm builds omit it (defaults to "empty").

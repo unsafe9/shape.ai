@@ -283,6 +283,9 @@
         ids.length >= 2 ? { kind: "multi", ids } : ids.length === 1 ? { kind: "object", id: ids[0] } : { kind: "canvas" };
       selectObject(next);
     },
+    // RA2b/AP3: a double-click on a container drills in (sets activeContainer); a
+    // leaf enters inline text edit through the existing path.
+    onObjectDoubleClick: (payload) => handleObjectDoubleClick(payload),
     // FC-11: freehand pen capture. Accumulate world points across start/move; on
     // end, lower the stroke to an object via the wasm core and author an
     // insert-object op (the tool stays sticky in "draw"); cancel discards.

@@ -62,6 +62,10 @@ export type ShapeCanvasHostCallbacks = {
   onTransformPreview: (id: string, matrix: RenderTransform3x3, kind: TransformKind) => void;
   onTransformCommit: (id: string, matrix: RenderTransform3x3, kind: TransformKind) => void;
   onMarquee: (ids: string[]) => void;
+  // RA2b/AP3: a double-click landed on an object. The shell drills into a container
+  // (hasChildren) or enters inline text edit on a leaf; a missed double-click never
+  // fires this. Optional so a host that omits it loses nothing.
+  onObjectDoubleClick?: (payload: { id: string; hasChildren: boolean }) => void;
   // FC-16: optional — no engine event routes to it. The right-click context pick
   // runs synchronously via `hitTestObjectAt` in the shell, not through an engine
   // event, so a host that omits this loses nothing.
@@ -408,6 +412,11 @@ export class ShapeCanvasHost {
     }
     if (event.type === "object-marquee") {
       this.callbacks.onMarquee(event.ids);
+      return;
+    }
+    // RA2b/AP3: a double-click on an object routes to the shell's drill-in / text-edit.
+    if (event.type === "object-double-click") {
+      this.callbacks.onObjectDoubleClick?.({ id: event.id, hasChildren: event.hasChildren });
       return;
     }
     // FC-11: freehand pen capture phase routes to the shell's draw controller.

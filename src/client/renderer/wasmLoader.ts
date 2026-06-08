@@ -129,6 +129,10 @@ export type RustInputBatchResult = {
   objectSelection?: string | null;
   objectTransformDelta?: RustObjectTransformDelta | null;
   objectMarqueeIds?: string[] | null;
+  // RA2b: a double-click that landed on an object. null (or absent) when the
+  // double-click missed every object; `hasChildren` lets the shell drill into a
+  // container vs. edit a leaf. Optional so a wasm build predating it still typechecks.
+  objectDoubleClick?: { id: string; hasChildren: boolean } | null;
   // W2-02: hover affordance the shell maps to a cursor. Optional so a wasm build /
   // test mock predating the field still typechecks; defaults to "empty".
   hoverAffordance?: HoverAffordance;
