@@ -104,11 +104,13 @@
     onDeleteSelected
   }: Props = $props();
 
+  // W2-09: basic shapes live in one section (Frame is not a basic shape — split
+  // into its own group below). Text is a basic-shape inserter and sits here too.
   const shapes: { id: PrimitiveKindId; label: string; icon: typeof Square }[] = [
     { id: "rectangle", label: "Rectangle (R)", icon: Square },
     { id: "ellipse", label: "Ellipse (O)", icon: Circle },
     { id: "line", label: "Line (L)", icon: LineIcon },
-    { id: "frame", label: "Frame (F)", icon: SquareDashed }
+    { id: "text", label: "Text (T)", icon: Type }
   ];
 
   // First text run of the selected object, the editable label in the property panel.
@@ -268,7 +270,7 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <!-- Shapes: object-primitive inserters. -->
+  <!-- Shapes: the basic-shape inserters (Rect / Ellipse / Line / Text). -->
   <div class="toolbar-group" aria-label="Shapes">
     <span class="toolbar-group-label">Shapes</span>
     <div class="toolbar-group-buttons">
@@ -290,19 +292,19 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <!-- Text: object-primitive inserter. -->
-  <div class="toolbar-group" aria-label="Text">
-    <span class="toolbar-group-label">Text</span>
+  <!-- Frame: a container, not a basic shape — split into its own group. -->
+  <div class="toolbar-group" aria-label="Frame">
+    <span class="toolbar-group-label">Frame</span>
     <div class="toolbar-group-buttons">
       <button
         class="icon-button"
         type="button"
         disabled={busy}
-        title="Text (T)"
-        aria-label="Insert Text (T)"
-        onclick={() => onInsertPrimitive("text")}
+        title="Frame (F)"
+        aria-label="Insert Frame (F)"
+        onclick={() => onInsertPrimitive("frame")}
       >
-        <Type size={16} />
+        <SquareDashed size={16} />
       </button>
     </div>
   </div>

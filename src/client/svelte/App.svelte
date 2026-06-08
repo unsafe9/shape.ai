@@ -40,6 +40,7 @@
   import SettingsModal from "./SettingsModal.svelte";
   import CanvasHost from "./ShapeCanvasHost.svelte";
   import ContextMenu, { type ContextMenuItem } from "./ContextMenu.svelte";
+  import TemplatePopup, { type TemplatePopupItem } from "./TemplatePopup.svelte";
   import PeerCursors from "./PeerCursors.svelte";
 
   // ----- canonical object scene (D1) -----
@@ -817,6 +818,13 @@
 
   // ----- templates (buildObjectTemplate -> FeatureRequest.templateApply) ---
 
+  // W2-09: the templates the scroll-popup offers. Ids map to buildObjectTemplate.
+  const TEMPLATES: TemplatePopupItem[] = [
+    { id: "todo_board", title: "Todo board", desc: "Columns of cards for tracking work" },
+    { id: "decision_map", title: "Decision map", desc: "Branching options around a choice" },
+    { id: "presentation", title: "Presentation", desc: "Stacked slides for a deck" }
+  ];
+
   function toggleTemplates(): void {
     templateOpen = !templateOpen;
   }
@@ -1404,11 +1412,7 @@
         />
 
         {#if templateOpen}
-          <div class="template-panel" aria-label="Templates">
-            <button class="template-item" type="button" onclick={() => applyTemplate("todo_board")}>Todo board</button>
-            <button class="template-item" type="button" onclick={() => applyTemplate("decision_map")}>Decision map</button>
-            <button class="template-item" type="button" onclick={() => applyTemplate("presentation")}>Presentation</button>
-          </div>
+          <TemplatePopup items={TEMPLATES} onSelect={applyTemplate} />
         {/if}
 
         {#if diagnosticsOpen}
