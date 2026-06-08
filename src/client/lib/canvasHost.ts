@@ -351,6 +351,12 @@ export class ShapeCanvasHost {
     this.engine?.setSpaceHeld(held);
   }
 
+  /** AP4 (#12c): drive RB1's renderer theme-bit (dark/light). No-op without a live
+   *  renderer or on a wasm build predating the export; the shell feature-detects. */
+  setObjectTheme(dark: boolean): void {
+    this.webGpuRenderer?.setObjectTheme?.(dark);
+  }
+
   getCamera(): CameraState {
     return this.camera;
   }

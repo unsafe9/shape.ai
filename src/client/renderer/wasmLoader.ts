@@ -243,6 +243,10 @@ export type RustWebGpuRenderer = {
   // Replace the transient multi-select highlight set (JSON array of ids). Optional
   // so a wasm build predating it is treated as a no-op by the engine.
   setMultiSelect?(idsJson: string): void;
+  // AP4/RB1 theme-bit: flip the renderer to dark/light. Re-resolves token-backed
+  // instance colors and writes ONLY the color slot (zero rebake). Optional so a
+  // wasm build predating the export stays valid; the shell feature-detects.
+  setObjectTheme?(dark: boolean): void;
 };
 
 type RustWebGpuRendererClass = {

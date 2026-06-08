@@ -21,6 +21,27 @@
   --glass-blur: blur(22px) saturate(1.25);
 }
 
+/* AP4 (#12c): dark mode. The `data-theme="dark"` attribute is set on the root by
+ * the shell's theme toggle (scene.ts `applyDocumentTheme`), which also flips RB1's
+ * renderer theme-bit so the canvas flips with this chrome. The canvas/surface/text
+ * values mirror the C1 dark token RGBA so shell chrome and rendered objects agree. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #161618;
+  --canvas: #1e1e20;
+  --surface: rgb(44 44 46 / 0.82);
+  --surface-solid: #2c2c2e;
+  --surface-2: rgb(58 58 60 / 0.92);
+  --surface-3: rgb(48 48 50 / 0.94);
+  --text: #f5f5f7;
+  --muted: #9a9aa0;
+  --line: rgb(245 245 247 / 0.12);
+  --line-strong: rgb(245 245 247 / 0.22);
+  --shadow-low: 0 1px 2px rgb(0 0 0 / 0.4), 0 10px 28px rgb(0 0 0 / 0.4);
+  --shadow-float: 0 18px 50px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.4);
+  --shadow-deep: 0 28px 70px rgb(0 0 0 / 0.6), 0 8px 18px rgb(0 0 0 / 0.5);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -462,6 +483,14 @@ p {
   top: 24px;
   left: 50%;
   transform: translateX(-50%);
+  z-index: 12;
+}
+
+/* AP4 (#12c): theme toggle — pinned top-right, above the canvas surface. */
+.theme-toggle {
+  position: absolute;
+  top: 28px;
+  right: 34px;
   z-index: 12;
 }
 

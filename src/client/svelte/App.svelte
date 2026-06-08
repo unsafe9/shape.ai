@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { BrainCircuit, Loader2, Copy, Trash2, Group as GroupIcon, Ungroup, MessageSquarePlus, LayoutTemplate } from "lucide-svelte";
-  import { screenToWorld } from "../renderer/scene";
+  import { BrainCircuit, Loader2, Copy, Trash2, Group as GroupIcon, Ungroup, MessageSquarePlus, LayoutTemplate, Sun, Moon } from "lucide-svelte";
+  import { screenToWorld, applyDocumentTheme, readStoredTheme, type Theme } from "../renderer/scene";
   import type { CameraState } from "../../shared/geometry";
   import {
     emptyObjectScene,
@@ -134,6 +134,23 @@
   let busy = $state(false);
   let diagnosticsOpen = $state(false);
   let settingsOpen = $state(false);
+  // AP4 (#12c): light/dark theme. Initialized from localStorage; the $effect below
+  // persists + flips the root `data-theme` attribute (dark-mode CSS) AND drives
+  // RB1's renderer theme-bit (`setObjectTheme`) so canvas + chrome flip together.
+  let theme = $state<Theme>(readStoredTheme(window.localStorage));
+  function toggleTheme(): void {
+    theme = theme === "dark" ? "light" : "dark";
+  }
+  // Single applier: on init and on every toggle, flip the root `data-theme`
+  // attribute (dark-mode CSS), persist the choice, and drive RB1's renderer
+  // theme-bit so the canvas flips with the chrome.
+  $effect(() => {
+    applyDocumentTheme(theme, {
+      root: document.documentElement,
+      storage: window.localStorage,
+      setRendererTheme: (dark) => host?.setObjectTheme?.(dark)
+    });
+  });
   let templateOpen = $state(false);
   let activeTool = $state<ActiveTool>("select");
   // W2-03: Space-hold pan + dynamic hover cursor. `spaceHeld` flips the empty
@@ -1507,6 +1524,16 @@
           onRenameSelected={renameSelected}
           onDeleteSelected={deleteSelection}
         />
+
+        <button
+          class="icon-button theme-toggle"
+          type="button"
+          aria-label="Toggle dark mode"
+          aria-pressed={theme === "dark"}
+          onclick={toggleTheme}
+        >
+          {#if theme === "dark"}<Sun size={16} />{:else}<Moon size={16} />{/if}
+        </button>
 
         {#if templateOpen}
           <TemplatePopup items={TEMPLATES} onSelect={applyTemplate} />

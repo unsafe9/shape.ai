@@ -253,6 +253,77 @@ export function truncateText(value: string, maxLength: number): string {
   return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
+// ---------------------------------------------------------------------------
+// Theme (AP4 #12c) — light/dark mode shell driver.
+//
+// The C1 contract owns the canonical token set (scene-core `object::theme`,
+// renderer `object_theme`); the kebab names below mirror it so the shell can
+// reference default object styles by token and drive the renderer theme-bit.
+// `applyDocumentTheme` is the single toggle entry: it flips a root attribute
+// (CSS chrome), persists the choice, and drives RB1's renderer theme-bit
+// (`setObjectTheme`) so the canvas and chrome flip together.
+// ---------------------------------------------------------------------------
+
+export type Theme = "light" | "dark";
+
+/** The C1 kebab token names (mirrors `object::theme::ALL_TOKENS`). */
+export const THEME_TOKEN_NAMES = [
+  "canvas-bg",
+  "surface",
+  "surface-muted",
+  "default-fill",
+  "default-stroke",
+  "text",
+  "shadow",
+  "selection-ring"
+] as const;
+
+export type ThemeTokenName = (typeof THEME_TOKEN_NAMES)[number];
+
+/** Default object style as C1 token refs (resolved renderer-side by RB1). */
+export const DEFAULT_OBJECT_STYLE_TOKENS: {
+  fill: ThemeTokenName;
+  stroke: ThemeTokenName;
+  text: ThemeTokenName;
+} = {
+  fill: "default-fill",
+  stroke: "default-stroke",
+  text: "text"
+};
+
+export const THEME_STORAGE_KEY = "shape-ai-theme";
+export const THEME_ROOT_ATTRIBUTE = "data-theme";
+
+/** Minimal injectable surfaces so the toggle stays unit-testable (no globals). */
+export type ThemeRoot = { setAttribute(name: string, value: string): void };
+export type ThemeStorage = { getItem(key: string): string | null; setItem(key: string, value: string): void };
+
+export function isTheme(value: string | null): value is Theme {
+  return value === "light" || value === "dark";
+}
+
+/** Read the persisted theme, defaulting to light when absent/invalid. */
+export function readStoredTheme(storage: ThemeStorage): Theme {
+  const stored = storage.getItem(THEME_STORAGE_KEY);
+  return isTheme(stored) ? stored : "light";
+}
+
+/**
+ * Apply `theme` across the shell: flip the root `data-theme` attribute (drives
+ * the dark-mode CSS variables), persist it, and drive RB1's renderer theme-bit.
+ * `setRendererTheme(dark)` is the feature-detected `ShapeWebGpuRenderer.setObjectTheme`
+ * hook — called with the resolved dark bit so the canvas flips with the chrome.
+ */
+export function applyDocumentTheme(
+  theme: Theme,
+  opts: { root: ThemeRoot; storage: ThemeStorage; setRendererTheme?: (dark: boolean) => void }
+): void {
+  const dark = theme === "dark";
+  opts.root.setAttribute(THEME_ROOT_ATTRIBUTE, theme);
+  opts.storage.setItem(THEME_STORAGE_KEY, theme);
+  opts.setRendererTheme?.(dark);
+}
+
 // ===========================================================================
 // Legacy 2D harness — `SceneSnapshot`/`ScenePatch` render primitives.
 //
