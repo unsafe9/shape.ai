@@ -5,6 +5,7 @@ import {
   type DomOverlayRequest,
   type FrameStats,
   type HitResult,
+  type RenderTransform3x3,
   type ScenePatch,
   type SceneSelection,
   type SceneSnapshot,
@@ -36,6 +37,10 @@ export function isPanIntent(intent: { spaceHeld: boolean; button: number }): boo
   return intent.button === 0 && intent.spaceHeld;
 }
 
+// W2-04/W2-05: the gesture that produced a transform delta. Mirrors the Rust
+// ObjectTransformDelta.kind; the shell uses it to drive the commit op kind/status.
+export type TransformKind = "translate" | "resize" | "rotate";
+
 export type EngineEvent =
   | { type: "stats"; stats: FrameStats }
   // T2.2: `additive` carries the shift/meta modifier held at pick time so the shell
@@ -52,15 +57,17 @@ export type EngineEvent =
   | { type: "context-pick"; hit: HitResult | null; screen: WorldPoint }
   // FC-08: object-path input results. `object-select` rides the pointer-down that
   // picked an object; `object-transform-preview` rides each pointer-move during an
-  // object drag (cumulative world-px delta from the pointer-down point — a
-  // non-destructive preview, the shell does NOT author yet); `object-transform-commit`
+  // object drag (a non-destructive preview the shell composes onto the scene); it
   // is emitted once on pointer-up when the drag moved, and is the single undoable
   // op; `object-marquee` rides the pointer-up of an empty-start drag.
+  // W2-04/W2-05: the transform is the full cumulative world-space delta matrix
+  // (row-major, PRE-multiplied onto the object's transform) plus the gesture
+  // `kind`, generalizing the FC-08 translate-only path to resize/rotate.
   // W2-03: `additive` carries the shift/meta held at pick time so the shell can
   // toggle the object in/out of the multi-select set instead of replacing it.
   | { type: "object-select"; id: string; additive: boolean }
-  | { type: "object-transform-preview"; id: string; dx: number; dy: number }
-  | { type: "object-transform-commit"; id: string; dx: number; dy: number }
+  | { type: "object-transform-preview"; id: string; matrix: RenderTransform3x3; kind: TransformKind }
+  | { type: "object-transform-commit"; id: string; matrix: RenderTransform3x3; kind: TransformKind }
   | { type: "object-marquee"; ids: string[] }
   // FC-11: freehand pen capture. While the draw tool is active, pointer/mouse
   // down/move/up emit draw phases instead of the select/marquee path; the shell
@@ -121,10 +128,11 @@ export class ShapeCanvasEngine {
   // FC-11: the locally-tracked active tool. When "draw", pointer/mouse handlers
   // emit draw phases instead of the renderer select/marquee input path.
   private activeTool: ActiveTool = "select";
-  // FC-08: the in-progress object drag (id + cumulative world-px delta). Set on the
-  // pointer-down that picks an object, updated on each move, and committed once on
-  // pointer-up when it moved. The renderer never mutates object transforms.
-  private objectDrag: { id: string; dx: number; dy: number } | null = null;
+  // FC-08/W2-05: the in-progress object drag (id + cumulative world-space delta
+  // matrix + gesture kind). Set on the pointer-down that picks an object, updated on
+  // each move, and committed once on pointer-up when the matrix moved off identity.
+  // The renderer never mutates object transforms.
+  private objectDrag: { id: string; matrix: RenderTransform3x3; kind: TransformKind } | null = null;
   // W2-03: whether Space is currently held (pushed from the shell). A pointer-down
   // while Space is held — or a middle-button drag — is a pan gesture: the engine
   // arms the core's hand-pan path for the gesture, then restores the user's tool on
@@ -880,21 +888,16 @@ export class ShapeCanvasEngine {
     // remembered drag; each move delta updates it and previews; an empty-start
     // marquee forwards its ids. The commit op is authored on pointer-up.
     if (typeof result.objectSelection === "string") {
-      this.objectDrag = { id: result.objectSelection, dx: 0, dy: 0 };
+      this.objectDrag = { id: result.objectSelection, matrix: IDENTITY_MATRIX, kind: "translate" };
       this.onEvent({ type: "object-select", id: result.objectSelection, additive: this.lastPointerAdditive });
     }
     if (result.objectTransformDelta) {
-      // W2-04 generalized the delta to a full matrix + kind. The translate preview
-      // path is unchanged (dx/dy are the matrix translation column); resize/rotate
-      // preview + commit is W2-05's responsibility and is intentionally not wired
-      // here yet.
+      // W2-05: the cumulative delta is a full world-space matrix + gesture kind
+      // (translate/resize/rotate). Remember it and emit a non-destructive preview;
+      // the shell composes the matrix onto the object and commits on pointer-up.
       const { id, matrix, kind } = result.objectTransformDelta;
-      if (kind === "translate") {
-        const dx = matrix[0][2];
-        const dy = matrix[1][2];
-        this.objectDrag = { id, dx, dy };
-        this.onEvent({ type: "object-transform-preview", id, dx, dy });
-      }
+      this.objectDrag = { id, matrix, kind };
+      this.onEvent({ type: "object-transform-preview", id, matrix, kind });
     }
     if (result.objectMarqueeIds != null) {
       this.onEvent({ type: "object-marquee", ids: result.objectMarqueeIds });
@@ -904,13 +907,14 @@ export class ShapeCanvasEngine {
     this.onEvent({ type: "affordance", affordance: result.hoverAffordance ?? "empty" });
   }
 
-  // FC-08: emit the single undoable transform commit when an object drag moved,
-  // then clear the remembered drag. Called on pointer-up/mouse-up AFTER the batch.
+  // FC-08/W2-05: emit the single undoable transform commit when an object drag
+  // moved (the cumulative matrix is off identity), then clear the remembered drag.
+  // Called on pointer-up/mouse-up AFTER the batch.
   private commitObjectDrag() {
     const drag = this.objectDrag;
     this.objectDrag = null;
-    if (drag && (drag.dx !== 0 || drag.dy !== 0)) {
-      this.onEvent({ type: "object-transform-commit", id: drag.id, dx: drag.dx, dy: drag.dy });
+    if (drag && !isIdentityMatrix(drag.matrix)) {
+      this.onEvent({ type: "object-transform-commit", id: drag.id, matrix: drag.matrix, kind: drag.kind });
     }
   }
 
@@ -1029,6 +1033,19 @@ function selectionEqual(left: SceneSelection, right: SceneSelection): boolean {
         left.ids.every((id, index) => id === right.ids[index])
       );
   }
+}
+
+// W2-05: the row-major identity transform and an exact-equality check, used to
+// seed the remembered object drag and to detect a no-op (un-moved) drag so the
+// commit op is skipped — matching the FC-08 dx===0 && dy===0 predicate.
+const IDENTITY_MATRIX: RenderTransform3x3 = [
+  [1, 0, 0],
+  [0, 1, 0],
+  [0, 0, 1]
+];
+
+function isIdentityMatrix(m: RenderTransform3x3): boolean {
+  return m.every((row, i) => row.every((v, j) => v === IDENTITY_MATRIX[i][j]));
 }
 
 function readMemoryBytes(): number | null {

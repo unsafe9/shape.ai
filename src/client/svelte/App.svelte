@@ -13,6 +13,7 @@
     type ObjectOp,
     type ObjectScene,
     type ObjectSelection,
+    type Transform3x3,
     type FeatureResponse
   } from "../../shared/object";
   import {
@@ -24,7 +25,7 @@
   import { SceneClient, type CanvasSummary } from "../lib/sceneClient";
   import type { PeerPresence } from "../lib/peers";
   import type { ConnectionStatus } from "../lib/wsTransport";
-  import type { ActiveTool } from "../renderer/engine";
+  import type { ActiveTool, TransformKind } from "../renderer/engine";
   import type { HoverAffordance } from "../renderer/wasmLoader";
   import {
     loadSceneCore,
@@ -47,11 +48,12 @@
   // ----- selection: single ObjectSelection + transient multi -----
   let selection = $state<ObjectSelection>({ kind: "canvas" });
 
-  // ----- FC-08: non-destructive live object drag preview. The canonical `scene`
-  //       is never mutated mid-drag; the renderer is fed a clone with this one
-  //       object shifted, so the commit op on pointer-up captures the correct
-  //       inverse (original transform), keeping undo correct (D21). -----
-  let dragPreview = $state<{ id: string; dx: number; dy: number } | null>(null);
+  // ----- FC-08/W2-05: non-destructive live object transform preview. The canonical
+  //       `scene` is never mutated mid-drag; the renderer is fed a clone with this
+  //       one object's transform pre-multiplied by the cumulative delta `matrix`
+  //       (translate/resize/rotate), so the commit op on pointer-up captures the
+  //       correct inverse (original transform), keeping undo correct (D21). -----
+  let dragPreview = $state<{ id: string; matrix: Transform3x3 } | null>(null);
 
   // FC-16: in the connected path authorOp's scene update is async (it arrives via
   // commitClientScene), so clearing dragPreview the instant the commit op is
@@ -144,18 +146,18 @@
     // a plain click replaces the selection with that object.
     onSelectObject: (id, additive) =>
       selectObject(additive ? toggleObjectSelection(selection, id) : { kind: "object", id }),
-    onTransformPreview: (id, dx, dy) => {
+    onTransformPreview: (id, matrix, _kind) => {
       // A new drag supersedes any commit still waiting for its scene update, so a
       // stale pendingCommit can never clear (or freeze) the new preview.
       if (pendingCommit && pendingCommit.id !== id) pendingCommit = null;
-      dragPreview = { id, dx, dy };
+      dragPreview = { id, matrix };
     },
-    onTransformCommit: (id, dx, dy) => {
+    onTransformCommit: (id, matrix, _kind) => {
       // The canonical scene was never mutated during the drag, so op-apply
       // captures the correct inverse (original transform), satisfying D21 undo.
       const src = scene.objects.find((o) => o.id === id);
       if (!src) return void (dragPreview = null);
-      const transform = shiftTransform(src.transform, dx, dy);
+      const transform = composeTransform(matrix, src.transform);
       // FC-16: pre-connect authorOp applies synchronously (scene is already the
       // committed scene on return), so the preview can clear immediately. In the
       // connected path the scene update is async — hold the preview until
@@ -1012,14 +1014,33 @@
     ];
   }
 
-  // FC-08: a shallow clone of the scene with one object's transform shifted by
-  // (dx,dy) world px. Used only for the live drag preview feed; the canonical
-  // scene is never mutated, so undo stays correct.
-  function sceneWithObjectShifted(source: ObjectScene, id: string, dx: number, dy: number): ObjectScene {
+  // FC-08/W2-05: a shallow clone of the scene with one object's transform composed
+  // with the cumulative delta `matrix` (pre-multiplied: newWorld = matrix * obj).
+  // Used only for the live transform preview feed; the canonical scene is never
+  // mutated, so undo stays correct.
+  function sceneWithObjectTransformed(source: ObjectScene, id: string, matrix: Transform3x3): ObjectScene {
     return {
       ...source,
-      objects: source.objects.map((o) => (o.id === id ? { ...o, transform: shiftTransform(o.transform, dx, dy) } : o))
+      objects: source.objects.map((o) => (o.id === id ? { ...o, transform: composeTransform(matrix, o.transform) } : o))
     };
+  }
+
+  // W2-05: 3x3 row-major pre-multiply newTransform = delta * base, with an absent
+  // base treated as the identity. The delta is the cumulative world-space gesture
+  // matrix from the renderer core; the base is the object's existing transform.
+  function composeTransform(delta: Transform3x3, base: SceneObject["transform"]): Transform3x3 {
+    const b = base ?? IDENTITY_TRANSFORM;
+    const out: Transform3x3 = [
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0]
+    ];
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        out[r][c] = delta[r][0] * b[0][c] + delta[r][1] * b[1][c] + delta[r][2] * b[2][c];
+      }
+    }
+    return out;
   }
 
   // FC-08/FC-11: the renderer feed. Start from the canonical scene, apply a live
@@ -1027,10 +1048,10 @@
   // the canonical `scene` nor runs op-apply (geometry-vocabulary construction only).
   function buildFeedScene(
     source: ObjectScene,
-    drag: { id: string; dx: number; dy: number } | null,
+    drag: { id: string; matrix: Transform3x3 } | null,
     pen: { x: number; y: number }[] | null
   ): ObjectScene {
-    let feed = drag ? sceneWithObjectShifted(source, drag.id, drag.dx, drag.dy) : source;
+    let feed = drag ? sceneWithObjectTransformed(source, drag.id, drag.matrix) : source;
     const preview = pen && pen.length >= 1 ? drawPreviewObject(pen) : null;
     if (preview) feed = { ...feed, objects: [...feed.objects, preview] };
     return feed;

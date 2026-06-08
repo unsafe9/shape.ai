@@ -24,8 +24,8 @@
 
 import type { CameraState } from "../../shared/geometry";
 import { GEOMETRY_QUANTUM_PER_PX, type ObjectScene, type ObjectSelection, type Stroke } from "../../shared/object";
-import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions } from "../renderer/engine";
-import type { FrameStats, WorldRect } from "../renderer/scene";
+import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions, type TransformKind } from "../renderer/engine";
+import type { FrameStats, RenderTransform3x3, WorldRect } from "../renderer/scene";
 import { loadRustCore, type HoverAffordance, type RustCoreStatus, type RustWebGpuRenderer } from "../renderer/wasmLoader";
 
 export type RendererStats = FrameStats;
@@ -51,16 +51,16 @@ export type ShapeCanvasHostCallbacks = {
   onStats: (stats: RendererStats) => void;
   onStatus: (message: string) => void;
   onHealthChange: (health: RendererHealth) => void;
-  // FC-08: object-path input results from the renderer. `onSelectObject` fires on
-  // the pointer-down that picked an object; `onTransformPreview` on each drag move
-  // (cumulative world-px delta — a non-destructive preview); `onTransformCommit`
-  // once on pointer-up when the drag moved (the single undoable op); `onMarquee` on
-  // an empty-start drag's pointer-up.
+  // FC-08/W2-05: object-path input results from the renderer. `onSelectObject` fires
+  // on the pointer-down that picked an object; `onTransformPreview` on each drag move
+  // (the cumulative world-space delta matrix + gesture kind — a non-destructive
+  // preview); `onTransformCommit` once on pointer-up when the drag moved (the single
+  // undoable op); `onMarquee` on an empty-start drag's pointer-up.
   // W2-03: `additive` is true when shift/meta was held at pick time, so the shell
   // toggles the object in/out of the multi-select set instead of replacing it.
   onSelectObject: (id: string, additive: boolean) => void;
-  onTransformPreview: (id: string, dx: number, dy: number) => void;
-  onTransformCommit: (id: string, dx: number, dy: number) => void;
+  onTransformPreview: (id: string, matrix: RenderTransform3x3, kind: TransformKind) => void;
+  onTransformCommit: (id: string, matrix: RenderTransform3x3, kind: TransformKind) => void;
   onMarquee: (ids: string[]) => void;
   // FC-16: optional — no engine event routes to it. The right-click context pick
   // runs synchronously via `hitTestObjectAt` in the shell, not through an engine
@@ -369,11 +369,11 @@ export class ShapeCanvasHost {
       return;
     }
     if (event.type === "object-transform-preview") {
-      this.callbacks.onTransformPreview(event.id, event.dx, event.dy);
+      this.callbacks.onTransformPreview(event.id, event.matrix, event.kind);
       return;
     }
     if (event.type === "object-transform-commit") {
-      this.callbacks.onTransformCommit(event.id, event.dx, event.dy);
+      this.callbacks.onTransformCommit(event.id, event.matrix, event.kind);
       return;
     }
     if (event.type === "object-marquee") {
