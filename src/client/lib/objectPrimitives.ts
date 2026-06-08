@@ -9,13 +9,15 @@
 // Geometry coordinates are object-local quantized integers at GEOMETRY_QUANTUM_PER_PX
 // (D2); the object is positioned in world space by a pure-translation transform.
 
+import type { CameraState } from "../../shared/geometry";
 import {
   GEOMETRY_QUANTUM_PER_PX,
-  translateTransform,
   type Fill,
   type Object as SceneObject,
-  type Stroke
+  type Stroke,
+  translateTransform
 } from "../../shared/object";
+import { worldToScreen, type WorldRect } from "../renderer/scene";
 import type { PrimitiveKindId } from "./toolbar";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
@@ -77,12 +79,10 @@ function primitiveSpec(kind: PrimitiveKindId): PrimitiveSpec {
     case "line":
       return { d: linePath(200), stroke: LINE_STROKE, size: { width: 200, height: 0 } };
     case "text":
-      return {
-        d: rectPath(180, 80),
-        fill: { paint: { kind: "solid", color: "#fff7d6" }, opacity: 1 },
-        text: { runs: [{ text: "Note" }], align: "start", valign: "top" },
-        size: { width: 180, height: 80 }
-      };
+      // W2-10: the text primitive is a borderless, style-less rect — no border, no
+      // fill, no default "Note" text. Every object can hold text; the text "shape"
+      // is just one with no border that enters inline edit immediately on create.
+      return { d: rectPath(180, 80), size: { width: 180, height: 80 } };
     case "frame":
       return { d: rectPath(420, 300), stroke: { paint: { kind: "solid", color: "#94a3b8" }, width: q(1) }, size: { width: 420, height: 300 } };
   }
@@ -164,4 +164,58 @@ export function buildPrimitiveObjectFromDrag(
     ...(spec.text ? { text: spec.text } : {}),
     ...(kind === "frame" ? { clip: true } : {})
   };
+}
+
+// W2-10: the on-screen rect to place the inline text-edit overlay over, in canvas-
+// local CSS px. The object's geometry path is object-local quantized integers; its
+// world AABB is the path's local bbox (de-quantized) run through the object's affine
+// transform, then projected to screen via {@link worldToScreen}. Pure so the shell
+// test can pin the placement without a renderer or a Svelte mount. Returns null when
+// the path carries no coordinate pairs.
+export function textOverlayScreenRect(object: SceneObject, camera: CameraState): WorldRect | null {
+  const local = pathLocalBbox(object.geometry.d);
+  if (!local) return null;
+  const t = object.transform;
+  const corners: Array<[number, number]> = [
+    [local.minX, local.minY],
+    [local.maxX, local.minY],
+    [local.maxX, local.maxY],
+    [local.minX, local.maxY]
+  ];
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const [lx, ly] of corners) {
+    const wx = t ? t[0][0] * lx + t[0][1] * ly + t[0][2] : lx;
+    const wy = t ? t[1][0] * lx + t[1][1] * ly + t[1][2] : ly;
+    minX = Math.min(minX, wx);
+    minY = Math.min(minY, wy);
+    maxX = Math.max(maxX, wx);
+    maxY = Math.max(maxY, wy);
+  }
+  const topLeft = worldToScreen({ x: minX, y: minY }, camera);
+  const bottomRight = worldToScreen({ x: maxX, y: maxY }, camera);
+  return { x: topLeft.x, y: topLeft.y, width: bottomRight.x - topLeft.x, height: bottomRight.y - topLeft.y };
+}
+
+// The object-local bbox (logical px) of a path-string's coordinate pairs. Coords are
+// quantized integers (GEOMETRY_QUANTUM_PER_PX per px); reading every numeric pair
+// covers M/L/C control points — a conservative enclosing box for the overlay.
+function pathLocalBbox(d: string): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  const nums = d.match(/-?\d+(?:\.\d+)?/g);
+  if (!nums || nums.length < 2) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i + 1 < nums.length; i += 2) {
+    const x = Number(nums[i]) / Q;
+    const y = Number(nums[i + 1]) / Q;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  }
+  return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
 }

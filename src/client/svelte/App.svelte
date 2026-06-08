@@ -34,7 +34,13 @@
     type UndoStack
   } from "../scene/sceneCoreWasm";
   import { createShortcutDispatcher } from "../lib/shortcuts";
-  import { buildPrimitiveObject, buildPrimitiveObjectFromDrag, MIN_DRAG_EXTENT_PX, type DragSpan } from "../lib/objectPrimitives";
+  import {
+    buildPrimitiveObject,
+    buildPrimitiveObjectFromDrag,
+    MIN_DRAG_EXTENT_PX,
+    textOverlayScreenRect,
+    type DragSpan
+  } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
@@ -91,6 +97,14 @@
   let createKind = $state<DragCreateShape | null>(null);
   let createDrag = $state<{ span: DragSpan; snapped: boolean } | null>(null);
 
+  // ----- W2-10: inline text editing. `textEdit` holds the id of the object being
+  //       edited and its in-progress value; a contenteditable overlay is positioned
+  //       over the object's screen bbox (worldToScreen) while it is non-null. Blur or
+  //       Enter commits a set-text op; Esc cancels. The platform contenteditable
+  //       handles IME. Creating a text object enters edit immediately; pressing Enter
+  //       on a selected object enters edit. -----
+  let textEdit = $state<{ id: string; value: string } | null>(null);
+
   // ----- ephemeral camera / chrome -----
   let camera = $state<CameraState>({ x: 140, y: 120, zoom: 0.6 });
   let status = $state("Ready");
@@ -145,6 +159,12 @@
   const cursorAffordance = $derived(
     spaceHeld ? "pan" : activeTool === "draw" || activeTool === "create" || activeTool === "erase" ? null : affordance
   );
+
+  // W2-10: the on-screen rect for the inline text-edit overlay, recomputed whenever
+  // the edited object, its transform, or the camera changes (so the overlay tracks
+  // the object under pan/zoom). Null when not editing or the object/path is gone.
+  const textEditObject = $derived(textEdit ? scene.objects.find((o) => o.id === textEdit.id) ?? null : null);
+  const textEditRect = $derived(textEditObject ? textOverlayScreenRect(textEditObject, camera) : null);
 
   const readyState = $derived(rendererHealth?.state ?? "wasm-unavailable");
   const rendererDetail = $derived(rendererHealth?.detail ?? "Detecting Rust/WASM package.");
@@ -553,6 +573,8 @@
     selection = { kind: "object", id: object.id };
     persistSelection(selection);
     status = `Inserted ${kind}`;
+    // W2-10: a freshly-created text object enters inline edit immediately.
+    if (kind === "text") enterTextEdit(object.id);
   }
 
   // W2-07: arm the shape drag-create submode. Mirrors the pen arming the draw tool:
@@ -816,6 +838,51 @@
     authorOp({ kind: "set-text", id: selection.id, text: { runs: [{ text }] } });
   }
 
+  // ----- W2-10: inline text editing -----
+
+  // Enter inline edit for an object: seed the overlay value from the object's first
+  // text run, then mount the contenteditable (the mount action focuses it). When the
+  // object has not landed in `scene` yet (the connected create path applies the
+  // insert-object asynchronously), seed empty — a fresh object carries no text, and
+  // `textEditRect` derives reactively, so the overlay appears once the object arrives.
+  function enterTextEdit(id: string): void {
+    const object = scene.objects.find((o) => o.id === id);
+    textEdit = { id, value: object?.text?.runs?.[0]?.text ?? "" };
+  }
+
+  // Commit the in-progress inline edit as a set-text op (only when the text changed),
+  // then dismiss the overlay. Called on blur or Enter.
+  function commitTextEdit(): void {
+    const edit = textEdit;
+    textEdit = null;
+    if (!edit) return;
+    const object = scene.objects.find((o) => o.id === edit.id);
+    if (!object) return;
+    const current = object.text?.runs?.[0]?.text ?? "";
+    if (edit.value === current) return;
+    authorOp({ kind: "set-text", id: edit.id, text: { runs: [{ text: edit.value }] } });
+  }
+
+  // Discard the in-progress inline edit without committing (Esc).
+  function cancelTextEdit(): void {
+    textEdit = null;
+  }
+
+  // W2-10: Svelte action — seed the contenteditable with the object's current text
+  // and focus it (placing the caret at the end) when the overlay mounts.
+  function mountTextEdit(node: HTMLDivElement, value: string) {
+    node.textContent = value;
+    node.focus();
+    const selection = window.getSelection();
+    if (selection) {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  }
+
   // ----- templates (buildObjectTemplate -> FeatureRequest.templateApply) ---
 
   // W2-09: the templates the scroll-popup offers. Ids map to buildObjectTemplate.
@@ -921,6 +988,8 @@
   }
 
   function handleEscape(): void {
+    // W2-10: a pending Escape first cancels an in-progress inline text edit.
+    if (textEdit) return void cancelTextEdit();
     // FC-11: a pending Escape first cancels an in-progress pen stroke.
     if (drawPoints) return void (drawPoints = null);
     // W2-07: cancel an in-progress shape drag-create, then disarm the tool.
@@ -971,8 +1040,10 @@
       "send-backward": () => reorderStep("backward"),
       undo: () => undo(),
       redo: () => redo(),
+      // W2-10: Enter on a selected object enters inline edit (contenteditable
+      // overlay) instead of a blocking prompt.
       "edit-text": () => {
-        if (selection.kind === "object") renameSelected(window.prompt("Text") ?? selectedObject?.text?.runs?.[0]?.text ?? "");
+        if (selection.kind === "object") enterTextEdit(selection.id);
       },
       "add-comment": () => addCommentToSelected(),
       "clear-selection": () => selectObject({ kind: "canvas" }),
@@ -1434,6 +1505,37 @@
           onHost={handleHost}
           onContextMenuRequest={handleContextMenuRequest}
         />
+
+        {#if textEdit && textEditRect}
+          <div
+            class="text-edit-overlay"
+            contenteditable="plaintext-only"
+            role="textbox"
+            tabindex="0"
+            aria-label="Edit text"
+            style:left={`${textEditRect.x}px`}
+            style:top={`${textEditRect.y}px`}
+            style:width={`${textEditRect.width}px`}
+            style:height={`${textEditRect.height}px`}
+            use:mountTextEdit={textEdit.value}
+            oninput={(event) => {
+              if (textEdit) textEdit = { id: textEdit.id, value: (event.currentTarget as HTMLDivElement).textContent ?? "" };
+            }}
+            onkeydown={(event) => {
+              if (event.isComposing) return;
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                event.stopPropagation();
+                commitTextEdit();
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                cancelTextEdit();
+              }
+            }}
+            onblur={() => commitTextEdit()}
+          ></div>
+        {/if}
       </div>
 
       {#if contextMenu}

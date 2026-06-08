@@ -289,6 +289,24 @@ p {
   background: var(--renderer-edit-selection-bg);
 }
 
+/* W2-10: inline text-edit overlay positioned over a text object's screen bbox. */
+.text-edit-overlay {
+  position: absolute;
+  z-index: 7;
+  margin: 0;
+  padding: 0;
+  border: none;
+  outline: 1px solid var(--accent, #2f7ee6);
+  background: rgb(255 255 255 / 0.92);
+  color: #1f2933;
+  font: inherit;
+  line-height: 1.3;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  overflow: hidden;
+  cursor: text;
+}
+
 .renderer-status-strip {
   position: absolute;
   left: 50%;

@@ -63,7 +63,9 @@ describe("(a) freehandToObject lowers a stroke to an insert-able open-path objec
 describe("(b) objectSceneToRenderObjectScene projects a heterogeneous scene", () => {
   it("produces a well-formed feed (de-quantized strokes, text preserved)", () => {
     const rectangle = buildPrimitiveObject("rectangle", { x: 0, y: 0 }, "rect-1", "a0");
-    const note = buildPrimitiveObject("text", { x: 400, y: 0 }, "note-1", "a1");
+    // W2-10: the text primitive is borderless + style-less (no default "Note"); set
+    // text explicitly to verify the projection preserves an object's text runs.
+    const note: SceneObject = { ...buildPrimitiveObject("text", { x: 400, y: 0 }, "note-1", "a1"), text: { runs: [{ text: "Note" }] } };
     const freehand = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a2");
 
     const scene: ObjectScene = { ...emptyObjectScene(), objects: [rectangle, note, freehand] };
