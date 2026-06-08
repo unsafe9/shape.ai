@@ -1665,6 +1665,22 @@ pub(crate) fn build_marquee_overlay_vertices(rect: &WorldRect, zoom: f64) -> Vec
     vertices
 }
 
+/// RA2a (#7): the overlay quads for an in-flight marquee drag (empty for any other
+/// drag / no drag). The single source both render passes (object + legacy) draw
+/// from, so the rubber-band surfaces identically over an object scene and a 2D
+/// scene. Kept pure (no GPU device) so the in-flight overlay can be unit-tested.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn marquee_overlay_for_drag(
+    input_drag: Option<&InputDragState>,
+    zoom: f64,
+) -> Vec<GpuVertex> {
+    let Some(InputDragState::Marquee { start, current, .. }) = input_drag else {
+        return Vec::new();
+    };
+    let rect = marquee_rect(*start, *current);
+    build_marquee_overlay_vertices(&rect, zoom)
+}
+
 /// W2-04: build the selection-handle overlay (8 resize handles + 1 rotate zone) in
 /// WORLD space for the selected object's `world_bbox`. Each handle is a square of
 /// `HANDLE_SIZE_PX / zoom` world units so the legacy shader's `* zoom` renders it at
@@ -3944,6 +3960,77 @@ mod tests {
             &mut out,
         );
         assert_eq!(out.marquee_ids, Some(vec!["near".to_string()]));
+    }
+
+    #[test]
+    fn object_marquee_reversed_drag_through_move_reaches_marquee_ids() {
+        // RA2a (#7): a full down -> move -> up sequence dragged bottom-right -> top-left
+        // (reversed corners) must still round-trip to the same ids the rect intersects.
+        let scene = object_scene(vec![
+            rect_object("near", 0.0, 0.0, 10),
+            rect_object("far", 500.0, 500.0, 10),
+        ]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        // Down bottom-right of "near" on empty space.
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown { pointer_id: 4, screen: WorldPoint { x: 15.0, y: 15.0 } },
+            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+        );
+        assert!(matches!(drag, Some(InputDragState::Marquee { .. })));
+        // Move toward top-left through an intermediate point (real drags emit moves).
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove { pointer_id: 4, screen: WorldPoint { x: 5.0, y: 5.0 } },
+            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+        );
+        // Up at (-5,-5): reversed rect [-5,15]² covers "near" only.
+        step_object_pointer(
+            &CanvasInputEvent::PointerUp { pointer_id: 4, screen: WorldPoint { x: -5.0, y: -5.0 }, edge_id: None },
+            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+        );
+        assert_eq!(out.marquee_ids, Some(vec!["near".to_string()]));
+    }
+
+    #[test]
+    fn object_mode_marquee_drag_yields_overlay_geometry_from_shared_source() {
+        // RA2a (#7): the in-flight object-mode marquee drag must produce drawable
+        // overlay geometry from the shared `marquee_overlay_for_drag` source the
+        // object render pass draws — without it the rubber-band never surfaces over an
+        // object scene. A non-Marquee / no drag yields no overlay.
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 10)]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        // No drag => no overlay.
+        assert!(marquee_overlay_for_drag(drag.as_ref(), 1.0).is_empty());
+
+        // Down on empty space then a move grows an in-flight marquee.
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown { pointer_id: 5, screen: WorldPoint { x: -20.0, y: -20.0 } },
+            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+        );
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove { pointer_id: 5, screen: WorldPoint { x: 30.0, y: 30.0 } },
+            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+        );
+        assert!(matches!(drag, Some(InputDragState::Marquee { .. })));
+        // The shared source the object pass draws must produce a full overlay
+        // (fill quad + 4 stroke quads) for the in-flight marquee.
+        let overlay = marquee_overlay_for_drag(drag.as_ref(), camera.zoom);
+        assert_eq!(overlay.len(), MARQUEE_OVERLAY_VERTEX_CAPACITY);
+
+        // An object drag (not a marquee) must NOT draw a marquee overlay.
+        let object_drag = Some(InputDragState::Object {
+            pointer_id: 6,
+            object_id: "o1".to_string(),
+            start: WorldPoint { x: 0.0, y: 0.0 },
+        });
+        assert!(marquee_overlay_for_drag(object_drag.as_ref(), 1.0).is_empty());
     }
 
     #[test]

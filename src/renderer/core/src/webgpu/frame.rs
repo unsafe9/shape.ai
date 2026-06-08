@@ -87,6 +87,33 @@ impl ShapeWebGpuRenderer {
                 pass.set_vertex_buffer(0, self.handle_vertex_buffer.slice(..));
                 pass.draw(0..handle_vertex_count as u32, 0..1);
             }
+            // RA2a (#7): the drag marquee must surface in object mode too. The object
+            // pass replaces the legacy 2D pass, which is the only place the marquee
+            // overlay was drawn — so without this the rubber-band never renders over
+            // an object scene. Same world-space pipeline, LoadOp::Load on top.
+            if overlay_vertex_count > 0 {
+                let color_attachments = [Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shape.ai object-pass marquee overlay pass"),
+                    color_attachments: &color_attachments,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.overlay_vertex_buffer.slice(..));
+                pass.draw(0..overlay_vertex_count as u32, 0..1);
+            }
         } else {
             let color_attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: &view,
@@ -248,11 +275,7 @@ impl ShapeWebGpuRenderer {
     /// dedicated overlay vertex buffer, returning the vertex count to draw. Zero
     /// when no marquee is in flight.
     fn write_marquee_overlay(&mut self) -> usize {
-        let Some(InputDragState::Marquee { start, current, .. }) = self.input_drag.clone() else {
-            return 0;
-        };
-        let rect = marquee_rect(start, current);
-        let vertices = build_marquee_overlay_vertices(&rect, self.camera.zoom);
+        let vertices = marquee_overlay_for_drag(self.input_drag.as_ref(), self.camera.zoom);
         if vertices.is_empty() {
             return 0;
         }
