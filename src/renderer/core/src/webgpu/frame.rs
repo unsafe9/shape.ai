@@ -325,14 +325,16 @@ impl ShapeWebGpuRenderer {
         vertices.len()
     }
 
-    /// W3-G7/#1: write the per-object outline highlight for the active multi-select
-    /// set into its dedicated buffer, returning the vertex count to draw. Zero when
-    /// the set is empty (single selection keeps its handle overlay instead).
+    /// W3-G7/#1 + W3-G9/#2: write the per-object outline ring into its dedicated
+    /// buffer, returning the vertex count to draw. Rings every multi-select member,
+    /// or (when the multi-select is empty) the single selected object/group — so a
+    /// grouped selection shows a continuous border, not just its 8 resize handles.
+    /// Zero when nothing is selected.
     fn write_multi_select_overlay(&mut self) -> usize {
         let ids = self
             .object_scene
             .as_ref()
-            .map(|scene| scene.multi_select.clone())
+            .map(outline_overlay_ids)
             .unwrap_or_default();
         let vertices =
             build_multi_select_overlay_vertices(&self.object_regions, &ids, self.camera.zoom);
