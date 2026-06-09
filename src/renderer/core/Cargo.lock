@@ -542,11 +542,20 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "shape_scene_core",
  "unicode-segmentation",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
  "wgpu",
+]
+
+[[package]]
+name = "shape_scene_core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

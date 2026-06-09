@@ -26,6 +26,7 @@ pub mod gestures;
 pub mod grouping;
 pub mod layout_solve;
 pub mod model;
+pub mod move_together;
 pub mod op;
 pub mod primitives;
 pub mod region;
@@ -34,7 +35,8 @@ pub mod theme;
 pub mod undo;
 pub mod validate;
 
-pub use anchor_follow::{anchor_follow_ops, synthesize_create_anchors};
+pub use anchor_follow::{anchor_follow_ops, reproject_geometry_node, synthesize_create_anchors};
+pub use move_together::{BindingGraph, BindingNode, PropEdge, PropKind};
 pub use anchors::{connection_graph, neighbors, reproject_object_anchors, resolve_endpoint};
 pub use cascade::{cascade_multi_transform_ops, cascade_transform_ops, move_ops, MoveRoots};
 pub use apply::{apply_object_op, apply_object_op_lww, apply_sequence, ApplyError};

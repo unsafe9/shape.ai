@@ -289,8 +289,10 @@ impl ShapeWebGpuRenderer {
         // W3-G9/#5: the bindings graph is derived from `object_scene`; rebuild it from
         // the restored scene so a rolled-back input batch leaves a consistent graph.
         self.object_bindings = match &self.object_scene {
-            Some(scene) => crate::transform_bindings::Bindings::build(scene),
-            None => crate::transform_bindings::Bindings::default(),
+            Some(scene) => shape_scene_core::object::move_together::BindingGraph::build(
+                &super::scene_feed::binding_nodes(scene),
+            ),
+            None => shape_scene_core::object::move_together::BindingGraph::default(),
         };
         self.text_layout_cache = state.text_layout_cache.clone();
         self.rebuild_vertex_buffer();

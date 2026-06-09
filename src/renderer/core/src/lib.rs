@@ -22,7 +22,6 @@ mod shaders;
 mod shadow_blur;
 mod stroke_expand;
 mod tessellate;
-mod transform_bindings;
 #[allow(dead_code)]
 mod text_layout;
 

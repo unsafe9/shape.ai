@@ -235,6 +235,33 @@ fn reproject_anchored_geometry(
     })
 }
 
+/// The shared LIVE reproject: rewrite the `node_index`-th node of `geometry_d` to
+/// where `at` lands when `target_transform` is moved by `delta`, returning the new
+/// path-string — or `None` on a no-op / unaddressable node / singular follower.
+///
+/// The renderer holds the target's BASE transform and the drag `delta` separately
+/// (the same `(target_base, delta)` shape its instance-matrix preview writes), so
+/// this composes `delta * target_transform` to form the target's NEW transform
+/// before the reproject, then drives the SAME two helpers the commit path's
+/// [`reproject_anchored_geometry`] uses ([`reproject_node_local_quantized`] +
+/// [`set_path_node`]). Sharing those helpers is what makes the renderer preview and
+/// the committed move byte-equivalent (pinned by `reproject_matches_cross_core_vector`).
+///
+/// `at` is the target-local QUANTIZED anchor point. Pure (no time/rng/IO/GPU),
+/// pointer-width-agnostic.
+pub fn reproject_geometry_node(
+    follower_transform: &Transform3x3,
+    target_transform: &Transform3x3,
+    delta: &Transform3x3,
+    at: LocalPoint,
+    node_index: i32,
+    geometry_d: &str,
+) -> Option<String> {
+    let target_new = delta.mul(target_transform);
+    let (qx, qy) = reproject_node_local_quantized(follower_transform, &target_new, at);
+    set_path_node(geometry_d, node_index, qx, qy)
+}
+
 /// The `edit-geometry` ops a committed move produces so anchored objects follow
 /// their target. `transform_ops` are the move's `set-transform` ops (each a moved
 /// id + its NEW transform); for every moved object, each scene object anchored to
@@ -505,6 +532,22 @@ mod tests {
 
         let geometry = reproject_anchored_geometry(&follower, &anchor, &target_new).expect("rewrite");
         assert_eq!(geometry.path_string, "M 0 0 L -664 224");
+
+        // The shared LIVE wrapper composes `delta * target_base` internally and must
+        // reach the SAME pinned vector — so the renderer preview (which calls it) and
+        // the commit path stay byte-equivalent.
+        let target_base = translate(10.0, 20.0);
+        let delta = translate(5.0, 7.0);
+        let rewritten = reproject_geometry_node(
+            &follower.transform,
+            &target_base,
+            &delta,
+            anchor.at,
+            anchor.node_index,
+            "M 0 0 L 64 0",
+        )
+        .expect("addressable, changed");
+        assert_eq!(rewritten, "M 0 0 L -664 224");
     }
 
     /// WIRE-CASING PIN (cross-core). The shell forwards each object's `anchors` to

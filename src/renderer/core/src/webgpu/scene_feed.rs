@@ -12,6 +12,7 @@ use crate::model::{
 use crate::object_pipeline::{ObjectPipeline, ObjectRenderer};
 use crate::render_object::RenderObjectScene;
 use crate::serde_wasm;
+use shape_scene_core::object::move_together::{BindingGraph, BindingNode};
 use crate::text::TextBuildStats;
 use wasm_bindgen::prelude::*;
 
@@ -106,7 +107,7 @@ impl ShapeWebGpuRenderer {
         self.multi_select = scene.multi_select.clone();
         // W3-G9/#5: precompute the move-together propagation graph ONCE per feed so
         // each drag preview is O(closure), not O(scene).
-        self.object_bindings = crate::transform_bindings::Bindings::build(&scene);
+        self.object_bindings = BindingGraph::build(&binding_nodes(&scene));
         self.object_scene = Some(scene);
         self.object_renderer = Some(renderer);
         serde_wasm(counts)
@@ -203,8 +204,9 @@ impl ShapeWebGpuRenderer {
     /// untouched, so the live reproject is patched back out exactly.
     ///
     /// O(followers), each a single small object — never a full-scene rebake. The
-    /// reproject math + the node rewrite are pure (`transform_bindings`); only the
-    /// re-expand is touched here, and the GPU write lives in `patch_follower_geometry`.
+    /// reproject math + the node rewrite are pure (scene-core
+    /// `reproject_geometry_node`); only the re-expand is touched here, and the GPU
+    /// write lives in `patch_follower_geometry`.
     fn reexpand_reprojected_followers(
         &self,
         scene: &RenderObjectScene,
@@ -230,19 +232,16 @@ impl ShapeWebGpuRenderer {
                     if &anchor.target != target_id {
                         continue;
                     }
-                    let Some((lx, ly)) = crate::transform_bindings::reproject_node_local_px(
-                        &follower.transform,
-                        &target.transform,
-                        delta,
-                        anchor,
-                    ) else {
-                        continue;
-                    };
-                    if let Some(rewritten) = crate::transform_bindings::rewrite_geometry_node(
+                    if let Some(rewritten) = shape_scene_core::object::reproject_geometry_node(
+                        &shape_scene_core::object::Transform3x3 { m: follower.transform },
+                        &shape_scene_core::object::Transform3x3 { m: target.transform },
+                        &shape_scene_core::object::Transform3x3 { m: *delta },
+                        shape_scene_core::object::LocalPoint {
+                            x: anchor.at.x.round() as i32,
+                            y: anchor.at.y.round() as i32,
+                        },
+                        i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
                         &geometry_d,
-                        anchor.node_index,
-                        lx,
-                        ly,
                     ) {
                         geometry_d = rewritten;
                     }
@@ -260,6 +259,23 @@ impl ShapeWebGpuRenderer {
         out
     }
 
+}
+
+/// W3-G9/#5: the tiny binding projection of `scene` the move-together graph is
+/// built from — each object's id, containment parent, and anchor targets. O(objects)
+/// cheap String clones, no geometry/transform copied. Paid once per feed at build
+/// time, never per frame.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn binding_nodes(scene: &RenderObjectScene) -> Vec<BindingNode> {
+    scene
+        .objects
+        .iter()
+        .map(|o| BindingNode {
+            id: o.id.clone(),
+            parent: o.parent.clone(),
+            anchor_targets: o.anchors.iter().map(|a| a.target.clone()).collect(),
+        })
+        .collect()
 }
 
 /// W3-G9/#5: the propagation ROOTS for a drag of `dragged`. If `dragged` is a
@@ -290,7 +306,7 @@ pub(crate) fn preview_roots(scene: &RenderObjectScene, dragged: &str) -> Vec<Str
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn preview_write_set(
     scene: &RenderObjectScene,
-    bindings: &crate::transform_bindings::Bindings,
+    bindings: &BindingGraph,
     dragged: &str,
 ) -> Vec<(String, [[f64; 3]; 3])> {
     let roots = preview_roots(scene, dragged);
@@ -316,7 +332,7 @@ pub(crate) fn preview_write_set(
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn preview_reproject_followers(
     scene: &RenderObjectScene,
-    bindings: &crate::transform_bindings::Bindings,
+    bindings: &BindingGraph,
     dragged: &str,
 ) -> Vec<(String, String)> {
     let roots = preview_roots(scene, dragged);
@@ -1717,10 +1733,10 @@ impl ShapeWebGpuRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{preview_roots, preview_write_set};
+    use super::{binding_nodes, preview_roots, preview_write_set};
     use crate::model::CameraState;
     use crate::render_object::{RenderObject, RenderObjectScene};
-    use crate::transform_bindings::Bindings;
+    use shape_scene_core::object::move_together::BindingGraph;
 
     fn scene_with_multi_select(multi_select: Vec<&str>) -> RenderObjectScene {
         RenderObjectScene {
@@ -1779,7 +1795,7 @@ mod tests {
             object("b", Some("a"), 2.0),
             object("d", None, 3.0),
         ];
-        let bindings = Bindings::build(&scene);
+        let bindings = BindingGraph::build(&binding_nodes(&scene));
 
         // Dragging member `a` writes the SameDelta closure of [a, d]: a, its child b,
         // and d — each paired with its OWN base transform (not the dragged one).
@@ -1800,7 +1816,7 @@ mod tests {
             object("b", Some("a"), 2.0),
             object("z", None, 9.0),
         ];
-        let bindings = Bindings::build(&scene);
+        let bindings = BindingGraph::build(&binding_nodes(&scene));
         let ids: Vec<String> = preview_write_set(&scene, &bindings, "a")
             .into_iter()
             .map(|(id, _)| id)
@@ -1838,15 +1854,16 @@ mod tests {
     /// (`preview_reproject_followers` + `preview_write_set`) drives the SAME pinned
     /// numeric vector scene-core's `anchor_follow::tests::reproject_matches_cross_core_vector`
     /// pins (`"M 0 0 L -664 224"`), closing the gap between "the math matches" and
-    /// "the closure actually routes the follower to that math". Renderer-only:
-    /// scene-core is intentionally absent from this standalone crate, so equivalence
-    /// is asserted against the same hand-computed vector pinned in BOTH cores.
+    /// "the closure actually routes the follower to that math". The renderer now
+    /// drives the SAME scene-core math: the closure is `BindingGraph` and the
+    /// reproject is `reproject_geometry_node`, so this guard pins the renderer's
+    /// real call path against the cross-core vector.
     #[cfg(feature = "wgpu-probe")]
     #[test]
     fn anchor_follower_closure_agrees_with_scene_core_vector() {
         use super::preview_reproject_followers;
         use crate::render_object::{RAnchor, RLocalPoint};
-        use crate::transform_bindings::{reproject_node_local_px, rewrite_geometry_node};
+        use shape_scene_core::object::{reproject_geometry_node, LocalPoint, Transform3x3};
 
         // Target A (the dragged object) and follower B anchored to A. Numbers reuse
         // the pinned cross-core vector so the closure result is hand-checkable.
@@ -1879,7 +1896,7 @@ mod tests {
             selection: None,
             multi_select: Vec::new(),
         };
-        let bindings = Bindings::build(&scene);
+        let bindings = BindingGraph::build(&binding_nodes(&scene));
         let delta = translate(5.0, 7.0);
 
         // (1) The closure returns the follower paired with its target: B follows A.
@@ -1895,21 +1912,29 @@ mod tests {
             "M 0 0 L 8 0 L 8 8 L 0 8 Z",
             Vec::new(),
         ));
-        let bindings2 = Bindings::build(&scene2);
+        let bindings2 = BindingGraph::build(&binding_nodes(&scene2));
         let write_set = preview_write_set(&scene2, &bindings2, "a");
         let ids: Vec<&str> = write_set.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["a", "c"]);
         assert!(!ids.iter().any(|id| *id == "b"));
 
-        // (3) Reprojected follower geometry equals the scene-core pinned vector.
+        // (3) Reprojected follower geometry equals the scene-core pinned vector, via
+        // the SAME `reproject_geometry_node` the live preview path now calls.
         let a_base = scene.objects.iter().find(|o| o.id == "a").unwrap().transform;
         let b = scene.objects.iter().find(|o| o.id == "b").unwrap();
         let anchor = &b.anchors[0];
-        let (lx, ly) =
-            reproject_node_local_px(&b.transform, &a_base, &delta, anchor).expect("non-singular");
-        assert!((lx - (-83.0)).abs() < 1e-9 && (ly - 28.0).abs() < 1e-9, "px ({lx},{ly})");
-        let d = rewrite_geometry_node(&b.geometry_d, anchor.node_index, lx, ly)
-            .expect("addressable, changed");
+        let d = reproject_geometry_node(
+            &Transform3x3 { m: b.transform },
+            &Transform3x3 { m: a_base },
+            &Transform3x3 { m: delta },
+            LocalPoint {
+                x: anchor.at.x.round() as i32,
+                y: anchor.at.y.round() as i32,
+            },
+            i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
+            &b.geometry_d,
+        )
+        .expect("addressable, changed");
         assert_eq!(d, "M 0 0 L -664 224");
     }
 
@@ -1953,7 +1978,7 @@ mod tests {
         assert_eq!(b.anchors[0].target, "a");
         // Bindings built from the PARSED scene (the scene_feed.rs:109 production path)
         // route B to follow A.
-        let bindings = Bindings::build(&scene);
+        let bindings = BindingGraph::build(&binding_nodes(&scene));
         let followers = preview_reproject_followers(&scene, &bindings, "a");
         assert_eq!(followers, vec![("b".to_string(), "a".to_string())]);
     }
