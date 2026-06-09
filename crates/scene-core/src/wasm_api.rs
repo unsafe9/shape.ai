@@ -63,6 +63,11 @@ use crate::object::grouping::{
 };
 use crate::object::model::{Geometry, Object, ObjectScene};
 use crate::object::op::ObjectOp;
+use crate::object::primitives::{
+    build_primitive as build_primitive_pure,
+    build_primitive_from_drag as build_primitive_from_drag_pure,
+    build_set_style_op as build_set_style_op_pure, DragSpan, PrimitiveKind,
+};
 use crate::object::region::{OutlineDeriver, StubOutlineDeriver};
 use crate::object::templates::build_template as build_template_pure;
 use crate::object::undo::UndoStack;
@@ -230,6 +235,65 @@ pub fn split_subpath_at(geometry_json: &str, x: i32, y: i32, radius: i32) -> Str
         Some(cut) => ok_json(&cut),
         None => error_json("erase touch hit no stroke node"),
     }
+}
+
+/// `build_primitive(kind, anchor_x, anchor_y, color, id, order) -> Object | {error}`.
+///
+/// Tier-3: build a basic primitive (rectangle/ellipse/line/text/frame) centered on
+/// a world anchor, in the toolbar `color` (an empty string means the kind default).
+/// `color` may be the theme-default sentinel (resolves to a text token) or a hex.
+/// The geometry is object-local; the world position rides a translate (P4). The
+/// shell sends the returned object as an `insert-object` op. `{error}` for an
+/// unknown `kind`.
+#[wasm_bindgen]
+pub fn build_primitive(kind: &str, anchor_x: f64, anchor_y: f64, color: &str, id: &str, order: &str) -> String {
+    let Some(kind) = PrimitiveKind::from_str(kind) else {
+        return error_json(&format!("unknown primitive kind: {kind}"));
+    };
+    let color = (!color.is_empty()).then_some(color);
+    let object = build_primitive_pure(kind, anchor_x, anchor_y, color, id, order);
+    ok_json(&object)
+}
+
+/// `build_primitive_from_drag(kind, start_x, start_y, end_x, end_y, color, id, order) -> Object | {error}`.
+///
+/// Tier-3: build a primitive sized to a drag span — closed kinds to the normalized
+/// bbox, the line corner-to-corner. Same color/anchor rules as [`build_primitive`].
+/// `{error}` for an unknown `kind`.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn build_primitive_from_drag(
+    kind: &str,
+    start_x: f64,
+    start_y: f64,
+    end_x: f64,
+    end_y: f64,
+    color: &str,
+    id: &str,
+    order: &str,
+) -> String {
+    let Some(kind) = PrimitiveKind::from_str(kind) else {
+        return error_json(&format!("unknown primitive kind: {kind}"));
+    };
+    let color = (!color.is_empty()).then_some(color);
+    let span = DragSpan { start_x, start_y, end_x, end_y };
+    let object = build_primitive_from_drag_pure(kind, span, color, id, order);
+    ok_json(&object)
+}
+
+/// `build_set_style_op(object_json, color) -> ObjectOp | {error}`.
+///
+/// Tier-3: author a `set-style` op recoloring `object` to `color` (a hex or the
+/// theme-default sentinel). Recolor touches only existing style fields; a borderless
+/// object gains a fill so the recolor is visible. The shell authors the op through
+/// the same op-apply path (D21 undo via the captured inverse).
+#[wasm_bindgen]
+pub fn build_set_style_op(object_json: &str, color: &str) -> String {
+    let object: Object = match parse("object", object_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&build_set_style_op_pure(&object, color))
 }
 
 /// `anchor_follow_ops(scene_json, transform_ops_json) -> ObjectOp[] | {error}`.

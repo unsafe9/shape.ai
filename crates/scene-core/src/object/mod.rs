@@ -27,6 +27,7 @@ pub mod grouping;
 pub mod layout_solve;
 pub mod model;
 pub mod op;
+pub mod primitives;
 pub mod region;
 pub mod templates;
 pub mod theme;
@@ -47,6 +48,10 @@ pub use gestures::{
 };
 pub use grouping::{
     double_click_action, has_children, pop_out_op, ungroup_enabled, DoubleClickAction,
+};
+pub use primitives::{
+    build_primitive, build_primitive_from_drag, build_set_style_op, paint_for_color, DragSpan,
+    PrimitiveKind, THEME_DEFAULT_COLOR,
 };
 pub use layout_solve::solve_layout;
 pub use templates::{
