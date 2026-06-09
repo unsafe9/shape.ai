@@ -84,6 +84,11 @@ export type ShapeCanvasHostCallbacks = {
     snapped: boolean,
     targetId: string | null
   ) => void;
+  // W3-G9 (#3): a bare create-tool hover snap probe (no button down). `targetId` is
+  // the object whose edge the cursor is over (null when not snapped); the shell
+  // renders a PERSISTENT anchor ring from it before any drag. Optional so a host
+  // that omits it loses nothing.
+  onCreateHover?: (world: { x: number; y: number }, snapped: boolean, targetId: string | null) => void;
   // W2-08: eraser touch over a stroke. `id` is the hit object; `partial` is the
   // partial-erase modifier (default = whole-stroke delete, modifier = subpath
   // cut). The shell authors the delete / edit-geometry op from `world` + `id`.
@@ -427,6 +432,12 @@ export class ShapeCanvasHost {
     // W2-07: shape drag-create phase routes to the shell's create controller.
     if (event.type === "create") {
       this.callbacks.onCreate(event.phase, event.world, event.snapped, event.targetId);
+      return;
+    }
+    // W3-G9 (#3): a bare create-tool hover snap probe routes to the shell's
+    // persistent anchor-ring controller.
+    if (event.type === "create-hover") {
+      this.callbacks.onCreateHover?.(event.world, event.snapped, event.targetId);
       return;
     }
     // W2-08: eraser touch routes to the shell's erase controller.

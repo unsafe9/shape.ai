@@ -61,6 +61,16 @@ export function shouldQuerySnap(intent: { altHeld: boolean; phase: "start" | "mo
   return !isSnapBypass({ altKey: intent.altHeld }) && intent.phase !== "cancel";
 }
 
+// W3-G9 (#3): classify a create-tool pointer move while the create tool is armed.
+// A move with NO drag in progress is a HOVER probe (it emits a persistent anchor-
+// ring snap before any drag, request #3); a move during a drag is the regular
+// rubber-band drag move. Pure so the shell test can pin the classification without
+// a renderer — falsifiable: it returns "hover" for a button-up move (it would
+// return "drag" if the old drag-gated behavior leaked back in).
+export function createMoveEmission(intent: { dragActive: boolean }): "hover" | "drag" {
+  return intent.dragActive ? "drag" : "hover";
+}
+
 export type EngineEvent =
   | { type: "stats"; stats: FrameStats }
   // T2.2: `additive` carries the shift/meta modifier held at pick time so the shell
@@ -105,6 +115,14 @@ export type EngineEvent =
   // `targetId` is the object whose outline the corner snapped to (null when not
   // snapped), so the shell can author a persistent anchor binding the endpoint.
   | { type: "create"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint; snapped: boolean; targetId: string | null }
+  // W3-G9 (#3): a HOVER snap probe emitted while the create tool is armed and no
+  // button is down — a bare mouse/pen hover over an existing object's edge. The
+  // shell renders a PERSISTENT anchor ring from it (before any drag) so the user
+  // sees where the next create would anchor. Distinct from the drag "create" event
+  // (which only rides an active rubber-band). `snapped`/`targetId` mirror "create":
+  // the snapped WORLD outline point + the object whose edge it landed on (null when
+  // not snapped, so the shell clears the ring). Honors the Alt snap-bypass upstream.
+  | { type: "create-hover"; world: WorldPoint; snapped: boolean; targetId: string | null }
   // W2-08: eraser. While the erase tool is active, a pointer/mouse down/move over a
   // stroke emits an erase touch carrying the hit object id + the touch in world
   // space, plus whether the partial-erase modifier (Alt) was held (default = whole-
@@ -192,6 +210,16 @@ export class ShapeCanvasEngine {
   // erasing along the drag (a bare hover never erases). Set on erase down, cleared
   // on up/cancel.
   private eraseDragActive = false;
+  // W3-G9 (#3): true while a create drag is in progress (between create start and
+  // up/cancel). A pen/touch onPointerMove with this false is a bare hover, so it
+  // emits a create-hover snap probe instead of a drag create event. Set on create
+  // start, cleared on up/cancel.
+  private createDragActive = false;
+  // W3-G9 (#3): the always-on hover mousemove target bound while the create tool is
+  // armed (mouse has no down-less move otherwise). Bound in setTool on entering
+  // create, unbound on leaving. Distinct from the mousedown-bound drag-move target,
+  // so a bare mouse hover emits a create-hover probe without disturbing the drag.
+  private createHoverTarget: EventTarget | null = null;
   // EN1 (#3): the previous eraser sample's screen point, so each move runs RA3's
   // swept hit-test over the segment (prev -> curr) and erases every crossed object
   // — a fast drag that skips between samples still erases what the segment passes
@@ -282,6 +310,15 @@ export class ShapeCanvasEngine {
   setTool(tool: ActiveTool) {
     this.activeTool = tool;
     this.coreSetTool("select");
+    // W3-G9 (#3): a bare mouse hover has no down-less move under the canvas, so the
+    // create tool arms an always-on hover mousemove to drive the persistent anchor
+    // ring; leaving create unbinds it (and clears the stale drag flag).
+    if (tool === "create") {
+      this.bindCreateHoverMove();
+    } else {
+      this.unbindCreateHoverMove();
+      this.createDragActive = false;
+    }
   }
 
   // W2-03: the shell mirrors the Space key down/up here. A pointer-down while
@@ -557,6 +594,7 @@ export class ShapeCanvasEngine {
     this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
     this.canvas.removeEventListener("mousedown", this.onMouseDown);
     this.unbindMouseFallbackMove();
+    this.unbindCreateHoverMove();
     this.canvas.removeEventListener("dblclick", this.onDoubleClick);
     this.canvas.removeEventListener("wheel", this.onWheel);
   }
@@ -572,6 +610,7 @@ export class ShapeCanvasEngine {
       return;
     }
     if (this.activeTool === "create" && !pan) {
+      this.createDragActive = true;
       this.emitCreate("start", event);
       this.canvas.setPointerCapture(event.pointerId);
       return;
@@ -603,7 +642,13 @@ export class ShapeCanvasEngine {
       return;
     }
     if (this.activeTool === "create" && !this.panGestureActive) {
-      this.emitCreate("move", event);
+      // W3-G9 (#3): a pen/touch move with no create drag in progress is a bare hover
+      // — emit a persistent anchor-ring snap probe instead of a drag create event.
+      if (createMoveEmission({ dragActive: this.createDragActive }) === "hover") {
+        this.emitCreateHover(event);
+      } else {
+        this.emitCreate("move", event);
+      }
       return;
     }
     if (this.activeTool === "erase" && !this.panGestureActive && this.eraseDragActive) {
@@ -625,6 +670,7 @@ export class ShapeCanvasEngine {
       return;
     }
     if (this.activeTool === "create" && !this.panGestureActive) {
+      this.createDragActive = false;
       this.emitCreate("end", event);
       try {
         this.canvas.releasePointerCapture(event.pointerId);
@@ -673,6 +719,7 @@ export class ShapeCanvasEngine {
       return;
     }
     if (this.activeTool === "create" && !this.panGestureActive) {
+      this.createDragActive = false;
       this.emitCreate("cancel", event);
       try {
         this.canvas.releasePointerCapture(event.pointerId);
@@ -712,6 +759,7 @@ export class ShapeCanvasEngine {
     }
     if (this.activeTool === "create" && !pan) {
       this.mouseDragActive = true;
+      this.createDragActive = true;
       this.bindMouseFallbackMove();
       this.emitCreate("start", event);
       return;
@@ -763,6 +811,7 @@ export class ShapeCanvasEngine {
       return;
     }
     if (this.activeTool === "create" && !this.panGestureActive) {
+      this.createDragActive = false;
       this.emitCreate("end", event);
       return;
     }
@@ -782,6 +831,16 @@ export class ShapeCanvasEngine {
     this.commitObjectDrag();
     this.disarmPanGesture();
     this.finishInputGesture();
+  };
+
+  // W3-G9 (#3): the always-on create-tool hover mousemove. A bare mouse hover (no
+  // button down) over an object's edge emits a create-hover snap probe so the
+  // persistent anchor ring tracks the cursor BEFORE any drag. Skipped while a drag
+  // is in progress (mouseDragActive) so it never fights the mousedown-bound drag
+  // move, and while a Space-armed pan rides the create tool.
+  private onCreateHoverMove = (event: MouseEvent) => {
+    if (this.mouseDragActive || this.panGestureActive) return;
+    this.emitCreateHover(event);
   };
 
   private onDoubleClick = (event: MouseEvent) => {
@@ -866,6 +925,21 @@ export class ShapeCanvasEngine {
   private eventPoint(event: MouseEvent | PointerEvent | WheelEvent): WorldPoint {
     const rect = this.canvas.getBoundingClientRect();
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
+
+  // W3-G9 (#3): bind/unbind the always-on create-tool hover mousemove on the canvas
+  // (a bare mouse hover, no button down, has no other move source). Idempotent;
+  // bound when entering create in setTool, unbound on leave + on stop().
+  private bindCreateHoverMove() {
+    if (this.createHoverTarget) return;
+    this.createHoverTarget = this.canvas;
+    this.createHoverTarget.addEventListener("mousemove", this.onCreateHoverMove as EventListener);
+  }
+
+  private unbindCreateHoverMove() {
+    if (!this.createHoverTarget) return;
+    this.createHoverTarget.removeEventListener("mousemove", this.onCreateHoverMove as EventListener);
+    this.createHoverTarget = null;
   }
 
   private bindMouseFallbackMove() {
@@ -1118,6 +1192,19 @@ export class ShapeCanvasEngine {
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(raw) : null;
     const world = snap ? { x: snap.x, y: snap.y } : raw;
     this.onEvent({ type: "create", phase, world, snapped: snap !== null, targetId: snap?.targetId ?? null });
+  }
+
+  // W3-G9 (#3): emit a HOVER snap probe for a bare create-tool move (no button
+  // down). Runs the same W2-06 outline snap query as the drag move (it already
+  // excludes the transient preview ids), so the persistent anchor ring shows where
+  // the next create would anchor. Honors the Alt snap-bypass (no ring when an
+  // Alt-create would author no anchor), mirroring emitCreate's `shouldQuerySnap`
+  // gate — `phase: "move"` so a held Alt suppresses the query, never the position.
+  private emitCreateHover(event: MouseEvent | PointerEvent) {
+    const raw = screenToWorld(this.eventPoint(event), this.camera);
+    const snap = shouldQuerySnap({ altHeld: event.altKey, phase: "move" }) ? this.querySnap(raw) : null;
+    const world = snap ? { x: snap.x, y: snap.y } : raw;
+    this.onEvent({ type: "create-hover", world, snapped: snap !== null, targetId: snap?.targetId ?? null });
   }
 
   // W2-08: emit an erase touch for the stroke under the cursor. The object id
