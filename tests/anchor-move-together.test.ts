@@ -7,7 +7,7 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { buildPrimitiveObjectFromDrag, type DragSpan } from "../src/client/lib/objectPrimitives";
+import { type DragSpan } from "../src/client/lib/objectPrimitives";
 import {
   GEOMETRY_QUANTUM_PER_PX,
   translateTransform,
@@ -28,13 +28,13 @@ beforeAll(async () => {
 
 /** A target rectangle at world top-left (tx,ty), 100x60 logical px. */
 function targetRect(id: string, tx: number, ty: number): SceneObject {
-  return buildPrimitiveObjectFromDrag("rectangle", { start: { x: tx, y: ty }, end: { x: tx + 100, y: ty + 60 } }, id, "a0");
+  return core.buildPrimitiveFromDrag("rectangle", { start: { x: tx, y: ty }, end: { x: tx + 100, y: ty + 60 } }, id, "a0");
 }
 
 /** A line whose end was snapped to the target's left edge, anchored to it. */
 function anchoredLine(target: SceneObject): SceneObject {
   const span: DragSpan = { start: { x: 40, y: 30 }, end: { x: 200, y: 30 } };
-  const line = buildPrimitiveObjectFromDrag("line", span, "edge-1", "a1");
+  const line = core.buildPrimitiveFromDrag("line", span, "edge-1", "a1");
   line.anchors = core.synthesizeCreateAnchors(line, target, span.end)!;
   return line;
 }
@@ -88,7 +88,7 @@ describe("anchorFollowOps (W3-G2 — the commit path's follow ops, scene-core wa
   it("an Alt-created (unanchored) object does NOT move when its would-be target moves", () => {
     const target = targetRect("rect-a", 200, 0);
     // Same drag, but the snap was bypassed (Alt-create) — no anchor synthesized.
-    const altLine = buildPrimitiveObjectFromDrag("line", { start: { x: 40, y: 30 }, end: { x: 200, y: 30 } }, "edge-1", "a1");
+    const altLine = core.buildPrimitiveFromDrag("line", { start: { x: 40, y: 30 }, end: { x: 200, y: 30 } }, "edge-1", "a1");
     expect(altLine.anchors).toBeUndefined();
 
     const ops = core.anchorFollowOps(sceneOf([target, altLine]), [moveOp("rect-a", translateTransform(250, 20))]);

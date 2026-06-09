@@ -5,9 +5,9 @@
 // so the renderer (which treats RStroke.width as px) does not draw 8x too thick.
 // Node-only, no GPU.
 
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { objectSceneToRenderObjectScene } from "../src/client/lib/canvasHost";
-import { buildPrimitiveObject } from "../src/client/lib/objectPrimitives";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
 import {
   GEOMETRY_QUANTUM_PER_PX,
   emptyObjectScene,
@@ -16,8 +16,14 @@ import {
 } from "../src/shared/object";
 
 describe("objectSceneToRenderObjectScene stroke units", () => {
+  let core: SceneCore;
+  beforeAll(async () => {
+    await ensureSceneCore();
+    core = await loadSceneCore();
+  });
+
   it("projects stroke width as source width / GEOMETRY_QUANTUM_PER_PX", () => {
-    const object = buildPrimitiveObject("rectangle", { x: 0, y: 0 }, "o1", "a0");
+    const object = core.buildPrimitive("rectangle", { x: 0, y: 0 }, "o1", "a0");
     const sourceWidth = (object.stroke as Stroke).width;
     const scene: ObjectScene = {
       ...emptyObjectScene(),

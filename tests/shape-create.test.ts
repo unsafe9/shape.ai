@@ -3,18 +3,27 @@
 // runs the outline snap (the "modifier nullifies snap" rule). Framework-neutral so
 // they pin without a renderer or a Svelte mount (the engine/App only wire them).
 
-import { describe, expect, it } from "vitest";
-import { buildPrimitiveObjectFromDrag, type DragSpan } from "../src/client/lib/objectPrimitives";
+import { beforeAll, describe, expect, it } from "vitest";
+import { type DragSpan } from "../src/client/lib/objectPrimitives";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
 import { isDragCreateShape } from "../src/client/lib/toolbar";
 import { shouldQuerySnap } from "../src/client/renderer/engine";
 import { GEOMETRY_QUANTUM_PER_PX } from "../src/shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 
-describe("buildPrimitiveObjectFromDrag (W2-07 bbox sizing)", () => {
+// Contract test over the REAL scene-core wasm builder (Tier-3): the drag-create
+// geometry/transform the core authors is what the committed object carries.
+describe("sceneCore.buildPrimitiveFromDrag (W2-07 bbox sizing)", () => {
+  let core: SceneCore;
+  beforeAll(async () => {
+    await ensureSceneCore();
+    core = await loadSceneCore();
+  });
+
   it("sizes a rectangle to the normalized drag bbox and positions it at the top-left", () => {
     const span: DragSpan = { start: { x: 100, y: 200 }, end: { x: 260, y: 300 } };
-    const object = buildPrimitiveObjectFromDrag("rectangle", span, "rect-1", "a0");
+    const object = core.buildPrimitiveFromDrag("rectangle", span, "rect-1", "a0");
     // The pure-translation transform sits at the bbox top-left (D7).
     expect(object.transform).toEqual([
       [1, 0, 100],
@@ -27,7 +36,7 @@ describe("buildPrimitiveObjectFromDrag (W2-07 bbox sizing)", () => {
 
   it("normalizes a drag dragged up-left so width/height stay positive", () => {
     const span: DragSpan = { start: { x: 300, y: 400 }, end: { x: 100, y: 250 } };
-    const object = buildPrimitiveObjectFromDrag("rectangle", span, "rect-2", "a0");
+    const object = core.buildPrimitiveFromDrag("rectangle", span, "rect-2", "a0");
     expect(object.transform?.[0][2]).toBe(100);
     expect(object.transform?.[1][2]).toBe(250);
     expect(object.geometry.d).toBe(`M 0 0 L ${200 * Q} 0 L ${200 * Q} ${150 * Q} L 0 ${150 * Q} Z`);
@@ -35,7 +44,7 @@ describe("buildPrimitiveObjectFromDrag (W2-07 bbox sizing)", () => {
 
   it("draws a line corner-to-corner (diagonal), anchored at the drag start", () => {
     const span: DragSpan = { start: { x: 50, y: 60 }, end: { x: 150, y: 110 } };
-    const object = buildPrimitiveObjectFromDrag("line", span, "line-1", "a0");
+    const object = core.buildPrimitiveFromDrag("line", span, "line-1", "a0");
     expect(object.transform).toEqual([
       [1, 0, 50],
       [0, 1, 60],
@@ -47,7 +56,7 @@ describe("buildPrimitiveObjectFromDrag (W2-07 bbox sizing)", () => {
 
   it("sizes an ellipse to the drag bbox (four cubic arcs)", () => {
     const span: DragSpan = { start: { x: 0, y: 0 }, end: { x: 140, y: 140 } };
-    const object = buildPrimitiveObjectFromDrag("ellipse", span, "ell-1", "a0");
+    const object = core.buildPrimitiveFromDrag("ellipse", span, "ell-1", "a0");
     expect(object.transform?.[0][2]).toBe(0);
     expect(object.geometry.d.startsWith("M 0")).toBe(true);
     expect(object.geometry.d).toContain("C ");

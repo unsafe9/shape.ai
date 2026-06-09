@@ -13,6 +13,7 @@
     type ObjectOp,
     type ObjectScene,
     type ObjectSelection,
+    type Paint,
     type FeatureResponse
   } from "../../shared/object";
   import {
@@ -38,11 +39,7 @@
   import { createShortcutDispatcher } from "../lib/shortcuts";
   import { ToastChannel } from "../lib/statusChannel";
   import {
-    buildPrimitiveObject,
-    buildPrimitiveObjectFromDrag,
-    buildSetStyleOp,
     MIN_DRAG_EXTENT_PX,
-    paintForColor,
     textOverlayScreenRect,
     THEME_DEFAULT_COLOR,
     type DragSpan
@@ -669,8 +666,9 @@
       armCreate(kind);
       return;
     }
+    if (!sceneCore) return;
     const center = anchor ?? viewportCenterWorld();
-    const object = buildPrimitiveObject(kind, center, freshId(kind), nextOrderKey(), selectedColor);
+    const object = sceneCore.buildPrimitive(kind, center, freshId(kind), nextOrderKey(), selectedColor);
     authorOp({ kind: "insert-object", object });
     selection = { kind: "object", id: object.id };
     persistSelection(selection);
@@ -705,6 +703,7 @@
   function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snappedIn: boolean, targetIdIn: string | null): void {
     const kind = createKind;
     if (!kind) return;
+    if (phase === "end" && !sceneCore) return;
     // W2-07/AP5 (#6): the snap query runs against the renderer's loaded regions,
     // which include the TRANSIENT drag-create preview (it rides the same feed). The
     // preview corner sits under the cursor, so an over-empty-canvas move self-snaps
@@ -739,8 +738,8 @@
     const dy = Math.abs(span.end.y - span.start.y);
     const tooSmall = kind === "line" ? dx < MIN_DRAG_EXTENT_PX && dy < MIN_DRAG_EXTENT_PX : dx < MIN_DRAG_EXTENT_PX || dy < MIN_DRAG_EXTENT_PX;
     const object = tooSmall
-      ? buildPrimitiveObject(kind, span.start, freshId(kind), nextOrderKey(), selectedColor)
-      : buildPrimitiveObjectFromDrag(kind, span, freshId(kind), nextOrderKey(), selectedColor);
+      ? sceneCore.buildPrimitive(kind, span.start, freshId(kind), nextOrderKey(), selectedColor)
+      : sceneCore.buildPrimitiveFromDrag(kind, span, freshId(kind), nextOrderKey(), selectedColor);
     // AP5 (#14): a snapped drag-create binds the dragged endpoint to the target's
     // outline with a persistent D5 anchor (Alt-create bypasses snap upstream, so
     // `snapTarget` is null and no anchor is authored). The endpoint then reprojects
@@ -799,7 +798,7 @@
     // The pen draws with the single toolbar color (selectedColor); there is no separate pen color.
     const strokeHex = selectedColor === THEME_DEFAULT_COLOR ? "#000000" : selectedColor;
     const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, PEN_EPSILON, freshId("draw"), nextOrderKey());
-    if (selectedColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = paintForColor(selectedColor);
+    if (selectedColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = previewPaint(selectedColor);
     authorOp({ kind: "insert-object", object });
     // Request 6: select the freshly-drawn stroke after creating it. The pen tool
     // stays sticky in "draw" so the next stroke draws immediately.
@@ -1003,10 +1002,10 @@
   // pick recolors it live through the existing op-apply path (D21 undo).
   function applySelectedColor(color: string): void {
     selectedColor = color;
-    if (selection.kind !== "object") return;
+    if (selection.kind !== "object" || !sceneCore) return;
     const object = scene.objects.find((o) => o.id === selection.id);
     if (!object) return;
-    authorOp(buildSetStyleOp(object, color));
+    authorOp(sceneCore.buildSetStyleOp(object, color));
   }
 
   // ----- AP3 (#9): double-click drill-in -----
@@ -1506,14 +1505,76 @@
   }
 
   // W2-07: transient preview objects for the in-progress shape drag-create — the
-  // rubber-band primitive (built directly in TS like the pen preview, NOT op-apply)
-  // and, when the dragged corner is snapped to an outline anchor, a small circle
-  // marker at that corner. The committed object replaces them on pointer-up.
+  // rubber-band primitive and, when the dragged corner is snapped to an outline
+  // anchor, a small circle marker at that corner. The committed object replaces
+  // them on pointer-up.
+  //
+  // PERF (Tier-3 #4): this runs EVERY pointer-move frame (via buildFeedScene), so
+  // the rubber-band is a CHEAP shell-side path — a throwaway visual affordance, a
+  // legitimate platform preview — NOT a per-frame wasm core call. The COMMITTED
+  // object always comes from the core (sceneCore.buildPrimitiveFromDrag on
+  // pointer-up); this preview only mirrors its geometry so the two look identical.
   function createPreviewObjects(kind: DragCreateShape, span: DragSpan, snapped: boolean): SceneObject[] {
-    const preview = buildPrimitiveObjectFromDrag(kind, span, "create-preview", nextOrderKey());
-    const objects: SceneObject[] = [preview];
+    const objects: SceneObject[] = [createPreviewObject(kind, span)];
     if (snapped) objects.push(snapIndicatorObject(span.end));
     return objects;
+  }
+
+  // W2-07/Tier-3: the transient rubber-band for one drag-create frame. Mirrors the
+  // core `build_primitive_from_drag` geometry (line corner-to-corner; closed kinds
+  // to the normalized bbox) on a pure-translation transform, cheaply in TS so the
+  // per-frame preview never crosses the FFI boundary. Color/snap-anchor are core
+  // concerns of the committed object, not this throwaway visual.
+  function createPreviewObject(kind: DragCreateShape, span: DragSpan): SceneObject {
+    const q = (px: number) => Math.round(px * GEOMETRY_QUANTUM_PER_PX);
+    let d: string;
+    let tx: number;
+    let ty: number;
+    if (kind === "line") {
+      d = `M 0 0 L ${q(span.end.x - span.start.x)} ${q(span.end.y - span.start.y)}`;
+      tx = span.start.x;
+      ty = span.start.y;
+    } else {
+      const w = Math.abs(span.end.x - span.start.x);
+      const h = Math.abs(span.end.y - span.start.y);
+      d = kind === "ellipse" ? previewEllipsePath(w, h) : `M 0 0 L ${q(w)} 0 L ${q(w)} ${q(h)} L 0 ${q(h)} Z`;
+      tx = Math.min(span.start.x, span.end.x);
+      ty = Math.min(span.start.y, span.end.y);
+    }
+    return {
+      id: "create-preview",
+      order: nextOrderKey(),
+      transform: translateTransform(tx, ty),
+      geometry: { d, fillRule: "nonZero" },
+      stroke: { paint: previewPaint(selectedColor), width: 2 * GEOMETRY_QUANTUM_PER_PX }
+    };
+  }
+
+  // The four-cubic ellipse rubber-band path (kappa 0.5523), object-local quantized.
+  // A shell-side preview affordance; the committed ellipse is built by the core.
+  function previewEllipsePath(w: number, h: number): string {
+    const q = (px: number) => Math.round(px * GEOMETRY_QUANTUM_PER_PX);
+    const cx = q(w / 2);
+    const cy = q(h / 2);
+    const kx = Math.round(q(w / 2) * 0.5523);
+    const ky = Math.round(q(h / 2) * 0.5523);
+    return [
+      `M 0 ${cy}`,
+      `C 0 ${cy - ky} ${cx - kx} 0 ${cx} 0`,
+      `C ${cx + kx} 0 ${q(w)} ${cy - ky} ${q(w)} ${cy}`,
+      `C ${q(w)} ${cy + ky} ${cx + kx} ${q(h)} ${cx} ${q(h)}`,
+      `C ${cx - kx} ${q(h)} 0 ${cy + ky} 0 ${cy}`,
+      "Z"
+    ].join(" ");
+  }
+
+  // Tier-3: the renderer Paint for a transient shell preview's selected color — the
+  // theme-default sentinel renders as the "text" token, every other color as solid.
+  // The CANONICAL sentinel→Paint rule lives in the core (build_primitive /
+  // build_set_style_op); this is the per-frame-preview mirror, kept off the FFI
+  // hot path. Pure presentation, not primitive logic.
+  function previewPaint(color: string): Paint {
+    return color === THEME_DEFAULT_COLOR ? { kind: "token", name: "text" } : { kind: "solid", color };
   }
 
   // W2-07: a small ring drawn at the snapped corner so the user sees the snap.
@@ -1552,7 +1613,7 @@
       id: "draw-preview",
       order: nextOrderKey(),
       geometry: { d },
-      stroke: { paint: paintForColor(selectedColor), width: penWidthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
+      stroke: { paint: previewPaint(selectedColor), width: penWidthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
     };
   }
 

@@ -33,12 +33,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { objectSceneToRenderObjectScene } from "../src/client/lib/canvasHost";
-import {
-  buildPrimitiveObject,
-  buildPrimitiveObjectFromDrag,
-  textOverlayScreenRect,
-  type DragSpan
-} from "../src/client/lib/objectPrimitives";
+import { textOverlayScreenRect, type DragSpan } from "../src/client/lib/objectPrimitives";
 import { isPanIntent, shouldQuerySnap } from "../src/client/renderer/engine";
 import type { RenderTransform3x3 } from "../src/client/renderer/scene";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
@@ -145,10 +140,10 @@ describe("(a) freehandToObject lowers a stroke to an insert-able open-path objec
 
 describe("(b) objectSceneToRenderObjectScene projects a heterogeneous scene", () => {
   it("produces a well-formed feed (de-quantized strokes, text preserved)", () => {
-    const rectangle = buildPrimitiveObject("rectangle", { x: 0, y: 0 }, "rect-1", "a0");
+    const rectangle = core.buildPrimitive("rectangle", { x: 0, y: 0 }, "rect-1", "a0");
     // W2-10: the text primitive is borderless + style-less (no default "Note"); set
     // text explicitly to verify the projection preserves an object's text runs.
-    const note: SceneObject = { ...buildPrimitiveObject("text", { x: 400, y: 0 }, "note-1", "a1"), text: { runs: [{ text: "Note" }] } };
+    const note: SceneObject = { ...core.buildPrimitive("text", { x: 400, y: 0 }, "note-1", "a1"), text: { runs: [{ text: "Note" }] } };
     const freehand = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a2");
 
     const scene: ObjectScene = { ...emptyObjectScene(), objects: [rectangle, note, freehand] };
@@ -220,7 +215,7 @@ describe("(e) handle resize/rotate commit lands one undoable set-transform (W2-0
   // this same apply path. We drive a resize then a rotate delta and assert each
   // commit + its inverse round-trip through the real core.
   it("composes a resize delta onto the transform and round-trips the inverse", () => {
-    const rect = buildPrimitiveObject("rectangle", { x: 200, y: 200 }, "rect-1", "a0");
+    const rect = core.buildPrimitive("rectangle", { x: 200, y: 200 }, "rect-1", "a0");
     const inserted = core.applyObjectOp(emptyObjectScene(), { kind: "insert-object", object: rect });
     expect(inserted.errors).toEqual([]);
     const base = rect.transform ?? IDENTITY_TRANSFORM;
@@ -242,7 +237,7 @@ describe("(e) handle resize/rotate commit lands one undoable set-transform (W2-0
   });
 
   it("composes a rotate delta onto the transform (one set-transform op)", () => {
-    const rect = buildPrimitiveObject("rectangle", { x: 0, y: 0 }, "rect-1", "a0");
+    const rect = core.buildPrimitive("rectangle", { x: 0, y: 0 }, "rect-1", "a0");
     const inserted = core.applyObjectOp(emptyObjectScene(), { kind: "insert-object", object: rect });
     const base = rect.transform ?? IDENTITY_TRANSFORM;
 
@@ -268,7 +263,7 @@ describe("(f) drag-create + snap-bypass + select-after-create (W2-07)", () => {
     expect(isDragCreateShape("frame")).toBe(false);
 
     const span: DragSpan = { start: { x: 100, y: 200 }, end: { x: 260, y: 300 } };
-    const object = buildPrimitiveObjectFromDrag("rectangle", span, "rect-1", "a0");
+    const object = core.buildPrimitiveFromDrag("rectangle", span, "rect-1", "a0");
     // Positioned at the normalized bbox top-left; 160x100 logical px object-local.
     expect(object.transform).toEqual(translateTransform(100, 200));
     const Q = GEOMETRY_QUANTUM_PER_PX;
@@ -349,7 +344,7 @@ describe("(g) draw + eraser (whole/partial), all undoable (W2-08, FC-11)", () =>
 
 describe("(h) inline text: borderless primitive + set-text + overlay placement (W2-10)", () => {
   it("inserts a borderless text object then commits a set-text op the inverse restores", () => {
-    const text = buildPrimitiveObject("text", { x: 90, y: 40 }, "note-1", "a0");
+    const text = core.buildPrimitive("text", { x: 90, y: 40 }, "note-1", "a0");
     // Borderless, style-less, no default text (the inline editor seeds it).
     expect(text.stroke).toBeUndefined();
     expect(text.fill).toBeUndefined();
@@ -374,7 +369,7 @@ describe("(h) inline text: borderless primitive + set-text + overlay placement (
 
   it("places the inline overlay over the text object's screen bbox (worldToScreen)", () => {
     // A 180x80 text rect anchored so its top-left lands at world (100, 200).
-    const text = buildPrimitiveObject("text", { x: 100 + 90, y: 200 + 40 }, "note-1", "a0");
+    const text = core.buildPrimitive("text", { x: 100 + 90, y: 200 + 40 }, "note-1", "a0");
     const rect = textOverlayScreenRect(text, { x: 50, y: 30, zoom: 2 });
     expect(rect).not.toBeNull();
     expect(rect?.x).toBeCloseTo(100 * 2 + 50);

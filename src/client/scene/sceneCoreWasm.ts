@@ -13,6 +13,8 @@
 // are NOT thrown: they ride in the `errors: string[]` field of the result.
 
 import type { Anchor, Object as SceneObject, ObjectOp, ObjectScene, Transform3x3 } from "../../shared/object";
+import type { DragSpan } from "../lib/objectPrimitives";
+import type { PrimitiveKindId } from "../lib/toolbar";
 
 /**
  * Tier-2 `move_ops` roots: a single dragged object, or a multi-select set. The
@@ -111,6 +113,25 @@ type SceneCoreModule = {
     id: string,
     order: string
   ) => string;
+  build_primitive: (
+    kind: string,
+    anchorX: number,
+    anchorY: number,
+    color: string,
+    id: string,
+    order: string
+  ) => string;
+  build_primitive_from_drag: (
+    kind: string,
+    startX: number,
+    startY: number,
+    endX: number,
+    endY: number,
+    color: string,
+    id: string,
+    order: string
+  ) => string;
+  build_set_style_op: (objectJson: string, color: string) => string;
   split_subpath_at: (geometryJson: string, x: number, y: number, radius: number) => string;
   anchor_follow_ops: (sceneJson: string, transformOpsJson: string) => string;
   move_ops: (sceneJson: string, rootsJson: string, deltaJson: string) => string;
@@ -196,6 +217,31 @@ export type SceneCore = {
     id: string,
     order: string
   ): SceneObject;
+  /** Tier-3: build a basic primitive (rectangle/ellipse/line/text/frame) centered
+   *  on a world anchor, in `color` (omit for the kind default — may be a hex or the
+   *  theme-default sentinel). The geometry is object-local; the world position rides
+   *  a translate (P4). The shell sends the result as an `insert-object` op. */
+  buildPrimitive(
+    kind: PrimitiveKindId,
+    anchor: { x: number; y: number },
+    id: string,
+    order: string,
+    color?: string
+  ): SceneObject;
+  /** Tier-3: build a primitive sized to a drag `span` — closed kinds to the
+   *  normalized bbox, the line corner-to-corner. Same color rules as
+   *  {@link buildPrimitive}. */
+  buildPrimitiveFromDrag(
+    kind: PrimitiveKindId,
+    span: DragSpan,
+    id: string,
+    order: string,
+    color?: string
+  ): SceneObject;
+  /** Tier-3: author a `set-style` op recoloring `object` to `color` (hex or the
+   *  theme-default sentinel). Recolors only existing style fields; a borderless
+   *  object gains a fill. The shell authors the op through the same op-apply path. */
+  buildSetStyleOp(object: SceneObject, color: string): ObjectOp;
   /** W2-08: partial erase — cut a stroke's geometry at an object-local quantized
    *  touch point + radius. Returns the new geometry (two open subpaths around the
    *  removed node), or null when the touch missed every node (nothing to cut). */
@@ -352,6 +398,33 @@ export async function loadSceneCore(): Promise<SceneCore> {
           id,
           order
         )
+      );
+    },
+    buildPrimitive(kind, anchor, id, order, color) {
+      return parseBridge<SceneObject>(
+        "build_primitive",
+        mod.build_primitive(kind, anchor.x, anchor.y, color ?? "", id, order)
+      );
+    },
+    buildPrimitiveFromDrag(kind, span, id, order, color) {
+      return parseBridge<SceneObject>(
+        "build_primitive_from_drag",
+        mod.build_primitive_from_drag(
+          kind,
+          span.start.x,
+          span.start.y,
+          span.end.x,
+          span.end.y,
+          color ?? "",
+          id,
+          order
+        )
+      );
+    },
+    buildSetStyleOp(object, color) {
+      return parseBridge<ObjectOp>(
+        "build_set_style_op",
+        mod.build_set_style_op(JSON.stringify(object), color)
       );
     },
     splitSubpathAt(geometry, x, y, radius) {

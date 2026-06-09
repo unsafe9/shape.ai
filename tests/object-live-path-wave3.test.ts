@@ -30,12 +30,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { objectSceneToRenderObjectScene } from "../src/client/lib/canvasHost";
-import {
-  buildPrimitiveObject,
-  buildPrimitiveObjectFromDrag,
-  buildSetStyleOp,
-  type DragSpan
-} from "../src/client/lib/objectPrimitives";
+import { type DragSpan } from "../src/client/lib/objectPrimitives";
 import { applyDocumentTheme } from "../src/client/renderer/scene";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
 import {
@@ -132,18 +127,18 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     // (B) color apply — a new shape carries the toolbar's selected color into BOTH
     // fill and stroke through the real insert path.
     const SELECTED = "#abcdef";
-    const rect = buildPrimitiveObject("rectangle", { x: 100, y: 100 }, "rect-1", "a0", SELECTED);
+    const rect = core.buildPrimitive("rectangle", { x: 100, y: 100 }, "rect-1", "a0", SELECTED);
     expect(rect.fill?.paint).toEqual({ kind: "solid", color: SELECTED });
     shell.author({ kind: "insert-object", object: rect });
     expect(shell.byId("rect-1")?.fill?.paint).toEqual({ kind: "solid", color: SELECTED });
 
-    const ellipse = buildPrimitiveObject("ellipse", { x: 400, y: 100 }, "ell-1", "a1", SELECTED);
+    const ellipse = core.buildPrimitive("ellipse", { x: 400, y: 100 }, "ell-1", "a1", SELECTED);
     shell.author({ kind: "insert-object", object: ellipse });
 
     // (B cont.) recolor a selected object: buildSetStyleOp authors a set-style the
     // core applies; the inverse restores the old paint (undoable recolor).
     const RECOLOR = "#123456";
-    shell.author(buildSetStyleOp(shell.byId("rect-1")!, RECOLOR));
+    shell.author(core.buildSetStyleOp(shell.byId("rect-1")!, RECOLOR));
     expect(shell.byId("rect-1")?.fill?.paint).toEqual({ kind: "solid", color: RECOLOR });
     shell.undo();
     expect(shell.byId("rect-1")?.fill?.paint).toEqual({ kind: "solid", color: SELECTED });
@@ -205,7 +200,7 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
 
     // (E) live text renders geometry: a borderless text primitive takes a set-text
     // op; the projected feed carries the runs the renderer shapes into glyph quads.
-    const note = buildPrimitiveObject("text", { x: 700, y: 100 }, "note-1", "a3");
+    const note = core.buildPrimitive("text", { x: 700, y: 100 }, "note-1", "a3");
     expect(note.text).toBeUndefined(); // borderless, style-less, no default text
     shell.author({ kind: "insert-object", object: note });
     shell.author({ kind: "set-text", id: "note-1", text: { runs: [{ text: "Live" }] } });
@@ -235,7 +230,7 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     const tx = target.transform?.[0][2] ?? 0;
     const ty = target.transform?.[1][2] ?? 0;
     const span: DragSpan = { start: { x: tx - 120, y: ty }, end: { x: tx, y: ty } };
-    const edge = buildPrimitiveObjectFromDrag("line", span, "edge-1", "a4");
+    const edge = core.buildPrimitiveFromDrag("line", span, "edge-1", "a4");
     const anchors = core.synthesizeCreateAnchors(edge, target, span.end);
     expect(anchors).not.toBeNull();
     expect(anchors![0].target).toBe("ell-1");
