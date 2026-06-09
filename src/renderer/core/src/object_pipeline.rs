@@ -753,11 +753,12 @@ pub struct ObjectDraw {
 const SHADOW_TOKEN: &str = "shadow";
 
 /// W3-G8/A drop-shadow constants (object-local px). The shadow is a SINGLE offset
-/// silhouette copy of the object's OWN fill, dropped down by [`SHADOW_OFFSET_PX`].
+/// silhouette copy of the object's OWN fill, offset by [`SHADOW_OFFSET_PX`] in y.
 /// Softness no longer comes from stacked tiers — the offscreen separable-Gaussian
-/// blur pass (see [`crate::shadow_blur`]) provides the uniform feather. The small
-/// offset gives the macOS-style slight downward drop while staying near-symmetric.
-const SHADOW_OFFSET_PX: f32 = 2.0;
+/// blur pass (see [`crate::shadow_blur`]) provides the uniform feather. W3-G9/#1:
+/// the offset is 0 so the halo is fully symmetric on ALL sides (macOS ambient
+/// look) — the wide quarter-res blur owns the soft spread, no downward bias.
+const SHADOW_OFFSET_PX: f32 = 0.0;
 
 /// Owns the CPU-built object draw data and the GPU buffers it uploads to, and
 /// records the object render pass.
@@ -3088,6 +3089,31 @@ mod tests {
         );
     }
 
+    /// W3-G9/#1: the drop offset is 0, so the shadow silhouette is a PERFECT
+    /// (untranslated) copy of the fill mesh — no downward bias. The wide quarter-res
+    /// blur owns the soft halo, which is symmetric on all sides only because the
+    /// silhouette is centered. FAILS if `SHADOW_OFFSET_PX` regresses to a non-zero
+    /// drop (the old +2px bottom-bias), which would push every shadow vertex in +y.
+    #[test]
+    fn shadow_offset_is_zero_so_silhouette_is_symmetric() {
+        assert_eq!(SHADOW_OFFSET_PX, 0.0, "shadow drop offset is removed (all-sides symmetric)");
+
+        let scene = scene_with(vec![rect_object("o1")], None);
+        let geo = build_scene_geometry(&scene);
+
+        let subpaths = flatten_object_subpaths(&scene.objects[0], scene.camera.zoom);
+        let fill_input: Vec<(bool, Vec<(f32, f32)>)> =
+            subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();
+        let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
+
+        // Every shadow vertex equals its fill-mesh source with NO y-offset (the emit
+        // is `p[1] + SHADOW_OFFSET_PX`, now `+0`): zero down-bias, fully symmetric.
+        for (sv, &idx) in geo.shadow_vertices.iter().zip(mesh.indices.iter()) {
+            let src = mesh.vertices[idx as usize];
+            assert_eq!(sv.position, src, "shadow vertex is untranslated (offset 0)");
+        }
+    }
+
     /// CONCAVE shape (an arrowhead with a reflex vertex): the shadow is the EXACT
     /// silhouette of the object's own fill triangulation (no centroid fan, no
     /// per-edge feather ring), translated by the drop offset. FAILS on the old
@@ -3262,8 +3288,8 @@ mod tests {
         };
         let full = paint_color(&shadow, 1.0, Theme::light());
         let half = paint_color(&shadow, 0.5, Theme::light());
-        // shadow light = 00000040 -> alpha 0x40/255.
-        let base_a = 0x40 as f32 / 255.0;
+        // shadow light = 00000055 -> alpha 0x55/255.
+        let base_a = 0x55 as f32 / 255.0;
         assert!((full[3] - base_a).abs() < 1e-6);
         assert!((half[3] - base_a * 0.5).abs() < 1e-6);
     }

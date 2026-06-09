@@ -88,7 +88,7 @@ impl ThemeToken {
             (ThemeToken::Text, false) => [0x1d, 0x1d, 0x1f, 0xff],
             (ThemeToken::Text, true) => [0xf5, 0xf5, 0xf7, 0xff],
 
-            (ThemeToken::Shadow, false) => [0x00, 0x00, 0x00, 0x40],
+            (ThemeToken::Shadow, false) => [0x00, 0x00, 0x00, 0x55],
             (ThemeToken::Shadow, true) => [0xff, 0xff, 0xff, 0x33],
 
             (ThemeToken::SelectionRing, false) => [0x00, 0x7a, 0xff, 0xff],
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(resolve_token("default-stroke", true), Some([0x54, 0x54, 0x56, 0xff]));
         assert_eq!(resolve_token("text", false), Some([0x1d, 0x1d, 0x1f, 0xff]));
         assert_eq!(resolve_token("text", true), Some([0xf5, 0xf5, 0xf7, 0xff]));
-        assert_eq!(resolve_token("shadow", false), Some([0x00, 0x00, 0x00, 0x40]));
+        assert_eq!(resolve_token("shadow", false), Some([0x00, 0x00, 0x00, 0x55]));
         assert_eq!(resolve_token("shadow", true), Some([0xff, 0xff, 0xff, 0x33]));
         assert_eq!(resolve_token("selection-ring", false), Some([0x00, 0x7a, 0xff, 0xff]));
         assert_eq!(resolve_token("selection-ring", true), Some([0x0a, 0x84, 0xff, 0xff]));
