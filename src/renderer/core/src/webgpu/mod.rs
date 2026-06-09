@@ -368,6 +368,12 @@ pub struct ShapeWebGpuRenderer {
     // None the legacy 2D path stays authoritative.
     object_scene: Option<RenderObjectScene>,
     object_regions: Vec<ObjectRegion>,
+    // W3-G9/#5: the move-together propagation graph (parent->child SameDelta +
+    // target->follower Reproject), built ONCE per `load_object_scene` from the
+    // parsed scene and held here so a per-drag preview is O(closure), never
+    // O(scene). Pure/derived from `object_scene`, so it is rebuilt (not rolled back)
+    // whenever the scene is restored.
+    object_bindings: crate::transform_bindings::Bindings,
     // W3-G6/#3: the persisted light/dark theme bit. The live theme is owned by the
     // per-scene `ObjectRenderer` (`self.theme`), which is destroyed and rebuilt on
     // every `load_object_scene` re-feed (pan/move/create), so the dark bit would be

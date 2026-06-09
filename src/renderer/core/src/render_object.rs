@@ -50,10 +50,34 @@ pub struct RenderObject {
     pub stroke: Option<RStroke>,
     #[serde(default)]
     pub text: Option<RText>,
+    /// Per-node attachments (D5): each binds one of this object's geometry nodes to
+    /// a `target` object. W3-G9/#5: the bindings graph inverts these into Reproject
+    /// edges (target -> this follower) so a moved target reprojects its followers.
+    #[serde(default)]
+    pub anchors: Vec<RAnchor>,
     /// Figma-style clip flag (D18). When true, children render clipped to this
     /// object's region/bounds.
     #[serde(default)]
     pub clip: bool,
+}
+
+/// A per-node attachment (D5): node `node_index` of the owning object is bound to
+/// `target` at the target-local point `at`. Mirrors the shell `Anchor` wire shape
+/// (`{ nodeIndex, target, at: { x, y } }`).
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RAnchor {
+    pub node_index: usize,
+    pub target: String,
+    pub at: RLocalPoint,
+}
+
+/// A target-local attachment point in object-local pixels (D5).
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RLocalPoint {
+    pub x: f64,
+    pub y: f64,
 }
 
 /// Fill paint applied to the derived region, below stroke (D4).
@@ -572,6 +596,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         };
         let resolved = resolve_visual(&obj, VisualState::default());
@@ -612,6 +637,7 @@ mod tests {
                 join: RStrokeJoin::Round,
             }),
             text: None,
+            anchors: Vec::new(),
             clip: false,
         };
         let resolved = resolve_visual(&obj, VisualState::default());
@@ -636,6 +662,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         };
         let selected = resolve_visual(

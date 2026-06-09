@@ -1994,6 +1994,7 @@ mod tests {
                 join: RStrokeJoin::Miter,
             }),
             text: None,
+            anchors: Vec::new(),
             clip: false,
         }
     }
@@ -2103,6 +2104,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         };
 

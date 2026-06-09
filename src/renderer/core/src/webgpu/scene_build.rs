@@ -3809,6 +3809,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         }
     }
@@ -3847,6 +3848,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         }
     }
@@ -3864,6 +3866,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         }
     }
@@ -4292,6 +4295,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         };
         let scene = object_scene(vec![l_shape]);
