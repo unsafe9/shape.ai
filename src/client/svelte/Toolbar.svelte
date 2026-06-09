@@ -36,9 +36,8 @@
     // W2-07: the armed drag-create shape (rect/ellipse/line), or null. Highlights
     // the active shape button while the create tool is armed.
     createKind: DragCreateShape | null;
-    // W2-08: draw-mode brush state the contextual sub-toolbar drives (only shown
-    // while the pen/eraser tool is active). Pure UI chrome — the parent owns state.
-    penColor: string;
+    // W2-08: brush state the Stroke popup drives. Color is owned by the separate
+    // Color control (selectedColor), so the Stroke popup carries width only.
     penWidthPx: number;
     penPalette: string[];
     penWidths: number[];
@@ -59,8 +58,7 @@
     connectionStatus: ConnectionStatus;
     canvasBusy: boolean;
     onSetTool: (tool: ActiveTool) => void;
-    // W2-08: draw-mode sub-toolbar setters.
-    onSetPenColor: (color: string) => void;
+    // W2-08: Stroke popup width setter (color is set via onSelectColor).
     onSetPenWidth: (widthPx: number) => void;
     onSelectColor: (color: string) => void;
     onInsertPrimitive: (kind: PrimitiveKindId) => void;
@@ -81,7 +79,6 @@
   let {
     activeTool,
     createKind,
-    penColor,
     penWidthPx,
     penPalette,
     penWidths,
@@ -96,7 +93,6 @@
     connectionStatus,
     canvasBusy,
     onSetTool,
-    onSetPenColor,
     onSetPenWidth,
     onSelectColor,
     onInsertPrimitive,
@@ -355,20 +351,6 @@
               </button>
             {/each}
           </div>
-        </div>
-        <div class="color-popup-swatches">
-          {#each penPalette as color (color)}
-            <button
-              class="icon-button swatch {penColor === color ? 'is-active' : ''}"
-              type="button"
-              title={swatchLabel(color)}
-              aria-label={`Color ${swatchLabel(color)}`}
-              aria-pressed={penColor === color}
-              onclick={() => onSetPenColor(color)}
-            >
-              <span class="swatch-fill" style={`background:${swatchFill(color)};`}></span>
-            </button>
-          {/each}
         </div>
       </div>
     {/if}

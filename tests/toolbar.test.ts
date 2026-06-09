@@ -235,12 +235,15 @@ describe("toolbar Stroke popup UI (S1 / #4)", () => {
     expect(source).toMatch(/\{#if strokePopupOpen\}/);
   });
 
-  it("the Stroke popup holds the brush size buttons AND the brush color swatches", () => {
-    const popup = source.slice(source.indexOf('aria-label="Stroke settings"'));
+  it("the Stroke popup holds only the brush size buttons (color lives in the separate Color popup)", () => {
+    const strokeStart = source.indexOf('aria-label="Stroke settings"');
+    const colorStart = source.indexOf('class="icon-button color-trigger', strokeStart);
+    const popup = source.slice(strokeStart, colorStart);
     expect(popup).toMatch(/\{#each penWidths as width/);
     expect(popup).toMatch(/onclick=\{\(\)\s*=>\s*onSetPenWidth\(width\)\}/);
-    expect(popup).toMatch(/\{#each penPalette as color/);
-    expect(popup).toMatch(/onclick=\{\(\)\s*=>\s*onSetPenColor\(color\)\}/);
+    // The brush color swatches were removed; color is set via the Color popup only.
+    expect(popup).not.toMatch(/color-popup-swatches/);
+    expect(source).not.toMatch(/onSetPenColor/);
   });
 
   it("closes on outside-click and Escape while open (its own effect)", () => {

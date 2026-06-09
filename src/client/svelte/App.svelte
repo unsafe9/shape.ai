@@ -92,9 +92,6 @@
   // drives (color + width); epsilon (RDP simplification) stays a constant. The
   // freehand commit + the live preview both read the current brush.
   const PEN_EPSILON = 2.0;
-  // S2 (#5): default to the theme-default sentinel so new strokes follow the theme
-  // (authored as a Paint::Token "text" that flips black-ish<->white-ish per theme).
-  let penColor = $state(THEME_DEFAULT_COLOR);
   let penWidthPx = $state(2);
   // D1/#5: the toolbar's always-visible selected color. It is the default fill/
   // stroke for the next NEW shape; recoloring a selected object authors a SetStyle
@@ -799,9 +796,10 @@
     // S2 (#5): freehandToObject is a hex API, so the theme-default sentinel can't be
     // passed through it — lower with a placeholder hex, then swap the stroke paint to
     // the "text" token so the stroke flips with the theme like every other authored color.
-    const strokeHex = penColor === THEME_DEFAULT_COLOR ? "#000000" : penColor;
+    // The pen draws with the single toolbar color (selectedColor); there is no separate pen color.
+    const strokeHex = selectedColor === THEME_DEFAULT_COLOR ? "#000000" : selectedColor;
     const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, PEN_EPSILON, freshId("draw"), nextOrderKey());
-    if (penColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = paintForColor(penColor);
+    if (selectedColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = paintForColor(selectedColor);
     authorOp({ kind: "insert-object", object });
     // Request 6: select the freshly-drawn stroke after creating it. The pen tool
     // stays sticky in "draw" so the next stroke draws immediately.
@@ -1553,7 +1551,7 @@
       id: "draw-preview",
       order: nextOrderKey(),
       geometry: { d },
-      stroke: { paint: paintForColor(penColor), width: penWidthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
+      stroke: { paint: paintForColor(selectedColor), width: penWidthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
     };
   }
 
@@ -1657,7 +1655,6 @@
         <Toolbar
           {activeTool}
           {createKind}
-          {penColor}
           {penWidthPx}
           penPalette={PEN_PALETTE}
           penWidths={PEN_WIDTHS}
@@ -1672,7 +1669,6 @@
           {connectionStatus}
           {canvasBusy}
           onSetTool={setActiveTool}
-          onSetPenColor={(color) => (penColor = color)}
           onSetPenWidth={(width) => (penWidthPx = width)}
           onSelectColor={applySelectedColor}
           onInsertPrimitive={insertPrimitive}
