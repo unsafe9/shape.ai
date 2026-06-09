@@ -507,6 +507,25 @@ mod tests {
         assert_eq!(geometry.path_string, "M 0 0 L -664 224");
     }
 
+    /// WIRE-CASING PIN (cross-core). The shell forwards each object's `anchors` to
+    /// the renderer VERBATIM (`canvasHost.ts`), so the renderer's `RAnchor` serde
+    /// (camelCase `nodeIndex`) only round-trips if scene-core EMITS that casing. A
+    /// `rename_all` regression to snake_case would silently drop `anchors` at the
+    /// renderer parse and kill live follow with no host-test failure anywhere. This
+    /// pins the emitted wire shape; its renderer twin
+    /// (`anchored_follower_survives_wire_serde_round_trip`) pins the parse of it.
+    #[test]
+    fn anchor_serializes_with_camelcase_wire_keys() {
+        let mut follower = Object::new("f", "a0", polyline("M 0 0 L 64 0"));
+        follower.anchors =
+            vec![Anchor { node_index: 1, target: "t".into(), at: LocalPoint { x: 16, y: 8 } }];
+        let json = serde_json::to_string(&follower).expect("object serializes to wire JSON");
+        assert!(json.contains("\"nodeIndex\":1"), "anchor must wire as camelCase nodeIndex: {json}");
+        assert!(json.contains("\"target\":\"t\""), "anchor target must wire: {json}");
+        assert!(json.contains("\"at\":{\"x\":16,\"y\":8}"), "anchor `at` must wire {{x,y}}: {json}");
+        assert!(!json.contains("node_index"), "snake_case node_index would be dropped: {json}");
+    }
+
     /// A `set-path-node` no-op (the new coords already match) authors nothing, so
     /// the commit path skips a pointless edit-geometry — matching the shell.
     #[test]

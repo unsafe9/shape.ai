@@ -1808,4 +1808,153 @@ mod tests {
         assert_eq!(ids, vec!["a", "b"]);
         assert!(!ids.iter().any(|id| id == "z"));
     }
+
+    fn translate(tx: f64, ty: f64) -> [[f64; 3]; 3] {
+        [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]]
+    }
+
+    fn anchored_object(
+        id: &str,
+        parent: Option<&str>,
+        transform: [[f64; 3]; 3],
+        geometry_d: &str,
+        anchors: Vec<crate::render_object::RAnchor>,
+    ) -> RenderObject {
+        RenderObject {
+            id: id.to_string(),
+            parent: parent.map(str::to_string),
+            order: "a0".to_string(),
+            transform,
+            geometry_d: geometry_d.to_string(),
+            fill: None,
+            stroke: None,
+            text: None,
+            anchors,
+            clip: false,
+        }
+    }
+
+    /// CROSS-CORE BINDING-GRAPH GUARD. Proves the renderer live-preview CLOSURE half
+    /// (`preview_reproject_followers` + `preview_write_set`) drives the SAME pinned
+    /// numeric vector scene-core's `anchor_follow::tests::reproject_matches_cross_core_vector`
+    /// pins (`"M 0 0 L -664 224"`), closing the gap between "the math matches" and
+    /// "the closure actually routes the follower to that math". Renderer-only:
+    /// scene-core is intentionally absent from this standalone crate, so equivalence
+    /// is asserted against the same hand-computed vector pinned in BOTH cores.
+    #[cfg(feature = "wgpu-probe")]
+    #[test]
+    fn anchor_follower_closure_agrees_with_scene_core_vector() {
+        use super::preview_reproject_followers;
+        use crate::render_object::{RAnchor, RLocalPoint};
+        use crate::transform_bindings::{reproject_node_local_px, rewrite_geometry_node};
+
+        // Target A (the dragged object) and follower B anchored to A. Numbers reuse
+        // the pinned cross-core vector so the closure result is hand-checkable.
+        let a = anchored_object(
+            "a",
+            None,
+            translate(10.0, 20.0),
+            "M 0 0 L 8 0 L 8 8 L 0 8 Z",
+            Vec::new(),
+        );
+        let b = anchored_object(
+            "b",
+            None,
+            translate(100.0, 0.0),
+            "M 0 0 L 64 0",
+            vec![RAnchor {
+                node_index: 1,
+                target: "a".to_string(),
+                at: RLocalPoint { x: 16.0, y: 8.0 },
+            }],
+        );
+        let scene = RenderObjectScene {
+            scene_id: "anchor-follow".to_string(),
+            camera: CameraState {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+            objects: vec![a, b],
+            selection: None,
+            multi_select: Vec::new(),
+        };
+        let bindings = Bindings::build(&scene);
+        let delta = translate(5.0, 7.0);
+
+        // (1) The closure returns the follower paired with its target: B follows A.
+        let followers = preview_reproject_followers(&scene, &bindings, "a");
+        assert_eq!(followers, vec![("b".to_string(), "a".to_string())]);
+
+        // (2) GROUP/multiselect SameDelta moves a child of A but NOT the follower B.
+        let mut scene2 = scene.clone();
+        scene2.objects.push(anchored_object(
+            "c",
+            Some("a"),
+            translate(3.0, 3.0),
+            "M 0 0 L 8 0 L 8 8 L 0 8 Z",
+            Vec::new(),
+        ));
+        let bindings2 = Bindings::build(&scene2);
+        let write_set = preview_write_set(&scene2, &bindings2, "a");
+        let ids: Vec<&str> = write_set.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+        assert!(!ids.iter().any(|id| *id == "b"));
+
+        // (3) Reprojected follower geometry equals the scene-core pinned vector.
+        let a_base = scene.objects.iter().find(|o| o.id == "a").unwrap().transform;
+        let b = scene.objects.iter().find(|o| o.id == "b").unwrap();
+        let anchor = &b.anchors[0];
+        let (lx, ly) =
+            reproject_node_local_px(&b.transform, &a_base, &delta, anchor).expect("non-singular");
+        assert!((lx - (-83.0)).abs() < 1e-9 && (ly - 28.0).abs() < 1e-9, "px ({lx},{ly})");
+        let d = rewrite_geometry_node(&b.geometry_d, anchor.node_index, lx, ly)
+            .expect("addressable, changed");
+        assert_eq!(d, "M 0 0 L -664 224");
+    }
+
+    /// PRODUCTION WIRE-SERDE GUARD. The closure guard above builds `RenderObject`
+    /// structs directly, BYPASSING serde. Production (`scene_feed.rs` load path,
+    /// line ~109) instead PARSES the wire JSON the shell sends
+    /// (`objectSceneToRenderObjectScene` -> camelCase `nodeIndex`/`geometryD`/
+    /// `multiSelect`) and builds the bindings from THAT. A silent serde field
+    /// mismatch would drop `anchors` -> empty reproject graph -> no live follow,
+    /// invisible to the struct-based guard. This parses the EXACT wire shape, then
+    /// asserts the anchor survived and the bindings still route the follower. Its
+    /// scene-core twin (`anchor_serializes_with_camelcase_wire_keys`) pins that
+    /// scene-core EMITS this casing, so the two cores meet on one wire.
+    #[cfg(feature = "wgpu-probe")]
+    #[test]
+    fn anchored_follower_survives_wire_serde_round_trip() {
+        use super::preview_reproject_followers;
+        // The exact camelCase wire an anchored line B (node 1 bound to target A)
+        // produces via the shell projection.
+        let wire = r#"{
+          "sceneId": "anchor-follow",
+          "camera": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+          "objects": [
+            { "id": "a", "order": "a0",
+              "transform": [[1,0,10],[0,1,20],[0,0,1]],
+              "geometryD": "M 0 0 L 8 0 L 8 8 L 0 8 Z", "anchors": [] },
+            { "id": "b", "order": "a1",
+              "transform": [[1,0,100],[0,1,0],[0,0,1]],
+              "geometryD": "M 0 0 L 64 0",
+              "anchors": [ { "nodeIndex": 1, "target": "a", "at": { "x": 16.0, "y": 8.0 } } ] }
+          ],
+          "multiSelect": []
+        }"#;
+        let scene: RenderObjectScene =
+            serde_json::from_str(wire).expect("wire parses into RenderObjectScene");
+        // The anchor SURVIVED the parse — the silent-drop check that the struct guard
+        // cannot make (a serde key mismatch would leave this empty).
+        let b = scene.objects.iter().find(|o| o.id == "b").expect("b present");
+        assert_eq!(b.anchors.len(), 1, "serde dropped `anchors` => empty reproject graph");
+        assert_eq!(b.anchors[0].node_index, 1);
+        assert_eq!(b.anchors[0].target, "a");
+        // Bindings built from the PARSED scene (the scene_feed.rs:109 production path)
+        // route B to follow A.
+        let bindings = Bindings::build(&scene);
+        let followers = preview_reproject_followers(&scene, &bindings, "a");
+        assert_eq!(followers, vec![("b".to_string(), "a".to_string())]);
+    }
 }
