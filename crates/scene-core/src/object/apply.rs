@@ -150,14 +150,23 @@ fn apply_inner(scene: &mut ObjectScene, op: ObjectOp) -> Result<ObjectOp, ApplyE
         }
 
         ObjectOp::SetAnchor { id, anchors } => {
-            for a in &anchors {
-                if !scene.objects.iter().any(|o| o.id == a.target) {
-                    return Err(ApplyError::MissingAnchorTarget(a.target.clone()));
-                }
-            }
-            let idx = index_of(scene, &id)?;
+            // Anchors are a relational overlay over a windowed/collaborative scene,
+            // so SetAnchor degrades gracefully when an endpoint has diverged out of
+            // the local scene (windowed load, applyRemote echo, off-viewport) — this
+            // op exists only as the Delete-inverse peer restore, never authored
+            // forward with a missing endpoint. Missing OWNER => no-op with a no-op
+            // inverse (the InsertObject sibling in a Delete-inverse Batch must still
+            // commit). Missing TARGET => filter that anchor (cannot anchor to a
+            // ghost), keeping the ones whose target is present.
+            let Ok(idx) = index_of(scene, &id) else {
+                return Ok(ObjectOp::Batch { ops: Vec::new() });
+            };
+            let kept: Vec<Anchor> = anchors
+                .into_iter()
+                .filter(|a| scene.objects.iter().any(|o| o.id == a.target))
+                .collect();
             let old: Vec<Anchor> = scene.objects[idx].anchors.clone();
-            scene.objects[idx].anchors = anchors;
+            scene.objects[idx].anchors = kept;
             Ok(ObjectOp::SetAnchor { id, anchors: old })
         }
 
@@ -1117,5 +1126,140 @@ mod tests {
         .expect("tags seq 3");
         assert_eq!(scene.get("o").unwrap().tags, vec!["t1".to_string()]);
         assert_eq!(scene.get("o").unwrap().transform, Transform3x3::translate(10.0, 0.0));
+    }
+
+    // ---- SetAnchor degrades gracefully over a windowed/divergent scene -------
+
+    /// An object carrying a single anchor whose `target` is `target`.
+    fn anchored_obj(id: &str, order: &str, target: &str) -> Object {
+        let mut o = multi_obj(id, order, vec![rect(0, 0, 10, 10)]);
+        o.anchors = vec![Anchor { node_index: 0, target: target.into(), at: LocalPoint { x: 0, y: 0 } }];
+        o
+    }
+
+    #[test]
+    fn multidelete_undo_restores_object_when_peer_diverged() {
+        // The data-loss bug: seed A + B(anchor->A). `delete A` captures a Batch
+        // inverse [insert A, set-anchor B [target A]]. If B has since diverged out
+        // of the windowed/optimistic client scene, applying that inverse must STILL
+        // restore A — the set-anchor B restore no-ops (owner B absent) instead of
+        // throwing NotFound and discarding the InsertObject sibling.
+        let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
+        let b = anchored_obj("B", "a1", "A");
+        let mut scene = scene_of(vec![a, b]);
+
+        let inverse = apply_object_op(&mut scene, ObjectOp::Delete { id: "A".into() })
+            .expect("delete A");
+        // The inverse is the Batch[insert A, set-anchor B] described above.
+        assert!(matches!(inverse, ObjectOp::Batch { .. }));
+        assert!(scene.get("A").is_none());
+
+        // Simulate divergence: B is gone from this windowed scene.
+        scene.objects.retain(|o| o.id != "B");
+        assert!(scene.get("B").is_none());
+
+        // Apply the captured inverse: A is restored, no error, B-restore no-ops.
+        apply_object_op(&mut scene, inverse).expect("undo must not fail when peer absent");
+        assert!(scene.get("A").is_some(), "A restored despite absent peer B");
+    }
+
+    #[test]
+    fn set_anchor_filters_absent_targets() {
+        // Owner present; anchor list has one present (A) + one absent (ghost)
+        // target -> only the present anchor is set (filtered, not failed).
+        let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
+        let edge = multi_obj("edge", "a1", vec![rect(0, 0, 5, 5)]);
+        let mut scene = scene_of(vec![a, edge]);
+
+        let inverse = apply_object_op(
+            &mut scene,
+            ObjectOp::SetAnchor {
+                id: "edge".into(),
+                anchors: vec![
+                    Anchor { node_index: 0, target: "A".into(), at: LocalPoint { x: 0, y: 0 } },
+                    Anchor { node_index: 1, target: "ghost".into(), at: LocalPoint { x: 0, y: 0 } },
+                ],
+            },
+        )
+        .expect("set-anchor with a ghost target must not fail");
+
+        let anchors = &scene.get("edge").unwrap().anchors;
+        assert_eq!(anchors.len(), 1, "ghost-target anchor filtered out");
+        assert_eq!(anchors[0].target, "A");
+        // Inverse restores the prior (empty) anchor list exactly.
+        apply_object_op(&mut scene, inverse).expect("apply inverse");
+        assert!(scene.get("edge").unwrap().anchors.is_empty());
+    }
+
+    #[test]
+    fn set_anchor_absent_owner_is_noop_with_noop_inverse() {
+        // Owner object id is absent -> Ok, scene unchanged, no-op (empty Batch)
+        // inverse so a Delete-inverse Batch sibling still commits.
+        let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
+        let mut scene = scene_of(vec![a]);
+        let before = scene.clone();
+
+        let inverse = apply_object_op(
+            &mut scene,
+            ObjectOp::SetAnchor {
+                id: "ghost-owner".into(),
+                anchors: vec![Anchor { node_index: 0, target: "A".into(), at: LocalPoint { x: 0, y: 0 } }],
+            },
+        )
+        .expect("set-anchor on absent owner must not fail");
+
+        assert_eq!(inverse, ObjectOp::Batch { ops: Vec::new() }, "no-op inverse");
+        assert_eq!(scene.objects, before.objects, "scene unchanged");
+    }
+
+    #[test]
+    fn set_anchor_normal_set_round_trips() {
+        // Owner present, target present: a real set. apply-then-apply-inverse
+        // restores the prior anchors exactly.
+        let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
+        let edge = anchored_obj("edge", "a1", "A");
+        let mut scene = scene_of(vec![a, edge]);
+        let before = scene.clone();
+
+        // Replace edge's anchor with a different (still-present) target binding.
+        let b = multi_obj("B", "a2", vec![rect(20, 0, 30, 10)]);
+        scene.objects.push(b);
+        let new_anchors = vec![Anchor { node_index: 0, target: "B".into(), at: LocalPoint { x: 20, y: 0 } }];
+        let inverse = apply_object_op(
+            &mut scene,
+            ObjectOp::SetAnchor { id: "edge".into(), anchors: new_anchors.clone() },
+        )
+        .expect("set-anchor");
+        assert_eq!(scene.get("edge").unwrap().anchors, new_anchors);
+
+        // Inverse restores the original (target-A) anchor exactly.
+        apply_object_op(&mut scene, inverse).expect("apply inverse");
+        assert_eq!(scene.get("edge").unwrap().anchors, before.get("edge").unwrap().anchors);
+    }
+
+    #[test]
+    fn set_anchor_filtered_set_round_trips() {
+        // Filtered set (one present + one absent target) round-trips: the inverse
+        // restores whatever the filtered write replaced.
+        let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
+        let edge = anchored_obj("edge", "a1", "A"); // starts anchored to A
+        let mut scene = scene_of(vec![a, edge]);
+        let before = scene.clone();
+
+        let inverse = apply_object_op(
+            &mut scene,
+            ObjectOp::SetAnchor {
+                id: "edge".into(),
+                anchors: vec![
+                    Anchor { node_index: 0, target: "A".into(), at: LocalPoint { x: 1, y: 1 } },
+                    Anchor { node_index: 1, target: "ghost".into(), at: LocalPoint { x: 0, y: 0 } },
+                ],
+            },
+        )
+        .expect("filtered set");
+        assert_eq!(scene.get("edge").unwrap().anchors.len(), 1);
+
+        apply_object_op(&mut scene, inverse).expect("apply inverse");
+        assert_eq!(scene.get("edge").unwrap().anchors, before.get("edge").unwrap().anchors);
     }
 }
