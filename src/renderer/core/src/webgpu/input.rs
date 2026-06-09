@@ -286,6 +286,12 @@ impl ShapeWebGpuRenderer {
         self.multi_select = state.multi_select;
         self.last_hit = state.last_hit;
         self.object_scene = state.object_scene;
+        // W3-G9/#5: the bindings graph is derived from `object_scene`; rebuild it from
+        // the restored scene so a rolled-back input batch leaves a consistent graph.
+        self.object_bindings = match &self.object_scene {
+            Some(scene) => crate::transform_bindings::Bindings::build(scene),
+            None => crate::transform_bindings::Bindings::default(),
+        };
         self.text_layout_cache = state.text_layout_cache.clone();
         self.rebuild_vertex_buffer();
         self.text_layout_cache = state.text_layout_cache;

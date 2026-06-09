@@ -414,6 +414,7 @@ impl ShapeWebGpuRenderer {
             object_renderer: None,
             object_scene: None,
             object_regions: Vec::new(),
+            object_bindings: crate::transform_bindings::Bindings::default(),
             object_theme: crate::object_theme::Theme::light(),
             shadow_blur,
         };

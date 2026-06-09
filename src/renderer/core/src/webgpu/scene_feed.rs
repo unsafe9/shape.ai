@@ -100,6 +100,13 @@ impl ShapeWebGpuRenderer {
         // FC-04: derive + retain each object's local-space region for hit-test /
         // marquee, then keep the parsed scene as the live-object branch switch.
         self.object_regions = derive_object_regions(&scene);
+        // W3-G9/#2: the wire now carries `multiSelect`; mirror it onto the renderer
+        // so a later object re-feed (which throws away the per-scene renderer) keeps
+        // the highlight set, matching how the legacy `load_scene` retains it.
+        self.multi_select = scene.multi_select.clone();
+        // W3-G9/#5: precompute the move-together propagation graph ONCE per feed so
+        // each drag preview is O(closure), not O(scene).
+        self.object_bindings = crate::transform_bindings::Bindings::build(&scene);
         self.object_scene = Some(scene);
         self.object_renderer = Some(renderer);
         serde_wasm(counts)
@@ -116,19 +123,20 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
-    /// W2-11 drag zero-rebake: push ONLY the dragged object's instance model matrix
-    /// to the GPU. `matrix_json` is a row-major `[[f64;3];3]` CUMULATIVE world-space
-    /// DELTA (the same contract as `ObjectTransformDelta.matrix`). The canonical
-    /// `object_scene` / `object_regions` are NOT mutated — the base transform is read
-    /// from the untouched scene and `delta * base` is written straight to the
-    /// instance buffer (no re-tessellation, no region re-derive). The RAF
-    /// `render_frame` loop then draws from the updated instance buffer on the next
-    /// tick, so no explicit redraw is needed. No-op if the object scene is unloaded
-    /// or the id is absent.
+    /// W2-11 drag zero-rebake: push ONLY the affected objects' instance model
+    /// matrices to the GPU. `matrix_json` is a row-major `[[f64;3];3]` CUMULATIVE
+    /// world-space DELTA (the same contract as `ObjectTransformDelta.matrix`). The
+    /// canonical `object_scene` / `object_regions` are NOT mutated — each affected
+    /// object's base transform is read from the untouched scene and `delta * base` is
+    /// written straight to its instance buffer (no re-tessellation, no region
+    /// re-derive). The RAF `render_frame` loop then draws from the updated instance
+    /// buffer on the next tick, so no explicit redraw is needed. No-op if the object
+    /// scene is unloaded or the id is absent.
     ///
-    /// W3-G8/B: when `id` is part of the canonical `multi_select` set, the SAME world
-    /// delta is applied to EVERY member (each against its own base), so the whole
-    /// selection previews together during a group drag.
+    /// W3-G9/#5: the affected set is the SameDelta closure of the bindings graph —
+    /// the dragged id (or, if it is a `multi_select` member, every member) plus their
+    /// children/descendants — so group children and multi members move LIVE during
+    /// the drag, each against its own base. O(closure) instance writes, zero rebake.
     #[wasm_bindgen(js_name = setObjectPreviewTransform)]
     pub fn set_object_preview_transform(
         &mut self,
@@ -140,75 +148,180 @@ impl ShapeWebGpuRenderer {
         let Some(scene) = self.object_scene.as_ref() else {
             return Ok(());
         };
-        let targets = preview_target_ids(scene, id);
-        let bases: Vec<(String, [[f64; 3]; 3])> = targets
-            .into_iter()
-            .filter_map(|target| {
-                scene
-                    .objects
-                    .iter()
-                    .find(|o| o.id == target)
-                    .map(|o| (target, o.transform))
-            })
-            .collect();
+        let write_set = preview_write_set(scene, &self.object_bindings, id);
+        // W3-G9/#4: the closure also yields `reproject_followers` — objects whose
+        // anchored geometry must reproject through a moved target LIVE. A follower is
+        // NOT uniformly transformed (one bound node moves, the rest stay), so the
+        // instance-matrix preview above cannot express it; instead each follower's
+        // geometry is rewritten with the reprojected node and re-expanded in place.
+        let followers = preview_reproject_followers(scene, &self.object_bindings, id);
+        let reexpanded = self.reexpand_reprojected_followers(scene, Some(&delta), &followers);
         if let Some(renderer) = self.object_renderer.as_mut() {
-            for (target, base) in &bases {
+            for (target, base) in &write_set {
                 renderer.set_preview_transform(&self.queue, target, &delta, base);
+            }
+            for (follower_id, rebuilt) in &reexpanded {
+                renderer.patch_follower_geometry(&self.queue, follower_id, rebuilt);
             }
         }
         Ok(())
     }
 
-    /// W2-11: revert the dragged object's instance matrix to its canonical baked
-    /// transform (`delta = identity`), dropping the live preview. No-op if the
+    /// W2-11: revert the affected objects' instance matrices to their canonical baked
+    /// transforms (`delta = identity`), dropping the live preview. No-op if the
     /// object scene is unloaded or the id is absent.
     ///
-    /// W3-G8/B: symmetric with the multi-member preview — a cancelled/failed group
-    /// drag reverts EVERY member of the `multi_select` set, not just the picked id.
+    /// W3-G9/#5: symmetric with the preview — reverts the SAME SameDelta closure
+    /// (group children + multi members), not just the picked id.
     #[wasm_bindgen(js_name = clearObjectPreview)]
     pub fn clear_object_preview(&mut self, id: &str) -> Result<(), JsValue> {
         let Some(scene) = self.object_scene.as_ref() else {
             return Ok(());
         };
-        let targets = preview_target_ids(scene, id);
-        let bases: Vec<(String, [[f64; 3]; 3])> = targets
-            .into_iter()
-            .filter_map(|target| {
-                scene
-                    .objects
-                    .iter()
-                    .find(|o| o.id == target)
-                    .map(|o| (target, o.transform))
-            })
-            .collect();
+        let write_set = preview_write_set(scene, &self.object_bindings, id);
+        // W3-G9/#4: restore each follower's CANONICAL baked geometry (re-expand from
+        // the untouched scene object) so a cancelled/failed drag reverts the live
+        // reproject too, not just the same-delta instance matrices.
+        let followers = preview_reproject_followers(scene, &self.object_bindings, id);
+        let restored = self.reexpand_reprojected_followers(scene, None, &followers);
         if let Some(renderer) = self.object_renderer.as_mut() {
-            for (target, base) in &bases {
+            for (target, base) in &write_set {
                 renderer.clear_preview_transform(&self.queue, target, base);
+            }
+            for (follower_id, rebuilt) in &restored {
+                renderer.patch_follower_geometry(&self.queue, follower_id, rebuilt);
             }
         }
         Ok(())
     }
 
+    /// W3-G9/#4: re-expand each follower's fill + stroke geometry for an in-place GPU
+    /// patch. With `Some(delta)` (the live preview), every node of the follower
+    /// anchored onto its moved `target` is rewritten to track the target's PREVIEWED
+    /// transform (`delta * target_base`) before the re-expand. With `None` (the
+    /// restore on cancel/commit), the follower's CANONICAL geometry is re-expanded
+    /// untouched, so the live reproject is patched back out exactly.
+    ///
+    /// O(followers), each a single small object — never a full-scene rebake. The
+    /// reproject math + the node rewrite are pure (`transform_bindings`); only the
+    /// re-expand is touched here, and the GPU write lives in `patch_follower_geometry`.
+    fn reexpand_reprojected_followers(
+        &self,
+        scene: &RenderObjectScene,
+        delta: Option<&[[f64; 3]; 3]>,
+        followers: &[(String, String)],
+    ) -> Vec<(String, crate::object_pipeline::FollowerReexpand)> {
+        let Some(theme) = self.object_renderer.as_ref().map(|r| r.theme()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(followers.len());
+        for (follower_id, target_id) in followers {
+            let Some(follower) = scene.objects.iter().find(|o| &o.id == follower_id) else {
+                continue;
+            };
+            let Some(target) = scene.objects.iter().find(|o| &o.id == target_id) else {
+                continue;
+            };
+            // Rewrite every node of the follower anchored onto this moved target; a
+            // `None` delta means restore, so the canonical geometry is left as-is.
+            let mut geometry_d = follower.geometry_d.clone();
+            if let Some(delta) = delta {
+                for anchor in &follower.anchors {
+                    if &anchor.target != target_id {
+                        continue;
+                    }
+                    let Some((lx, ly)) = crate::transform_bindings::reproject_node_local_px(
+                        &follower.transform,
+                        &target.transform,
+                        delta,
+                        anchor,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(rewritten) = crate::transform_bindings::rewrite_geometry_node(
+                        &geometry_d,
+                        anchor.node_index,
+                        lx,
+                        ly,
+                    ) {
+                        geometry_d = rewritten;
+                    }
+                }
+            }
+            let mut reprojected = follower.clone();
+            reprojected.geometry_d = geometry_d;
+            let rebuilt = crate::object_pipeline::reexpand_single_object(
+                &reprojected,
+                theme,
+                scene.camera.clone(),
+            );
+            out.push((follower_id.clone(), rebuilt));
+        }
+        out
+    }
+
 }
 
-/// W3-G8/B: the set of object ids that should preview together when `dragged` is
-/// dragged. If `dragged` is a member of the scene's `multi_select` set, the whole
-/// set previews together (deduped, canonical order preserved); otherwise just the
-/// dragged id — so dragging a non-member is a fresh single drag even when a
-/// multi-select exists. Pure (no device/GPU), so it is host-testable under
-/// `wgpu-probe` without the wasm32-gated GPU glue around it.
+/// W3-G9/#5: the propagation ROOTS for a drag of `dragged`. If `dragged` is a
+/// member of the scene's `multi_select` set, every member is a root (deduped,
+/// canonical order preserved), so the whole selection drives the closure; otherwise
+/// just the dragged id — so dragging a non-member is a fresh single drag even when a
+/// multi-select exists. Pure (no device/GPU), host-testable under `wgpu-probe`.
 #[cfg(feature = "wgpu-probe")]
-pub(crate) fn preview_target_ids(scene: &RenderObjectScene, dragged: &str) -> Vec<String> {
+pub(crate) fn preview_roots(scene: &RenderObjectScene, dragged: &str) -> Vec<String> {
     if !scene.multi_select.iter().any(|id| id == dragged) {
         return vec![dragged.to_string()];
     }
-    let mut targets: Vec<String> = Vec::with_capacity(scene.multi_select.len());
+    let mut roots: Vec<String> = Vec::with_capacity(scene.multi_select.len());
     for id in &scene.multi_select {
-        if !targets.iter().any(|seen| seen == id) {
-            targets.push(id.clone());
+        if !roots.iter().any(|seen| seen == id) {
+            roots.push(id.clone());
         }
     }
-    targets
+    roots
+}
+
+/// W3-G9/#5: the `(id, base)` GPU write-set for a drag of `dragged` — the SameDelta
+/// closure of the bindings graph from [`preview_roots`], each id paired with its
+/// canonical base transform from `scene`. This is the pure half of
+/// [`ShapeWebGpuRenderer::set_object_preview_transform`]: every same-delta id gets
+/// the same world delta applied against its own base, so group children + multi
+/// members move LIVE. Ids absent from `scene.objects` are dropped. Host-testable.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn preview_write_set(
+    scene: &RenderObjectScene,
+    bindings: &crate::transform_bindings::Bindings,
+    dragged: &str,
+) -> Vec<(String, [[f64; 3]; 3])> {
+    let roots = preview_roots(scene, dragged);
+    let (same_delta, _reproject_followers) = bindings.propagation_closure(&roots);
+    same_delta
+        .into_iter()
+        .filter_map(|id| {
+            scene
+                .objects
+                .iter()
+                .find(|o| o.id == id)
+                .map(|o| (id, o.transform))
+        })
+        .collect()
+}
+
+/// W3-G9/#4: the `(follower_id, target_id)` reproject pairs for a drag of `dragged`
+/// — the Reproject half of the same closure [`preview_write_set`] consumes the
+/// SameDelta half of. Each pair names a follower whose anchored geometry must
+/// reproject through a moved `target` (a same-delta object). Pure (no device/GPU),
+/// host-testable under `wgpu-probe`; the wasm32 preview path turns each pair into an
+/// in-place follower vertex patch.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn preview_reproject_followers(
+    scene: &RenderObjectScene,
+    bindings: &crate::transform_bindings::Bindings,
+    dragged: &str,
+) -> Vec<(String, String)> {
+    let roots = preview_roots(scene, dragged);
+    let (_same_delta, reproject_followers) = bindings.propagation_closure(&roots);
+    reproject_followers
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -1604,9 +1717,10 @@ impl ShapeWebGpuRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::preview_target_ids;
+    use super::{preview_roots, preview_write_set};
     use crate::model::CameraState;
-    use crate::render_object::RenderObjectScene;
+    use crate::render_object::{RenderObject, RenderObjectScene};
+    use crate::transform_bindings::Bindings;
 
     fn scene_with_multi_select(multi_select: Vec<&str>) -> RenderObjectScene {
         RenderObjectScene {
@@ -1622,22 +1736,76 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dragging_a_member_previews_the_whole_set_in_canonical_order() {
-        let scene = scene_with_multi_select(vec!["a", "b", "c"]);
-        // The bug returned only ["b"]; the fix previews every member together.
-        assert_eq!(preview_target_ids(&scene, "b"), vec!["a", "b", "c"]);
+    fn object(id: &str, parent: Option<&str>, tx: f64) -> RenderObject {
+        RenderObject {
+            id: id.to_string(),
+            parent: parent.map(str::to_string),
+            order: "a0".to_string(),
+            transform: [[1.0, 0.0, tx], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            geometry_d: "M 0 0 L 8 0 L 8 8 L 0 8 Z".to_string(),
+            fill: None,
+            stroke: None,
+            text: None,
+            anchors: Vec::new(),
+            clip: false,
+        }
     }
 
     #[test]
-    fn dragging_a_non_member_previews_only_itself() {
+    fn dragging_a_member_roots_the_whole_set_in_canonical_order() {
         let scene = scene_with_multi_select(vec!["a", "b", "c"]);
-        assert_eq!(preview_target_ids(&scene, "z"), vec!["z"]);
+        // The bug returned only ["b"]; the fix roots every member together.
+        assert_eq!(preview_roots(&scene, "b"), vec!["a", "b", "c"]);
     }
 
     #[test]
-    fn empty_multi_select_previews_only_the_dragged_id() {
+    fn dragging_a_non_member_roots_only_itself() {
+        let scene = scene_with_multi_select(vec!["a", "b", "c"]);
+        assert_eq!(preview_roots(&scene, "z"), vec!["z"]);
+    }
+
+    #[test]
+    fn empty_multi_select_roots_only_the_dragged_id() {
         let scene = scene_with_multi_select(Vec::new());
-        assert_eq!(preview_target_ids(&scene, "a"), vec!["a"]);
+        assert_eq!(preview_roots(&scene, "a"), vec!["a"]);
+    }
+
+    #[test]
+    fn write_set_is_the_closure_with_each_objects_own_base() {
+        // Frame `a{b}` plus a stand-alone member `d`; multi-select [a, d].
+        let mut scene = scene_with_multi_select(vec!["a", "d"]);
+        scene.objects = vec![
+            object("a", None, 1.0),
+            object("b", Some("a"), 2.0),
+            object("d", None, 3.0),
+        ];
+        let bindings = Bindings::build(&scene);
+
+        // Dragging member `a` writes the SameDelta closure of [a, d]: a, its child b,
+        // and d — each paired with its OWN base transform (not the dragged one).
+        let write_set = preview_write_set(&scene, &bindings, "a");
+        let ids: Vec<&str> = write_set.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "d"]);
+        // tx is encoded in column 2 of row 0; confirm per-object base, not shared.
+        assert_eq!(write_set[0].1[0][2], 1.0); // a
+        assert_eq!(write_set[1].1[0][2], 2.0); // b (child of a)
+        assert_eq!(write_set[2].1[0][2], 3.0); // d (other member)
+    }
+
+    #[test]
+    fn write_set_of_a_lone_drag_is_just_that_subtree() {
+        let mut scene = scene_with_multi_select(Vec::new());
+        scene.objects = vec![
+            object("a", None, 1.0),
+            object("b", Some("a"), 2.0),
+            object("z", None, 9.0),
+        ];
+        let bindings = Bindings::build(&scene);
+        let ids: Vec<String> = preview_write_set(&scene, &bindings, "a")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert!(!ids.iter().any(|id| id == "z"));
     }
 }

@@ -1727,6 +1727,20 @@ pub(crate) fn build_handle_overlay_vertices(world_bbox: &WorldRect, zoom: f64) -
     vertices
 }
 
+/// W3-G9/#2: the id set that gets a continuous bbox outline ring. When a
+/// multi-select is active, every member rings (single selection then keeps its
+/// 8-handle overlay too, but those are drawn separately). When the multi-select is
+/// empty, a lone selected object/group still gets ONE ring so a grouped selection
+/// shows a visible border, not just the 8 resize dots. Returns member-input order;
+/// empty when nothing is selected.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn outline_overlay_ids(scene: &RenderObjectScene) -> Vec<String> {
+    if !scene.multi_select.is_empty() {
+        return scene.multi_select.clone();
+    }
+    scene.selection.iter().cloned().collect()
+}
+
 /// W3-G7/#1: per-object outline highlight for the multi-select set. For each id
 /// present in `regions`, draw the object's world-space bbox as a 4-edge rectangle
 /// outline (constant ~2px screen width via `2.0 / zoom`) in the selection blue, so
@@ -3795,6 +3809,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         }
     }
@@ -3833,6 +3848,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         }
     }
@@ -3850,6 +3866,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         }
     }
@@ -4278,6 +4295,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         };
         let scene = object_scene(vec![l_shape]);
@@ -4542,6 +4560,35 @@ mod tests {
 
         // Empty set => nothing drawn (single selection keeps its handle overlay).
         assert!(build_multi_select_overlay_vertices(&regions, &[], 1.0).is_empty());
+    }
+
+    #[test]
+    fn outline_ids_ring_single_selection_and_every_multi_member() {
+        let mut scene = object_scene(vec![
+            rect_object("a", 0.0, 0.0, 20),
+            rect_object("b", 50.0, 50.0, 20),
+        ]);
+        let regions = derive_object_regions(&scene);
+
+        // W3-G9/#2: a lone selected object/group rings (so a grouped selection shows
+        // a border, not just resize dots) even though multi_select is empty.
+        scene.selection = Some("a".to_string());
+        scene.multi_select = Vec::new();
+        let single = outline_overlay_ids(&scene);
+        assert_eq!(single, vec!["a".to_string()]);
+        let verts = build_multi_select_overlay_vertices(&regions, &single, 1.0);
+        assert!(!verts.is_empty(), "single selection must emit an outline ring");
+        assert_eq!(verts.len(), 24, "one 24-vert ring for the single selection");
+
+        // A multi-select rings every member (the single selection is subsumed).
+        scene.multi_select = vec!["a".to_string(), "b".to_string()];
+        let multi = outline_overlay_ids(&scene);
+        assert_eq!(multi, vec!["a".to_string(), "b".to_string()]);
+
+        // Nothing selected => no ring.
+        scene.selection = None;
+        scene.multi_select = Vec::new();
+        assert!(outline_overlay_ids(&scene).is_empty());
     }
 
     #[test]

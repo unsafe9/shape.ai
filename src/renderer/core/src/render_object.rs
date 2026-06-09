@@ -50,10 +50,34 @@ pub struct RenderObject {
     pub stroke: Option<RStroke>,
     #[serde(default)]
     pub text: Option<RText>,
+    /// Per-node attachments (D5): each binds one of this object's geometry nodes to
+    /// a `target` object. W3-G9/#5: the bindings graph inverts these into Reproject
+    /// edges (target -> this follower) so a moved target reprojects its followers.
+    #[serde(default)]
+    pub anchors: Vec<RAnchor>,
     /// Figma-style clip flag (D18). When true, children render clipped to this
     /// object's region/bounds.
     #[serde(default)]
     pub clip: bool,
+}
+
+/// A per-node attachment (D5): node `node_index` of the owning object is bound to
+/// `target` at the target-local point `at`. Mirrors the shell `Anchor` wire shape
+/// (`{ nodeIndex, target, at: { x, y } }`).
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RAnchor {
+    pub node_index: usize,
+    pub target: String,
+    pub at: RLocalPoint,
+}
+
+/// A target-local attachment point in object-local pixels (D5).
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RLocalPoint {
+    pub x: f64,
+    pub y: f64,
 }
 
 /// Fill paint applied to the derived region, below stroke (D4).
@@ -195,8 +219,10 @@ pub struct RenderObjectScene {
     /// Persisted single-anchor selection: the id of the selected object, if any.
     #[serde(default)]
     pub selection: Option<String>,
-    /// Transient multi-select set, never persisted (mirrors `SceneSnapshot`).
-    #[serde(default, skip)]
+    /// Transient multi-select set. Shell-owned and never round-tripped to disk, but
+    /// the shell DOES send it on the live wire (`multiSelect`), so it must
+    /// deserialize — the draw path (outline overlay, preview closure) reads it.
+    #[serde(default, rename = "multiSelect")]
     pub multi_select: Vec<String>,
 }
 
@@ -570,6 +596,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         };
         let resolved = resolve_visual(&obj, VisualState::default());
@@ -610,6 +637,7 @@ mod tests {
                 join: RStrokeJoin::Round,
             }),
             text: None,
+            anchors: Vec::new(),
             clip: false,
         };
         let resolved = resolve_visual(&obj, VisualState::default());
@@ -634,6 +662,7 @@ mod tests {
             fill: None,
             stroke: None,
             text: None,
+            anchors: Vec::new(),
             clip: false,
         };
         let selected = resolve_visual(
@@ -705,5 +734,20 @@ mod tests {
 
     fn identity_transform() -> [[f64; 3]; 3] {
         [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    }
+
+    #[test]
+    fn multi_select_deserializes_from_the_wire() {
+        // W3-G9/#2: the shell sends `multiSelect` on the live wire; before the fix it
+        // was `skip`ped so this always parsed empty (no outline, no group preview).
+        let json = r##"{
+            "sceneId": "s1",
+            "camera": { "x": 0, "y": 0, "zoom": 1 },
+            "objects": [],
+            "multiSelect": ["a", "b"]
+        }"##;
+        let scene: RenderObjectScene =
+            serde_json::from_str(json).expect("scene with multiSelect deserializes");
+        assert_eq!(scene.multi_select, vec!["a".to_string(), "b".to_string()]);
     }
 }
