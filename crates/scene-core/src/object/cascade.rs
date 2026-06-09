@@ -25,6 +25,7 @@
 
 use super::anchor_follow::anchor_follow_ops;
 use super::model::{Object, ObjectScene, Transform3x3};
+use super::move_together::{BindingGraph, BindingNode};
 use super::op::ObjectOp;
 
 /// 3x3 row-major pre-multiply `new = delta * base`. The delta is the cumulative
@@ -43,39 +44,40 @@ fn push_move(ops: &mut Vec<ObjectOp>, object: &Object, delta: &Transform3x3) {
     });
 }
 
-/// Append `root`'s subtree `set-transform` ops onto `ops`, skipping any id already
-/// present (global dedup across the whole batch). The root (when not already seen)
-/// goes first, then its transitive descendants expanded parent-before-child, BFS
-/// in scene order — matching the renderer-core SameDelta closure for one root.
-fn cascade_subtree_into(
-    ops: &mut Vec<ObjectOp>,
-    seen: &mut Vec<String>,
+/// Project the scene into the [`BindingNode`] slice [`BindingGraph::build`] consumes,
+/// in `scene.objects` order so the graph's per-parent SameDelta edges list children
+/// in scene order — exactly the order the old hand-rolled BFS scanned them.
+fn binding_nodes(scene: &ObjectScene) -> Vec<BindingNode> {
+    scene
+        .objects
+        .iter()
+        .map(|o| BindingNode {
+            id: o.id.clone(),
+            parent: o.parent.clone(),
+            anchor_targets: o.anchors.iter().map(|a| a.target.clone()).collect(),
+        })
+        .collect()
+}
+
+/// The cascade `set-transform` ops for the SameDelta closure of `roots`: the single
+/// move-together traversal in scene-core (`move_together::BindingGraph::propagation_closure`,
+/// the same one the renderer consumes) yields the id set+ORDER, and each id maps to
+/// its object's `set-transform` (base composed under the world `delta`). Roots are
+/// pre-filtered to live ids, so every closure id resolves in the scene.
+fn cascade_same_delta_ops(
     scene: &ObjectScene,
-    root: &Object,
+    roots: &[String],
     delta: &Transform3x3,
-) {
-    // A root already fully expanded as a descendant of an earlier root keeps its
-    // first position; skip re-walking its subtree (order is fixed by first insert).
-    if seen.iter().any(|id| id == &root.id) {
-        return;
-    }
-    seen.push(root.id.clone());
-    push_move(ops, root, delta);
-    let mut frontier = vec![root.id.clone()];
-    while let Some(parent) = frontier.first().cloned() {
-        frontier.remove(0);
-        for child in &scene.objects {
-            if child.parent.as_deref() != Some(parent.as_str()) {
-                continue;
-            }
-            if seen.iter().any(|id| id == &child.id) {
-                continue;
-            }
-            seen.push(child.id.clone());
-            push_move(ops, child, delta);
-            frontier.push(child.id.clone());
+) -> Vec<ObjectOp> {
+    let graph = BindingGraph::build(&binding_nodes(scene));
+    let (same_delta_ids, _reproject) = graph.propagation_closure(roots);
+    let mut ops = Vec::with_capacity(same_delta_ids.len());
+    for id in &same_delta_ids {
+        if let Some(object) = scene.get(id) {
+            push_move(&mut ops, object, delta);
         }
     }
+    ops
 }
 
 /// The `set-transform` ops a drag of `id` produces: the dragged object first, then
@@ -86,13 +88,10 @@ fn cascade_subtree_into(
 /// Mirrors the shell `cascadeTransformOps`; the order matches the renderer-core
 /// `propagation_closure` SameDelta result for the single-root case.
 pub fn cascade_transform_ops(scene: &ObjectScene, id: &str, delta: &Transform3x3) -> Vec<ObjectOp> {
-    let Some(root) = scene.get(id) else {
+    if scene.get(id).is_none() {
         return Vec::new();
-    };
-    let mut ops = Vec::new();
-    let mut seen = Vec::new();
-    cascade_subtree_into(&mut ops, &mut seen, scene, root, delta);
-    ops
+    }
+    cascade_same_delta_ops(scene, std::slice::from_ref(&id.to_string()), delta)
 }
 
 /// A Multi selection drags as one unit (the renderer anchors the gesture on a
@@ -110,15 +109,14 @@ pub fn cascade_multi_transform_ops(
     ids: &[String],
     delta: &Transform3x3,
 ) -> Vec<ObjectOp> {
-    let mut ops = Vec::new();
-    let mut seen = Vec::new();
-    for id in ids {
-        let Some(root) = scene.get(id) else {
-            continue;
-        };
-        cascade_subtree_into(&mut ops, &mut seen, scene, root, delta);
-    }
-    ops
+    // A missing root contributes nothing; the closure preserves input-root order and
+    // dedups, so pre-filtering to live ids reproduces the old per-root cascade union.
+    let live_roots: Vec<String> = ids
+        .iter()
+        .filter(|id| scene.get(id).is_some())
+        .cloned()
+        .collect();
+    cascade_same_delta_ops(scene, &live_roots, delta)
 }
 
 /// Either one dragged root or a multi-select set. The combined [`move_ops`] entry
