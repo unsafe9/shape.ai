@@ -240,6 +240,18 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     shell.author({ kind: "insert-object", object: edge });
     shell.author({ kind: "set-anchor", id: "edge-1", anchors: anchors! });
     expect(shell.byId("edge-1")?.anchors?.[0].target).toBe("ell-1");
+    // W3-G9/#5 regression: the wire projection MUST carry each object's anchors so
+    // the core builds the Reproject edges that drive live move-together. Before the
+    // fix the projection dropped `anchors`, so the core's bindings graph had zero
+    // anchor edges and a moved target never reprojected its follower LIVE. This
+    // fails if `objectSceneToRenderObjectScene` omits anchors again.
+    const anchorFeed = objectSceneToRenderObjectScene(shell.scene, { x: 0, y: 0, zoom: 1 }, shell.selection, "ig1-anchor");
+    const feedEdge = (anchorFeed.objects as Array<Record<string, unknown>>).find((o) => o.id === "edge-1")!;
+    const feedAnchors = feedEdge.anchors as Array<{ nodeIndex: number; target: string; at: { x: number; y: number } }>;
+    expect(feedAnchors).toHaveLength(1);
+    expect(feedAnchors[0].target).toBe("ell-1");
+    expect(typeof feedAnchors[0].nodeIndex).toBe("number");
+    expect(typeof feedAnchors[0].at.x).toBe("number");
     // At rest the endpoint resolves to the snap point; after moving the target it
     // tracks it (move-together) — the falsifiable anchor behavior.
     const atRest = reprojectAnchoredEndpoint(target, anchors![0]);

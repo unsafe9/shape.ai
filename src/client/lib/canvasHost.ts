@@ -139,6 +139,12 @@ export function objectSceneToRenderObjectScene(
       fill: object.fill ?? null,
       stroke: projectStroke(object.stroke),
       text: object.text ?? null,
+      // W3-G9/#5: the D5 anchors must reach the core so `Bindings::build` inverts
+      // them into Reproject edges and a moved target reprojects its followers LIVE
+      // during the drag. Dropping them here silently leaves the bindings graph
+      // anchor-free (the host bindings test builds scenes directly, so it can't
+      // catch a missing wire projection).
+      anchors: object.anchors ?? [],
       clip: object.clip ?? false
     }))
   };
