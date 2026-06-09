@@ -722,6 +722,12 @@ pub struct ObjectDraw {
     /// Index range into the shared fill megabuffer (`fill_indices`), or an empty
     /// range when the object has no fillable region.
     pub fill_range: DrawRange,
+    /// VERTEX range of this object's fill inside the shared fill vertex buffer
+    /// (`[start, end)`), distinct from `fill_range` which indexes the INDEX buffer.
+    /// W3-G9/#4 needs the vertex base/length to patch a follower's fill positions in
+    /// place during a live anchor reproject (the megabuffer rebases indices by this
+    /// vertex offset). Empty when the object has no fillable region.
+    pub fill_vertex_range: DrawRange,
     pub fill_instance: FillInstance,
     /// RB3 drop-shadow quad vertex range into the shared `shadow_vertices` buffer.
     /// Empty when the object has no boundable region (nothing to cast a shadow).
@@ -1211,6 +1217,65 @@ impl ObjectRenderer {
         written
     }
 
+    /// W3-G9/#4 LIVE anchor reproject: patch a follower's baked fill + stroke
+    /// vertices in place so its anchored node tracks a moved target DURING the drag
+    /// (the follower is NOT uniformly transformed — one node moves, so its shape
+    /// changes and the instance-matrix preview path cannot express it). `rebuilt` is
+    /// the follower re-expanded with the reprojected node ([`reexpand_single_object`]);
+    /// this writes its fill vertices, fill indices (rebased into the megabuffer), and
+    /// stroke ribbon vertices over the follower's EXISTING ranges — zero full rebake,
+    /// O(one small object).
+    ///
+    /// DEFENSIVE (GPU-blind): a vertex/index COUNT that no longer matches the baked
+    /// range (a topology/LOD edge case) makes [`follower_patch_plan`] return `None`,
+    /// and this SKIPS the write entirely — never a partial/mismatched range that
+    /// would corrupt the buffer or bleed into a neighbour. Returns false if `id` is
+    /// absent or the patch was skipped.
+    pub fn patch_follower_geometry(
+        &mut self,
+        queue: &wgpu::Queue,
+        id: &str,
+        rebuilt: &FollowerReexpand,
+    ) -> bool {
+        let Some(draw) = self.draws.iter().find(|d| d.id == id) else {
+            return false;
+        };
+        let Some(plan) = follower_patch_plan(draw, rebuilt) else {
+            return false;
+        };
+        // Fill vertices: same count as the baked range (guarded), so the write stays
+        // within `[start, end)` of the shared fill vertex buffer.
+        if !rebuilt.fill_vertices.is_empty() {
+            queue.write_buffer(
+                &self.fill_vertex_buffer,
+                plan.fill_vertex_byte_offset,
+                bytemuck::cast_slice(&rebuilt.fill_vertices),
+            );
+            // Re-emit the indices rebased to the follower's vertex base. The count is
+            // guarded equal, so a re-tessellation that kept the count but changed the
+            // index pattern is still corrected (not just the positions).
+            let rebased: Vec<u32> = rebuilt
+                .fill_indices
+                .iter()
+                .map(|&i| i + plan.fill_index_rebase)
+                .collect();
+            queue.write_buffer(
+                &self.fill_index_buffer,
+                plan.fill_index_byte_offset,
+                bytemuck::cast_slice(&rebased),
+            );
+        }
+        // Stroke ribbon vertices: same count as the baked range (guarded).
+        if !rebuilt.stroke_vertices.is_empty() {
+            queue.write_buffer(
+                &self.stroke_vertex_buffer,
+                plan.stroke_vertex_byte_offset,
+                bytemuck::cast_slice(&rebuilt.stroke_vertices),
+            );
+        }
+        true
+    }
+
     /// RA1: the live preview WORLD transform (`delta * base`) for `id`, or `None`
     /// when the object has no in-flight drag preview. The composed transform is the
     /// one `set_preview_transform` pushed to the instance buffer, so a caller can
@@ -1538,7 +1603,14 @@ pub fn build_scene_geometry_themed_with_measure(
         // `push` appends this mesh's vertices, so we extend `fill_edges` with this
         // mesh's boundary flags in lockstep (D4 analytic fill AA).
         geometry.fill_edges.extend_from_slice(&mesh.boundary_flags());
+        // Record the fill VERTEX sub-range (distinct from the index range `push`
+        // returns) so a follower's fill positions can be patched in place (W3-G9/#4).
+        let fill_vertex_start = geometry.fill.vertices.len() as u32;
         let fill_range = geometry.fill.push(&mesh);
+        let fill_vertex_range = DrawRange {
+            start: fill_vertex_start,
+            end: geometry.fill.vertices.len() as u32,
+        };
         geometry.fill_instances.push(FillInstance {
             m0: matrix_col(&obj.transform, 0),
             m1: matrix_col(&obj.transform, 1),
@@ -1613,6 +1685,7 @@ pub fn build_scene_geometry_themed_with_measure(
         geometry.draws.push(ObjectDraw {
             id: obj.id.clone(),
             fill_range,
+            fill_vertex_range,
             fill_instance: *geometry
                 .fill_instances
                 .last()
@@ -1890,6 +1963,94 @@ pub fn preview_instance_strides() -> [u64; 4] {
         std::mem::size_of::<TextInstance>() as u64,
         std::mem::size_of::<ShadowInstance>() as u64,
     ]
+}
+
+/// W3-G9/#4: the re-expanded fill + stroke geometry for ONE object, used to patch
+/// a follower's baked vertices in place during a live anchor reproject. The fill
+/// indices are object-LOCAL (0-based); the caller rebases them by the follower's
+/// vertex base in the shared megabuffer before writing.
+pub struct FollowerReexpand {
+    pub fill_vertices: Vec<FillVertex>,
+    pub fill_indices: Vec<u32>,
+    pub stroke_vertices: Vec<StrokeVertex>,
+}
+
+/// W3-G9/#4: re-expand a SINGLE object's fill + stroke geometry, reusing the exact
+/// build-loop path ([`build_scene_geometry_themed`]) so the result is byte-identical
+/// to what a full rebake of that object would produce. The object is built alone in
+/// a one-object scene carrying the live `camera` (so the zoom/LOD bucket matches the
+/// canonical bake) and `theme` (so the silhouette-AA `edge` flags match); selection
+/// is dropped because it only adds a focus ring, never changing fill/stroke vertex
+/// COUNT. Returns the widened fill vertices, the object-local fill indices, and the
+/// stroke ribbon vertices. Pure (device-free), so the COUNT-equality that makes the
+/// in-place patch size-safe is host-testable without a GPU.
+pub fn reexpand_single_object(
+    obj: &RenderObject,
+    theme: Theme,
+    camera: CameraState,
+) -> FollowerReexpand {
+    let scene = RenderObjectScene {
+        scene_id: String::new(),
+        camera,
+        objects: vec![obj.clone()],
+        selection: None,
+        multi_select: Vec::new(),
+    };
+    let build = build_scene_geometry_themed(&scene, theme);
+    let fill_vertices: Vec<FillVertex> = build
+        .fill
+        .vertices
+        .iter()
+        .zip(&build.fill_edges)
+        .map(|(&position, &edge)| FillVertex { position, edge })
+        .collect();
+    FollowerReexpand {
+        fill_vertices,
+        fill_indices: build.fill.indices,
+        stroke_vertices: build.stroke_vertices,
+    }
+}
+
+/// W3-G9/#4: the byte offsets + element counts for writing a follower's re-expanded
+/// geometry over its EXISTING megabuffer ranges, or `None` when the re-expand is not
+/// size-safe (topology/LOD edge case: a vertex/index count changed). Skipping on
+/// `None` is the defensive guard — a mismatched write would bleed into another
+/// object's range or corrupt the buffer. Pure (no GPU), so the count-safety decision
+/// is host-testable; the actual `queue.write_buffer` consuming this is GPU-only.
+pub struct FollowerPatchPlan {
+    /// Byte offset of the follower's fill vertices in the shared fill vertex buffer.
+    pub fill_vertex_byte_offset: u64,
+    /// Byte offset of the follower's fill indices in the shared fill index buffer.
+    pub fill_index_byte_offset: u64,
+    /// Amount to add to each object-local fill index so it points at the follower's
+    /// vertices inside the merged megabuffer (the build-time rebase).
+    pub fill_index_rebase: u32,
+    /// Byte offset of the follower's stroke vertices in the shared stroke buffer.
+    pub stroke_vertex_byte_offset: u64,
+}
+
+/// W3-G9/#4: validate that `rebuilt` exactly fills the follower `draw`'s existing
+/// megabuffer ranges (same fill vertex count, fill index count, stroke vertex count)
+/// and, if so, return the [`FollowerPatchPlan`] byte offsets. Returns `None` on ANY
+/// count mismatch so the caller SKIPS the patch this frame rather than writing a
+/// mismatched range. The node COUNT is unchanged during a drag (only positions move)
+/// and the LOD bucket is fixed, so the counts normally match; a `None` is the rare
+/// topology edge case the guard exists for. Pure + falsifiable without a device.
+pub fn follower_patch_plan(draw: &ObjectDraw, rebuilt: &FollowerReexpand) -> Option<FollowerPatchPlan> {
+    if rebuilt.fill_vertices.len() as u32 != draw.fill_vertex_range.len()
+        || rebuilt.fill_indices.len() as u32 != draw.fill_range.len()
+        || rebuilt.stroke_vertices.len() as u32 != draw.stroke_range.len()
+    {
+        return None;
+    }
+    Some(FollowerPatchPlan {
+        fill_vertex_byte_offset: draw.fill_vertex_range.start as u64
+            * std::mem::size_of::<FillVertex>() as u64,
+        fill_index_byte_offset: draw.fill_range.start as u64 * std::mem::size_of::<u32>() as u64,
+        fill_index_rebase: draw.fill_vertex_range.start,
+        stroke_vertex_byte_offset: draw.stroke_range.start as u64
+            * std::mem::size_of::<StrokeVertex>() as u64,
+    })
 }
 
 /// Resolve a paint to a single RGBA color for the inline-solid first cutover,
@@ -3268,5 +3429,81 @@ mod tests {
         let base_a = 0x40 as f32 / 255.0;
         assert!((full[3] - base_a).abs() < 1e-6);
         assert!((half[3] - base_a * 0.5).abs() < 1e-6);
+    }
+
+    /// An open 2-node stroke object (no fill, so the patch exercises only the stroke
+    /// ribbon) carrying `geometry_d`.
+    fn open_stroke_object(id: &str, d: &str) -> RenderObject {
+        RenderObject {
+            id: id.to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: identity(),
+            geometry_d: d.to_string(),
+            fill: None,
+            stroke: Some(RStroke {
+                paint: RPaint::Solid {
+                    color: "#00ff00".to_string(),
+                },
+                width: 4.0,
+                opacity: 1.0,
+                dash: Vec::new(),
+                cap: RStrokeCap::Butt,
+                join: RStrokeJoin::Miter,
+            }),
+            text: None,
+            anchors: Vec::new(),
+            clip: false,
+        }
+    }
+
+    #[test]
+    fn reexpand_keeps_vertex_count_when_only_a_node_moves() {
+        // A 2-node open stroke; the canonical draw record gives the baked ranges.
+        let canonical = open_stroke_object("f", "M0 0 L800 0");
+        let scene = scene_with(vec![canonical.clone()], None);
+        let build = build_scene_geometry_themed(&scene, Theme::light());
+        let draw = &build.draws[0];
+
+        // Move ONLY node 1 (no topology change): re-expand the moved follower.
+        let moved = open_stroke_object("f", "M0 0 L800 400");
+        let rebuilt = reexpand_single_object(&moved, Theme::light(), scene.camera.clone());
+
+        // The COUNTS must match the baked ranges, so the in-place patch is size-safe.
+        assert_eq!(rebuilt.stroke_vertices.len() as u32, draw.stroke_range.len());
+        assert_eq!(rebuilt.fill_vertices.len() as u32, draw.fill_vertex_range.len());
+        assert_eq!(rebuilt.fill_indices.len() as u32, draw.fill_range.len());
+        // And the patch plan is produced (Some), with the stroke offset at the baked
+        // range start (a lone object => start 0).
+        let plan = follower_patch_plan(draw, &rebuilt).expect("size-safe patch");
+        assert_eq!(
+            plan.stroke_vertex_byte_offset,
+            draw.stroke_range.start as u64 * std::mem::size_of::<StrokeVertex>() as u64
+        );
+        // The moved node actually changed the ribbon geometry (not a no-op write).
+        let canonical_rebuild = reexpand_single_object(&canonical, Theme::light(), scene.camera.clone());
+        assert_ne!(
+            rebuilt.stroke_vertices, canonical_rebuild.stroke_vertices,
+            "moving a node must change the ribbon vertices"
+        );
+    }
+
+    #[test]
+    fn follower_patch_plan_is_none_on_a_topology_change() {
+        // Canonical: a 2-node open stroke. The baked draw has a fixed stroke range.
+        let canonical = open_stroke_object("f", "M0 0 L800 0");
+        let scene = scene_with(vec![canonical], None);
+        let build = build_scene_geometry_themed(&scene, Theme::light());
+        let draw = &build.draws[0];
+
+        // A 3-node re-expand changes the vertex COUNT — the guard must refuse it so a
+        // mismatched range is NEVER written to the GPU buffer.
+        let three_nodes = open_stroke_object("f", "M0 0 L800 0 L800 400");
+        let rebuilt = reexpand_single_object(&three_nodes, Theme::light(), scene.camera.clone());
+        assert_ne!(rebuilt.stroke_vertices.len() as u32, draw.stroke_range.len());
+        assert!(
+            follower_patch_plan(draw, &rebuilt).is_none(),
+            "a topology/LOD count change must SKIP the patch, not corrupt the buffer"
+        );
     }
 }

@@ -149,12 +149,19 @@ impl ShapeWebGpuRenderer {
             return Ok(());
         };
         let write_set = preview_write_set(scene, &self.object_bindings, id);
-        // W3-G9/A2 seam: the closure also yields `reproject_followers` (objects whose
-        // anchored geometry must reproject through a moved target). They are NOT
-        // previewed here — A2 plugs in at this call site, consuming the same closure.
+        // W3-G9/#4: the closure also yields `reproject_followers` — objects whose
+        // anchored geometry must reproject through a moved target LIVE. A follower is
+        // NOT uniformly transformed (one bound node moves, the rest stay), so the
+        // instance-matrix preview above cannot express it; instead each follower's
+        // geometry is rewritten with the reprojected node and re-expanded in place.
+        let followers = preview_reproject_followers(scene, &self.object_bindings, id);
+        let reexpanded = self.reexpand_reprojected_followers(scene, Some(&delta), &followers);
         if let Some(renderer) = self.object_renderer.as_mut() {
             for (target, base) in &write_set {
                 renderer.set_preview_transform(&self.queue, target, &delta, base);
+            }
+            for (follower_id, rebuilt) in &reexpanded {
+                renderer.patch_follower_geometry(&self.queue, follower_id, rebuilt);
             }
         }
         Ok(())
@@ -172,12 +179,85 @@ impl ShapeWebGpuRenderer {
             return Ok(());
         };
         let write_set = preview_write_set(scene, &self.object_bindings, id);
+        // W3-G9/#4: restore each follower's CANONICAL baked geometry (re-expand from
+        // the untouched scene object) so a cancelled/failed drag reverts the live
+        // reproject too, not just the same-delta instance matrices.
+        let followers = preview_reproject_followers(scene, &self.object_bindings, id);
+        let restored = self.reexpand_reprojected_followers(scene, None, &followers);
         if let Some(renderer) = self.object_renderer.as_mut() {
             for (target, base) in &write_set {
                 renderer.clear_preview_transform(&self.queue, target, base);
             }
+            for (follower_id, rebuilt) in &restored {
+                renderer.patch_follower_geometry(&self.queue, follower_id, rebuilt);
+            }
         }
         Ok(())
+    }
+
+    /// W3-G9/#4: re-expand each follower's fill + stroke geometry for an in-place GPU
+    /// patch. With `Some(delta)` (the live preview), every node of the follower
+    /// anchored onto its moved `target` is rewritten to track the target's PREVIEWED
+    /// transform (`delta * target_base`) before the re-expand. With `None` (the
+    /// restore on cancel/commit), the follower's CANONICAL geometry is re-expanded
+    /// untouched, so the live reproject is patched back out exactly.
+    ///
+    /// O(followers), each a single small object — never a full-scene rebake. The
+    /// reproject math + the node rewrite are pure (`transform_bindings`); only the
+    /// re-expand is touched here, and the GPU write lives in `patch_follower_geometry`.
+    fn reexpand_reprojected_followers(
+        &self,
+        scene: &RenderObjectScene,
+        delta: Option<&[[f64; 3]; 3]>,
+        followers: &[(String, String)],
+    ) -> Vec<(String, crate::object_pipeline::FollowerReexpand)> {
+        let Some(theme) = self.object_renderer.as_ref().map(|r| r.theme()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(followers.len());
+        for (follower_id, target_id) in followers {
+            let Some(follower) = scene.objects.iter().find(|o| &o.id == follower_id) else {
+                continue;
+            };
+            let Some(target) = scene.objects.iter().find(|o| &o.id == target_id) else {
+                continue;
+            };
+            // Rewrite every node of the follower anchored onto this moved target; a
+            // `None` delta means restore, so the canonical geometry is left as-is.
+            let mut geometry_d = follower.geometry_d.clone();
+            if let Some(delta) = delta {
+                for anchor in &follower.anchors {
+                    if &anchor.target != target_id {
+                        continue;
+                    }
+                    let Some((lx, ly)) = crate::transform_bindings::reproject_node_local_px(
+                        &follower.transform,
+                        &target.transform,
+                        delta,
+                        anchor,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(rewritten) = crate::transform_bindings::rewrite_geometry_node(
+                        &geometry_d,
+                        anchor.node_index,
+                        lx,
+                        ly,
+                    ) {
+                        geometry_d = rewritten;
+                    }
+                }
+            }
+            let mut reprojected = follower.clone();
+            reprojected.geometry_d = geometry_d;
+            let rebuilt = crate::object_pipeline::reexpand_single_object(
+                &reprojected,
+                theme,
+                scene.camera.clone(),
+            );
+            out.push((follower_id.clone(), rebuilt));
+        }
+        out
     }
 
 }
@@ -225,6 +305,23 @@ pub(crate) fn preview_write_set(
                 .map(|o| (id, o.transform))
         })
         .collect()
+}
+
+/// W3-G9/#4: the `(follower_id, target_id)` reproject pairs for a drag of `dragged`
+/// — the Reproject half of the same closure [`preview_write_set`] consumes the
+/// SameDelta half of. Each pair names a follower whose anchored geometry must
+/// reproject through a moved `target` (a same-delta object). Pure (no device/GPU),
+/// host-testable under `wgpu-probe`; the wasm32 preview path turns each pair into an
+/// in-place follower vertex patch.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn preview_reproject_followers(
+    scene: &RenderObjectScene,
+    bindings: &crate::transform_bindings::Bindings,
+    dragged: &str,
+) -> Vec<(String, String)> {
+    let roots = preview_roots(scene, dragged);
+    let (_same_delta, reproject_followers) = bindings.propagation_closure(&roots);
+    reproject_followers
 }
 
 #[cfg(feature = "wgpu-probe")]

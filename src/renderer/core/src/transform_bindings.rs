@@ -19,7 +19,8 @@
 
 use std::collections::HashMap;
 
-use crate::render_object::RenderObjectScene;
+use crate::hit_test_object::{invert_3x3, mat3_mul, UNITS_PER_PX};
+use crate::render_object::{RAnchor, RenderObjectScene};
 
 /// Which structural relationship an edge encodes (see module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +137,149 @@ impl Bindings {
             }
         }
         (same_delta, reproject)
+    }
+}
+
+/// W3-G9/#4: the LIVE follower-LOCAL pixel position of an anchored node when its
+/// target moves by `delta`. Mirrors the shell `reprojectAnchoredGeometry`
+/// (anchorCreate.ts): the anchor `at` is a point in the TARGET's local QUANTIZED
+/// space, so de-quantize it (`/ UNITS_PER_PX`), carry it to world through the
+/// target's PREVIEWED transform (`delta * target_base`), then back into the
+/// follower's OWN local pixel space (`follower_base^-1`). Returns the follower-
+/// local `(x, y)` in pixels, or `None` when `follower_base` is singular.
+///
+/// Pure affine compose: `follower_base^-1 * (delta * target_base) * (at / Q)`.
+/// A pure target translation therefore moves the follower node by the SAME world
+/// delta (asserted in tests). The geometry write that consumes this is in the
+/// wasm32-gated preview path; this math half is host-testable.
+pub fn reproject_node_local_px(
+    follower_base: &[[f64; 3]; 3],
+    target_base: &[[f64; 3]; 3],
+    delta: &[[f64; 3]; 3],
+    at: &RAnchor,
+) -> Option<(f64, f64)> {
+    let inv = invert_3x3(follower_base)?;
+    // `delta * target_base` is the target's PREVIEWED world transform (the same
+    // composition the SameDelta instance write applies to the moved target).
+    let target_world = mat3_mul(delta, target_base);
+    // De-quantize the target-local anchor point to pixels before the affine carry.
+    let lx = at.at.x / UNITS_PER_PX;
+    let ly = at.at.y / UNITS_PER_PX;
+    let wx = target_world[0][0] * lx + target_world[0][1] * ly + target_world[0][2];
+    let wy = target_world[1][0] * lx + target_world[1][1] * ly + target_world[1][2];
+    let fx = inv[0][0] * wx + inv[0][1] * wy + inv[0][2];
+    let fy = inv[1][0] * wx + inv[1][1] * wy + inv[1][2];
+    if fx.is_finite() && fy.is_finite() {
+        Some((fx, fy))
+    } else {
+        None
+    }
+}
+
+/// W3-G9/#4: rewrite the `node_index`-th coordinate PAIR of a path-string `d` to
+/// the QUANTIZED `(x, y)` (object-local units, rounded from pixels), preserving
+/// every command token and every other coordinate. Mirrors the shell `setPathNode`
+/// (anchorCreate.ts): coordinate pairs are counted in token order across the whole
+/// string (M/L/C all contribute pairs), and only the target pair is replaced.
+/// Returns `None` when the string has no such pair (the node is unaddressable) or
+/// when the rewrite is a no-op (the new coords already match), so the caller can
+/// skip a pointless re-expand + GPU write.
+pub fn rewrite_geometry_node(d: &str, node_index: usize, x_px: f64, y_px: f64) -> Option<String> {
+    let qx = (x_px * UNITS_PER_PX).round() as i64;
+    let qy = (y_px * UNITS_PER_PX).round() as i64;
+    let mut pair = 0usize;
+    let mut numbers_seen = 0usize;
+    let mut hit = false;
+    let mut changed = false;
+    let mut out = String::with_capacity(d.len());
+    let mut last = 0usize;
+    for m in NumberSpans::new(d) {
+        out.push_str(&d[last..m.start]);
+        let is_x = numbers_seen % 2 == 0;
+        let at_target = pair == node_index;
+        if !is_x {
+            pair += 1;
+        }
+        numbers_seen += 1;
+        if at_target {
+            hit = true;
+            let replacement = if is_x { qx } else { qy };
+            let original = &d[m.start..m.end];
+            let replacement_str = replacement.to_string();
+            if original != replacement_str {
+                changed = true;
+            }
+            out.push_str(&replacement_str);
+        } else {
+            out.push_str(&d[m.start..m.end]);
+        }
+        last = m.end;
+    }
+    out.push_str(&d[last..]);
+    if hit && changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// A half-open byte span `[start, end)` of one signed-decimal number token in a
+/// path string. Used by [`rewrite_geometry_node`] to splice coordinates without a
+/// regex (the pure core carries no regex dependency).
+struct NumberSpan {
+    start: usize,
+    end: usize,
+}
+
+/// Iterator over the signed-decimal number spans of a path string, matching the
+/// shell `setPathNode` regex `-?\d+(?:\.\d+)?` (an optional leading `-`, digits,
+/// an optional `.`-fraction). Non-number characters (command letters, spaces,
+/// commas) are skipped between spans.
+struct NumberSpans<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> NumberSpans<'a> {
+    fn new(d: &'a str) -> Self {
+        Self {
+            bytes: d.as_bytes(),
+            pos: 0,
+        }
+    }
+}
+
+impl Iterator for NumberSpans<'_> {
+    type Item = NumberSpan;
+
+    fn next(&mut self) -> Option<NumberSpan> {
+        let n = self.bytes.len();
+        while self.pos < n {
+            let b = self.bytes[self.pos];
+            let starts = b == b'-' || b.is_ascii_digit();
+            if !starts {
+                self.pos += 1;
+                continue;
+            }
+            let start = self.pos;
+            if self.bytes[self.pos] == b'-' {
+                self.pos += 1;
+            }
+            while self.pos < n && self.bytes[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+            if self.pos < n && self.bytes[self.pos] == b'.' {
+                self.pos += 1;
+                while self.pos < n && self.bytes[self.pos].is_ascii_digit() {
+                    self.pos += 1;
+                }
+            }
+            return Some(NumberSpan {
+                start,
+                end: self.pos,
+            });
+        }
+        None
     }
 }
 
@@ -296,5 +440,86 @@ mod tests {
         assert_eq!(same_delta, vec!["a"]);
         assert!(reproject.is_empty());
         assert!(!same_delta.iter().any(|id| id == "z"));
+    }
+
+    const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+    fn translate(dx: f64, dy: f64) -> [[f64; 3]; 3] {
+        [[1.0, 0.0, dx], [0.0, 1.0, dy], [0.0, 0.0, 1.0]]
+    }
+
+    fn anchor_at(node_index: usize, target: &str, qx: f64, qy: f64) -> RAnchor {
+        RAnchor {
+            node_index,
+            target: target.to_string(),
+            at: RLocalPoint { x: qx, y: qy },
+        }
+    }
+
+    #[test]
+    fn reproject_matches_hand_computed_affine_compose() {
+        // follower_base translates by (100,0); target_base translates by (10,20);
+        // delta translates by (5,7). The anchor `at` is the target-local point
+        // (16,8) QUANTIZED units => (2,1) px (Q=8).
+        //
+        // world = (delta * target_base) * (2,1) = (10+5+2, 20+7+1) = (17, 28).
+        // local = follower_base^-1 * world = (17-100, 28-0) = (-83, 28).
+        let follower_base = translate(100.0, 0.0);
+        let target_base = translate(10.0, 20.0);
+        let delta = translate(5.0, 7.0);
+        let at = anchor_at(0, "t", 16.0, 8.0);
+        let (fx, fy) =
+            reproject_node_local_px(&follower_base, &target_base, &delta, &at).expect("non-singular");
+        assert!((fx - (-83.0)).abs() < 1e-9, "fx={fx}");
+        assert!((fy - 28.0).abs() < 1e-9, "fy={fy}");
+    }
+
+    #[test]
+    fn pure_target_translation_moves_follower_node_by_the_same_world_delta() {
+        // With identity bases, the follower-local node position equals the de-
+        // quantized anchor point; a pure target translation `delta` must shift that
+        // node by EXACTLY the same world delta (no scale/rotation in play).
+        let at = anchor_at(0, "t", 24.0, 40.0); // (3, 5) px de-quantized.
+        let (bx, by) =
+            reproject_node_local_px(&IDENTITY, &IDENTITY, &IDENTITY, &at).expect("non-singular");
+        let delta = translate(11.0, -4.0);
+        let (mx, my) =
+            reproject_node_local_px(&IDENTITY, &IDENTITY, &delta, &at).expect("non-singular");
+        assert!((bx - 3.0).abs() < 1e-9 && (by - 5.0).abs() < 1e-9, "base ({bx},{by})");
+        assert!((mx - bx - 11.0).abs() < 1e-9, "dx={}", mx - bx);
+        assert!((my - by - (-4.0)).abs() < 1e-9, "dy={}", my - by);
+    }
+
+    #[test]
+    fn reproject_is_none_for_a_singular_follower_base() {
+        let singular = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let at = anchor_at(0, "t", 8.0, 8.0);
+        assert!(reproject_node_local_px(&singular, &IDENTITY, &IDENTITY, &at).is_none());
+    }
+
+    #[test]
+    fn rewrite_geometry_node_replaces_only_the_addressed_pair_quantized() {
+        // Node 1 is the `L 64 0` pair; move it to (10, 4) px => (80, 32) quantized.
+        let d = "M 0 0 L 64 0 L 64 64 L 0 64 Z";
+        let out = rewrite_geometry_node(d, 1, 10.0, 4.0).expect("node 1 is addressable");
+        assert_eq!(out, "M 0 0 L 80 32 L 64 64 L 0 64 Z");
+    }
+
+    #[test]
+    fn rewrite_geometry_node_is_none_when_unchanged_or_unaddressable() {
+        let d = "M 0 0 L 64 0";
+        // Rewriting node 1 to its EXISTING value (8px,0px => 64,0) is a no-op.
+        assert!(rewrite_geometry_node(d, 1, 8.0, 0.0).is_none());
+        // Node 9 does not exist.
+        assert!(rewrite_geometry_node(d, 9, 1.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn rewrite_geometry_node_counts_pairs_across_cubic_control_points() {
+        // `C` contributes three pairs (two controls + endpoint). Pair indices:
+        // 0:M(0,0) 1:c1(8,0) 2:c2(16,8) 3:end(24,8) 4:L(32,8). Move pair 4.
+        let d = "M 0 0 C 8 0 16 8 24 8 L 32 8";
+        let out = rewrite_geometry_node(d, 4, 5.0, 1.0).expect("pair 4 is the L endpoint");
+        assert_eq!(out, "M 0 0 C 8 0 16 8 24 8 L 40 8");
     }
 }
