@@ -47,11 +47,15 @@ fn parse<T: serde::de::DeserializeOwned>(label: &str, json: &str) -> Result<T, S
 // templates as the server (P1: one core, the shell carries no domain logic).
 // ---------------------------------------------------------------------------
 
+use crate::object::anchor_follow::{
+    anchor_follow_ops as anchor_follow_ops_pure,
+    synthesize_create_anchors as synthesize_create_anchors_pure,
+};
 use crate::object::apply::apply_object_op as apply_object_op_pure;
 use crate::object::commands::object_command_catalog_json;
 use crate::object::gestures::object_gesture_catalog_json;
 use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush, DrawingSession};
-use crate::object::model::{Geometry, ObjectScene};
+use crate::object::model::{Geometry, Object, ObjectScene};
 use crate::object::op::ObjectOp;
 use crate::object::region::{OutlineDeriver, StubOutlineDeriver};
 use crate::object::templates::build_template as build_template_pure;
@@ -220,6 +224,53 @@ pub fn split_subpath_at(geometry_json: &str, x: i32, y: i32, radius: i32) -> Str
         Some(cut) => ok_json(&cut),
         None => error_json("erase touch hit no stroke node"),
     }
+}
+
+/// `anchor_follow_ops(scene_json, transform_ops_json) -> ObjectOp[] | {error}`.
+///
+/// Tier-1/#14 commit-time anchor move-together. `transform_ops_json` is the move's
+/// `set-transform` ops; the result is the `edit-geometry` ops that reproject every
+/// object anchored to a moved target through that target's NEW transform (the SAME
+/// reproject the renderer-core LIVE preview applies). Returns `[]` when nothing
+/// follows. The shell batches the returned ops into the committed move.
+#[wasm_bindgen]
+pub fn anchor_follow_ops(scene_json: &str, transform_ops_json: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let transform_ops: Vec<ObjectOp> = match parse("transformOps", transform_ops_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&anchor_follow_ops_pure(&scene, &transform_ops))
+}
+
+/// `synthesize_create_anchors(created_json, target_json, endpoint_x, endpoint_y)
+/// -> Anchor[] | null | {error}`.
+///
+/// AP5 drag-create anchoring. Binds `created`'s node nearest the snapped world
+/// endpoint to `target`; `at` is the snap world point in the target's LOCAL
+/// quantized space. Returns `null` when no anchor should be authored (the target
+/// is the created object, or the created geometry has no node), which the shell
+/// treats as "no anchor" (the Alt-create / no-snap case).
+#[wasm_bindgen]
+pub fn synthesize_create_anchors(
+    created_json: &str,
+    target_json: &str,
+    endpoint_x: f64,
+    endpoint_y: f64,
+) -> String {
+    let created: Object = match parse("created", created_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let target: Object = match parse("target", target_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let anchors = synthesize_create_anchors_pure(&created, &target, endpoint_x, endpoint_y);
+    ok_json(&anchors)
 }
 
 // ---------------------------------------------------------------------------

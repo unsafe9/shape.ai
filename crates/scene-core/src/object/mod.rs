@@ -16,6 +16,7 @@
 //! - [`layout_solve`] — thin auto-layout solve (OB3.A1/D3).
 //! - [`validate`] — pure structural validators (OB3.S2).
 
+pub mod anchor_follow;
 pub mod anchors;
 pub mod apply;
 pub mod commands;
@@ -30,6 +31,7 @@ pub mod theme;
 pub mod undo;
 pub mod validate;
 
+pub use anchor_follow::{anchor_follow_ops, synthesize_create_anchors};
 pub use anchors::{connection_graph, neighbors, reproject_object_anchors, resolve_endpoint};
 pub use apply::{apply_object_op, apply_object_op_lww, apply_sequence, ApplyError};
 pub use commands::{

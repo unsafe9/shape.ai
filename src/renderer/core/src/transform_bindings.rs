@@ -141,9 +141,10 @@ impl Bindings {
 }
 
 /// W3-G9/#4: the LIVE follower-LOCAL pixel position of an anchored node when its
-/// target moves by `delta`. Mirrors the shell `reprojectAnchoredGeometry`
-/// (anchorCreate.ts): the anchor `at` is a point in the TARGET's local QUANTIZED
-/// space, so de-quantize it (`/ UNITS_PER_PX`), carry it to world through the
+/// target moves by `delta`. Mirrors the scene-core canonical SetTransform reproject
+/// (`object::anchor_follow::reproject_node_local_quantized`): the anchor `at` is a
+/// point in the TARGET's local QUANTIZED space, so de-quantize it
+/// (`/ UNITS_PER_PX`), carry it to world through the
 /// target's PREVIEWED transform (`delta * target_base`), then back into the
 /// follower's OWN local pixel space (`follower_base^-1`). Returns the follower-
 /// local `(x, y)` in pixels, or `None` when `follower_base` is singular.
@@ -178,8 +179,8 @@ pub fn reproject_node_local_px(
 
 /// W3-G9/#4: rewrite the `node_index`-th coordinate PAIR of a path-string `d` to
 /// the QUANTIZED `(x, y)` (object-local units, rounded from pixels), preserving
-/// every command token and every other coordinate. Mirrors the shell `setPathNode`
-/// (anchorCreate.ts): coordinate pairs are counted in token order across the whole
+/// every command token and every other coordinate. Mirrors the scene-core
+/// `anchor_follow::set_path_node`: coordinate pairs are counted in token order across the whole
 /// string (M/L/C all contribute pairs), and only the target pair is replaced.
 /// Returns `None` when the string has no such pair (the node is unaddressable) or
 /// when the rewrite is a no-op (the new coords already match), so the caller can
@@ -521,5 +522,33 @@ mod tests {
         let d = "M 0 0 C 8 0 16 8 24 8 L 32 8";
         let out = rewrite_geometry_node(d, 4, 5.0, 1.0).expect("pair 4 is the L endpoint");
         assert_eq!(out, "M 0 0 C 8 0 16 8 24 8 L 40 8");
+    }
+
+    /// CROSS-CORE EQUIVALENCE GUARD (the drift killer). The SAME concrete numeric
+    /// vector and hand-computed expected as scene-core
+    /// `anchor_follow::tests::reproject_matches_cross_core_vector`, asserted here
+    /// against the LIVE-preview half (`reproject_node_local_px` +
+    /// `rewrite_geometry_node`), so either copy drifting fails its own test.
+    ///
+    /// Shared formula (documented in both cores):
+    ///   follower_base = translate(100, 0); target_base = translate(10, 20);
+    ///   delta = translate(5, 7)  (=> target NEW = delta * target_base = translate(15,27));
+    ///   anchor.at = (16, 8) quantized => (2, 1) px de-quantized (Q=8);
+    ///   d = "M 0 0 L 64 0"; node_index = 1.
+    ///   world = target_new * (2, 1) = (17, 28)
+    ///   follower-local px = follower_base^-1 * world = (17-100, 28) = (-83, 28)
+    ///   quantized = round((-83, 28) * 8) = (-664, 224)
+    ///   => rewrite "M 0 0 L 64 0" node 1 = "M 0 0 L -664 224"
+    #[test]
+    fn reproject_matches_cross_core_vector() {
+        let follower_base = translate(100.0, 0.0);
+        let target_base = translate(10.0, 20.0);
+        let delta = translate(5.0, 7.0);
+        let at = anchor_at(1, "t", 16.0, 8.0);
+        let (fx, fy) =
+            reproject_node_local_px(&follower_base, &target_base, &delta, &at).expect("non-singular");
+        assert!((fx - (-83.0)).abs() < 1e-9 && (fy - 28.0).abs() < 1e-9, "px ({fx},{fy})");
+        let out = rewrite_geometry_node("M 0 0 L 64 0", 1, fx, fy).expect("node 1 addressable");
+        assert_eq!(out, "M 0 0 L -664 224");
     }
 }
