@@ -23,6 +23,7 @@ pub mod cascade;
 pub mod commands;
 pub mod drawing;
 pub mod gestures;
+pub mod grouping;
 pub mod layout_solve;
 pub mod model;
 pub mod op;
@@ -43,6 +44,9 @@ pub use drawing::{fit_beziers, pressure_to_width, rdp_simplify, Brush, DrawingSe
 pub use gestures::{
     object_gesture_catalog, object_gesture_catalog_json, HoldInput, HoldTrigger, ObjectGesture,
     ObjectGestureCategory,
+};
+pub use grouping::{
+    double_click_action, has_children, pop_out_op, ungroup_enabled, DoubleClickAction,
 };
 pub use layout_solve::solve_layout;
 pub use templates::{

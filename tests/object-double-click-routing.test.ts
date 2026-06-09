@@ -10,14 +10,38 @@
 // branch is exercised, not re-derived. Falsifiable: if the field is dropped anywhere
 // (wasmLoader type / engine read / engine event), no event fires and the test fails.
 
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import { ShapeCanvasEngine, type EngineEvent } from "../src/client/renderer/engine";
-import { doubleClickAction } from "../src/client/lib/grouping";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
+import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../src/shared/object";
 import type { RustInputBatchResult, RustWebGpuRenderer } from "../src/client/renderer/wasmLoader";
 import type { CameraState } from "../src/client/renderer/scene";
 
 const CAMERA: CameraState = { x: 0, y: 0, zoom: 1 };
+
+let core: SceneCore;
+
+beforeAll(async () => {
+  await ensureSceneCore();
+  core = await loadSceneCore();
+});
+
+function obj(id: string, parent: string | undefined): SceneObject {
+  return {
+    id,
+    ...(parent ? { parent } : {}),
+    order: "a0",
+    geometry: { d: "M 0 0 L 8 0" }
+  } as SceneObject;
+}
+
+// A scene where `frame-1` is a container (has a child) and `rect-1` is a leaf —
+// the same forest the engine's hasChildren signal reflects, so the core decision
+// the shell runs agrees with the renderer-emitted hasChildren bit.
+function routingScene(): ObjectScene {
+  return { ...emptyObjectScene(), objects: [obj("frame-1", undefined), obj("child", "frame-1"), obj("rect-1", undefined)] };
+}
 
 // A minimal fake renderer whose `inputBatch` returns the supplied objectDoubleClick
 // on a double-click event (and nothing on any other event). Only the methods the
@@ -124,15 +148,15 @@ describe("W3-G1 double-click drill-in routing", () => {
     const event = driveDoubleClick({ id: "frame-1", hasChildren: true });
     // The field reached the engine and rode out as the event the host forwards.
     expect(event).toEqual({ type: "object-double-click", id: "frame-1", hasChildren: true });
-    // App.handleObjectDoubleClick runs this exact decision: a container drills in
-    // (sets activeContainer to the id), not into text edit.
-    expect(doubleClickAction(event)).toEqual({ kind: "drill-in", id: "frame-1" });
+    // App.handleObjectDoubleClick runs this exact core decision off the event id: a
+    // container drills in (sets activeContainer to the id), not into text edit.
+    expect(core.doubleClickAction(routingScene(), event!.id)).toEqual({ kind: "drill-in-container" });
   });
 
   it("routes a leaf double-click (no children) to inline text edit, not drill-in", () => {
     const event = driveDoubleClick({ id: "rect-1", hasChildren: false });
     expect(event).toEqual({ type: "object-double-click", id: "rect-1", hasChildren: false });
-    expect(doubleClickAction(event)).toEqual({ kind: "edit-text", id: "rect-1" });
+    expect(core.doubleClickAction(routingScene(), event!.id)).toEqual({ kind: "edit-leaf" });
   });
 
   it("emits nothing when the double-click misses every object", () => {

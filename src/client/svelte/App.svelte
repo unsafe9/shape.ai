@@ -48,7 +48,6 @@
     type DragSpan
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
-  import { doubleClickAction, ungroupEnabled, popOutOp } from "../lib/grouping";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
   import CanvasHost from "./ShapeCanvasHost.svelte";
@@ -921,10 +920,10 @@
 
   // AP3 (#18): pop the right-clicked child out one level — reparent it to its
   // parent's parent (or canvas root when the parent sits at the root). The op is
-  // built by the pure `popOutOp` helper; a non-child picked target yields null.
+  // authored by the core `popOutOp` query; a non-child picked target yields null.
   function popOutSelection(picked: ObjectSelection): void {
-    if (picked.kind !== "object") return;
-    const op = popOutOp(scene.objects, picked.id);
+    if (picked.kind !== "object" || !sceneCore) return;
+    const op = sceneCore.popOutOp(scene, picked.id);
     if (!op) return;
     authorOp(op);
     showToast("Popped out one level");
@@ -1013,19 +1012,20 @@
   // ----- AP3 (#9): double-click drill-in -----
 
   // RA2b surfaces a double-click on an object as { id, hasChildren } on the
-  // inputBatch result. Branch it (D6): a container (hasChildren) drills in — the
-  // shell sets the active container; a leaf enters inline text edit (the existing
-  // path). A null signal (double-click missed every object) is a no-op.
+  // inputBatch result. The core `doubleClickAction` query branches it (D6): a
+  // container drills in — the shell sets the active container; a leaf enters inline
+  // text edit (the existing path). A null signal (double-click missed every
+  // object) is a no-op; the container-vs-leaf decision lives in the core.
   function handleObjectDoubleClick(signal: { id: string; hasChildren: boolean } | null): void {
-    const action = doubleClickAction(signal);
-    if (!action) return;
-    if (action.kind === "drill-in") {
-      activeContainer = action.id;
-      selectObject({ kind: "object", id: action.id });
+    if (!signal || !sceneCore) return;
+    const action = sceneCore.doubleClickAction(scene, signal.id);
+    if (action.kind === "drill-in-container") {
+      activeContainer = signal.id;
+      selectObject({ kind: "object", id: signal.id });
       showToast("Entered group");
       return;
     }
-    enterTextEdit(action.id);
+    enterTextEdit(signal.id);
   }
 
   // ----- W2-10: inline text editing -----
@@ -1307,12 +1307,12 @@
 
   // AP3 (#13): ungroup is enabled only for a single container object (has children).
   function ungroupPickEnabled(picked: ObjectSelection): boolean {
-    return picked.kind === "object" && ungroupEnabled(scene.objects, picked.id);
+    return picked.kind === "object" && !!sceneCore && sceneCore.ungroupEnabled(scene, picked.id);
   }
 
   // AP3 (#18): pop-out is enabled only when the single picked object has a parent.
   function popOutPickEnabled(picked: ObjectSelection): boolean {
-    return picked.kind === "object" && popOutOp(scene.objects, picked.id) !== null;
+    return picked.kind === "object" && !!sceneCore && sceneCore.popOutOp(scene, picked.id) !== null;
   }
 
   const OBJECT_MENU: ContextMenuEntry[] = [

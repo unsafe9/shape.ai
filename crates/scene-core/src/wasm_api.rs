@@ -57,6 +57,10 @@ use crate::object::model::Transform3x3;
 use crate::object::commands::object_command_catalog_json;
 use crate::object::gestures::object_gesture_catalog_json;
 use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush, DrawingSession};
+use crate::object::grouping::{
+    double_click_action as double_click_action_pure, has_children as has_children_pure,
+    pop_out_op as pop_out_op_pure, ungroup_enabled as ungroup_enabled_pure,
+};
 use crate::object::model::{Geometry, Object, ObjectScene};
 use crate::object::op::ObjectOp;
 use crate::object::region::{OutlineDeriver, StubOutlineDeriver};
@@ -320,6 +324,71 @@ pub fn synthesize_create_anchors(
 }
 
 // ---------------------------------------------------------------------------
+// Grouping bridges (Tier-4) — group-hierarchy containment op-generation + forest
+// queries. The shell's context-menu pop-out, the ungroup-enabled menu gate, and
+// the double-click container-vs-leaf decision now run THE core query; the shell
+// keeps only the dispatch (author the op / set active-container / inline edit).
+// ---------------------------------------------------------------------------
+
+/// `pop_out_op(scene_json, id) -> ObjectOp | null | {error}`.
+///
+/// Author the `reparent` op that pops `id` out one level (to its grandparent, or
+/// to the canvas root when the parent sits at the root), preserving its order key.
+/// Returns `null` when `id` is unknown or already at the root (nothing to pop out
+/// of). The shell authors the returned op through the same op-apply path (whose
+/// `reparent` arm carries the cycle check).
+#[wasm_bindgen]
+pub fn pop_out_op(scene_json: &str, id: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&pop_out_op_pure(&scene, id))
+}
+
+/// `has_children(scene_json, id) -> bool | {error}`.
+/// Whether `id` is a container (has at least one child) in the object forest.
+#[wasm_bindgen]
+pub fn has_children(scene_json: &str, id: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&has_children_pure(&scene, id))
+}
+
+/// `ungroup_enabled(scene_json, selected_id) -> bool | {error}`.
+///
+/// Whether ungroup is enabled for the single selected object: true only when a
+/// non-null `selected_id` is a container (has children). An empty `selected_id`
+/// string is treated as no selection (the canvas / multi-select case the shell
+/// gates out before calling).
+#[wasm_bindgen]
+pub fn ungroup_enabled(scene_json: &str, selected_id: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let selected = if selected_id.is_empty() { None } else { Some(selected_id) };
+    ok_json(&ungroup_enabled_pure(&scene, selected))
+}
+
+/// `double_click_action(scene_json, id) -> DoubleClickAction | {error}`.
+///
+/// The container-vs-leaf decision for a double-click on object `id`:
+/// `{"kind":"drill-in-container"}` when it has children, else
+/// `{"kind":"edit-leaf"}`. The shell drives this off the renderer's double-click
+/// signal id and dispatches the action (set active-container vs inline text edit).
+#[wasm_bindgen]
+pub fn double_click_action(scene_json: &str, id: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&double_click_action_pure(&scene, id))
+}
+
+// ---------------------------------------------------------------------------
 // Undo/redo bridge (FC-15). The per-actor `UndoStack` (D21) now lives in the
 // core; the shell drives it through this stateful wrapper instead of a TS
 // reimplementation. The wrapper mirrors the crate's semantics exactly: undo/redo
@@ -568,6 +637,59 @@ mod tests {
         let scene = scene_json(&[line_object_json("a", None, 0.0, 0.0)]);
         let out = move_ops(&scene, "not json", "[[1,0,0],[0,1,0],[0,0,1]]");
         assert!(out.contains("\"error\""), "malformed roots is a bridge error");
+    }
+
+    // --- grouping bridges (Tier-4) ---
+
+    /// A scene with `root -> mid -> deep` plus a root-level `leaf`, in the
+    /// camelCase wire shape the shell sends.
+    fn grouping_scene_json() -> String {
+        scene_json(&[
+            line_object_json("root", None, 0.0, 0.0),
+            line_object_json("mid", Some("root"), 0.0, 0.0),
+            line_object_json("deep", Some("mid"), 0.0, 0.0),
+            line_object_json("leaf", None, 0.0, 0.0),
+        ])
+    }
+
+    #[test]
+    fn pop_out_op_bridge_authors_reparent_to_grandparent() {
+        let out = pop_out_op(&grouping_scene_json(), "deep");
+        let op: serde_json::Value = serde_json::from_str(&out).expect("op json");
+        assert_eq!(op["kind"], "reparent");
+        assert_eq!(op["id"], "deep");
+        assert_eq!(op["parent"], "root");
+        assert_eq!(op["order"], "a0");
+    }
+
+    #[test]
+    fn pop_out_op_bridge_is_null_for_root_level() {
+        // `leaf` sits at the root -> null (nothing to pop out of).
+        assert_eq!(pop_out_op(&grouping_scene_json(), "leaf"), "null");
+    }
+
+    #[test]
+    fn has_children_bridge_reports_container() {
+        assert_eq!(has_children(&grouping_scene_json(), "root"), "true");
+        assert_eq!(has_children(&grouping_scene_json(), "leaf"), "false");
+    }
+
+    #[test]
+    fn ungroup_enabled_bridge_gates_on_children_and_selection() {
+        assert_eq!(ungroup_enabled(&grouping_scene_json(), "mid"), "true");
+        assert_eq!(ungroup_enabled(&grouping_scene_json(), "leaf"), "false");
+        // An empty selected-id string is no selection.
+        assert_eq!(ungroup_enabled(&grouping_scene_json(), ""), "false");
+    }
+
+    #[test]
+    fn double_click_action_bridge_branches_container_vs_leaf() {
+        let drill: serde_json::Value =
+            serde_json::from_str(&double_click_action(&grouping_scene_json(), "root")).unwrap();
+        assert_eq!(drill["kind"], "drill-in-container");
+        let edit: serde_json::Value =
+            serde_json::from_str(&double_click_action(&grouping_scene_json(), "leaf")).unwrap();
+        assert_eq!(edit["kind"], "edit-leaf");
     }
 
     // --- WasmUndoStack bridge (FC-15) ---

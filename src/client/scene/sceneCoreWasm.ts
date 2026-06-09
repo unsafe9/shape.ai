@@ -70,6 +70,13 @@ export type ObjectGesture = {
 /** A derived outline/region for an object's geometry (OB1.3, reference stub). */
 export type DerivedRegion = Record<string, unknown>;
 
+/**
+ * Tier-4 container-vs-leaf decision for a double-click (mirrors the core
+ * `DoubleClickAction`): a container drills in, a leaf edits its text. The shell
+ * dispatches the action (set active-container vs inline text edit).
+ */
+export type DoubleClickAction = { kind: "drill-in-container" } | { kind: "edit-leaf" };
+
 // Shape of the generated wasm-pack module (`shape_scene_core.js`). Declared
 // locally — matching wasmLoader.ts — so this file does not statically import the
 // gitignored build artifact's types; the dynamic import is `@vite-ignore`d.
@@ -113,6 +120,10 @@ type SceneCoreModule = {
     endpointX: number,
     endpointY: number
   ) => string;
+  pop_out_op: (sceneJson: string, id: string) => string;
+  has_children: (sceneJson: string, id: string) => string;
+  ungroup_enabled: (sceneJson: string, selectedId: string) => string;
+  double_click_action: (sceneJson: string, id: string) => string;
   WasmUndoStack: new (actorId: string) => WasmUndoStack;
 };
 
@@ -213,6 +224,19 @@ export type SceneCore = {
     target: SceneObject,
     endpoint: { x: number; y: number }
   ): Anchor[] | null;
+  /** Tier-4 (#18): the `reparent` op that pops `id` out one level (to its
+   *  grandparent, or to the canvas root when the parent sits at the root),
+   *  preserving its order key. Null when `id` is unknown or already at the root.
+   *  The shell authors the returned op through the same op-apply path. */
+  popOutOp(scene: ObjectScene, id: string): ObjectOp | null;
+  /** Tier-4 (#13): whether `id` is a container (has at least one child). */
+  hasChildren(scene: ObjectScene, id: string): boolean;
+  /** Tier-4 (#13): whether ungroup is enabled for the single selected object —
+   *  true only when a non-null `selectedId` is a container (has children). */
+  ungroupEnabled(scene: ObjectScene, selectedId: string | null): boolean;
+  /** Tier-4 (#9): the container-vs-leaf decision for a double-click on `id`. The
+   *  shell dispatches the action (drill-in vs inline text edit). */
+  doubleClickAction(scene: ObjectScene, id: string): DoubleClickAction;
   /** FC-15: create a per-actor undo/redo stack backed by the core (D21). */
   createUndoStack(actorId: string): UndoStack;
 };
@@ -361,6 +385,24 @@ export async function loadSceneCore(): Promise<SceneCore> {
           endpoint.x,
           endpoint.y
         )
+      );
+    },
+    popOutOp(scene, id) {
+      return parseBridge<ObjectOp | null>("pop_out_op", mod.pop_out_op(JSON.stringify(scene), id));
+    },
+    hasChildren(scene, id) {
+      return parseBridge<boolean>("has_children", mod.has_children(JSON.stringify(scene), id));
+    },
+    ungroupEnabled(scene, selectedId) {
+      return parseBridge<boolean>(
+        "ungroup_enabled",
+        mod.ungroup_enabled(JSON.stringify(scene), selectedId ?? "")
+      );
+    },
+    doubleClickAction(scene, id) {
+      return parseBridge<DoubleClickAction>(
+        "double_click_action",
+        mod.double_click_action(JSON.stringify(scene), id)
       );
     },
     createUndoStack(actorId) {

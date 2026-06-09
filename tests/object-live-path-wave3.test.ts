@@ -30,7 +30,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { objectSceneToRenderObjectScene } from "../src/client/lib/canvasHost";
-import { hasChildren, ungroupEnabled, doubleClickAction } from "../src/client/lib/grouping";
 import {
   buildPrimitiveObject,
   buildPrimitiveObjectFromDrag,
@@ -177,12 +176,13 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
       ]
     });
     expect(shell.byId("rect-1")?.parent).toBe("frame-1");
-    expect(hasChildren(shell.scene.objects, "frame-1")).toBe(true);
-    expect(ungroupEnabled(shell.scene.objects, "frame-1")).toBe(true);
-    expect(ungroupEnabled(shell.scene.objects, "rect-1")).toBe(false); // leaf is not ungroupable
+    expect(core.hasChildren(shell.scene, "frame-1")).toBe(true);
+    expect(core.ungroupEnabled(shell.scene, "frame-1")).toBe(true);
+    expect(core.ungroupEnabled(shell.scene, "rect-1")).toBe(false); // leaf is not ungroupable
 
     // (D cont.) double-click drills into the container (a leaf would edit-text).
-    expect(doubleClickAction({ id: "frame-1", hasChildren: true })).toEqual({ kind: "drill-in", id: "frame-1" });
+    expect(core.doubleClickAction(shell.scene, "frame-1")).toEqual({ kind: "drill-in-container" });
+    expect(core.doubleClickAction(shell.scene, "rect-1")).toEqual({ kind: "edit-leaf" });
 
     // (C/D cascade) a parent drag cascades the world-space delta to the children —
     // dragging the frame moves rect + ellipse with it (one op per object). Tier-2:
