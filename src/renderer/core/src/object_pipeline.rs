@@ -1619,24 +1619,6 @@ pub fn build_scene_geometry_themed_with_measure(
             fill: paint_color(&resolved.fill.paint, resolved.fill.opacity as f32, theme),
         });
 
-        // ---- Shadow: an offset copy of the fill silhouette (RB3 #11) -------
-        // The shadow REUSES the object's own fill `mesh` (the exact, hole-aware,
-        // concavity-correct region triangulation), translated down-right by the
-        // drop offset and drawn beneath the fill. Its color is the theme `shadow`
-        // token, NEVER hardcoded — so a theme flip is a per-instance color refresh,
-        // the geometry stays put (zero rebake, P4). No extra tessellation.
-        let shadow_start = geometry.shadow_vertices.len() as u32;
-        append_shadow_quad(&mut geometry.shadow_vertices, &mesh);
-        let shadow_end = geometry.shadow_vertices.len() as u32;
-        geometry.shadow_instances.push(ShadowInstance {
-            m0: matrix_col(&obj.transform, 0),
-            m1: matrix_col(&obj.transform, 1),
-            m2: matrix_col(&obj.transform, 2),
-            // The drop-shadow color is the `shadow` token resolved against the
-            // active theme — wired through the token table, never a hardcoded RGBA.
-            shadow: resolve_token_f32(SHADOW_TOKEN, theme.dark).unwrap_or([0.0, 0.0, 0.0, 0.25]),
-        });
-
         // ---- Stroke: expand each (dashed) subpath into a ribbon ------------
         let stroke_start = geometry.stroke_vertices.len() as u32;
         let cap = match resolved.stroke.cap {
@@ -1652,14 +1634,53 @@ pub fn build_scene_geometry_themed_with_measure(
             crate::render_object::RStrokeJoin::Round => Join::Miter,
         };
         let width = resolved.stroke.width as f32;
+        // Collect the object's stroke ribbon triangle meshes so a fill-LESS object
+        // (open/free-draw stroke) can still cast a shadow from its line outline
+        // (W3-G10/#3); a filled object ignores these and casts from its fill mesh.
+        let mut stroke_meshes: Vec<crate::stroke_expand::Mesh> = Vec::new();
         for (closed, pts) in &subpaths {
             let runs = dash_segments(pts, &dash_px(&resolved.stroke.dash));
             for run in runs {
                 let stroke_mesh = expand_stroke(&run, *closed, width, None, cap, join);
                 append_stroke_ribbon(&mut geometry.stroke_vertices, &stroke_mesh, width);
+                stroke_meshes.push(stroke_mesh);
             }
         }
         let stroke_end = geometry.stroke_vertices.len() as u32;
+
+        // ---- Shadow: an offset copy of the silhouette (RB3 #11) ------------
+        // The shadow REUSES the object's own fill `mesh` (the exact, hole-aware,
+        // concavity-correct region triangulation), translated by the drop offset
+        // and drawn beneath the fill. Its color is the theme `shadow` token, NEVER
+        // hardcoded — so a theme flip is a per-instance color refresh, the geometry
+        // stays put (zero rebake, P4). No extra tessellation.
+        //
+        // W3-G10/#3: when the fill mesh is EMPTY (an open/stroke-only free-draw
+        // object) but the object has a stroke ribbon, build the silhouette from the
+        // STROKE RIBBON instead so the line itself casts a soft shadow. The ribbon
+        // is the already-expanded triangle list `append_stroke_ribbon` consumed, so
+        // this is still a copy of baked geometry — zero re-tessellation.
+        let shadow_start = geometry.shadow_vertices.len() as u32;
+        if mesh.indices.is_empty() {
+            for stroke_mesh in &stroke_meshes {
+                append_shadow_quad(
+                    &mut geometry.shadow_vertices,
+                    &stroke_mesh.vertices,
+                    &stroke_mesh.indices,
+                );
+            }
+        } else {
+            append_shadow_quad(&mut geometry.shadow_vertices, &mesh.vertices, &mesh.indices);
+        }
+        let shadow_end = geometry.shadow_vertices.len() as u32;
+        geometry.shadow_instances.push(ShadowInstance {
+            m0: matrix_col(&obj.transform, 0),
+            m1: matrix_col(&obj.transform, 1),
+            m2: matrix_col(&obj.transform, 2),
+            // The drop-shadow color is the `shadow` token resolved against the
+            // active theme — wired through the token table, never a hardcoded RGBA.
+            shadow: resolve_token_f32(SHADOW_TOKEN, theme.dark).unwrap_or([0.0, 0.0, 0.0, 0.25]),
+        });
         geometry.stroke_instances.push(StrokeInstance {
             m0: matrix_col(&obj.transform, 0),
             m1: matrix_col(&obj.transform, 1),
@@ -1793,15 +1814,20 @@ fn flatten_object_subpaths(obj: &RenderObject, zoom: f64) -> Vec<(bool, Vec<(f32
 /// approximation. `feather` is emitted `0` (the slot stays for the shader contract;
 /// the offscreen blur owns softness now).
 ///
-/// An empty fill mesh (an open polyline / no fillable interior) casts nothing, so
-/// the object's `shadow_range` stays empty — matching the fill's "no boundable
-/// region emits nothing" contract.
-fn append_shadow_quad(out: &mut Vec<ShadowVertex>, mesh: &crate::tessellate::Mesh) {
-    if mesh.indices.is_empty() {
+/// An empty mesh (an open polyline / no fillable interior, with no stroke ribbon)
+/// casts nothing, so the object's `shadow_range` stays empty — matching the fill's
+/// "no boundable region emits nothing" contract.
+///
+/// Takes the triangle-list as bare `(vertices, indices)` slices so it serves both
+/// the fill mesh ([`crate::tessellate::Mesh`]) and the stroke ribbon
+/// ([`crate::stroke_expand::Mesh`]) — same `[[f32;2]]` + `[u32]` shape — without
+/// coupling to either concrete type.
+fn append_shadow_quad(out: &mut Vec<ShadowVertex>, vertices: &[[f32; 2]], indices: &[u32]) {
+    if indices.is_empty() {
         return;
     }
-    for &index in &mesh.indices {
-        let p = mesh.vertices[index as usize];
+    for &index in indices {
+        let p = vertices[index as usize];
         out.push(ShadowVertex {
             position: [p[0], p[1] + SHADOW_OFFSET_PX],
             feather: 0.0,
@@ -2253,8 +2279,10 @@ mod tests {
     /// default white chord region), while a CLOSED path with no fill keeps the
     /// structural default fill. The per-object instance buffers stay index-aligned.
     /// FAILS if open brush strokes still tessellate a fill (the ugly white region).
+    /// W3-G10/#3: the open stroke now casts a shadow from its stroke ribbon (its
+    /// fill mesh is empty), so its `shadow_range` is non-empty.
     #[test]
-    fn open_path_without_fill_skips_fill_and_shadow() {
+    fn open_path_without_fill_skips_fill_but_shadows_the_stroke() {
         // A bare-bones object factory: identity transform, the given geometry, no
         // inline fill, no stroke.
         let fill_less = |id: &str, d: &str| RenderObject {
@@ -2279,17 +2307,18 @@ mod tests {
         let open_draw = &geo.draws[0];
         let closed_draw = &geo.draws[1];
 
-        // (a) Open + fill:None => NO fill region and NO shadow.
+        // (a) Open + fill:None => NO fill region, but the stroke ribbon STILL casts a
+        // shadow (W3-G10/#3: a free-draw line floats over the canvas too).
         assert!(
             open_draw.fill_range.is_empty(),
             "open brush stroke must not tessellate a fill region"
         );
-        assert!(
-            open_draw.shadow_range.is_empty(),
-            "an unfilled open stroke casts no shadow"
-        );
         // It still strokes (an open path is a visible line).
         assert!(!open_draw.stroke_range.is_empty(), "open stroke still draws a ribbon");
+        assert!(
+            !open_draw.shadow_range.is_empty(),
+            "an unfilled open stroke casts a shadow from its stroke ribbon"
+        );
 
         // (b) Closed + fill:None => the structural default fill STILL applies.
         assert!(
@@ -3342,6 +3371,66 @@ mod tests {
                 .iter()
                 .any(|v| (v.position[0] - cx).abs() < 1e-3 && (v.position[1] - cy).abs() < 1e-3),
             "no shadow vertex sits at the outline centroid (the old core-fan apex)"
+        );
+    }
+
+    /// W3-G10/#3: a stroke-only (free-draw) object — open path, `fill: None`, a
+    /// non-empty stroke ribbon — now casts a shadow built from the STROKE RIBBON
+    /// (its fill mesh is empty), so its `shadow_range` is non-empty. A filled object
+    /// still casts from its fill-mesh silhouette (unchanged). An object with neither
+    /// a fillable interior NOR a stroke ribbon casts nothing. FAILS if a stroke-only
+    /// object stays shadowless (the empty-fill fall-through is removed).
+    #[test]
+    fn stroke_only_object_casts_shadow_from_ribbon() {
+        // (1) Stroke-only: open 2-node line, fill None -> empty fill mesh, but a real
+        // stroke ribbon. Shadow must come from the ribbon (non-empty), and equal the
+        // ribbon triangle list exactly (one copy, untranslated at offset 0).
+        let stroke_only = open_stroke_object("line", "M0 0 L800 400");
+        let scene = scene_with(vec![stroke_only], None);
+        let geo = build_scene_geometry(&scene);
+        let draw = &geo.draws[0];
+        assert!(draw.fill_range.is_empty(), "open + fill None has no fill mesh");
+        assert!(
+            !draw.shadow_range.is_empty(),
+            "stroke-only object casts a shadow from its stroke ribbon"
+        );
+        // The shadow silhouette equals the object's stroke ribbon triangle count.
+        assert_eq!(
+            draw.shadow_range.len(),
+            draw.stroke_range.len(),
+            "stroke-only shadow is one copy of the stroke ribbon"
+        );
+        assert!(
+            geo.shadow_vertices.iter().all(|v| v.feather == 0.0),
+            "the stroke-ribbon silhouette reads flat (feather 0)"
+        );
+
+        // (2) Filled object: shadow is STILL the fill-mesh silhouette, NOT the ribbon.
+        let filled = scene_with(vec![rect_object("r")], None);
+        let fgeo = build_scene_geometry(&filled);
+        let fdraw = &fgeo.draws[0];
+        let subpaths = flatten_object_subpaths(&filled.objects[0], filled.camera.zoom);
+        let fill_input: Vec<(bool, Vec<(f32, f32)>)> =
+            subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();
+        let fill_mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
+        assert!(!fill_mesh.indices.is_empty(), "rect fills");
+        assert_eq!(
+            fdraw.shadow_range.len(),
+            fill_mesh.indices.len() as u32,
+            "a filled object's shadow is its fill-mesh silhouette (unchanged)"
+        );
+
+        // (3) Neither fill nor stroke ribbon: a lone MoveTo (single point) — open so
+        // it does not fill, and a <2-node subpath expands to an empty ribbon — casts
+        // nothing.
+        let empty = open_stroke_object("dot", "M0 0");
+        let egeo = build_scene_geometry(&scene_with(vec![empty], None));
+        let edraw = &egeo.draws[0];
+        assert!(edraw.fill_range.is_empty(), "single point has no fill");
+        assert!(edraw.stroke_range.is_empty(), "single point has no stroke ribbon");
+        assert!(
+            edraw.shadow_range.is_empty(),
+            "an object with neither a fill nor a stroke ribbon casts nothing"
         );
     }
 
