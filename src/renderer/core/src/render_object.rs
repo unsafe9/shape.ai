@@ -195,8 +195,10 @@ pub struct RenderObjectScene {
     /// Persisted single-anchor selection: the id of the selected object, if any.
     #[serde(default)]
     pub selection: Option<String>,
-    /// Transient multi-select set, never persisted (mirrors `SceneSnapshot`).
-    #[serde(default, skip)]
+    /// Transient multi-select set. Shell-owned and never round-tripped to disk, but
+    /// the shell DOES send it on the live wire (`multiSelect`), so it must
+    /// deserialize — the draw path (outline overlay, preview closure) reads it.
+    #[serde(default, rename = "multiSelect")]
     pub multi_select: Vec<String>,
 }
 
@@ -705,5 +707,20 @@ mod tests {
 
     fn identity_transform() -> [[f64; 3]; 3] {
         [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    }
+
+    #[test]
+    fn multi_select_deserializes_from_the_wire() {
+        // W3-G9/#2: the shell sends `multiSelect` on the live wire; before the fix it
+        // was `skip`ped so this always parsed empty (no outline, no group preview).
+        let json = r##"{
+            "sceneId": "s1",
+            "camera": { "x": 0, "y": 0, "zoom": 1 },
+            "objects": [],
+            "multiSelect": ["a", "b"]
+        }"##;
+        let scene: RenderObjectScene =
+            serde_json::from_str(json).expect("scene with multiSelect deserializes");
+        assert_eq!(scene.multi_select, vec!["a".to_string(), "b".to_string()]);
     }
 }

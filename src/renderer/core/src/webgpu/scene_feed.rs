@@ -100,6 +100,10 @@ impl ShapeWebGpuRenderer {
         // FC-04: derive + retain each object's local-space region for hit-test /
         // marquee, then keep the parsed scene as the live-object branch switch.
         self.object_regions = derive_object_regions(&scene);
+        // W3-G9/#2: the wire now carries `multiSelect`; mirror it onto the renderer
+        // so a later object re-feed (which throws away the per-scene renderer) keeps
+        // the highlight set, matching how the legacy `load_scene` retains it.
+        self.multi_select = scene.multi_select.clone();
         self.object_scene = Some(scene);
         self.object_renderer = Some(renderer);
         serde_wasm(counts)
