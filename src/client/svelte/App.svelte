@@ -119,6 +119,12 @@
   // snapped to (null when not snapped); it is captured per phase so the commit can
   // synthesize a persistent anchor binding the created endpoint to that target.
   let createDrag = $state<{ span: DragSpan; snapped: boolean; target: string | null } | null>(null);
+  // W3-G9 (#3): the pre-drag hover snap. While the create tool is armed and no
+  // button is down, a bare hover over an existing object's edge sets this to the
+  // snapped world point + target id; `feedScene` renders a PERSISTENT anchor ring
+  // from it (only while `createDrag` is null, so a drag's own ring takes over). Null
+  // when the cursor is off any edge, or once a drag starts / the tool disarms.
+  let createHoverSnap = $state<{ at: { x: number; y: number }; target: string | null } | null>(null);
 
   // ----- W2-10: inline text editing. `textEdit` holds the id of the object being
   //       edited and its in-progress value; a contenteditable overlay is positioned
@@ -235,7 +241,7 @@
   // FC-11/W2-07: while a freehand stroke or shape drag-create is in progress, append
   // a transient preview object (a NEW object has no instance to update, so it bakes
   // once per geometry change — correct, not a P4 violation).
-  const feedScene = $derived(buildFeedScene(scene, drawPoints, createKind, createDrag));
+  const feedScene = $derived(buildFeedScene(scene, drawPoints, createKind, createDrag, createHoverSnap));
 
   const hostCallbacks: ShapeCanvasHostCallbacks = {
     onCameraChange: (next) => (camera = next),
@@ -320,6 +326,8 @@
     onDraw: (phase, world) => handleDraw(phase, world),
     // W2-07: shape drag-create rubber-band + commit + select-after-create.
     onCreate: (phase, world, snapped, targetId) => handleCreate(phase, world, snapped, targetId),
+    // W3-G9 (#3): pre-drag hover snap probe — drives the persistent anchor ring.
+    onCreateHover: (world, snapped, targetId) => handleCreateHover(world, snapped, targetId),
     // W2-08: eraser touch — whole-stroke delete or partial subpath cut.
     onErase: (id, world, partial) => handleErase(id, world, partial),
     // W2-03: the core's per-move hover classification drives the canvas cursor.
@@ -686,6 +694,7 @@
     }
     createKind = kind;
     createDrag = null;
+    createHoverSnap = null;
     setActiveTool("create");
     status = `Drag to create ${kind}`;
   }
@@ -709,11 +718,15 @@
     const targetId = targetIdIn !== null && scene.objects.some((o) => o.id === targetIdIn) ? targetIdIn : null;
     const snapped = snappedIn && targetId !== null;
     if (phase === "start") {
+      // W3-G9 (#3): a drag takes over the ring (its own snap-indicator rides the
+      // preview), so drop the pre-drag hover snap to avoid a doubled ring.
+      createHoverSnap = null;
       createDrag = { span: { start: world, end: world }, snapped, target: targetId };
       return;
     }
     if (phase === "cancel") {
       createDrag = null;
+      createHoverSnap = null;
       return;
     }
     if (!createDrag) return;
@@ -747,6 +760,18 @@
     createKind = null;
     setActiveTool("select");
     showToast(`Inserted ${kind}`);
+  }
+
+  // W3-G9 (#3): drive the PERSISTENT pre-drag anchor ring. A bare create-tool hover
+  // over an object's edge sets `createHoverSnap` (the snapped world point + target);
+  // a hover off any edge (or onto the transient preview, never a real object)
+  // clears it. The canonicalization mirrors handleCreate (#6): honor a snap ONLY
+  // when its target is a REAL canonical object, so the ring never shows over the
+  // preview's own outline. The ring renders from feedScene while createDrag is null.
+  function handleCreateHover(world: { x: number; y: number }, snappedIn: boolean, targetIdIn: string | null): void {
+    if (!createKind) return void (createHoverSnap = null);
+    const target = targetIdIn !== null && scene.objects.some((o) => o.id === targetIdIn) ? targetIdIn : null;
+    createHoverSnap = snappedIn && target !== null ? { at: world, target } : null;
   }
 
   // FC-11: drive the freehand pen. Accumulate world points across start/move; on
@@ -1176,6 +1201,8 @@
     if (tool !== "create") {
       createKind = null;
       createDrag = null;
+      // W3-G9 (#3): leaving create drops the persistent hover ring so it never lingers.
+      createHoverSnap = null;
     }
     activeTool = tool;
   }
@@ -1460,7 +1487,8 @@
     source: ObjectScene,
     pen: { x: number; y: number }[] | null,
     create: DragCreateShape | null,
-    createState: { span: DragSpan; snapped: boolean } | null
+    createState: { span: DragSpan; snapped: boolean } | null,
+    hoverSnap: { at: { x: number; y: number }; target: string | null } | null
   ): ObjectScene {
     let feed = source;
     const preview = pen && pen.length >= 1 ? drawPreviewObject(pen) : null;
@@ -1470,6 +1498,10 @@
     if (create && createState) {
       const extra = createPreviewObjects(create, createState.span, createState.snapped);
       if (extra.length > 0) feed = { ...feed, objects: [...feed.objects, ...extra] };
+    } else if (hoverSnap) {
+      // W3-G9 (#3): no drag in progress — render the PERSISTENT pre-drag anchor ring
+      // at the hovered edge so the user sees where the next create would anchor.
+      feed = { ...feed, objects: [...feed.objects, snapIndicatorObject(hoverSnap.at)] };
     }
     return feed;
   }
