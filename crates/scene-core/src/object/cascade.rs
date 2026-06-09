@@ -1,14 +1,14 @@
-//! Tier-2 — the parent-drag + multi-select transform CASCADE (the canonical
-//! commit-time mirror of the renderer-core LIVE preview `transform_bindings`).
+//! Tier-2 — the parent-drag + multi-select transform CASCADE (the commit-time
+//! op-generation half of the move-together graph).
 //!
 //! A drag commits a world-space delta matrix for the dragged object(s). Children
 //! are reparented under a frame with world-absolute transforms (D3), so moving a
 //! parent must apply the SAME world delta to every descendant — otherwise the
-//! frame slides out from under its contents. This is the commit-time op-generation
-//! half of the move-together graph; the renderer-core
-//! `transform_bindings::Bindings::propagation_closure` is the LIVE-preview half,
-//! and the orderings MUST match (so the preview the renderer shows is the same set
-//! of objects, in the same order, the commit authors).
+//! frame slides out from under its contents. The SameDelta id set + ORDER is
+//! derived from the SINGLE source `super::move_together::BindingGraph::propagation_closure`
+//! — the SAME traversal the renderer-core LIVE preview consumes (via the scene-core
+//! path-dep) — so the objects the preview shows and the ops the commit authors are
+//! the same set, in the same order, by construction (they cannot drift).
 //!
 //! Ported from the shell `transformCascade.ts` (`cascadeTransformOps` /
 //! `cascadeMultiTransformOps` / `composeTransform`) so the canvas logic lives in
@@ -379,11 +379,11 @@ mod tests {
         assert_eq!(direct, viamove);
     }
 
-    // PIN the ordering equals the renderer-core SameDelta closure ordering: a
+    // PIN the cascade ordering equals the shared SameDelta closure ordering: a
     // documented expected sequence for two frames a{b}, d{e} multi-selected [a,d].
-    // This is the SAME fixture as renderer-core
-    // `transform_bindings::tests::multi_select_roots_expand_each_subtree_once`
-    // (expected `["a","b","d","e"]`), so the two cores cannot drift on ordering.
+    // This is the SAME fixture as `super::move_together::tests` (expected
+    // `["a","b","d","e"]`); cascade now DERIVES its order from that closure, so this
+    // pins the canonical order both the commit and the renderer live-preview share.
     #[test]
     fn multi_cascade_order_matches_renderer_core_same_delta_closure() {
         let scene = scene_of(vec![
