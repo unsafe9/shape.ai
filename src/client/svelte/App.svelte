@@ -48,7 +48,6 @@
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import { cascadeTransformOps, cascadeMultiTransformOps } from "../lib/transformCascade";
-  import { anchorFollowOps, synthesizeCreateAnchors } from "../lib/anchorCreate";
   import { doubleClickAction, ungroupEnabled, popOutOp } from "../lib/grouping";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
@@ -286,7 +285,7 @@
       // AP5 (#14): every object anchored to a moved object reprojects its bound
       // node through that object's NEW transform, so anchored endpoints move WITH
       // the target. No anchors onto anything moved => no extra ops (the no-op case).
-      const allOps = [...ops, ...anchorFollowOps(scene.objects, ops)];
+      const allOps = [...ops, ...(sceneCore ? sceneCore.anchorFollowOps(scene, ops) : [])];
       const op: ObjectOp = allOps.length === 1 ? allOps[0] : { kind: "batch", ops: allOps };
       // FC-16: pre-connect authorOp applies synchronously (the committed scene is on
       // return, so the rebake $effect drops the preview matrix immediately). In the
@@ -745,9 +744,9 @@
     // outline with a persistent D5 anchor (Alt-create bypasses snap upstream, so
     // `snapTarget` is null and no anchor is authored). The endpoint then reprojects
     // through the target's transform, so the new object moves WITH the target.
-    if (!tooSmall && snapTarget) {
+    if (!tooSmall && snapTarget && sceneCore) {
       const target = scene.objects.find((o) => o.id === snapTarget);
-      const anchors = synthesizeCreateAnchors(object, target, span.end);
+      const anchors = target ? sceneCore.synthesizeCreateAnchors(object, target, span.end) : null;
       if (anchors) object.anchors = anchors;
     }
     authorOp({ kind: "insert-object", object });

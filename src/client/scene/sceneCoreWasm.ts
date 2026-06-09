@@ -12,7 +12,7 @@
 // callers can use plain try/catch. Domain failures (unknown id, invalid patch)
 // are NOT thrown: they ride in the `errors: string[]` field of the result.
 
-import type { Object as SceneObject, ObjectOp, ObjectScene } from "../../shared/object";
+import type { Anchor, Object as SceneObject, ObjectOp, ObjectScene } from "../../shared/object";
 
 /**
  * Result of `apply_object_op` (OB4.3). On success `scene` is the next object
@@ -98,6 +98,13 @@ type SceneCoreModule = {
     order: string
   ) => string;
   split_subpath_at: (geometryJson: string, x: number, y: number, radius: number) => string;
+  anchor_follow_ops: (sceneJson: string, transformOpsJson: string) => string;
+  synthesize_create_anchors: (
+    createdJson: string,
+    targetJson: string,
+    endpointX: number,
+    endpointY: number
+  ) => string;
   WasmUndoStack: new (actorId: string) => WasmUndoStack;
 };
 
@@ -179,6 +186,19 @@ export type SceneCore = {
     y: number,
     radius: number
   ): SceneObject["geometry"] | null;
+  /** Tier-1/#14: the commit-time anchor move-together follow ops. `ops` are the
+   *  move's set-transform ops; the result is the edit-geometry ops that reproject
+   *  every object anchored to a moved target through that target's NEW transform.
+   *  Returns `[]` when nothing follows (the shell batches the result into the move). */
+  anchorFollowOps(scene: ObjectScene, ops: ObjectOp[]): ObjectOp[];
+  /** AP5: synthesize the persistent anchor(s) for a snapped drag-create binding
+   *  `created`'s endpoint node to `target`, or null when no anchor should be
+   *  authored (target is the created object, or no node / no snap). */
+  synthesizeCreateAnchors(
+    created: SceneObject,
+    target: SceneObject,
+    endpoint: { x: number; y: number }
+  ): Anchor[] | null;
   /** FC-15: create a per-actor undo/redo stack backed by the core (D21). */
   createUndoStack(actorId: string): UndoStack;
 };
@@ -305,6 +325,23 @@ export async function loadSceneCore(): Promise<SceneCore> {
         return null;
       }
       return value as SceneObject["geometry"];
+    },
+    anchorFollowOps(scene, ops) {
+      return parseBridge<ObjectOp[]>(
+        "anchor_follow_ops",
+        mod.anchor_follow_ops(JSON.stringify(scene), JSON.stringify(ops))
+      );
+    },
+    synthesizeCreateAnchors(created, target, endpoint) {
+      return parseBridge<Anchor[] | null>(
+        "synthesize_create_anchors",
+        mod.synthesize_create_anchors(
+          JSON.stringify(created),
+          JSON.stringify(target),
+          endpoint.x,
+          endpoint.y
+        )
+      );
     },
     createUndoStack(actorId) {
       const inner = new mod.WasmUndoStack(actorId);

@@ -30,7 +30,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { objectSceneToRenderObjectScene } from "../src/client/lib/canvasHost";
-import { reprojectAnchoredEndpoint, synthesizeCreateAnchors } from "../src/client/lib/anchorCreate";
 import { cascadeTransformOps, composeTransform } from "../src/client/lib/transformCascade";
 import { hasChildren, ungroupEnabled, doubleClickAction } from "../src/client/lib/grouping";
 import {
@@ -234,8 +233,8 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     const ty = target.transform?.[1][2] ?? 0;
     const span: DragSpan = { start: { x: tx - 120, y: ty }, end: { x: tx, y: ty } };
     const edge = buildPrimitiveObjectFromDrag("line", span, "edge-1", "a4");
-    const anchors = synthesizeCreateAnchors(edge, target, span.end);
-    expect(anchors).toBeDefined();
+    const anchors = core.synthesizeCreateAnchors(edge, target, span.end);
+    expect(anchors).not.toBeNull();
     expect(anchors![0].target).toBe("ell-1");
     shell.author({ kind: "insert-object", object: edge });
     shell.author({ kind: "set-anchor", id: "edge-1", anchors: anchors! });
@@ -252,11 +251,24 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     expect(feedAnchors[0].target).toBe("ell-1");
     expect(typeof feedAnchors[0].nodeIndex).toBe("number");
     expect(typeof feedAnchors[0].at.x).toBe("number");
-    // At rest the endpoint resolves to the snap point; after moving the target it
-    // tracks it (move-together) — the falsifiable anchor behavior.
-    const atRest = reprojectAnchoredEndpoint(target, anchors![0]);
-    const movedTarget: SceneObject = { ...target, transform: translateTransform(tx + 200, ty + 60) };
-    const afterMove = reprojectAnchoredEndpoint(movedTarget, anchors![0]);
+    // Move-together (the falsifiable anchor behavior): authoring a set-transform on
+    // the target through the core's commit-time follow ops must reproject the bound
+    // node so it tracks the target's +200/+60 delta. The world position of the
+    // edge's node 1 (the anchored endpoint) before vs after the follow.
+    const worldNode1 = (obj: SceneObject): { x: number; y: number } => {
+      const nums = obj.geometry.d.match(/-?\d+(?:\.\d+)?/g)!;
+      const lx = Number(nums[2]) / GEOMETRY_QUANTUM_PER_PX;
+      const ly = Number(nums[3]) / GEOMETRY_QUANTUM_PER_PX;
+      const t = obj.transform;
+      return { x: t ? t[0][0] * lx + t[0][1] * ly + t[0][2] : lx, y: t ? t[1][0] * lx + t[1][1] * ly + t[1][2] : ly };
+    };
+    const atRest = worldNode1(shell.byId("edge-1")!);
+    const moveOp: ObjectOp = { kind: "set-transform", id: "ell-1", transform: translateTransform(tx + 200, ty + 60) };
+    const followOps = core.anchorFollowOps(shell.scene, [moveOp]);
+    expect(followOps).toHaveLength(1);
+    const follow = followOps[0];
+    if (follow.kind !== "edit-geometry" || follow.id !== "edge-1") throw new Error("expected edge-1 reproject");
+    const afterMove = worldNode1({ ...shell.byId("edge-1")!, geometry: follow.geometry });
     expect(afterMove.x).toBeCloseTo(atRest.x + 200);
     expect(afterMove.y).toBeCloseTo(atRest.y + 60);
 
