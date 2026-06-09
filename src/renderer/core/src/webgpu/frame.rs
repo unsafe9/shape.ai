@@ -336,8 +336,17 @@ impl ShapeWebGpuRenderer {
             .as_ref()
             .map(outline_overlay_ids)
             .unwrap_or_default();
-        let vertices =
-            build_multi_select_overlay_vertices(&self.object_regions, &ids, self.camera.zoom);
+        // W3-G10/#2: feed each id's LIVE preview transform so the outline ring tracks
+        // the drag every frame like the resize handles, not just on commit. The G9
+        // multi-member SameDelta preview writes every member's instance matrix, so a
+        // group/multi drag rings every member live (zero-rebake read).
+        let object_renderer = self.object_renderer.as_ref();
+        let vertices = build_multi_select_overlay_vertices(
+            &self.object_regions,
+            &ids,
+            self.camera.zoom,
+            |id| object_renderer.and_then(|renderer| renderer.preview_transform(id)),
+        );
         if vertices.is_empty() {
             return 0;
         }

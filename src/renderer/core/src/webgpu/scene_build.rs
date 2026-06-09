@@ -1747,11 +1747,18 @@ pub(crate) fn outline_overlay_ids(scene: &RenderObjectScene) -> Vec<String> {
 /// a marquee/shortcut multi-select shows a visible ring on every member (single
 /// selection keeps its 8-handle overlay). Stops once the buffer capacity is hit.
 /// Empty when `ids` is empty. World-space so the legacy overlay pipeline draws it.
+///
+/// W3-G10/#2: `preview` supplies each id's LIVE drag transform (`None` when not
+/// dragging); the ring is built at the PREVIEWED bbox so it tracks the drag every
+/// frame like the resize handles, instead of snapping only on commit. Transform-
+/// only — `region_world_bounds` recomputes the bbox from the preview matrix, no
+/// re-tessellation.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn build_multi_select_overlay_vertices(
     regions: &[ObjectRegion],
     ids: &[String],
     zoom: f64,
+    preview: impl Fn(&str) -> Option<[[f64; 3]; 3]>,
 ) -> Vec<GpuVertex> {
     let mut vertices = Vec::new();
     let thickness = (2.0 / zoom.max(0.025)) as f32;
@@ -1762,7 +1769,8 @@ pub(crate) fn build_multi_select_overlay_vertices(
         let Some(region) = regions.iter().find(|region| &region.id == id) else {
             continue;
         };
-        let Some(bounds) = region_world_bounds(region, None) else {
+        let preview_t = preview(id);
+        let Some(bounds) = region_world_bounds(region, preview_t.as_ref()) else {
             continue;
         };
         let x = bounds.x as f32;
@@ -4546,6 +4554,7 @@ mod tests {
             &regions,
             &["a".to_string(), "b".to_string()],
             1.0,
+            |_| None,
         );
         // 4 edge quads * 6 verts = 24 per object; non-empty and a clean multiple.
         assert!(!verts.is_empty(), "multi-select highlight must emit geometry");
@@ -4559,7 +4568,72 @@ mod tests {
         assert_eq!(verts[0].color, MULTI_SELECT_OUTLINE_COLOR);
 
         // Empty set => nothing drawn (single selection keeps its handle overlay).
-        assert!(build_multi_select_overlay_vertices(&regions, &[], 1.0).is_empty());
+        assert!(build_multi_select_overlay_vertices(&regions, &[], 1.0, |_| None).is_empty());
+    }
+
+    #[test]
+    fn multi_select_overlay_ring_follows_live_preview_transform() {
+        // W3-G10/#2: a 20px rect at world origin; canonical ring spans [0,20]². A live
+        // drag pushes a preview WORLD transform translating +100,+50. The outline ring
+        // MUST be built at the PREVIEWED bbox [100,120]×[50,70], tracking the drag like
+        // the resize handles — not snapping only on commit. Fails if the ring ignores
+        // the preview (would stay at the canonical [0,20]² bounds).
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+        let ids = vec!["o1".to_string()];
+
+        // Bounding box of all ring vertex positions = the world bbox the ring is drawn
+        // at (modulo a half-thickness skirt that is identical across both calls).
+        let ring_bbox = |verts: &[GpuVertex]| -> (f32, f32, f32, f32) {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for v in verts {
+                min_x = min_x.min(v.position[0]);
+                min_y = min_y.min(v.position[1]);
+                max_x = max_x.max(v.position[0]);
+                max_y = max_y.max(v.position[1]);
+            }
+            (min_x, min_y, max_x, max_y)
+        };
+
+        let canonical = build_multi_select_overlay_vertices(&regions, &ids, 1.0, |_| None);
+        let (cx0, cy0, cx1, cy1) = ring_bbox(&canonical);
+        // Anchored near origin (within the ~1px half-thickness ring skirt at zoom 1.0).
+        assert!(
+            cx0.abs() < 1.5 && cy0.abs() < 1.5,
+            "canonical ring anchored at origin: ({cx0},{cy0})"
+        );
+
+        let preview = [[1.0, 0.0, 100.0], [0.0, 1.0, 50.0], [0.0, 0.0, 1.0]];
+        let previewed = build_multi_select_overlay_vertices(&regions, &ids, 1.0, |id| {
+            (id == "o1").then_some(preview)
+        });
+        let (px0, py0, px1, py1) = ring_bbox(&previewed);
+
+        // The previewed ring must be translated by the drag delta, NOT the canonical
+        // bounds: this assertion fails if the outline path ignores the preview.
+        assert!(
+            (px0 - cx0 - 100.0).abs() < 1e-3 && (py0 - cy0 - 50.0).abs() < 1e-3,
+            "ring origin tracks the preview drag (+100,+50): canonical ({cx0},{cy0}) previewed ({px0},{py0})"
+        );
+        assert!(
+            ((px1 - px0) - (cx1 - cx0)).abs() < 1e-3 && ((py1 - py0) - (cy1 - cy0)).abs() < 1e-3,
+            "previewed ring keeps the same extent (pure translation), no re-tessellation"
+        );
+
+        // preview None reproduces the canonical-bounds ring (same count + bbox).
+        let none_preview = build_multi_select_overlay_vertices(&regions, &ids, 1.0, |_| None);
+        assert_eq!(none_preview.len(), canonical.len());
+        let (nx0, ny0, nx1, ny1) = ring_bbox(&none_preview);
+        assert!(
+            (nx0 - cx0).abs() < 1e-6
+                && (ny0 - cy0).abs() < 1e-6
+                && (nx1 - cx1).abs() < 1e-6
+                && (ny1 - cy1).abs() < 1e-6,
+            "preview None must reproduce the canonical-bounds ring"
+        );
     }
 
     #[test]
@@ -4576,7 +4650,7 @@ mod tests {
         scene.multi_select = Vec::new();
         let single = outline_overlay_ids(&scene);
         assert_eq!(single, vec!["a".to_string()]);
-        let verts = build_multi_select_overlay_vertices(&regions, &single, 1.0);
+        let verts = build_multi_select_overlay_vertices(&regions, &single, 1.0, |_| None);
         assert!(!verts.is_empty(), "single selection must emit an outline ring");
         assert_eq!(verts.len(), 24, "one 24-vert ring for the single selection");
 
