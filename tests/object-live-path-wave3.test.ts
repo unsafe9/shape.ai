@@ -30,7 +30,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { objectSceneToRenderObjectScene } from "../src/client/lib/canvasHost";
-import { cascadeTransformOps, composeTransform } from "../src/client/lib/transformCascade";
 import { hasChildren, ungroupEnabled, doubleClickAction } from "../src/client/lib/grouping";
 import {
   buildPrimitiveObject,
@@ -186,10 +185,11 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     expect(doubleClickAction({ id: "frame-1", hasChildren: true })).toEqual({ kind: "drill-in", id: "frame-1" });
 
     // (C/D cascade) a parent drag cascades the world-space delta to the children —
-    // dragging the frame moves rect + ellipse with it (one op per object).
+    // dragging the frame moves rect + ellipse with it (one op per object). Tier-2:
+    // the cascade now comes from the REAL scene-core `moveOps` (single root).
     const rectOriginX = shell.byId("rect-1")!.transform![0][2];
     const dragDelta = translateTransform(40, 25);
-    const cascade = cascadeTransformOps(shell.scene.objects, "frame-1", dragDelta);
+    const cascade = core.moveOps(shell.scene, { kind: "single", id: "frame-1" }, dragDelta);
     expect(cascade.map((o) => (o.kind === "set-transform" ? o.id : "")).sort()).toEqual(["ell-1", "frame-1", "rect-1"]);
     shell.author({ kind: "batch", ops: cascade });
     expect(shell.byId("rect-1")?.transform?.[0][2]).toBe(rectOriginX + 40); // delta reached the child
@@ -217,10 +217,13 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
 
     // (F) live handles follow preview: a rotate-handle delta composes onto the rect's
     // transform and lands as ONE undoable set-transform (the preview IS the commit).
+    // Tier-2: the commit composes through the REAL scene-core `moveOps` (rect-1 has
+    // no children/anchors here, so it returns exactly one set-transform op).
     const rectBase = shell.byId("rect-1")!.transform!;
     const handleDelta = rotateAboutDelta(Math.PI / 2, 0, 0);
-    const rotated = composeTransform(handleDelta, rectBase);
-    shell.author({ kind: "set-transform", id: "rect-1", transform: rotated });
+    const rotateOps = core.moveOps(shell.scene, { kind: "single", id: "rect-1" }, handleDelta);
+    expect(rotateOps).toHaveLength(1);
+    shell.author(rotateOps[0]);
     const m = shell.byId("rect-1")!.transform!;
     expect(Math.abs(m[0][1])).toBeGreaterThan(0.5); // off-diagonal proves the rotation landed
     shell.undo();

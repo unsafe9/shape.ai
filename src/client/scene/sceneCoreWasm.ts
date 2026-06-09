@@ -12,7 +12,14 @@
 // callers can use plain try/catch. Domain failures (unknown id, invalid patch)
 // are NOT thrown: they ride in the `errors: string[]` field of the result.
 
-import type { Anchor, Object as SceneObject, ObjectOp, ObjectScene } from "../../shared/object";
+import type { Anchor, Object as SceneObject, ObjectOp, ObjectScene, Transform3x3 } from "../../shared/object";
+
+/**
+ * Tier-2 `move_ops` roots: a single dragged object, or a multi-select set. The
+ * wire shape the scene-core bridge decodes (`{kind:"single",id} |
+ * {kind:"multi",ids}`).
+ */
+export type MoveRoots = { kind: "single"; id: string } | { kind: "multi"; ids: string[] };
 
 /**
  * Result of `apply_object_op` (OB4.3). On success `scene` is the next object
@@ -99,6 +106,7 @@ type SceneCoreModule = {
   ) => string;
   split_subpath_at: (geometryJson: string, x: number, y: number, radius: number) => string;
   anchor_follow_ops: (sceneJson: string, transformOpsJson: string) => string;
+  move_ops: (sceneJson: string, rootsJson: string, deltaJson: string) => string;
   synthesize_create_anchors: (
     createdJson: string,
     targetJson: string,
@@ -191,6 +199,12 @@ export type SceneCore = {
    *  every object anchored to a moved target through that target's NEW transform.
    *  Returns `[]` when nothing follows (the shell batches the result into the move). */
   anchorFollowOps(scene: ObjectScene, ops: ObjectOp[]): ObjectOp[];
+  /** Tier-2: the combined commit-time move ops for a parent-drag / multi-select
+   *  drag — the transform CASCADE ops (the dragged subtree, or every multi member
+   *  and its subtree, deduped) FOLLOWED BY the anchor-follow `edit-geometry` ops
+   *  those moves trigger, as ONE batch-ready array (cascade BEFORE follow). `delta`
+   *  is the world-space gesture matrix. Collapses the shell commit to one call. */
+  moveOps(scene: ObjectScene, roots: MoveRoots, delta: Transform3x3): ObjectOp[];
   /** AP5: synthesize the persistent anchor(s) for a snapped drag-create binding
    *  `created`'s endpoint node to `target`, or null when no anchor should be
    *  authored (target is the created object, or no node / no snap). */
@@ -330,6 +344,12 @@ export async function loadSceneCore(): Promise<SceneCore> {
       return parseBridge<ObjectOp[]>(
         "anchor_follow_ops",
         mod.anchor_follow_ops(JSON.stringify(scene), JSON.stringify(ops))
+      );
+    },
+    moveOps(scene, roots, delta) {
+      return parseBridge<ObjectOp[]>(
+        "move_ops",
+        mod.move_ops(JSON.stringify(scene), JSON.stringify(roots), JSON.stringify(delta))
       );
     },
     synthesizeCreateAnchors(created, target, endpoint) {

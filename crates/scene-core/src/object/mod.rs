@@ -19,6 +19,7 @@
 pub mod anchor_follow;
 pub mod anchors;
 pub mod apply;
+pub mod cascade;
 pub mod commands;
 pub mod drawing;
 pub mod gestures;
@@ -33,6 +34,7 @@ pub mod validate;
 
 pub use anchor_follow::{anchor_follow_ops, synthesize_create_anchors};
 pub use anchors::{connection_graph, neighbors, reproject_object_anchors, resolve_endpoint};
+pub use cascade::{cascade_multi_transform_ops, cascade_transform_ops, move_ops, MoveRoots};
 pub use apply::{apply_object_op, apply_object_op_lww, apply_sequence, ApplyError};
 pub use commands::{
     object_command_catalog, object_command_catalog_json, ObjectCommand, ObjectCommandCategory,

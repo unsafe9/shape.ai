@@ -4,7 +4,7 @@
 // decisions over the object forest: who has children, where a popped-out child
 // reparents, and whether a double-click drills into a container or edits a leaf.
 // These hold no scene access, randomness, or op-apply, so the shell test pins
-// them directly (mirrors transformCascade.ts).
+// them directly.
 
 import type { Object as SceneObject, ObjectOp, ObjectId } from "../../shared/object";
 

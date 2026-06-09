@@ -29,6 +29,7 @@
   import type { HoverAffordance } from "../renderer/wasmLoader";
   import {
     loadSceneCore,
+    type MoveRoots,
     type ObjectCommand,
     type ObjectGesture,
     type SceneCore,
@@ -47,7 +48,6 @@
     type DragSpan
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
-  import { cascadeTransformOps, cascadeMultiTransformOps } from "../lib/transformCascade";
   import { doubleClickAction, ungroupEnabled, popOutOp } from "../lib/grouping";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
@@ -272,20 +272,22 @@
       const src = scene.objects.find((o) => o.id === id);
       // W2-11: with no src the GPU preview must not linger — revert it to canonical.
       if (!src) return void host?.clearObjectPreview(id);
-      // AP2 (#15): a parent drag cascades the world-space delta to its descendants
-      // (children transforms are world-absolute, D3), so a frame moves with its
-      // contents. AP2 (#10): when a Multi selection is dragged, the renderer anchors
-      // the gesture on the one picked `id` but the delta applies to EVERY member (and
-      // each member's subtree) — so the whole set moves together. A single selection
-      // (or a drag of a non-member) cascades only the dragged object's subtree.
-      const ops =
+      // Tier-2: the parent-drag cascade + multi-select union + anchor-follow now
+      // live in scene-core as ONE call. AP2 (#15): a parent drag cascades the
+      // world-space delta to its descendants (children transforms are world-absolute,
+      // D3), so a frame moves with its contents. AP2 (#10): a Multi drag anchors the
+      // gesture on the one picked `id` but the delta applies to EVERY member (and
+      // each member's subtree). AP5 (#14): every object anchored to a moved object
+      // reprojects its bound node through that object's NEW transform — cascade ops
+      // first, then the anchor-follow edit-geometry ops, as one batch.
+      const roots: MoveRoots =
         selection.kind === "multi" && selection.ids.includes(id)
-          ? cascadeMultiTransformOps(scene.objects, selection.ids, matrix)
-          : cascadeTransformOps(scene.objects, id, matrix);
-      // AP5 (#14): every object anchored to a moved object reprojects its bound
-      // node through that object's NEW transform, so anchored endpoints move WITH
-      // the target. No anchors onto anything moved => no extra ops (the no-op case).
-      const allOps = [...ops, ...(sceneCore ? sceneCore.anchorFollowOps(scene, ops) : [])];
+          ? { kind: "multi", ids: selection.ids }
+          : { kind: "single", id };
+      // Null-guard (mirrors Tier-1's degrade): with no scene-core the cascade cannot
+      // be authored — drop the GPU preview rather than commit shell-side matrix math.
+      if (!sceneCore) return void host?.clearObjectPreview(id);
+      const allOps = sceneCore.moveOps(scene, roots, matrix);
       const op: ObjectOp = allOps.length === 1 ? allOps[0] : { kind: "batch", ops: allOps };
       // FC-16: pre-connect authorOp applies synchronously (the committed scene is on
       // return, so the rebake $effect drops the preview matrix immediately). In the
@@ -294,9 +296,9 @@
       // (no snap-back). If the commit op fails, revert the GPU preview to canonical.
       const wasConnected = sceneClientReady && sceneClient !== null;
       // The GPU previewed only the dragged `id`; pendingCommit (snap-back guard) is
-      // keyed on it, so read ITS composed transform from the cascade — not ops[0],
-      // which under a multi cascade may be another member.
-      const draggedOp = ops.find((o) => o.kind === "set-transform" && o.id === id);
+      // keyed on it, so read ITS composed transform from the cascade — not allOps[0],
+      // which under a multi cascade may be another member (and may be a follow op).
+      const draggedOp = allOps.find((o) => o.kind === "set-transform" && o.id === id);
       const rootTransform = draggedOp?.kind === "set-transform" ? draggedOp.transform : src.transform;
       if (wasConnected && rootTransform) pendingCommit = { id, transform: rootTransform };
       authorOp(op, true, (ok) => {

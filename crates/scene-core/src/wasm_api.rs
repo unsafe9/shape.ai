@@ -14,7 +14,7 @@
 //! bad patch) are NOT errors here: they flow through normally as the `errors`
 //! array inside the returned payload, exactly as the pure functions report them.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::wasm_bindgen;
 
 /// Serialize `value`, or fall back to an `{"error": ...}` JSON if serialization
@@ -52,6 +52,8 @@ use crate::object::anchor_follow::{
     synthesize_create_anchors as synthesize_create_anchors_pure,
 };
 use crate::object::apply::apply_object_op as apply_object_op_pure;
+use crate::object::cascade::{move_ops as move_ops_pure, MoveRoots};
+use crate::object::model::Transform3x3;
 use crate::object::commands::object_command_catalog_json;
 use crate::object::gestures::object_gesture_catalog_json;
 use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush, DrawingSession};
@@ -244,6 +246,50 @@ pub fn anchor_follow_ops(scene_json: &str, transform_ops_json: &str) -> String {
         Err(e) => return e,
     };
     ok_json(&anchor_follow_ops_pure(&scene, &transform_ops))
+}
+
+/// Wire shape for the [`move_ops`] roots: `{kind:"single",id}` for a single
+/// dragged object, or `{kind:"multi",ids}` for a multi-select drag. Decoded here
+/// and converted into the pure [`MoveRoots`] (which carries no serde).
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum MoveRootsWire {
+    Single { id: String },
+    Multi { ids: Vec<String> },
+}
+
+impl From<MoveRootsWire> for MoveRoots {
+    fn from(wire: MoveRootsWire) -> Self {
+        match wire {
+            MoveRootsWire::Single { id } => MoveRoots::Single(id),
+            MoveRootsWire::Multi { ids } => MoveRoots::Multi(ids),
+        }
+    }
+}
+
+/// `move_ops(scene_json, roots_json, delta_json) -> ObjectOp[] | {error}`.
+///
+/// Tier-2 combined commit entry: the parent-drag / multi-select transform CASCADE
+/// ops FOLLOWED BY the anchor-follow `edit-geometry` ops those moves trigger, as
+/// ONE batch-ready Vec (cascade BEFORE follow — a contract). `roots_json` is the
+/// [`MoveRootsWire`] shape (`{kind:"single",id} | {kind:"multi",ids}`); `delta_json`
+/// is the world-space gesture matrix (a row-major 3x3). Collapses the shell commit
+/// to a single core call.
+#[wasm_bindgen]
+pub fn move_ops(scene_json: &str, roots_json: &str, delta_json: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let roots: MoveRootsWire = match parse("roots", roots_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let delta: Transform3x3 = match parse("delta", delta_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&move_ops_pure(&scene, &roots.into(), &delta))
 }
 
 /// `synthesize_create_anchors(created_json, target_json, endpoint_x, endpoint_y)
@@ -458,6 +504,70 @@ mod tests {
         let geometry = r#"{"d":"M 0 0 L 80 0"}"#;
         let out = split_subpath_at(geometry, 5000, 5000, 16);
         assert!(out.contains("\"error\""), "a missed touch is an error");
+    }
+
+    // --- move_ops bridge (Tier-2) ---
+
+    /// A two-node line object at translate `(tx, ty)`, optionally parented, in the
+    /// camelCase wire shape the shell sends.
+    fn line_object_json(id: &str, parent: Option<&str>, tx: f64, ty: f64) -> String {
+        let parent_field = parent.map(|p| format!(r#""parent":"{p}","#)).unwrap_or_default();
+        format!(
+            r#"{{"id":"{id}",{parent_field}"order":"a0","transform":[[1,0,{tx}],[0,1,{ty}],[0,0,1]],"geometry":{{"d":"M 0 0 L 8 0"}}}}"#
+        )
+    }
+
+    fn scene_json(objects: &[String]) -> String {
+        format!(r#"{{"objects":[{}]}}"#, objects.join(","))
+    }
+
+    /// The ordered set-transform ids from a `move_ops` result JSON.
+    fn move_ops_ids(out: &str) -> Vec<String> {
+        let ops: serde_json::Value = serde_json::from_str(out).expect("move_ops returns ops");
+        ops.as_array()
+            .unwrap()
+            .iter()
+            .filter(|op| op["kind"] == "set-transform")
+            .map(|op| op["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn move_ops_bridge_single_root_cascades_subtree() {
+        let scene = scene_json(&[
+            line_object_json("frame", None, 100.0, 100.0),
+            line_object_json("c1", Some("frame"), 110.0, 120.0),
+        ]);
+        let roots = r#"{"kind":"single","id":"frame"}"#;
+        let delta = "[[1,0,40],[0,1,25],[0,0,1]]";
+        let out = move_ops(&scene, roots, delta);
+        assert_eq!(move_ops_ids(&out), vec!["frame", "c1"]);
+        // The child shifted by exactly the delta: 110+40, 120+25.
+        let ops: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let c1 = ops.as_array().unwrap().iter().find(|op| op["id"] == "c1").unwrap();
+        assert_eq!(c1["transform"][0][2].as_f64().unwrap(), 150.0);
+        assert_eq!(c1["transform"][1][2].as_f64().unwrap(), 145.0);
+    }
+
+    #[test]
+    fn move_ops_bridge_multi_root_dedupes_in_input_order() {
+        // a{b}, d{e}; multi-select [a,d] => ["a","b","d","e"] (matches renderer-core).
+        let scene = scene_json(&[
+            line_object_json("a", None, 0.0, 0.0),
+            line_object_json("b", Some("a"), 0.0, 0.0),
+            line_object_json("d", None, 0.0, 0.0),
+            line_object_json("e", Some("d"), 0.0, 0.0),
+        ]);
+        let roots = r#"{"kind":"multi","ids":["a","d"]}"#;
+        let out = move_ops(&scene, roots, "[[1,0,1],[0,1,1],[0,0,1]]");
+        assert_eq!(move_ops_ids(&out), vec!["a", "b", "d", "e"]);
+    }
+
+    #[test]
+    fn move_ops_bridge_rejects_malformed_roots() {
+        let scene = scene_json(&[line_object_json("a", None, 0.0, 0.0)]);
+        let out = move_ops(&scene, "not json", "[[1,0,0],[0,1,0],[0,0,1]]");
+        assert!(out.contains("\"error\""), "malformed roots is a bridge error");
     }
 
     // --- WasmUndoStack bridge (FC-15) ---

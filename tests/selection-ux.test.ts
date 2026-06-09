@@ -4,14 +4,22 @@
 //      (the pure `toggleObjectSelection`), and App.svelte routes the engine's C2
 //      additive flag through it;
 //  (b) the marquee ids (RA2a) are applied to the selection;
-//  (c) a parent drag cascades the world-space delta to its descendants
-//      (`cascadeTransformOps`) — the delta reaches children (and grandchildren).
+//  (c) a parent/Multi drag cascades the world-space delta to its descendants via
+//      the scene-core `moveOps` core call — the delta reaches children (and
+//      grandchildren), with the multi-union deduped.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
-import { toggleObjectSelection, type Object as SceneObject, type ObjectSelection } from "../src/shared/object";
-import { cascadeMultiTransformOps, cascadeTransformOps, composeTransform } from "../src/client/lib/transformCascade";
+import { beforeAll, describe, expect, it } from "vitest";
+import {
+  emptyObjectScene,
+  toggleObjectSelection,
+  type Object as SceneObject,
+  type ObjectOp,
+  type ObjectScene,
+  type ObjectSelection
+} from "../src/shared/object";
+import { loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
 
 // The pure mirror of App.svelte's onSelectObject routing (W3-G5 #10). A plain pick
 // on a member of the current Multi keeps the Multi (so a group-drag does not
@@ -101,89 +109,91 @@ function obj(id: string, parent: string | undefined, tx: number, ty: number): Sc
   } as SceneObject;
 }
 
-describe("cascadeTransformOps (parent-drag cascade, #15)", () => {
-  it("applies the world-space delta to the parent AND its children", () => {
-    const scene = [obj("frame", undefined, 100, 100), obj("c1", "frame", 110, 120), obj("c2", "frame", 130, 140)];
-    const ops = cascadeTransformOps(scene, "frame", translateDelta(40, 25));
-    // One op per object: the dragged frame first, then each child.
-    expect(ops).toHaveLength(3);
-    const byId = new Map(ops.map((o) => [o.kind === "set-transform" ? o.id : "", o]));
-    for (const [id, baseX, baseY] of [
-      ["frame", 100, 100],
-      ["c1", 110, 120],
-      ["c2", 130, 140]
-    ] as const) {
-      const op = byId.get(id);
-      expect(op?.kind).toBe("set-transform");
-      if (op?.kind !== "set-transform") throw new Error("expected set-transform");
-      // The delta reached the child: its origin shifted by exactly (40, 25).
-      expect(op.transform[0][2]).toBe(baseX + 40);
-      expect(op.transform[1][2]).toBe(baseY + 25);
-    }
+function sceneOf(objects: SceneObject[]): ObjectScene {
+  return { ...emptyObjectScene(), objects };
+}
+
+/** The ordered set-transform ids of a move-ops batch. */
+function setTransformIds(ops: ObjectOp[]): string[] {
+  return ops.filter((o) => o.kind === "set-transform").map((o) => (o.kind === "set-transform" ? o.id : ""));
+}
+
+/** The composed `(x, y)` translate of the set-transform op for `id`. */
+function originOf(ops: ObjectOp[], id: string): [number, number] {
+  const op = ops.find((o) => o.kind === "set-transform" && o.id === id);
+  if (op?.kind !== "set-transform") throw new Error(`expected set-transform for ${id}`);
+  return [op.transform[0][2], op.transform[1][2]];
+}
+
+// Tier-2: the cascade now lives in scene-core; these are CONTRACT tests over the
+// REAL wasm `sceneCore.moveOps` (single/multi roots), one-to-one with the deleted
+// `transformCascade.ts` shell tests. None of these objects carry anchors, so
+// move_ops returns the cascade only (no trailing edit-geometry follow ops).
+describe("sceneCore.moveOps cascade (parent-drag #15 / multi #10)", () => {
+  let core: SceneCore;
+  beforeAll(async () => {
+    core = await loadSceneCore();
+  });
+
+  it("applies the world-space delta to the parent AND its children, parent first", () => {
+    const scene = sceneOf([obj("frame", undefined, 100, 100), obj("c1", "frame", 110, 120), obj("c2", "frame", 130, 140)]);
+    const ops = core.moveOps(scene, { kind: "single", id: "frame" }, translateDelta(40, 25));
+    // One op per object: the dragged frame first, then each child in scene order.
+    expect(setTransformIds(ops)).toEqual(["frame", "c1", "c2"]);
+    expect(originOf(ops, "frame")).toEqual([140, 125]);
+    expect(originOf(ops, "c1")).toEqual([150, 145]); // delta reached the child
+    expect(originOf(ops, "c2")).toEqual([170, 165]);
   });
 
   it("cascades transitively to a grandchild (child frame nested under the parent)", () => {
-    const scene = [obj("frame", undefined, 0, 0), obj("inner", "frame", 50, 50), obj("leaf", "inner", 70, 80)];
-    const ops = cascadeTransformOps(scene, "frame", translateDelta(10, -5));
-    expect(ops).toHaveLength(3);
-    const leaf = ops.find((o) => o.kind === "set-transform" && o.id === "leaf");
-    if (leaf?.kind !== "set-transform") throw new Error("expected set-transform for leaf");
-    expect(leaf.transform[0][2]).toBe(80);
-    expect(leaf.transform[1][2]).toBe(75);
+    const scene = sceneOf([obj("frame", undefined, 0, 0), obj("inner", "frame", 50, 50), obj("leaf", "inner", 70, 80)]);
+    const ops = core.moveOps(scene, { kind: "single", id: "frame" }, translateDelta(10, -5));
+    expect(setTransformIds(ops)).toEqual(["frame", "inner", "leaf"]);
+    expect(originOf(ops, "leaf")).toEqual([80, 75]);
   });
 
   it("does NOT touch siblings outside the dragged subtree", () => {
-    const scene = [obj("frame", undefined, 0, 0), obj("c1", "frame", 10, 10), obj("loner", undefined, 200, 200)];
-    const ops = cascadeTransformOps(scene, "frame", translateDelta(5, 5));
-    const ids = ops.map((o) => (o.kind === "set-transform" ? o.id : "")).sort();
-    expect(ids).toEqual(["c1", "frame"]);
+    const scene = sceneOf([obj("frame", undefined, 0, 0), obj("c1", "frame", 10, 10), obj("loner", undefined, 200, 200)]);
+    const ops = core.moveOps(scene, { kind: "single", id: "frame" }, translateDelta(5, 5));
+    expect(setTransformIds(ops).sort()).toEqual(["c1", "frame"]);
   });
 
   it("returns no ops when the dragged id is not in the scene", () => {
-    expect(cascadeTransformOps([obj("a", undefined, 0, 0)], "ghost", translateDelta(1, 1))).toEqual([]);
+    const scene = sceneOf([obj("a", undefined, 0, 0)]);
+    expect(core.moveOps(scene, { kind: "single", id: "ghost" }, translateDelta(1, 1))).toEqual([]);
   });
 
   it("a Multi drag moves EVERY member together (#10) — same world delta to each, deduped", () => {
-    const scene = [obj("a", undefined, 100, 100), obj("b", undefined, 300, 50), obj("c", undefined, 500, 500)];
+    const scene = sceneOf([obj("a", undefined, 100, 100), obj("b", undefined, 300, 50), obj("c", undefined, 500, 500)]);
     // Drag the Multi {a, b}: both move by (40, 25); the unselected `c` does not.
-    const ops = cascadeMultiTransformOps(scene, ["a", "b"], translateDelta(40, 25));
-    const byId = new Map(ops.map((o) => [o.kind === "set-transform" ? o.id : "", o]));
-    expect([...byId.keys()].sort()).toEqual(["a", "b"]);
-    for (const [id, baseX, baseY] of [
-      ["a", 100, 100],
-      ["b", 300, 50]
-    ] as const) {
-      const op = byId.get(id);
-      if (op?.kind !== "set-transform") throw new Error("expected set-transform");
-      expect(op.transform[0][2]).toBe(baseX + 40);
-      expect(op.transform[1][2]).toBe(baseY + 25);
-    }
+    const ops = core.moveOps(scene, { kind: "multi", ids: ["a", "b"] }, translateDelta(40, 25));
+    expect(setTransformIds(ops)).toEqual(["a", "b"]);
+    expect(originOf(ops, "a")).toEqual([140, 125]);
+    expect(originOf(ops, "b")).toEqual([340, 75]);
   });
 
   it("a Multi drag where one member is a frame cascades to its children AND dedupes overlap", () => {
     // `frame` contains `child`; the Multi also explicitly selects `child`. The
     // delta must reach `child` exactly once (frame's cascade), not twice.
-    const scene = [obj("frame", undefined, 0, 0), obj("child", "frame", 50, 50)];
-    const ops = cascadeMultiTransformOps(scene, ["frame", "child"], translateDelta(10, 10));
-    const ids = ops.map((o) => (o.kind === "set-transform" ? o.id : ""));
-    expect(ids.filter((id) => id === "child")).toHaveLength(1); // deduped
-    const child = ops.find((o) => o.kind === "set-transform" && o.id === "child");
-    if (child?.kind !== "set-transform") throw new Error("expected set-transform");
-    expect(child.transform[0][2]).toBe(60); // 50 + 10, applied once
+    const scene = sceneOf([obj("frame", undefined, 0, 0), obj("child", "frame", 50, 50)]);
+    const ops = core.moveOps(scene, { kind: "multi", ids: ["frame", "child"] }, translateDelta(10, 10));
+    expect(setTransformIds(ops).filter((id) => id === "child")).toHaveLength(1); // deduped
+    expect(originOf(ops, "child")).toEqual([60, 60]); // 50 + 10, applied once
   });
 
   it("composes delta*base (pre-multiply), so a rotation about origin rotates the child position", () => {
     // 90° rotation delta about the world origin; pre-multiply must move a child at
-    // (1,0) to (0,1), proving composeTransform applies delta on the left.
+    // (1,0) to (0,1), proving the core composes delta on the LEFT.
     const rot90: [[number, number, number], [number, number, number], [number, number, number]] = [
       [0, -1, 0],
       [1, 0, 0],
       [0, 0, 1]
     ];
-    const child = obj("c", "frame", 1, 0);
-    const composed = composeTransform(rot90, child.transform);
-    expect(composed[0][2]).toBeCloseTo(0, 9);
-    expect(composed[1][2]).toBeCloseTo(1, 9);
+    const scene = sceneOf([obj("c", undefined, 1, 0)]);
+    const ops = core.moveOps(scene, { kind: "single", id: "c" }, rot90);
+    const [x, y] = originOf(ops, "c");
+    expect(x).toBeCloseTo(0, 9);
+    expect(y).toBeCloseTo(1, 9);
   });
 });
 
@@ -207,9 +217,11 @@ describe("App.svelte selection-UX wiring (AP2)", () => {
     expect(source).toMatch(/ids\.length\s*>=\s*2\s*\?\s*\{\s*kind:\s*"multi",\s*ids\s*\}/);
   });
 
-  it("cascades a parent drag to its descendants, and a Multi drag to every member (#10/#15)", () => {
-    expect(source).toMatch(/cascadeTransformOps\(scene\.objects,\s*id,\s*matrix\)/);
-    expect(source).toMatch(/cascadeMultiTransformOps\(scene\.objects,\s*selection\.ids,\s*matrix\)/);
+  it("commits a parent/Multi drag through the single scene-core moveOps call (#10/#15)", () => {
+    // Tier-2: the cascade + multi-union + anchor-follow collapsed to one core call.
+    expect(source).toMatch(/\{\s*kind:\s*"multi",\s*ids:\s*selection\.ids\s*\}/);
+    expect(source).toMatch(/\{\s*kind:\s*"single",\s*id\s*\}/);
+    expect(source).toMatch(/sceneCore\.moveOps\(scene,\s*roots,\s*matrix\)/);
     expect(source).toMatch(/allOps\.length\s*===\s*1\s*\?\s*allOps\[0\]\s*:\s*\{\s*kind:\s*"batch",\s*ops:\s*allOps\s*\}/);
   });
 });
