@@ -92,7 +92,7 @@ impl Token {
 
             // Translucent shadow: dark veil in light mode, light veil in dark.
             (Token::Shadow, false) => [0x00, 0x00, 0x00, 0x40],
-            (Token::Shadow, true) => [0xff, 0xff, 0xff, 0x33],
+            (Token::Shadow, true) => [0xff, 0xff, 0xff, 0xa8],
 
             // Blue accent (macOS systemBlue-ish), slightly brighter in dark mode.
             (Token::SelectionRing, false) => [0x00, 0x7a, 0xff, 0xff],

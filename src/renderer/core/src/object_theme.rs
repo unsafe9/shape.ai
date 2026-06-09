@@ -89,7 +89,7 @@ impl ThemeToken {
             (ThemeToken::Text, true) => [0xf5, 0xf5, 0xf7, 0xff],
 
             (ThemeToken::Shadow, false) => [0x00, 0x00, 0x00, 0x55],
-            (ThemeToken::Shadow, true) => [0xff, 0xff, 0xff, 0x33],
+            (ThemeToken::Shadow, true) => [0xff, 0xff, 0xff, 0xa8],
 
             (ThemeToken::SelectionRing, false) => [0x00, 0x7a, 0xff, 0xff],
             (ThemeToken::SelectionRing, true) => [0x0a, 0x84, 0xff, 0xff],
@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(resolve_token("text", false), Some([0x1d, 0x1d, 0x1f, 0xff]));
         assert_eq!(resolve_token("text", true), Some([0xf5, 0xf5, 0xf7, 0xff]));
         assert_eq!(resolve_token("shadow", false), Some([0x00, 0x00, 0x00, 0x55]));
-        assert_eq!(resolve_token("shadow", true), Some([0xff, 0xff, 0xff, 0x33]));
+        assert_eq!(resolve_token("shadow", true), Some([0xff, 0xff, 0xff, 0xa8]));
         assert_eq!(resolve_token("selection-ring", false), Some([0x00, 0x7a, 0xff, 0xff]));
         assert_eq!(resolve_token("selection-ring", true), Some([0x0a, 0x84, 0xff, 0xff]));
     }
@@ -211,6 +211,18 @@ mod tests {
     fn shadow_is_translucent_in_both_modes() {
         assert!(resolve_token("shadow", false).unwrap()[3] < 0xff);
         assert!(resolve_token("shadow", true).unwrap()[3] < 0xff);
+    }
+
+    #[test]
+    fn dark_shadow_is_a_visible_white_halo() {
+        // W3-G10/#1: dark-mode shadow must be a WHITE veil with enough alpha that
+        // the wide quarter-res blur still reads over the near-black canvas. The old
+        // 0x33 (~0.20) was imperceptible; pin a substantially raised alpha so a
+        // regression back to that faint value fails here.
+        let [r, g, b, a] = resolve_token("shadow", true).unwrap();
+        assert_eq!([r, g, b], [0xff, 0xff, 0xff], "dark shadow must be white");
+        assert!(a >= 0x99, "dark shadow alpha must be raised (got {a:#x})");
+        assert!(a < 0xff, "dark shadow stays translucent");
     }
 
     #[test]
