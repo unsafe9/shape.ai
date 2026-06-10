@@ -51,6 +51,7 @@ use crate::object::anchor_follow::{
     anchor_follow_ops as anchor_follow_ops_pure,
     synthesize_create_anchors as synthesize_create_anchors_pure,
 };
+use crate::object::deform::endpoint_release_ops as endpoint_release_ops_pure;
 use crate::object::apply::apply_object_op as apply_object_op_pure;
 use crate::object::cascade::{move_ops as move_ops_pure, MoveRoots};
 use crate::object::model::Transform3x3;
@@ -385,6 +386,54 @@ pub fn synthesize_create_anchors(
     };
     let anchors = synthesize_create_anchors_pure(&created, &target, endpoint_x, endpoint_y);
     ok_json(&anchors)
+}
+
+/// A world-px point on the wire (`{x,y}`), used by [`endpoint_release_ops`]'s
+/// optional snap-at payload.
+#[derive(Deserialize)]
+struct PointWire {
+    x: f64,
+    y: f64,
+}
+
+/// `endpoint_release_ops(scene_json, id, node_index, new_x_px, new_y_px,
+/// snap_target_id, snap_at_json) -> ObjectOp[] | {error}`.
+///
+/// Anchor-semantics v3 §2b: the commit of an endpoint-drag release — ONE
+/// chord-deform `edit-geometry` moving the dragged endpoint to the world-px
+/// release point, plus the `set-anchor` whole-vector rewrite (rebind when the
+/// release snapped, unbind when it landed in empty space). `snap_target_id`
+/// empty = no snap; `snap_at_json` is the snapped world point `{x,y}` (empty =
+/// the release point itself). Returns `[]` when the op does not apply (unknown
+/// id, closed-class, interior node). The shell batches the returned ops.
+#[wasm_bindgen]
+pub fn endpoint_release_ops(
+    scene_json: &str,
+    id: &str,
+    node_index: i32,
+    new_x_px: f64,
+    new_y_px: f64,
+    snap_target_id: &str,
+    snap_at_json: &str,
+) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let snap_at: Option<(f64, f64)> = if snap_at_json.is_empty() {
+        None
+    } else {
+        match parse::<PointWire>("snapAt", snap_at_json) {
+            Ok(p) => Some((p.x, p.y)),
+            Err(e) => return e,
+        }
+    };
+    let snap = if snap_target_id.is_empty() {
+        None
+    } else {
+        Some((snap_target_id, snap_at.unwrap_or((new_x_px, new_y_px))))
+    };
+    ok_json(&endpoint_release_ops_pure(&scene, id, node_index, (new_x_px, new_y_px), snap))
 }
 
 // ---------------------------------------------------------------------------

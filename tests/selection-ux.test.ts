@@ -183,13 +183,16 @@ describe("sceneCore.moveOps cascade (parent-drag #15 / multi #10)", () => {
 
   it("composes delta*base (pre-multiply), so a rotation about origin rotates the child position", () => {
     // 90° rotation delta about the world origin; pre-multiply must move a child at
-    // (1,0) to (0,1), proving the core composes delta on the LEFT.
+    // (1,0) to (0,1), proving the core composes delta on the LEFT. A CLOSED rect:
+    // open-class members route non-translate deltas through their endpoints
+    // (anchor-semantics v3 §2c) instead of composing a set-transform.
     const rot90: [[number, number, number], [number, number, number], [number, number, number]] = [
       [0, -1, 0],
       [1, 0, 0],
       [0, 0, 1]
     ];
-    const scene = sceneOf([obj("c", undefined, 1, 0)]);
+    const closed = { ...obj("c", undefined, 1, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z" } } as SceneObject;
+    const scene = sceneOf([closed]);
     const ops = core.moveOps(scene, { kind: "single", id: "c" }, rot90);
     const [x, y] = originOf(ops, "c");
     expect(x).toBeCloseTo(0, 9);

@@ -24,7 +24,11 @@
 //! Pure (no time/rng/IO/GPU), pointer-width-agnostic.
 
 use super::anchor_follow::anchor_follow_ops;
-use super::model::{Object, ObjectScene, Transform3x3};
+use super::deform::{
+    deform_open_path, is_open_class, is_pure_translate, open_endpoint_pins, route_open_endpoints,
+    EndpointRoute,
+};
+use super::model::{Geometry, Object, ObjectScene, Transform3x3};
 use super::move_together::{BindingGraph, BindingNode};
 use super::op::ObjectOp;
 
@@ -59,10 +63,65 @@ fn binding_nodes(scene: &ObjectScene) -> Vec<BindingNode> {
         .collect()
 }
 
-/// The cascade `set-transform` ops for the SameDelta closure of `roots`: the single
+/// Route ONE moved-set member to its commit op (anchor-semantics v3 §2b/§2c/§3
+/// decision table). A closed-class member — and every legacy case: multi
+/// subpath, an interior-node anchor — keeps the SetTransform cascade unchanged
+/// (rule 5). An open-class member commits through its ENDPOINTS:
+///   - nothing pins and the delta is a pure translate → the existing
+///     SetTransform (rule 1, and the rule-3 reduction when anchor targets move
+///     in the same batch — geometry untouched, 0-rebake);
+///   - both endpoints pinned by unmoved anchor targets → no op (rule 3);
+///   - otherwise → ONE chord-deform `edit-geometry` (rules 2/3): pinned
+///     endpoints hold position, the rest map through `inv(T)·delta·T`.
+fn push_member_op(
+    ops: &mut Vec<ObjectOp>,
+    object: &Object,
+    moved_ids: &[String],
+    delta: &Transform3x3,
+) {
+    // Rule 1 fast path: an unanchored pure-translate member keeps the 0-rebake
+    // SetTransform without parsing any geometry (the common drag).
+    if object.anchors.is_empty() && is_pure_translate(delta) {
+        push_move(ops, object, delta);
+        return;
+    }
+    if !is_open_class(&object.geometry) {
+        push_move(ops, object, delta);
+        return;
+    }
+    let d = &object.geometry.path_string;
+    let target_moved = |target: &str| moved_ids.iter().any(|id| id == target);
+    let Some((start_pinned, end_pinned)) = open_endpoint_pins(d, &object.anchors, target_moved)
+    else {
+        // Rule 5: an interior-node anchor (node-splice era) rides the whole
+        // transform exactly as before.
+        push_move(ops, object, delta);
+        return;
+    };
+    match route_open_endpoints(d, &object.transform, delta, start_pinned, end_pinned) {
+        Some(EndpointRoute::Pinned) => {}
+        Some(EndpointRoute::Deform { new_start, new_end }) => {
+            if let Some(new_d) = deform_open_path(d, new_start, new_end).filter(|nd| nd != d) {
+                ops.push(ObjectOp::EditGeometry {
+                    id: object.id.clone(),
+                    geometry: Geometry {
+                        path_string: new_d,
+                        fill_rule: object.geometry.fill_rule,
+                        subpaths: Vec::new(),
+                    },
+                });
+            }
+        }
+        Some(EndpointRoute::Translate) | None => push_move(ops, object, delta),
+    }
+}
+
+/// The cascade ops for the SameDelta closure of `roots`: the single
 /// move-together traversal in scene-core (`move_together::BindingGraph::propagation_closure`,
 /// the same one the renderer consumes) yields the id set+ORDER, and each id maps to
-/// its object's `set-transform` (base composed under the world `delta`). Roots are
+/// its member op via [`push_member_op`] — a `set-transform` (base composed under
+/// the world `delta`), or for an open-class member the §3 endpoint routing (a
+/// chord-deform `edit-geometry`, or nothing when both endpoints pin). Roots are
 /// pre-filtered to live ids, so every closure id resolves in the scene.
 fn cascade_same_delta_ops(
     scene: &ObjectScene,
@@ -74,15 +133,16 @@ fn cascade_same_delta_ops(
     let mut ops = Vec::with_capacity(same_delta_ids.len());
     for id in &same_delta_ids {
         if let Some(object) = scene.get(id) {
-            push_move(&mut ops, object, delta);
+            push_member_op(&mut ops, object, &same_delta_ids, delta);
         }
     }
     ops
 }
 
-/// The `set-transform` ops a drag of `id` produces: the dragged object first, then
-/// every descendant (transitively, via the `parent` chain), each carrying the same
-/// world-space `delta` composed onto its own base. Order is parent-before-child so
+/// The ops a drag of `id` produces: the dragged object first, then every
+/// descendant (transitively, via the `parent` chain), each carrying the same
+/// world-space `delta` composed onto its own base (open-class members route
+/// through [`push_member_op`]'s endpoint table). Order is parent-before-child so
 /// the batch is deterministic. Returns `[]` when `id` is not in the scene.
 ///
 /// Mirrors the shell `cascadeTransformOps`; the order matches the renderer-core
@@ -127,11 +187,13 @@ pub enum MoveRoots {
     Multi(Vec<String>),
 }
 
-/// The COMBINED commit entry: the cascade `set-transform` ops FOLLOWED BY the
+/// The COMBINED commit entry: the cascade ops FOLLOWED BY the
 /// [`anchor_follow_ops`] `edit-geometry` ops those moves trigger, as ONE
 /// batch-ready Vec. Cascade ops come BEFORE follow ops (a contract — the followers
 /// reproject through the moved targets' NEW transforms, which the cascade ops
-/// carry). This collapses the shell commit to a single core call.
+/// carry; an open-class member's cascade op may itself be a chord-deform
+/// `edit-geometry`, §2c, which the follow pass then skips). This collapses the
+/// shell commit to a single core call.
 pub fn move_ops(scene: &ObjectScene, roots: &MoveRoots, delta: &Transform3x3) -> Vec<ObjectOp> {
     let mut ops = match roots {
         MoveRoots::Single(id) => cascade_transform_ops(scene, id, delta),
@@ -161,6 +223,15 @@ mod tests {
     /// A two-node line object at translate `(tx, ty)`, optionally parented.
     fn obj(id: &str, parent: Option<&str>, tx: f64, ty: f64) -> Object {
         let mut o = Object::new(id, "a0", polyline("M 0 0 L 8 0"));
+        o.parent = parent.map(str::to_string);
+        o.transform = Transform3x3::translate(tx, ty);
+        o
+    }
+
+    /// A CLOSED rect object at translate `(tx, ty)` — closed-class keeps the
+    /// SetTransform route under any delta (v3 §1).
+    fn closed_obj(id: &str, parent: Option<&str>, tx: f64, ty: f64) -> Object {
+        let mut o = Object::new(id, "a0", polyline("M 0 0 L 80 0 L 80 40 L 0 40 Z"));
         o.parent = parent.map(str::to_string);
         o.transform = Transform3x3::translate(tx, ty);
         o
@@ -296,14 +367,118 @@ mod tests {
 
     // (g) compose is pre-multiply `delta * base`: a 90° rotation delta about the
     //     origin rotates a child position (proves delta applies on the LEFT).
+    //     A CLOSED rect — open-class members route non-translate deltas through
+    //     their endpoints (v3 §2c) instead of composing a set-transform.
     #[test]
     fn compose_is_pre_multiply_delta_times_base() {
         let rot90 = Transform3x3 { m: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]] };
-        let scene = scene_of(vec![obj("c", None, 1.0, 0.0)]);
+        let scene = scene_of(vec![closed_obj("c", None, 1.0, 0.0)]);
         let ops = cascade_transform_ops(&scene, "c", &rot90);
         let (x, y) = moved_translate(&ops, "c");
         assert!((x - 0.0).abs() < 1e-9, "x={x}");
         assert!((y - 1.0).abs() < 1e-9, "y={y}");
+    }
+
+    // --- v3 §2b/§2c/§3: open-class moved members commit through endpoints ---
+
+    /// An identity-transform open line (0,0)->(100,0)px with the given anchors.
+    fn open_edge(anchors: Vec<Anchor>) -> Object {
+        let mut o = Object::new("edge", "a1", polyline("M 0 0 L 800 0"));
+        o.anchors = anchors;
+        o
+    }
+
+    fn anchor_to(node_index: i32, target: &str) -> Anchor {
+        Anchor { node_index, target: target.to_string(), at: LocalPoint { x: 0, y: 0 } }
+    }
+
+    // Rule 3: a body translate of an open line with ONE anchored endpoint pins
+    // the anchored end (its target did not move) and moves only the free end —
+    // an edit-geometry, never a set-transform.
+    #[test]
+    fn open_member_translate_with_one_pinned_endpoint_moves_only_the_free_end() {
+        let scene = scene_of(vec![
+            closed_obj("rect-a", None, 0.0, 0.0),
+            open_edge(vec![anchor_to(0, "rect-a")]),
+        ]);
+        let ops = move_ops(&scene, &MoveRoots::Single("edge".to_string()), &translate(40.0, 30.0));
+        assert_eq!(ops.len(), 1, "one deform op: {ops:?}");
+        let ObjectOp::EditGeometry { id, geometry } = &ops[0] else {
+            panic!("expected edit-geometry, got {ops:?}");
+        };
+        assert_eq!(id, "edge");
+        // The anchored start pins at (0,0); the free end takes the (40,30)px delta.
+        assert_eq!(geometry.path_string, "M 0 0 L 1120 240");
+    }
+
+    // Rule 3: both endpoints anchored to unmoved targets — the body drag is a
+    // no-op (Alt-drag detach is the way to move it, DU4).
+    #[test]
+    fn open_member_with_both_endpoints_pinned_authors_nothing() {
+        let scene = scene_of(vec![
+            closed_obj("rect-a", None, 0.0, 0.0),
+            closed_obj("rect-b", None, 300.0, 0.0),
+            open_edge(vec![anchor_to(0, "rect-a"), anchor_to(1, "rect-b")]),
+        ]);
+        let ops = move_ops(&scene, &MoveRoots::Single("edge".to_string()), &translate(40.0, 30.0));
+        assert!(ops.is_empty(), "both ends pinned => no op: {ops:?}");
+    }
+
+    // Rule 3 -> rule 1 reduction: when the anchor target moves IN THE SAME batch,
+    // the anchored endpoint follows the delta like the free one — all-equal
+    // translate, so the member keeps the 0-rebake set-transform (and the follow
+    // pass skips it as a moved id).
+    #[test]
+    fn both_moved_translate_reduces_to_set_transform() {
+        let scene = scene_of(vec![
+            closed_obj("rect-a", None, 200.0, 0.0),
+            open_edge(vec![anchor_to(1, "rect-a")]),
+        ]);
+        let roots = MoveRoots::Multi(vec!["rect-a".to_string(), "edge".to_string()]);
+        let ops = move_ops(&scene, &roots, &translate(50.0, 20.0));
+        assert_eq!(moved_ids(&ops), vec!["rect-a", "edge"]);
+        assert!(
+            ops.iter().all(|op| matches!(op, ObjectOp::SetTransform { .. })),
+            "no deform/follow op when both ride the same translate: {ops:?}"
+        );
+        assert_eq!(moved_translate(&ops, "edge"), (50.0, 20.0));
+    }
+
+    // Rule 2 (§2b group routing): a rotating group reaches its open-class member
+    // through the member's ENDPOINTS — a hand-computed chord deform, while the
+    // closed frame keeps its set-transform.
+    #[test]
+    fn group_rotate_routes_the_open_member_through_endpoint_deform() {
+        let rot90 = Transform3x3 { m: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]] };
+        let frame = closed_obj("g", None, 0.0, 0.0);
+        let mut edge = open_edge(Vec::new());
+        edge.parent = Some("g".to_string());
+        let scene = scene_of(vec![frame, edge]);
+        let ops = move_ops(&scene, &MoveRoots::Single("g".to_string()), &rot90);
+        // Only the closed frame carries a set-transform.
+        assert_eq!(moved_ids(&ops), vec!["g"]);
+        // The open member rotates via its endpoints: (0,0)->(100,0)px maps to
+        // (0,0)->(0,100)px under the 90° delta.
+        let deform = ops
+            .iter()
+            .find_map(|op| match op {
+                ObjectOp::EditGeometry { id, geometry } if id == "edge" => Some(geometry),
+                _ => None,
+            })
+            .expect("a chord-deform op for the open member");
+        assert_eq!(deform.path_string, "M 0 0 L 0 800");
+    }
+
+    // Rule 5: an interior-node anchor is the node-splice era — the moved member
+    // keeps the whole-transform route (no deform, no behavior change).
+    #[test]
+    fn open_member_with_an_interior_anchor_keeps_set_transform() {
+        let mut edge = Object::new("edge", "a1", polyline("M 0 0 L 800 0 L 1600 0"));
+        edge.anchors = vec![anchor_to(1, "rect-a")];
+        let scene = scene_of(vec![closed_obj("rect-a", None, 100.0, 0.0), edge]);
+        let ops = move_ops(&scene, &MoveRoots::Single("edge".to_string()), &translate(40.0, 30.0));
+        assert_eq!(moved_ids(&ops), vec!["edge"], "legacy splice era rides the transform");
+        assert_eq!(ops.len(), 1, "{ops:?}");
     }
 
     // --- move_ops: cascade BEFORE follow (the ordering contract) ---

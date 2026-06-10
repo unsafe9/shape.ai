@@ -45,7 +45,10 @@ pub use apply::{apply_object_op, apply_object_op_lww, apply_sequence, ApplyError
 pub use commands::{
     object_command_catalog, object_command_catalog_json, ObjectCommand, ObjectCommandCategory,
 };
-pub use deform::{deform_open_path, is_open_class, is_open_class_d};
+pub use deform::{
+    deform_open_path, endpoint_release_ops, is_open_class, is_open_class_d, is_pure_translate,
+    open_endpoint_pins, route_open_endpoints, EndpointRoute,
+};
 pub use drawing::{fit_beziers, pressure_to_width, rdp_simplify, Brush, DrawingSession};
 pub use gestures::{
     object_gesture_catalog, object_gesture_catalog_json, HoldInput, HoldTrigger, ObjectGesture,

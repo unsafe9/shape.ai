@@ -141,6 +141,15 @@ type SceneCoreModule = {
     endpointX: number,
     endpointY: number
   ) => string;
+  endpoint_release_ops: (
+    sceneJson: string,
+    id: string,
+    nodeIndex: number,
+    newXPx: number,
+    newYPx: number,
+    snapTargetId: string,
+    snapAtJson: string
+  ) => string;
   pop_out_op: (sceneJson: string, id: string) => string;
   has_children: (sceneJson: string, id: string) => string;
   ungroup_enabled: (sceneJson: string, selectedId: string) => string;
@@ -270,6 +279,21 @@ export type SceneCore = {
     target: SceneObject,
     endpoint: { x: number; y: number }
   ): Anchor[] | null;
+  /** Anchor-semantics v3 §2b: the commit ops of an endpoint-drag release on an
+   *  open-class object — one chord-deform `edit-geometry` moving the endpoint
+   *  (`nodeIndex`, 0 or last) to the world-px release point, plus the
+   *  `set-anchor` whole-vector rewrite: rebound to `snap.targetId` (at the
+   *  snapped world point `snap.at`, defaulting to the release point) when the
+   *  release snapped, or that endpoint's anchor removed when `snap` is null.
+   *  Returns `[]` when the op does not apply (unknown id, closed-class,
+   *  interior node). The shell batches the returned ops. */
+  endpointReleaseOps(
+    scene: ObjectScene,
+    id: string,
+    nodeIndex: number,
+    newPoint: { x: number; y: number },
+    snap: { targetId: string; at?: { x: number; y: number } } | null
+  ): ObjectOp[];
   /** Tier-4 (#18): the `reparent` op that pops `id` out one level (to its
    *  grandparent, or to the canvas root when the parent sits at the root),
    *  preserving its order key. Null when `id` is unknown or already at the root.
@@ -457,6 +481,20 @@ export async function loadSceneCore(): Promise<SceneCore> {
           JSON.stringify(target),
           endpoint.x,
           endpoint.y
+        )
+      );
+    },
+    endpointReleaseOps(scene, id, nodeIndex, newPoint, snap) {
+      return parseBridge<ObjectOp[]>(
+        "endpoint_release_ops",
+        mod.endpoint_release_ops(
+          JSON.stringify(scene),
+          id,
+          nodeIndex,
+          newPoint.x,
+          newPoint.y,
+          snap?.targetId ?? "",
+          snap?.at ? JSON.stringify(snap.at) : ""
         )
       );
     },

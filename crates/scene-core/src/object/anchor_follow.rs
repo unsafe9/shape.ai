@@ -20,6 +20,7 @@
 //! resolution ([`super::anchors`]) is a SEPARATE axis (geometry-edit follow); this
 //! module is the transform-based move-together only and must not be folded into it.
 
+use super::deform::{deform_open_path, is_open_class_d};
 use super::model::{
     Anchor, Geometry, LocalPoint, Object, ObjectScene, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
 };
@@ -32,12 +33,13 @@ const UNITS_PER_PX: f64 = GEOMETRY_QUANTUM_PER_PX as f64;
 
 /// A 2x3 affine (the top two rows of a row-major 3x3 with `g=h=0,i=1`), used for
 /// the tiny invert/apply the reproject needs. A scene-core-local copy (no shared
-/// crate); equivalent to the shell `applyTransform` / `invertAffine`.
-type Affine = [[f64; 3]; 2];
+/// crate); equivalent to the shell `applyTransform` / `invertAffine`. Shared
+/// (`pub(super)`) with the open-class endpoint routing in [`super::deform`].
+pub(super) type Affine = [[f64; 3]; 2];
 
 /// The affine rows of a transform (absent => identity), dropping the projective
 /// bottom row (anchors are affine-only, matching the shell `Transform3x3` shape).
-fn affine_of(t: &Transform3x3) -> Affine {
+pub(super) fn affine_of(t: &Transform3x3) -> Affine {
     [
         [t.m[0][0], t.m[0][1], t.m[0][2]],
         [t.m[1][0], t.m[1][1], t.m[1][2]],
@@ -45,7 +47,7 @@ fn affine_of(t: &Transform3x3) -> Affine {
 }
 
 /// Apply a row-major affine to a point. Mirrors the shell `applyTransform`.
-fn apply_affine(a: &Affine, x: f64, y: f64) -> (f64, f64) {
+pub(super) fn apply_affine(a: &Affine, x: f64, y: f64) -> (f64, f64) {
     (
         a[0][0] * x + a[0][1] * y + a[0][2],
         a[1][0] * x + a[1][1] * y + a[1][2],
@@ -54,7 +56,7 @@ fn apply_affine(a: &Affine, x: f64, y: f64) -> (f64, f64) {
 
 /// Invert a row-major affine (`g=h=0,i=1`). Returns identity when singular,
 /// matching the shell `invertAffine` (a singular follower then no-ops the node).
-fn invert_affine(a: &Affine) -> Affine {
+pub(super) fn invert_affine(a: &Affine) -> Affine {
     let (a00, a01, a02) = (a[0][0], a[0][1], a[0][2]);
     let (a10, a11, a12) = (a[1][0], a[1][1], a[1][2]);
     let det = a00 * a11 - a01 * a10;
@@ -104,8 +106,10 @@ fn number_spans(d: &str) -> Vec<(usize, usize)> {
 }
 
 /// The object-local node points parsed from a path-string's M/L/C coords, in pair
-/// order (M/L/C all contribute pairs). Mirrors the shell `localNodes`.
-fn local_nodes(d: &str) -> Vec<(f64, f64)> {
+/// order (M/L/C all contribute pairs). Mirrors the shell `localNodes`. Anchor
+/// `node_index` addresses THIS pair space (so 0 and `len()-1` are the open-path
+/// endpoints — control points are never first or last in the codec's output).
+pub(super) fn local_nodes(d: &str) -> Vec<(f64, f64)> {
     let spans = number_spans(d);
     let mut out = Vec::with_capacity(spans.len() / 2);
     let mut i = 0;
@@ -273,6 +277,13 @@ pub fn reproject_geometry_node(
 /// id + its NEW transform); every follower anchor whose target moved reprojects
 /// through that target's NEW transform.
 ///
+/// Anchor-semantics v3 §3: an open-class follower whose anchors all bind
+/// ENDPOINTS deforms as ONE chord ([`deform_open_path`]) — anchored endpoints at
+/// their reprojected positions, the un-anchored endpoint pinned at its original
+/// position — so interior nodes follow the chord instead of staying behind as a
+/// spike. Everything else (closed-class, legacy multi-subpath ink, an
+/// interior-node anchor) keeps the node-splice path (rule 5 — no regression).
+///
 /// W3-G13: ONE cumulative `edit-geometry` per follower — each follower starts from
 /// its base path-string and folds in EVERY moved-target anchor (two anchors onto
 /// one moved target, or anchors onto two different moved targets, land in the SAME
@@ -280,7 +291,10 @@ pub fn reproject_geometry_node(
 /// sequentially. Ops come out in scene-object (follower) order.
 ///
 /// A follower that is itself in the moved set is skipped (it rides its own
-/// transform), and an object anchored to nothing moved authors nothing — so an
+/// transform), as is one whose geometry the SAME batch already rewrote (an
+/// open-class moved member commits as a chord-deform `edit-geometry` instead of a
+/// `set-transform`, §2c — reprojecting it again from its base would stomp that
+/// deform). An object anchored to nothing moved authors nothing — so an
 /// unanchored (Alt-created) move stays a no-op. The whole batch is returned in ONE
 /// call (the shell batches it). Mirrors the shell `anchorFollowOps`.
 pub fn anchor_follow_ops(scene: &ObjectScene, transform_ops: &[ObjectOp]) -> Vec<ObjectOp> {
@@ -300,13 +314,66 @@ pub fn anchor_follow_ops(scene: &ObjectScene, transform_ops: &[ObjectOp]) -> Vec
             }
         }
     }
+    // Ids whose geometry the batch already rewrote: they ride that rewrite.
+    let edited: Vec<&str> = transform_ops
+        .iter()
+        .filter_map(|op| match op {
+            ObjectOp::EditGeometry { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut ops = Vec::new();
     for follower in &scene.objects {
-        if moved.iter().any(|(id, _)| *id == follower.id) || follower.anchors.is_empty() {
+        if moved.iter().any(|(id, _)| *id == follower.id)
+            || edited.contains(&follower.id.as_str())
+            || follower.anchors.is_empty()
+        {
             continue;
         }
         let base = &follower.geometry.path_string;
-        // `Some` once any anchor's rewrite landed; later anchors fold into it.
+        let pairs = local_nodes(base);
+        let last_pair = i32::try_from(pairs.len().saturating_sub(1)).unwrap_or(i32::MAX);
+        let endpoint_deform = pairs.len() >= 2
+            && follower.anchors.iter().all(|a| a.node_index == 0 || a.node_index == last_pair)
+            && is_open_class_d(base);
+        if endpoint_deform {
+            // §3 chord follow: reprojected endpoints in, the whole silhouette out.
+            let mut new_start = pairs[0];
+            let mut new_end = pairs[pairs.len() - 1];
+            let mut any_moved = false;
+            for anchor in &follower.anchors {
+                let Some((_, target_new)) = moved.iter().find(|(id, _)| *id == anchor.target)
+                else {
+                    continue;
+                };
+                let (qx, qy) =
+                    reproject_node_local_quantized(&follower.transform, target_new, anchor.at);
+                let p = (qx as f64, qy as f64);
+                if anchor.node_index == 0 {
+                    new_start = p;
+                } else {
+                    new_end = p;
+                }
+                any_moved = true;
+            }
+            if !any_moved {
+                continue;
+            }
+            let Some(d) = deform_open_path(base, new_start, new_end).filter(|d| d != base) else {
+                continue;
+            };
+            ops.push(ObjectOp::EditGeometry {
+                id: follower.id.clone(),
+                geometry: Geometry {
+                    path_string: d,
+                    fill_rule: follower.geometry.fill_rule,
+                    subpaths: Vec::new(),
+                },
+            });
+            continue;
+        }
+        // Legacy node-splice fold (rule 5). `Some` once any anchor's rewrite
+        // landed; later anchors fold into it.
         let mut rewritten: Option<String> = None;
         for anchor in &follower.anchors {
             let Some((_, target_new)) = moved.iter().find(|(id, _)| *id == anchor.target) else {
@@ -580,6 +647,90 @@ mod tests {
         assert_eq!(id, "edge-1");
         // Node 0 follows rect-a; node 1 (anchored to unmoved rect-b) is untouched.
         assert_eq!(geometry.path_string, "M 880 40 L 2400 0");
+    }
+
+    // v3 §3 (RED before the chord deform): a moved target drags a multi-node
+    // follower's anchored ENDPOINT — the interior node must follow the chord, not
+    // stay behind as a spike (the old splice rewrote only the bound endpoint).
+    #[test]
+    fn target_move_carries_interior_nodes_along_the_chord() {
+        let target = line("rect-a", 0, 0, 200.0, 0.0);
+        // Three-node line (0,0)->(100,0)->(200,0)px; the END (pair 2) is anchored
+        // to rect-a's origin at world (200,0).
+        let mut follower = Object::new("edge-1", "a1", polyline("M 0 0 L 800 0 L 1600 0"));
+        follower.anchors =
+            vec![Anchor { node_index: 2, target: "rect-a".into(), at: LocalPoint { x: 0, y: 0 } }];
+        let scene = scene_of(vec![target, follower]);
+        let ops = anchor_follow_ops(&scene, &[move_op("rect-a", translate(360.0, 0.0))]);
+        assert_eq!(ops.len(), 1, "one cumulative follow op");
+        let ObjectOp::EditGeometry { id, geometry } = &ops[0] else {
+            panic!("expected edit-geometry");
+        };
+        assert_eq!(id, "edge-1");
+        // Chord (0,0)->(1600,0) becomes (0,0)->(2880,0) (σ=1.8): the interior node
+        // rides the chord to 1440. The old splice left it at 800 — the spike.
+        assert_eq!(geometry.path_string, "M 0 0 L 1440 0 L 2880 0");
+    }
+
+    // v3 §3 rule 5: an anchor bound to an INTERIOR node is the node-splice era —
+    // only the bound node is rewritten, the endpoints stay (no chord deform).
+    #[test]
+    fn interior_node_anchor_keeps_the_legacy_splice() {
+        let target = line("rect-a", 0, 0, 100.0, 0.0);
+        // The MIDDLE node (pair 1) sits at world (100,0) — the target's origin.
+        let mut follower = Object::new("edge-1", "a1", polyline("M 0 0 L 800 0 L 1600 0"));
+        follower.anchors =
+            vec![Anchor { node_index: 1, target: "rect-a".into(), at: LocalPoint { x: 0, y: 0 } }];
+        let scene = scene_of(vec![target, follower]);
+        let ops = anchor_follow_ops(&scene, &[move_op("rect-a", translate(110.0, 5.0))]);
+        assert_eq!(ops.len(), 1, "one splice follow op");
+        let ObjectOp::EditGeometry { id, geometry } = &ops[0] else {
+            panic!("expected edit-geometry");
+        };
+        assert_eq!(id, "edge-1");
+        // Node 1 reprojects to (110,5)px => (880,40); both endpoints untouched.
+        assert_eq!(geometry.path_string, "M 0 0 L 880 40 L 1600 0");
+    }
+
+    // v3 §2c: an id whose geometry the SAME batch already rewrote (an open-class
+    // moved member commits as a chord-deform edit-geometry, not a set-transform)
+    // is skipped as a follower — its endpoints were already placed; a reproject
+    // from its base geometry would stomp the deform.
+    #[test]
+    fn follower_with_a_batch_edit_geometry_is_skipped() {
+        let target = line("rect-a", 0, 0, 200.0, 0.0);
+        let follower = anchored_line(&target, 200.0, 30.0);
+        let deformed = follower.geometry.clone();
+        let scene = scene_of(vec![target, follower]);
+        let ops = anchor_follow_ops(
+            &scene,
+            &[
+                move_op("rect-a", translate(250.0, 20.0)),
+                ObjectOp::EditGeometry { id: "edge-1".to_string(), geometry: deformed },
+            ],
+        );
+        assert!(ops.is_empty(), "a batch-deformed follower is not reprojected again");
+    }
+
+    // The §3 deform path must land EXACTLY on the cross-core pinned vector: for a
+    // two-node line the chord deform and the old node splice are the same map, so
+    // the pin (`reproject_matches_cross_core_vector`) stays green across the
+    // endpoint-routing rewrite. RED if the deform drifts by even one quantum.
+    #[test]
+    fn endpoint_deform_reproduces_the_cross_core_pin_vector() {
+        let target = line("t", 0, 0, 10.0, 20.0);
+        let mut follower = Object::new("f", "a0", polyline("M 0 0 L 64 0"));
+        follower.transform = translate(100.0, 0.0);
+        follower.anchors =
+            vec![Anchor { node_index: 1, target: "t".into(), at: LocalPoint { x: 16, y: 8 } }];
+        let scene = scene_of(vec![target, follower]);
+        let ops = anchor_follow_ops(&scene, &[move_op("t", translate(15.0, 27.0))]);
+        assert_eq!(ops.len(), 1, "one follow op");
+        let ObjectOp::EditGeometry { id, geometry } = &ops[0] else {
+            panic!("expected edit-geometry");
+        };
+        assert_eq!(id, "f");
+        assert_eq!(geometry.path_string, "M 0 0 L -664 224");
     }
 
     // (e) synthesize round-trip: a snapped create yields an Anchor whose `at` maps
