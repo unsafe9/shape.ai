@@ -98,6 +98,10 @@
   // drives (color + width). The freehand commit + the live preview both read the
   // current brush; simplification thresholds live in scene-core recognition.
   let penWidthPx = $state(2);
+  // Pen recognition mode toggle (toolbar, next to the Pen): false = Basic (the
+  // default — every stroke snaps to a basic shape), true = Free (the full
+  // pipeline with polygon/curve fallbacks). The shell only forwards the bool.
+  let freeRecognition = $state(false);
   // D1/#5: the toolbar's always-visible selected color. It is the default fill/
   // stroke for the next NEW shape; recoloring a selected object authors a SetStyle
   // op (applySelectedColor). The native picker passes a CSS hex through verbatim.
@@ -922,7 +926,7 @@
     // the "text" token so the stroke flips with the theme like every other authored color.
     // The pen draws with the single toolbar color (selectedColor); there is no separate pen color.
     const strokeHex = selectedColor === THEME_DEFAULT_COLOR ? "#000000" : selectedColor;
-    const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, freshId("draw"), nextOrderKey());
+    const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, freshId("draw"), nextOrderKey(), freeRecognition ? "free" : "basic");
     if (selectedColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = previewPaint(selectedColor);
     // v3 §4 freehand anchoring: an OPEN recognition authors endpoint anchors through
     // the same release path as drag-create (both corners); a CLOSED recognition
@@ -1859,6 +1863,7 @@
           {penWidthPx}
           penPalette={PEN_PALETTE}
           penWidths={PEN_WIDTHS}
+          {freeRecognition}
           {selectedColor}
           dark={theme === "dark"}
           {busy}
@@ -1870,6 +1875,7 @@
           {connectionStatus}
           {canvasBusy}
           onSetTool={setActiveTool}
+          onToggleFreeRecognition={() => (freeRecognition = !freeRecognition)}
           onSetPenWidth={(width) => (penWidthPx = width)}
           onSelectColor={applySelectedColor}
           onInsertPrimitive={insertPrimitive}

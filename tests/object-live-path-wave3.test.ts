@@ -274,7 +274,7 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     // stroke node-by-node through the core split (the swept path the eraser walks).
     // The whole drag coalesces into ONE undo step (D21): the core's coalesce window
     // keeps the FIRST inverse, so a single undo lands at the PRE-sweep geometry.
-    const stroke = core.freehandToObject(ZIGZAG_POINTS, PEN.color, PEN.widthPx, "draw-1", "a5");
+    const stroke = core.freehandToObject(ZIGZAG_POINTS, PEN.color, PEN.widthPx, "draw-1", "a5", "free");
     shell.author({ kind: "insert-object", object: stroke });
     const originalGeometryD = shell.byId("draw-1")!.geometry.d;
     const undo = core.createUndoStack("ig1");

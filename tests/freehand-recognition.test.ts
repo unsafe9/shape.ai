@@ -57,7 +57,7 @@ function circleStroke(cx: number, cy: number, r: number): { x: number; y: number
 
 describe("(1) freehandToObject recognizes the pen-up stroke (v3 §4)", () => {
   it("commits a straight stroke as a canonical 2-node OPEN line with preserved endpoints", () => {
-    const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2");
+    const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2", "free");
     expect(stroke.geometry.d).toBe(`M 0 0 L ${200 * Q} 0`);
     expect(core.isOpenClassD(stroke.geometry.d)).toBe(true);
     // Endpoint preservation — the anchoring premise: the recognized endpoints
@@ -68,7 +68,7 @@ describe("(1) freehandToObject recognizes the pen-up stroke (v3 §4)", () => {
   });
 
   it("commits a circular stroke as a CLOSED ring (not open-class)", () => {
-    const stroke = core.freehandToObject(circleStroke(100, 100, 40), PEN.color, PEN.widthPx, "draw-2", "a2");
+    const stroke = core.freehandToObject(circleStroke(100, 100, 40), PEN.color, PEN.widthPx, "draw-2", "a2", "free");
     expect(stroke.geometry.d.trim().endsWith("Z")).toBe(true);
     expect(core.isOpenClassD(stroke.geometry.d)).toBe(false);
   });
@@ -82,7 +82,7 @@ describe("(1) freehandToObject recognizes the pen-up stroke (v3 §4)", () => {
       { x: 120, y: 80 }, { x: 90, y: 79 }, { x: 60, y: 79.2 }, { x: 30, y: 78.8 },
       { x: 0, y: 80 }, { x: 1, y: 55 }, { x: 0.8, y: 30 }, { x: 0, y: 10 }
     ];
-    const stroke = core.freehandToObject(rectStroke, PEN.color, PEN.widthPx, "draw-3", "a2");
+    const stroke = core.freehandToObject(rectStroke, PEN.color, PEN.widthPx, "draw-3", "a2", "free");
     expect(stroke.geometry.d).toBe(`M 0 0 L ${120 * Q} 0 L ${120 * Q} ${80 * Q} L 0 ${80 * Q} Z`);
   });
 });
@@ -93,7 +93,7 @@ describe("(2) freehand release anchoring (v3 §4 — open results, both corners)
     // edge-to-edge between them (the start snap and the release snap).
     const rectA = targetRect("rect-a", 200, 0);
     const rectB = targetRect("rect-b", 500, 0);
-    const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2");
+    const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2", "free");
     expect(core.isOpenClassD(stroke.geometry.d)).toBe(true); // the shell's anchor gate
 
     const anchors = synthesizeReleaseAnchors(core, [rectA, rectB], stroke, [
@@ -113,7 +113,7 @@ describe("(2) freehand release anchoring (v3 §4 — open results, both corners)
 
   it("skips null corners and corners whose target left the scene", () => {
     const rectA = targetRect("rect-a", 200, 0);
-    const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2");
+    const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2", "free");
     const anchors = synthesizeReleaseAnchors(core, [rectA], stroke, [
       null, // the stroke never started on an edge
       { target: "rect-gone", at: { x: 500, y: 30 } } // stale release target
@@ -126,7 +126,7 @@ describe("(2) freehand release anchoring (v3 §4 — open results, both corners)
     // coincide — both corners resolve to the same nearest node, and only the
     // first binding survives.
     const rectA = targetRect("rect-a", 200, 0);
-    const tap = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 300, y: 30 }), PEN.color, PEN.widthPx, "draw-4", "a2");
+    const tap = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 300, y: 30 }), PEN.color, PEN.widthPx, "draw-4", "a2", "free");
     const anchors = synthesizeReleaseAnchors(core, [rectA], tap, [
       { target: "rect-a", at: { x: 300, y: 30 } },
       { target: "rect-a", at: { x: 300, y: 30 } }
@@ -138,7 +138,53 @@ describe("(2) freehand release anchoring (v3 §4 — open results, both corners)
   it("a CLOSED recognition fails the shell's open-class gate, so no anchors are authored (DU7=(b))", () => {
     // A circle drawn ON a target's edge still recognizes closed — and the shell
     // only calls the anchor path for open-class results.
-    const stroke = core.freehandToObject(circleStroke(300, 30, 25), PEN.color, PEN.widthPx, "draw-2", "a2");
+    const stroke = core.freehandToObject(circleStroke(300, 30, 25), PEN.color, PEN.widthPx, "draw-2", "a2", "free");
     expect(core.isOpenClassD(stroke.geometry.d)).toBe(false);
+  });
+});
+
+describe("(3) recognition mode contract — the SAME stroke resolves differently per mode", () => {
+  it("an open S-curve: Basic snaps to the 2-node chord line, Free keeps the bezier curve", () => {
+    // y = 20·sin(2πt) over x ∈ [0,150]: smooth, far over the line threshold.
+    const sCurve = Array.from({ length: 31 }, (_, i) => {
+      const t = i / 30;
+      return { x: 150 * t, y: 20 * Math.sin(2 * Math.PI * t) };
+    });
+    const basic = core.freehandToObject(sCurve, PEN.color, PEN.widthPx, "draw-b", "a2", "basic");
+    // Exactly 2 line nodes (object-local: the bbox-min origin rides the
+    // transform, so the chord sits at the S-curve's dip height, not y=0).
+    expect(basic.geometry.d).toMatch(/^M \d+ \d+ L \d+ \d+$/);
+    expect(core.isOpenClassD(basic.geometry.d)).toBe(true);
+    const free = core.freehandToObject(sCurve, PEN.color, PEN.widthPx, "draw-f", "a2", "free");
+    expect(free.geometry.d).not.toBe(basic.geometry.d);
+    expect(free.geometry.d).toContain("C"); // bezier-smoothed curve, not a line
+  });
+
+  it("a closed pentagon-ish stroke: Basic snaps to a basic primitive, Free keeps the 5-corner polygon", () => {
+    // An irregular pentagon perimeter walk, pen-up short of the start (the
+    // same trajectory the scene-core golden pins to the bbox ellipse).
+    const v = [
+      { x: 0, y: 0 }, { x: 100, y: 10 }, { x: 130, y: 90 },
+      { x: 40, y: 130 }, { x: -40, y: 70 }
+    ];
+    const pentagon = v.flatMap((a, k) => {
+      const b = v[(k + 1) % v.length];
+      const n = k === v.length - 1 ? 9 : 10; // last edge stops short
+      return Array.from({ length: n }, (_, i) => ({
+        x: a.x + ((b.x - a.x) * i) / n,
+        y: a.y + ((b.y - a.y) * i) / n
+      }));
+    });
+    const free = core.freehandToObject(pentagon, PEN.color, PEN.widthPx, "draw-f", "a2", "free");
+    // Free: a 5-corner straight-edged closed polygon (M + 4 L + Z).
+    expect(free.geometry.d.match(/L/g)).toHaveLength(4);
+    expect(free.geometry.d.trim().endsWith("Z")).toBe(true);
+    expect(free.geometry.d).not.toContain("C");
+    const basic = core.freehandToObject(pentagon, PEN.color, PEN.widthPx, "draw-b", "a2", "basic");
+    // Basic forbids the polygon: the residual comparison resolves the bbox
+    // ellipse (the curved four-arc ring), a different d than Free's.
+    expect(basic.geometry.d).toContain("C");
+    expect(basic.geometry.d.trim().endsWith("Z")).toBe(true);
+    expect(basic.geometry.d).not.toBe(free.geometry.d);
   });
 });

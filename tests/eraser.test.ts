@@ -34,7 +34,7 @@ beforeAll(async () => {
 
 describe("(1) whole-stroke delete authors a delete op with an inverse re-insert", () => {
   it("removes the stroke and captures the inverse that restores it (D21)", () => {
-    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
+    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0", "free");
     const scene = { ...emptyObjectScene(), objects: [stroke] };
 
     const deleted = core.applyObjectOp(scene, { kind: "delete", id: "draw-1" });
@@ -51,7 +51,7 @@ describe("(1) whole-stroke delete authors a delete op with an inverse re-insert"
 
 describe("(2) partial erase cuts the touched subpath into two open pieces", () => {
   it("splits the stroke geometry at the touched node (object-local quantized)", () => {
-    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
+    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0", "free");
     // The middle sample (80,0 world) maps to object-local (80 - origin.x, 0 -
     // origin.y) px, then quantized. A generous radius tolerates RDP/bezier-fit
     // nudging the interior node slightly.
@@ -75,7 +75,7 @@ describe("(2) partial erase cuts the touched subpath into two open pieces", () =
   });
 
   it("returns null when the touch misses every stroke node (no-op)", () => {
-    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
+    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0", "free");
     const cut = core.splitSubpathAt(stroke.geometry, 9999, 9999, 12 * GEOMETRY_QUANTUM_PER_PX);
     expect(cut).toBeNull();
   });

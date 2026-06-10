@@ -60,7 +60,7 @@ use crate::object::model::Transform3x3;
 use crate::object::commands::object_command_catalog_json;
 use crate::object::gestures::object_gesture_catalog_json;
 use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush};
-use crate::object::recognize::recognize_stroke_object;
+use crate::object::recognize::{recognize_stroke_object, RecognizeMode};
 use crate::object::grouping::{
     double_click_action as double_click_action_pure, has_children as has_children_pure,
     pop_out_op as pop_out_op_pure, ungroup_enabled as ungroup_enabled_pure,
@@ -182,15 +182,17 @@ pub fn build_object_template(
     ok_json(&objects)
 }
 
-/// `freehand_to_object(points_json, color, width_px, id, order) -> Object | {error}`.
+/// `freehand_to_object(points_json, color, width_px, id, order, mode) -> Object | {error}`.
 ///
 /// Commit a single freehand stroke (FC-11 / anchor-semantics v3 §4):
 /// `points_json` is a JSON array of `[x, y]` world-px samples. The pen-up
-/// stroke is RECOGNIZED into its canonical form (line / ellipse / rect /
-/// polygon / normalized silhouette, open or closed) — one stroke = one
-/// object. The geometry is object-local with the origin (the stroke's bbox
-/// min) riding the transform translate (P4 zero-rebake). Returns `{error}`
-/// for fewer than 2 points (a tap has no extent) or a malformed input.
+/// stroke is RECOGNIZED per `mode` — `"basic"` force-snaps to a basic
+/// primitive (line / ellipse / rect / triangle, threshold-free), `"free"`
+/// runs the full pipeline (line / ellipse / rect / polygon / normalized
+/// silhouette, open or closed) — one stroke = one object. The geometry is
+/// object-local with the origin (the stroke's bbox min) riding the transform
+/// translate (P4 zero-rebake). Returns `{error}` for fewer than 2 points (a
+/// tap has no extent), an unknown mode, or a malformed input.
 #[wasm_bindgen]
 pub fn freehand_to_object(
     points_json: &str,
@@ -198,7 +200,13 @@ pub fn freehand_to_object(
     width_px: f64,
     id: &str,
     order: &str,
+    mode: &str,
 ) -> String {
+    let mode = match mode {
+        "basic" => RecognizeMode::Basic,
+        "free" => RecognizeMode::Free,
+        _ => return error_json("mode must be \"basic\" or \"free\""),
+    };
     let points: Vec<[f64; 2]> = match parse("points", points_json) {
         Ok(v) => v,
         Err(e) => return e,
@@ -209,6 +217,7 @@ pub fn freehand_to_object(
     let pts: Vec<(f64, f64)> = points.iter().map(|p| (p[0], p[1])).collect();
     let object = recognize_stroke_object(
         &pts,
+        mode,
         &Brush::new(color, width_px),
         id.to_string(),
         order.to_string(),
@@ -667,6 +676,7 @@ mod tests {
             2.0,
             "draw-1",
             "a0",
+            "free",
         );
         let object: Object = serde_json::from_str(&json).expect("freehand returns a valid Object");
         assert_eq!(object.id, "draw-1");
@@ -677,8 +687,24 @@ mod tests {
     }
 
     #[test]
+    fn freehand_mode_gates_basic_snap_vs_free_pipeline() {
+        // A zigzag the Free pipeline keeps as a multi-node open path but the
+        // Basic mode force-snaps to the 2-node chord line.
+        let zigzag = "[[0,0],[25,40],[50,0],[75,40],[100,0]]";
+        let basic = freehand_to_object(zigzag, "#1f2933", 2.0, "d1", "a0", "basic");
+        let object: Object = serde_json::from_str(&basic).expect("basic returns a valid Object");
+        assert_eq!(object.geometry.path_string, "M 0 0 L 800 0");
+        let free = freehand_to_object(zigzag, "#1f2933", 2.0, "d2", "a0", "free");
+        let object: Object = serde_json::from_str(&free).expect("free returns a valid Object");
+        assert_ne!(object.geometry.path_string, "M 0 0 L 800 0", "free keeps the zigzag");
+        // Unknown modes error instead of silently picking a pipeline.
+        let bad = freehand_to_object(zigzag, "#1f2933", 2.0, "d3", "a0", "diagonal");
+        assert!(bad.contains("\"error\""), "unknown mode is an error");
+    }
+
+    #[test]
     fn freehand_rejects_too_few_points() {
-        let json = freehand_to_object("[[0,0]]", "#000000", 1.0, "d", "a0");
+        let json = freehand_to_object("[[0,0]]", "#000000", 1.0, "d", "a0", "basic");
         assert!(json.contains("\"error\""), "single point is an error");
     }
 

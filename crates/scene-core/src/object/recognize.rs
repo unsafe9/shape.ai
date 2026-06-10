@@ -5,7 +5,7 @@
 //! object (replacing the D13 "session = one multi-subpath object" policy —
 //! a recognized rect and a recognized line have no reason to share an object).
 //!
-//! Pipeline ([`recognize_stroke`]):
+//! Pipeline ([`recognize_stroke`], [`RecognizeMode::Free`]):
 //!   1. closure test — trim ladder first ([`trim_overshoot`]: a tail that
 //!      crosses back over the head closes at the crossing, and a near-miss
 //!      T-junction — an endpoint almost touching the far end's segments —
@@ -21,6 +21,12 @@
 //!      smoothing (sharp turns stay corners, smooth runs stay curves; this is
 //!      also the open "smooth curve" fit when no corner is detected), capped
 //!      at [`MAX_FALLBACK_NODES`]; closed per the step-1 test.
+//!
+//! [`RecognizeMode::Basic`] (the toolbar default) shares step 1 and then
+//! FORCE-snaps to a basic primitive — no confidence thresholds, no polygon
+//! (5+ sides) and no silhouette fallback: open → the 2-node line between the
+//! exact input endpoints; closed → whichever of ellipse / rect / triangle
+//! carries the smallest normalized residual ([`basic_closed_fit`]).
 //!
 //! The recognizer's geometry helpers REUSE `drawing.rs` ([`rdp_simplify`],
 //! [`fit_beziers`], `perpendicular_distance`, `quantize_px`) — no duplicates.
@@ -85,10 +91,23 @@ const RECT_ANGLE_TOL_DEG: f64 = 20.0;
 const AXIS_SNAP_DEG: f64 = 10.0;
 /// Polygon side ceiling (3..=8 per the design).
 const POLYGON_MAX_SIDES: usize = 8;
+/// How densely the bbox-ellipse outline is sampled for the Basic-mode residual
+/// comparison (the rect/triangle outlines are their exact corner rings).
+const BASIC_ELLIPSE_OUTLINE_SAMPLES: usize = 64;
 /// Fallback node ceiling: a complex blob normalizes, it does not balloon.
 const MAX_FALLBACK_NODES: usize = 24;
 /// Cubic-arc circle constant (matches the primitive ellipse builders).
 const KAPPA: f64 = 0.5523;
+
+/// Pen recognition mode. `Free` is the full module pipeline (polygon +
+/// silhouette fallbacks allowed); `Basic` (the toolbar default) force-snaps
+/// every stroke to a basic primitive — open → 2-node line, closed → the best
+/// of ellipse / rect / triangle by normalized residual, threshold-free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecognizeMode {
+    Basic,
+    Free,
+}
 
 /// A recognized stroke: the canonical SVG-subset path-string (world-px
 /// quantized units, exactly one subpath) plus whether it is closed.
@@ -101,8 +120,8 @@ pub struct RecognizedStroke {
 /// Recognize one freehand stroke (raw world-px samples) into its canonical
 /// form (module pipeline). Fewer than 3 points skip recognition and fit as-is
 /// (a 2-point stroke IS already a line; 0/1 points have no extent).
-pub fn recognize_stroke(points: &[(f64, f64)]) -> RecognizedStroke {
-    let (nodes, closed) = recognize_nodes(points);
+pub fn recognize_stroke(points: &[(f64, f64)], mode: RecognizeMode) -> RecognizedStroke {
+    let (nodes, closed) = recognize_nodes(points, mode);
     RecognizedStroke { d: path_string::serialize(&[SubPath { closed, nodes }]), closed }
 }
 
@@ -112,11 +131,12 @@ pub fn recognize_stroke(points: &[(f64, f64)]) -> RecognizedStroke {
 /// to the stroke style. `id`/`order` are caller-supplied (purity).
 pub fn recognize_stroke_object(
     points: &[(f64, f64)],
+    mode: RecognizeMode,
     brush: &Brush,
     id: String,
     order: String,
 ) -> Object {
-    let (nodes, closed) = recognize_nodes(points);
+    let (nodes, closed) = recognize_nodes(points, mode);
     let origin_x = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
     let origin_y = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
     let ox = quantize_px(origin_x);
@@ -134,7 +154,8 @@ pub fn recognize_stroke_object(
 }
 
 /// The recognition core: canonical-fit nodes (world-px quantized) + closure.
-fn recognize_nodes(points: &[(f64, f64)]) -> (Vec<PathNode>, bool) {
+/// The closure ladder is mode-independent; the mode picks the fit set.
+fn recognize_nodes(points: &[(f64, f64)], mode: RecognizeMode) -> (Vec<PathNode>, bool) {
     if points.len() < 3 {
         return (fit_beziers(points), false);
     }
@@ -150,6 +171,9 @@ fn recognize_nodes(points: &[(f64, f64)]) -> (Vec<PathNode>, bool) {
     let gap = (last.0 - first.0).hypot(last.1 - first.1);
     let closed = crossed || (diag > f64::EPSILON && gap < CLOSE_RATIO * diag);
     if closed {
+        if mode == RecognizeMode::Basic {
+            return (basic_closed_fit(points, (min_x, min_y, max_x, max_y), diag), true);
+        }
         if let Some(nodes) = fit_ellipse(points, (min_x, min_y, max_x, max_y)) {
             return (nodes, true);
         }
@@ -158,6 +182,9 @@ fn recognize_nodes(points: &[(f64, f64)]) -> (Vec<PathNode>, bool) {
         }
         (normalize(points, diag, true), true)
     } else {
+        if mode == RecognizeMode::Basic {
+            return (force_line(points), false);
+        }
         if let Some(nodes) = fit_line(points) {
             return (nodes, false);
         }
@@ -336,6 +363,17 @@ fn segment_intersection(
 // Canonical fits.
 // ---------------------------------------------------------------------------
 
+/// The 2-node line between the exact quantized INPUT endpoints — the
+/// anchoring premise, and the unconditional Basic-mode open snap.
+fn force_line(points: &[(f64, f64)]) -> Vec<PathNode> {
+    let a = points[0];
+    let b = points[points.len() - 1];
+    vec![
+        PathNode::corner(quantize_px(a.0), quantize_px(a.1)),
+        PathNode::corner(quantize_px(b.0), quantize_px(b.1)),
+    ]
+}
+
 /// Straight line: every sample within `LINE_MAX_DEV_RATIO · chord` of the
 /// start→end chord. The endpoints are the INPUT endpoints, untouched —
 /// the anchoring premise.
@@ -347,12 +385,7 @@ fn fit_line(points: &[(f64, f64)]) -> Option<Vec<PathNode>> {
         return None;
     }
     let max_dev = points.iter().map(|&p| perpendicular_distance(p, a, b)).fold(0.0, f64::max);
-    (max_dev / chord <= LINE_MAX_DEV_RATIO).then(|| {
-        vec![
-            PathNode::corner(quantize_px(a.0), quantize_px(a.1)),
-            PathNode::corner(quantize_px(b.0), quantize_px(b.1)),
-        ]
-    })
+    (max_dev / chord <= LINE_MAX_DEV_RATIO).then(|| force_line(points))
 }
 
 /// Circle/ellipse: least-squares radial residual against the axis-aligned
@@ -380,6 +413,14 @@ fn fit_ellipse(
     if mse.sqrt() > ELLIPSE_MAX_RMS {
         return None;
     }
+    Some(ellipse_nodes(cx, cy, rx, ry))
+}
+
+/// The standard four-cubic-arc closed ring for the axis-aligned ellipse, in
+/// the parse-canonical closed-curve form: the closing arc's landing node is
+/// explicit (last == first position), so `subpaths` and a re-parse of the
+/// serialized `d` are byte-identical (no runtime-mirror divergence).
+fn ellipse_nodes(cx: f64, cy: f64, rx: f64, ry: f64) -> Vec<PathNode> {
     let kx = KAPPA * rx;
     let ky = KAPPA * ry;
     let handle = |dx: f64, dy: f64| Some(HandlePoint { dx: quantize_px(dx), dy: quantize_px(dy) });
@@ -390,16 +431,13 @@ fn fit_ellipse(
         out_handle: out_h,
         width: None,
     };
-    // The parse-canonical closed-curve form: the closing arc's landing node is
-    // explicit (last == first position), so `subpaths` and a re-parse of the
-    // serialized `d` are byte-identical (no runtime-mirror divergence).
-    Some(vec![
+    vec![
         node(cx - rx, cy, None, handle(0.0, -ky)),
         node(cx, cy - ry, handle(-kx, 0.0), handle(kx, 0.0)),
         node(cx + rx, cy, handle(0.0, -ky), handle(0.0, ky)),
         node(cx, cy + ry, handle(kx, 0.0), handle(-kx, 0.0)),
         node(cx - rx, cy, handle(0.0, ky), None),
-    ])
+    ]
 }
 
 /// Triangle/rect/polygon: coarse-RDP vertices, near-collinear ones merged
@@ -457,25 +495,135 @@ fn fit_rect(corners: &[(f64, f64)]) -> Option<Vec<PathNode>> {
             best = (len, (b.1 - a.1).atan2(b.0 - a.0).to_degrees());
         }
     }
-    // Fold the orientation into [-45°, 45°): rect symmetry is mod 90°.
-    let mut theta = best.1.rem_euclid(90.0);
+    Some(
+        oriented_rect_corners(corners, best.1)
+            .iter()
+            .map(|&(x, y)| PathNode::corner(quantize_px(x), quantize_px(y)))
+            .collect(),
+    )
+}
+
+/// Min bbox of `points` at orientation `edge_angle_deg` (folded into
+/// [-45°, 45°) — rect symmetry is mod 90° — and snapped to 0° within
+/// [`AXIS_SNAP_DEG`]): bbox in the rotated frame, corners mapped back in ring
+/// order. `frame_theta == 0` degenerates to the axis-aligned bbox.
+fn oriented_rect_corners(points: &[(f64, f64)], edge_angle_deg: f64) -> [(f64, f64); 4] {
+    let mut theta = edge_angle_deg.rem_euclid(90.0);
     if theta >= 45.0 {
         theta -= 90.0;
     }
     let frame_theta = if theta.abs() <= AXIS_SNAP_DEG { 0.0 } else { theta.to_radians() };
     let (sin, cos) = frame_theta.sin_cos();
-    // Min-area at the chosen orientation: bbox in the rotated frame, corners
-    // mapped back. frame_theta == 0 degenerates to the axis-aligned bbox.
     let frame: Vec<(f64, f64)> =
-        corners.iter().map(|&(x, y)| (x * cos + y * sin, -x * sin + y * cos)).collect();
+        points.iter().map(|&(x, y)| (x * cos + y * sin, -x * sin + y * cos)).collect();
     let (fx0, fy0, fx1, fy1) = bbox(&frame);
     let back = |fx: f64, fy: f64| (fx * cos - fy * sin, fx * sin + fy * cos);
-    Some(
-        [back(fx0, fy0), back(fx1, fy0), back(fx1, fy1), back(fx0, fy1)]
-            .iter()
-            .map(|&(x, y)| PathNode::corner(quantize_px(x), quantize_px(y)))
-            .collect(),
-    )
+    [back(fx0, fy0), back(fx1, fy0), back(fx1, fy1), back(fx0, fy1)]
+}
+
+// ---------------------------------------------------------------------------
+// Basic-mode forced closed fit (ellipse vs rect vs triangle, threshold-free).
+// ---------------------------------------------------------------------------
+
+/// Basic-mode closed snap: fit ALL THREE basic candidates — the bbox ellipse,
+/// the oriented min-bbox rect, the max-area triangle — and adopt the smallest
+/// normalized residual: RMS sample→outline distance over the bbox diagonal,
+/// the SAME scale for every candidate, so the residuals compare directly. No
+/// confidence thresholds and no polygon (5+ sides) or silhouette fallback —
+/// one of the three always wins (ties resolve ellipse → rect → triangle).
+fn basic_closed_fit(
+    points: &[(f64, f64)],
+    (min_x, min_y, max_x, max_y): (f64, f64, f64, f64),
+    diag: f64,
+) -> Vec<PathNode> {
+    let cx = (min_x + max_x) / 2.0;
+    let cy = (min_y + max_y) / 2.0;
+    let rx = (max_x - min_x) / 2.0;
+    let ry = (max_y - min_y) / 2.0;
+    let ellipse_ring: Vec<(f64, f64)> = (0..BASIC_ELLIPSE_OUTLINE_SAMPLES)
+        .map(|i| {
+            let t = core::f64::consts::TAU * i as f64 / BASIC_ELLIPSE_OUTLINE_SAMPLES as f64;
+            (cx + rx * t.cos(), cy + ry * t.sin())
+        })
+        .collect();
+    let rect = basic_rect_corners(points, diag);
+    let tri = basic_triangle_corners(points, diag);
+    let scale = diag.max(f64::EPSILON);
+    let ellipse_res = outline_rms(points, &ellipse_ring) / scale;
+    let rect_res = outline_rms(points, &rect) / scale;
+    let tri_res = outline_rms(points, &tri) / scale;
+    let corner_ring = |ring: &[(f64, f64)]| {
+        ring.iter().map(|&(x, y)| PathNode::corner(quantize_px(x), quantize_px(y))).collect()
+    };
+    if ellipse_res <= rect_res && ellipse_res <= tri_res {
+        ellipse_nodes(cx, cy, rx, ry)
+    } else if rect_res <= tri_res {
+        corner_ring(&rect)
+    } else {
+        corner_ring(&tri)
+    }
+}
+
+/// Basic-mode rect candidate: the longest coarse-RDP edge sets the
+/// orientation (axis-snapped, as in [`fit_rect`]) and the rect is the min
+/// bbox of ALL samples at that orientation — it always exists, no corner
+/// detection required.
+fn basic_rect_corners(points: &[(f64, f64)], diag: f64) -> [(f64, f64); 4] {
+    let kept = rdp_simplify(points, normalize_epsilon(diag));
+    let mut best = (0.0_f64, 0.0_f64); // (edge length, edge angle deg)
+    for w in kept.windows(2) {
+        let len = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+        if len > best.0 {
+            best = (len, (w[1].1 - w[0].1).atan2(w[1].0 - w[0].0).to_degrees());
+        }
+    }
+    oriented_rect_corners(points, best.1)
+}
+
+/// Basic-mode triangle candidate: the max-area triple over the coarse-RDP
+/// ring (pen-up endpoint dropped, as in [`fit_polygon`]), kept in ring order
+/// so the triangle never self-intersects. The coarse ring is small, so the
+/// brute-force sweep is a one-shot pen-up cost.
+fn basic_triangle_corners(points: &[(f64, f64)], diag: f64) -> [(f64, f64); 3] {
+    let kept = rdp_simplify(points, normalize_epsilon(diag));
+    let ring: &[(f64, f64)] = if kept.len() > 3 { &kept[..kept.len() - 1] } else { &kept };
+    if ring.len() < 3 {
+        // Degenerate closed scribble: spread three picks along the samples.
+        return [points[0], points[points.len() / 3], points[2 * points.len() / 3]];
+    }
+    let area2 = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+        ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs()
+    };
+    let mut best = (f64::NEG_INFINITY, [ring[0], ring[1], ring[2]]);
+    for i in 0..ring.len() {
+        for j in i + 1..ring.len() {
+            for k in j + 1..ring.len() {
+                let a2 = area2(ring[i], ring[j], ring[k]);
+                if a2 > best.0 {
+                    best = (a2, [ring[i], ring[j], ring[k]]);
+                }
+            }
+        }
+    }
+    best.1
+}
+
+/// RMS distance (px) from every sample to a closed outline ring — the shared
+/// Basic-mode residual metric (normalized by the caller).
+fn outline_rms(points: &[(f64, f64)], ring: &[(f64, f64)]) -> f64 {
+    let mse = points
+        .iter()
+        .map(|&p| {
+            let mut best = f64::INFINITY;
+            for i in 0..ring.len() {
+                let (_, dist) = project_to_segment(p, ring[i], ring[(i + 1) % ring.len()]);
+                best = best.min(dist);
+            }
+            best * best
+        })
+        .sum::<f64>()
+        / points.len() as f64;
+    mse.sqrt()
 }
 
 // ---------------------------------------------------------------------------
@@ -633,7 +781,7 @@ mod tests {
                 (200.0 * t, 10.0 * t + wiggle)
             })
             .collect();
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(!rec.closed);
         // Exactly two nodes at the EXACT quantized input endpoints.
         assert_eq!(rec.d, format!("M 0 0 L {} {}", 200 * Q, 10 * Q));
@@ -649,7 +797,7 @@ mod tests {
                 (100.0 + r * theta.cos(), 100.0 + r * theta.sin())
             })
             .collect();
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(rec.closed);
         let subpaths = parse(&rec.d);
         assert_eq!(subpaths.len(), 1);
@@ -693,7 +841,7 @@ mod tests {
             (1.0, 30.0),
             (0.0, 10.0),
         ];
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(rec.closed);
         assert_eq!(rec.d, format!("M 0 0 L {} 0 L {} {} L 0 {} Z", 120 * Q, 120 * Q, 80 * Q, 80 * Q));
     }
@@ -704,7 +852,7 @@ mod tests {
         edge((0.0, 0.0), (100.0, 0.0), 10, &mut pts);
         edge((100.0, 0.0), (50.0, 80.0), 10, &mut pts);
         edge((50.0, 80.0), (0.0, 0.0), 9, &mut pts); // stops short of the start
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(rec.closed);
         assert_eq!(rec.d, format!("M 0 0 L {} 0 L {} {} Z", 100 * Q, 50 * Q, 80 * Q));
     }
@@ -720,7 +868,7 @@ mod tests {
         edge((100.0, 0.0), (50.0, 80.0), 10, &mut pts);
         edge((50.0, 80.0), (15.0, -25.0), 10, &mut pts);
         pts.push((15.0, -25.0));
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(rec.closed, "cross-closure detected: {}", rec.d);
         // The loop closes at the crossing: corners X=(70/3,0) -> (100,0) ->
         // (50,80), the dangles on both sides trimmed away. 187 = round(8·70/3).
@@ -739,7 +887,7 @@ mod tests {
         edge((100.0, 100.0), (0.0, 100.0), 10, &mut pts);
         edge((0.0, 100.0), (12.0, -40.0), 10, &mut pts);
         pts.push((12.0, -40.0));
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(rec.closed, "cross-closure detected: {}", rec.d);
         assert_eq!(
             rec.d,
@@ -758,7 +906,7 @@ mod tests {
         edge((100.0, 0.0), (50.0, 80.0), 10, &mut pts);
         edge((50.0, 80.0), (-10.0, -100.0), 10, &mut pts);
         pts.push((-10.0, -100.0));
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(!rec.closed, "long dangle stays untrimmed: {}", rec.d);
     }
 
@@ -768,7 +916,7 @@ mod tests {
         // scan windows: consecutive segments touch at their shared point, which
         // must never read as a self-crossing (index-gap guard) — open stroke.
         let pts = vec![(0.0, 0.0), (8.0, 0.0), (8.0, 4.0), (120.0, 4.0)];
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(!rec.closed, "corner touch is not a closure: {}", rec.d);
     }
 
@@ -789,7 +937,7 @@ mod tests {
         edge((100.0, 100.0), (0.0, 100.0), 10, &mut pts);
         edge((0.0, 100.0), (8.0, 3.0), 10, &mut pts);
         pts.push((8.0, 3.0));
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(rec.closed, "T-junction near-miss closes: {}", rec.d);
         assert_eq!(
             rec.d,
@@ -811,7 +959,7 @@ mod tests {
         edge((100.0, 0.0), (0.0, 0.0), 10, &mut pts);
         edge((0.0, 0.0), (-30.0, 0.0), 3, &mut pts);
         pts.push((-30.0, 0.0));
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(rec.closed, "tail-side T-junction closes: {}", rec.d);
         assert_eq!(
             rec.d,
@@ -831,7 +979,7 @@ mod tests {
         edge((100.0, 100.0), (0.0, 100.0), 10, &mut pts);
         edge((0.0, 100.0), (8.0, 12.0), 10, &mut pts);
         pts.push((8.0, 12.0));
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(!rec.closed, "out-of-tolerance near-miss stays open: {}", rec.d);
     }
 
@@ -850,7 +998,7 @@ mod tests {
         edge((0.0, 100.0), (0.0, 0.0), 10, &mut pts);
         edge((0.0, 0.0), (46.0, 3.0), 10, &mut pts);
         pts.push((46.0, 3.0));
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(!rec.closed, "oversized dangle stays untrimmed: {}", rec.d);
     }
 
@@ -860,7 +1008,7 @@ mod tests {
         let mut pts: Vec<(f64, f64)> =
             (0..=10).map(|i| (100.0 - 10.0 * f64::from(i), 0.0)).collect();
         pts.extend((1..=10).map(|i| (0.0, 10.0 * f64::from(i))));
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(!rec.closed);
         let sp = &parse(&rec.d)[0];
         assert!(!sp.closed);
@@ -888,7 +1036,7 @@ mod tests {
                 (200.0 + r * theta.cos(), 200.0 + r * theta.sin())
             })
             .collect();
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(rec.closed);
         let sp = &parse(&rec.d)[0];
         assert!(sp.closed);
@@ -905,7 +1053,7 @@ mod tests {
                 (100.0 * t, 40.0 * (core::f64::consts::PI * t).sin())
             })
             .collect();
-        let rec = recognize_stroke(&pts);
+        let rec = recognize_stroke(&pts, RecognizeMode::Free);
         assert!(!rec.closed);
         let sp = &parse(&rec.d)[0];
         assert!(sp.nodes.len() > 2, "a curve, not a collapsed line: {}", rec.d);
@@ -924,6 +1072,7 @@ mod tests {
             .collect();
         let object = recognize_stroke_object(
             &pts,
+            RecognizeMode::Free,
             &Brush::new("#112233", 2.0),
             "draw-1".into(),
             "a0".into(),
@@ -939,9 +1088,137 @@ mod tests {
 
     #[test]
     fn degenerate_inputs_fit_as_is_without_recognition() {
-        assert_eq!(recognize_stroke(&[]), RecognizedStroke { d: String::new(), closed: false });
-        let two = recognize_stroke(&[(0.0, 0.0), (10.0, 0.0)]);
+        assert_eq!(
+            recognize_stroke(&[], RecognizeMode::Free),
+            RecognizedStroke { d: String::new(), closed: false }
+        );
+        let two = recognize_stroke(&[(0.0, 0.0), (10.0, 0.0)], RecognizeMode::Basic);
         assert_eq!(two.d, format!("M 0 0 L {} 0", 10 * Q));
         assert!(!two.closed);
+    }
+
+    // -- RecognizeMode::Basic — forced snap to the basic primitives. ---------
+
+    /// An irregular wobbly pentagon: 5 sharp corners (turns 60°–87°), interior
+    /// edge samples carrying alternating ±1px noise, pen-up short of the start.
+    fn wobbly_pentagon() -> Vec<(f64, f64)> {
+        let v = [(0.0, 0.0), (100.0, 10.0), (130.0, 90.0), (40.0, 130.0), (-40.0, 70.0)];
+        let mut pts = Vec::new();
+        edge(v[0], v[1], 10, &mut pts);
+        edge(v[1], v[2], 10, &mut pts);
+        edge(v[2], v[3], 10, &mut pts);
+        edge(v[3], v[4], 10, &mut pts);
+        edge(v[4], v[0], 9, &mut pts); // stops short of the start
+        for (i, p) in pts.iter_mut().enumerate() {
+            if i % 10 != 0 {
+                p.1 += if i % 2 == 0 { 1.0 } else { -1.0 };
+            }
+        }
+        pts
+    }
+
+    #[test]
+    fn basic_mode_snaps_a_wobbly_pentagon_to_a_canonical_primitive() {
+        let pts = wobbly_pentagon();
+        // Free keeps the 5-corner polygon (the silhouette).
+        let free = recognize_stroke(&pts, RecognizeMode::Free);
+        assert!(free.closed);
+        let free_sp = &parse(&free.d)[0];
+        assert_eq!(free_sp.nodes.len(), 5, "Free keeps the pentagon: {}", free.d);
+        assert!(free_sp.nodes.iter().all(|n| n.in_handle.is_none() && n.out_handle.is_none()));
+        // Basic forbids the polygon: the same stroke snaps to the closest of
+        // ellipse/rect/triangle — here the bbox ellipse (node-shape golden:
+        // the parse-canonical four-arc ring, no corner ring).
+        let basic = recognize_stroke(&pts, RecognizeMode::Basic);
+        assert!(basic.closed);
+        let sp = &parse(&basic.d)[0];
+        assert_eq!(sp.nodes.len(), 5, "four-arc ellipse: {}", basic.d);
+        assert_eq!((sp.nodes[4].x, sp.nodes[4].y), (sp.nodes[0].x, sp.nodes[0].y));
+        assert!(sp.nodes[1..4].iter().all(|n| n.in_handle.is_some() && n.out_handle.is_some()));
+        assert_ne!(basic.d, free.d, "Basic re-resolved the polygon");
+    }
+
+    #[test]
+    fn basic_mode_forces_a_wobbly_open_s_curve_to_a_two_node_line() {
+        // An S-bend from (0,0) to (150,0) with ±0.8px wiggle on the interior:
+        // far over the Free line threshold (dev/chord ≈ 0.13), smooth curve.
+        let pts: Vec<(f64, f64)> = (0..=30)
+            .map(|i| {
+                let t = f64::from(i) / 30.0;
+                let wiggle =
+                    if i == 0 || i == 30 { 0.0 } else if i % 2 == 0 { 0.8 } else { -0.8 };
+                (150.0 * t, 20.0 * (core::f64::consts::TAU * t).sin() + wiggle)
+            })
+            .collect();
+        let free = recognize_stroke(&pts, RecognizeMode::Free);
+        assert!(!free.closed);
+        let free_sp = &parse(&free.d)[0];
+        assert!(free_sp.nodes.len() > 2, "Free keeps the curve: {}", free.d);
+        assert!(free.d.contains('C'), "Free smooths with bezier handles: {}", free.d);
+        // Basic: unconditional 2-node line between the EXACT quantized input
+        // endpoints (fit_line's endpoint preservation, threshold ignored).
+        let basic = recognize_stroke(&pts, RecognizeMode::Basic);
+        assert!(!basic.closed);
+        assert_eq!(basic.d, format!("M 0 0 L {} 0", 150 * Q));
+    }
+
+    #[test]
+    fn basic_residual_comparison_picks_the_ellipse_for_a_circular_stroke() {
+        let pts: Vec<(f64, f64)> = (0..72)
+            .map(|i| {
+                let theta = f64::from(i) * 5.0_f64.to_radians();
+                (100.0 + 50.0 * theta.cos(), 100.0 + 50.0 * theta.sin())
+            })
+            .collect();
+        let rec = recognize_stroke(&pts, RecognizeMode::Basic);
+        assert!(rec.closed);
+        let sp = &parse(&rec.d)[0];
+        // The four-arc ellipse won over rect/triangle: curved ring on the
+        // exact circle bbox, cardinals at (50,100)/(100,50)/(150,100)/(100,150).
+        assert_eq!(sp.nodes.len(), 5, "four-arc ellipse: {}", rec.d);
+        assert!(sp.nodes[1..4].iter().all(|n| n.in_handle.is_some()));
+        assert_eq!((sp.nodes[0].x, sp.nodes[0].y), (50 * Q, 100 * Q));
+        assert_eq!((sp.nodes[1].x, sp.nodes[1].y), (100 * Q, 50 * Q));
+        assert_eq!((sp.nodes[2].x, sp.nodes[2].y), (150 * Q, 100 * Q));
+        assert_eq!((sp.nodes[3].x, sp.nodes[3].y), (100 * Q, 150 * Q));
+    }
+
+    #[test]
+    fn basic_residual_comparison_picks_the_rect_for_a_square_stroke() {
+        // Perimeter walk of (0,0)-(100,100), exact corners, inward-only edge
+        // noise (so the sample bbox IS the square), pen-up short of the start.
+        let pts = vec![
+            (0.0, 0.0),
+            (30.0, 1.2),
+            (60.0, 0.8),
+            (90.0, 1.0),
+            (100.0, 0.0),
+            (99.0, 26.0),
+            (98.8, 53.0),
+            (100.0, 100.0),
+            (70.0, 99.0),
+            (40.0, 98.8),
+            (0.0, 100.0),
+            (1.0, 70.0),
+            (0.9, 40.0),
+            (0.0, 12.0),
+        ];
+        let rec = recognize_stroke(&pts, RecognizeMode::Basic);
+        assert!(rec.closed);
+        assert_eq!(
+            rec.d,
+            format!("M 0 0 L {} 0 L {} {} L 0 {} Z", 100 * Q, 100 * Q, 100 * Q, 100 * Q)
+        );
+    }
+
+    #[test]
+    fn basic_residual_comparison_picks_the_triangle_for_a_triangular_stroke() {
+        let mut pts = Vec::new();
+        edge((0.0, 0.0), (100.0, 0.0), 10, &mut pts);
+        edge((100.0, 0.0), (50.0, 80.0), 10, &mut pts);
+        edge((50.0, 80.0), (0.0, 0.0), 9, &mut pts); // stops short of the start
+        let rec = recognize_stroke(&pts, RecognizeMode::Basic);
+        assert!(rec.closed);
+        assert_eq!(rec.d, format!("M 0 0 L {} 0 L {} {} Z", 100 * Q, 50 * Q, 80 * Q));
     }
 }

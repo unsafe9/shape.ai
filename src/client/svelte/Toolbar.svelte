@@ -13,6 +13,7 @@
     PenTool,
     Plus,
     Scan,
+    Spline,
     Square,
     Loader2,
     Trash2,
@@ -41,6 +42,9 @@
     penWidthPx: number;
     penPalette: string[];
     penWidths: number[];
+    // Pen recognition mode: false = Basic (snap to canonical basic shapes,
+    // the default), true = Free (polygon/curve fallbacks allowed).
+    freeRecognition: boolean;
     // D1/#5: always-visible toolbar color. AP1 applies this to the selection via
     // SetStyle; the toolbar owns only the swatch palette + native-picker UI.
     selectedColor: string;
@@ -58,6 +62,7 @@
     connectionStatus: ConnectionStatus;
     canvasBusy: boolean;
     onSetTool: (tool: ActiveTool) => void;
+    onToggleFreeRecognition: () => void;
     // W2-08: Stroke popup width setter (color is set via onSelectColor).
     onSetPenWidth: (widthPx: number) => void;
     onSelectColor: (color: string) => void;
@@ -82,6 +87,7 @@
     penWidthPx,
     penPalette,
     penWidths,
+    freeRecognition,
     selectedColor,
     dark,
     busy,
@@ -93,6 +99,7 @@
     connectionStatus,
     canvasBusy,
     onSetTool,
+    onToggleFreeRecognition,
     onSetPenWidth,
     onSelectColor,
     onInsertPrimitive,
@@ -277,6 +284,18 @@
         onclick={() => onSetTool("draw")}
       >
         <Pencil size={16} />
+      </button>
+      <!-- Pen recognition mode toggle: off (default) = Basic snaps every stroke
+           to a basic shape; on = Free keeps polygon/curve fallbacks. -->
+      <button
+        class="icon-button {freeRecognition ? 'is-active' : ''}"
+        type="button"
+        title="Free-form recognition"
+        aria-label="Free-form recognition"
+        aria-pressed={freeRecognition}
+        onclick={onToggleFreeRecognition}
+      >
+        <Spline size={16} />
       </button>
       <button
         class="icon-button {activeTool === 'erase' ? 'is-active' : ''}"

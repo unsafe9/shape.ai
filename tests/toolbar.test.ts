@@ -252,6 +252,47 @@ describe("toolbar Stroke popup UI (S1 / #4)", () => {
   });
 });
 
+describe("toolbar pen recognition toggle (Basic/Free)", () => {
+  // No DOM in the node test env: assert the wiring against the .svelte sources.
+  // Falsifiable — dropping the toggle button, moving it away from the Pen,
+  // flipping the default to Free, or not forwarding the mode to the freehand
+  // commit all fail these.
+  const toolbar = readFileSync(
+    fileURLToPath(new URL("../src/client/svelte/Toolbar.svelte", import.meta.url)),
+    "utf8"
+  );
+  const app = readFileSync(
+    fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)),
+    "utf8"
+  );
+
+  it("renders the Free-form recognition toggle right next to the Pen button", () => {
+    const pen = toolbar.indexOf('aria-label="Pen tool"');
+    const toggle = toolbar.indexOf('aria-label="Free-form recognition"');
+    const eraser = toolbar.indexOf('aria-label="Eraser tool"');
+    expect(pen).toBeGreaterThan(-1);
+    expect(toggle).toBeGreaterThan(pen);
+    expect(eraser).toBeGreaterThan(toggle); // Pen -> toggle -> Eraser, same Draw group
+  });
+
+  it("uses the standard toggle visual pattern (is-active + aria-pressed)", () => {
+    expect(toolbar).toMatch(/class="icon-button \{freeRecognition \? 'is-active' : ''\}"/);
+    expect(toolbar).toMatch(/aria-pressed=\{freeRecognition\}/);
+    expect(toolbar).toMatch(/onclick=\{onToggleFreeRecognition\}/);
+  });
+
+  it("declares the freeRecognition prop and onToggleFreeRecognition callback", () => {
+    expect(toolbar).toMatch(/freeRecognition:\s*boolean;/);
+    expect(toolbar).toMatch(/onToggleFreeRecognition:\s*\(\)\s*=>\s*void;/);
+  });
+
+  it("App owns the state, defaulting to Basic (false), and forwards only the mode bool", () => {
+    expect(app).toMatch(/let freeRecognition = \$state\(false\)/);
+    expect(app).toMatch(/onToggleFreeRecognition=\{\(\)\s*=>\s*\(freeRecognition = !freeRecognition\)\}/);
+    expect(app).toMatch(/freeRecognition \? "free" : "basic"/);
+  });
+});
+
 describe("toolbar color-popup UI (TB1 / #3)", () => {
   // The node test env has no DOM, so we assert the component's prop/callback
   // contract and the popup wiring against the .svelte source. Falsifiable: dropping

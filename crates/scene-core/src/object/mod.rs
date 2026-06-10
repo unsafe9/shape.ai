@@ -54,7 +54,7 @@ pub use deform::{
     open_endpoint_pins, route_open_endpoints, EndpointRoute,
 };
 pub use drawing::{fit_beziers, pressure_to_width, rdp_simplify, Brush};
-pub use recognize::{recognize_stroke, recognize_stroke_object, RecognizedStroke};
+pub use recognize::{recognize_stroke, recognize_stroke_object, RecognizeMode, RecognizedStroke};
 pub use gestures::{
     object_gesture_catalog, object_gesture_catalog_json, HoldInput, HoldTrigger, ObjectGesture,
     ObjectGestureCategory,

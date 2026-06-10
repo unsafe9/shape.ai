@@ -79,6 +79,13 @@ export type DerivedRegion = Record<string, unknown>;
  */
 export type DoubleClickAction = { kind: "drill-in-container" } | { kind: "edit-leaf" };
 
+/**
+ * Pen recognition mode (core `RecognizeMode`): `"basic"` force-snaps every
+ * stroke to a basic primitive (line / ellipse / rect / triangle), `"free"`
+ * runs the full pipeline with polygon + silhouette fallbacks.
+ */
+export type RecognizeMode = "basic" | "free";
+
 // Shape of the generated wasm-pack module (`shape_scene_core.js`). Declared
 // locally — matching wasmLoader.ts — so this file does not statically import the
 // gitignored build artifact's types; the dynamic import is `@vite-ignore`d.
@@ -110,7 +117,8 @@ type SceneCoreModule = {
     color: string,
     widthPx: number,
     id: string,
-    order: string
+    order: string,
+    mode: string
   ) => string;
   build_primitive: (
     kind: string,
@@ -216,16 +224,19 @@ export type SceneCore = {
     idPrefix: string
   ): SceneObject[];
   /** FC-11 / anchor-semantics v3 §4: RECOGNIZE one freehand stroke (world-px
-   *  points) at pen-up and commit it as one `Object` — line / ellipse / rect /
-   *  polygon / normalized silhouette, open or closed — with an object-local
-   *  geometry + brush stroke. Points become a JSON array of `[x, y]` pairs for
-   *  the wasm bridge. */
+   *  points) at pen-up and commit it as one `Object`, per `mode` — `"basic"`
+   *  force-snaps to a basic primitive (line / ellipse / rect / triangle),
+   *  `"free"` runs the full pipeline (line / ellipse / rect / polygon /
+   *  normalized silhouette, open or closed) — with an object-local geometry +
+   *  brush stroke. Points become a JSON array of `[x, y]` pairs for the wasm
+   *  bridge. */
   freehandToObject(
     points: { x: number; y: number }[],
     color: string,
     widthPx: number,
     id: string,
-    order: string
+    order: string,
+    mode: RecognizeMode
   ): SceneObject;
   /** Tier-3: build a basic primitive (rectangle/ellipse/line/text/frame) centered
    *  on a world anchor, in `color` (omit for the kind default — may be a hex or the
@@ -417,7 +428,7 @@ export async function loadSceneCore(): Promise<SceneCore> {
         mod.build_object_template(templateId, anchorX, anchorY, idPrefix)
       );
     },
-    freehandToObject(points, color, widthPx, id, order) {
+    freehandToObject(points, color, widthPx, id, order, mode) {
       return parseBridge<SceneObject>(
         "freehand_to_object",
         mod.freehand_to_object(
@@ -425,7 +436,8 @@ export async function loadSceneCore(): Promise<SceneCore> {
           color,
           widthPx,
           id,
-          order
+          order,
+          mode
         )
       );
     },
