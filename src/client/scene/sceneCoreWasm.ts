@@ -132,6 +132,7 @@ type SceneCoreModule = {
     order: string
   ) => string;
   build_set_style_op: (objectJson: string, color: string) => string;
+  is_open_class_d: (d: string) => string;
   split_subpath_at: (geometryJson: string, x: number, y: number, radius: number) => string;
   anchor_follow_ops: (sceneJson: string, transformOpsJson: string) => string;
   move_ops: (sceneJson: string, rootsJson: string, deltaJson: string) => string;
@@ -251,6 +252,11 @@ export type SceneCore = {
    *  theme-default sentinel). Recolors only existing style fields; a borderless
    *  object gains a fill. The shell authors the op through the same op-apply path. */
   buildSetStyleOp(object: SceneObject, color: string): ObjectOp;
+  /** Anchor-semantics v3 §1: the open/closed data-level dichotomy for a path
+   *  string — true iff the geometry is exactly one OPEN subpath. Class-dependent
+   *  shell branches (Alt-detach, fill-vs-stroke routing) consult THE core
+   *  classifier instead of re-parsing geometry in TS. */
+  isOpenClassD(d: string): boolean;
   /** W2-08: partial erase — cut a stroke's geometry at an object-local quantized
    *  touch point + radius. Returns the new geometry (two open subpaths around the
    *  removed node), or null when the touch missed every node (nothing to cut). */
@@ -450,6 +456,9 @@ export async function loadSceneCore(): Promise<SceneCore> {
         "build_set_style_op",
         mod.build_set_style_op(JSON.stringify(object), color)
       );
+    },
+    isOpenClassD(d) {
+      return parseBridge<boolean>("is_open_class_d", mod.is_open_class_d(d));
     },
     splitSubpathAt(geometry, x, y, radius) {
       // A missed touch comes back as `{error}` (nothing to cut); treat that as a

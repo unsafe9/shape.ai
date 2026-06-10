@@ -55,8 +55,10 @@ describe("buildPrimitiveFromDrag default color (AP1 drag-create path)", () => {
 });
 
 describe("buildSetStyleOp recolor (AP1 recolor-selection path)", () => {
+  // Closed d: the closed-class recolor contract (anchor-semantics v3 §1 routes
+  // OPEN-class color to the stroke — see the dedicated describe below).
   function obj(extra: Partial<SceneObject>): SceneObject {
-    return { id: "o1", order: "a0", geometry: { d: "M 0 0 L 8 0" }, ...extra } as SceneObject;
+    return { id: "o1", order: "a0", geometry: { d: "M 0 0 L 8 0 L 8 8 Z" }, ...extra } as SceneObject;
   }
 
   it("emits a set-style op recoloring both fill and stroke of a filled shape", () => {
@@ -96,6 +98,45 @@ describe("buildSetStyleOp recolor (AP1 recolor-selection path)", () => {
     if (op.kind !== "set-style") throw new Error("expected set-style");
     expect(op.fill).toEqual({ action: "set", value: { paint: { kind: "solid", color: COLOR }, opacity: 1 } });
     expect(op.stroke).toBeUndefined();
+  });
+});
+
+describe("open-class recolor routes to the stroke (anchor-semantics v3 §1)", () => {
+  // Open d (one open subpath): the color must reach the STROKE and never author
+  // a fill — open-class carries no fill (the shell stays class-ignorant; the
+  // routing lives in the core's build_set_style_op).
+  function openObj(extra: Partial<SceneObject>): SceneObject {
+    return { id: "o1", order: "a0", geometry: { d: "M 0 0 L 8 0" }, ...extra } as SceneObject;
+  }
+
+  it("recolors the stroke and leaves a legacy fill untouched", () => {
+    const object = openObj({
+      fill: { paint: { kind: "solid", color: "#000000" }, opacity: 1 },
+      stroke: { paint: { kind: "solid", color: "#111111" }, width: 16 }
+    });
+    const op = core.buildSetStyleOp(object, COLOR);
+    if (op.kind !== "set-style") throw new Error("expected set-style");
+    expect(op.fill).toBeUndefined();
+    expect(op.stroke).toEqual({
+      action: "set",
+      value: { paint: { kind: "solid", color: COLOR }, width: 16, opacity: 1, cap: "butt", join: "miter" }
+    });
+  });
+
+  it("gives a strokeless open path the line-default stroke, NOT a fill", () => {
+    const op = core.buildSetStyleOp(openObj({}), COLOR);
+    if (op.kind !== "set-style") throw new Error("expected set-style");
+    expect(op.fill).toBeUndefined();
+    expect(op.stroke).toEqual({
+      action: "set",
+      value: { paint: { kind: "solid", color: COLOR }, width: 16, opacity: 1, cap: "butt", join: "miter" }
+    });
+  });
+
+  it("classifies via the core bridge the shell consults (isOpenClassD)", () => {
+    expect(core.isOpenClassD("M 0 0 L 8 0")).toBe(true);
+    expect(core.isOpenClassD("M 0 0 L 8 0 L 8 8 Z")).toBe(false);
+    expect(core.isOpenClassD("M 0 0 L 8 0 M 16 0 L 24 0")).toBe(false);
   });
 });
 

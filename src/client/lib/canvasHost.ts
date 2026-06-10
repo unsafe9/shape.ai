@@ -60,7 +60,18 @@ export type ShapeCanvasHostCallbacks = {
   // toggles the object in/out of the multi-select set instead of replacing it.
   onSelectObject: (id: string, additive: boolean) => void;
   onTransformPreview: (id: string, matrix: RenderTransform3x3, kind: TransformKind) => void;
-  onTransformCommit: (id: string, matrix: RenderTransform3x3, kind: TransformKind) => void;
+  // v3 §3 (DU4): `detach` is the C2 `detach-alt` gesture bit (Alt held at release)
+  // — the shell branches an anchored open-class body drag into a whole translate
+  // plus an anchor-clearing set-anchor (the class/anchor judgment is the core's).
+  onTransformCommit: (id: string, matrix: RenderTransform3x3, kind: TransformKind, detach: boolean) => void;
+  // v3 §2b: open-class endpoint drag. `onEndpointPreview` rides each endpoint-drag
+  // move (the chord deform is already live on the GPU; the payload carries the
+  // release-snap probe so the shell drives the anchor ring); `onEndpointCommit`
+  // rides the pointer-up — the shell authors `endpointReleaseOps` from it (chord
+  // EditGeometry + anchor rebind/unbind). Optional so a host that omits them
+  // loses nothing.
+  onEndpointPreview?: (id: string, nodeIndex: number, world: { x: number; y: number }, snapped: boolean, targetId: string | null) => void;
+  onEndpointCommit?: (id: string, nodeIndex: number, world: { x: number; y: number }, snapped: boolean, targetId: string | null) => void;
   onMarquee: (ids: string[]) => void;
   // RA2b/AP3: a double-click landed on an object. The shell drills into a container
   // (hasChildren) or enters inline text edit on a leaf; a missed double-click never
@@ -329,6 +340,15 @@ export class ShapeCanvasHost {
     this.webGpuRenderer?.clearObjectPreview?.(id);
   }
 
+  /** v3 §2b: revert an endpoint drag's live chord deform to the canonical baked
+   *  geometry. The shell calls this when the release authored nothing (no-op
+   *  release / failed commit); the success path lets the committed scene's re-feed
+   *  land the deformed geometry canonically. No-op without a live renderer or on a
+   *  wasm build predating the method. */
+  clearObjectEndpointPreview(id: string): void {
+    this.webGpuRenderer?.clearObjectEndpointPreview?.(id);
+  }
+
   /** Upload the object scene to the live renderer when available (browser-only;
    *  a no-op without a WebGPU device). FC-05: this only UPLOADS the geometry; the
    *  RAF `renderFrame` loop is the sole frame driver and records the object pass
@@ -338,6 +358,11 @@ export class ShapeCanvasHost {
     if (!renderer || typeof renderer.loadObjectScene !== "function") return;
     try {
       renderer.loadObjectScene(sceneJson);
+      // v3 §2b: a re-feed rebuilds every baked geometry from the canonical scene,
+      // wiping a live endpoint chord deform (the renderer resets its patch
+      // bookkeeping on feed). Re-apply the in-flight drag's latest sample — e.g.
+      // when the shell's snap ring rides the feed mid-drag.
+      this.engine?.refreshEndpointPreview();
     } catch (error) {
       this.callbacks.onStatus(errorMessage(error, "Object scene upload failed."));
     }
@@ -418,7 +443,16 @@ export class ShapeCanvasHost {
       return;
     }
     if (event.type === "object-transform-commit") {
-      this.callbacks.onTransformCommit(event.id, event.matrix, event.kind);
+      this.callbacks.onTransformCommit(event.id, event.matrix, event.kind, event.detach);
+      return;
+    }
+    // v3 §2b: open-class endpoint drag preview/commit route to the shell.
+    if (event.type === "object-endpoint-preview") {
+      this.callbacks.onEndpointPreview?.(event.id, event.nodeIndex, event.world, event.snapped, event.targetId);
+      return;
+    }
+    if (event.type === "object-endpoint-commit") {
+      this.callbacks.onEndpointCommit?.(event.id, event.nodeIndex, event.world, event.snapped, event.targetId);
       return;
     }
     if (event.type === "object-marquee") {

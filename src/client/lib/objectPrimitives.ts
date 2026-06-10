@@ -8,7 +8,13 @@
 // sentinel (the *selection* value; its mapping to a Paint lives in the core).
 
 import type { CameraState } from "../../shared/geometry";
-import { GEOMETRY_QUANTUM_PER_PX, type Object as SceneObject } from "../../shared/object";
+import {
+  GEOMETRY_QUANTUM_PER_PX,
+  type Object as SceneObject,
+  type ObjectOp,
+  type ObjectScene,
+  type Transform3x3
+} from "../../shared/object";
 import { worldToScreen, type WorldRect } from "../renderer/scene";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
@@ -63,6 +69,26 @@ export function resolveCreateRelease(
     }
   }
   return { end: release.end, target: null };
+}
+
+// v3 §3 (DU4) Alt-detach: the commit ops of an Alt-held body drag of an ANCHORED
+// open-class object — clear its anchors (one whole-vector set-anchor), then move it
+// WHOLE. The move ops are computed by the core against the scene with the dragged
+// object's anchors already cleared, so the open-class endpoint routing sees no pins
+// and keeps the 0-rebake SetTransform translate (and followers anchored TO the
+// dragged object still follow). Pure composition — every judgment is a core call;
+// the caller decides eligibility (detach gesture + open-class + anchored).
+export function altDetachOps(
+  core: { moveOps(scene: ObjectScene, roots: { kind: "single"; id: string }, delta: Transform3x3): ObjectOp[] },
+  scene: ObjectScene,
+  id: string,
+  delta: Transform3x3
+): ObjectOp[] {
+  const detached: ObjectScene = {
+    ...scene,
+    objects: scene.objects.map((o) => (o.id === id ? { ...o, anchors: [] } : o))
+  };
+  return [{ kind: "set-anchor", id, anchors: [] }, ...core.moveOps(detached, { kind: "single", id }, delta)];
 }
 
 // W2-10: the on-screen rect to place the inline text-edit overlay over, in canvas-

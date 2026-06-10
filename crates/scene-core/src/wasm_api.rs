@@ -51,7 +51,9 @@ use crate::object::anchor_follow::{
     anchor_follow_ops as anchor_follow_ops_pure,
     synthesize_create_anchors as synthesize_create_anchors_pure,
 };
-use crate::object::deform::endpoint_release_ops as endpoint_release_ops_pure;
+use crate::object::deform::{
+    endpoint_release_ops as endpoint_release_ops_pure, is_open_class_d as is_open_class_d_pure,
+};
 use crate::object::apply::apply_object_op as apply_object_op_pure;
 use crate::object::cascade::{move_ops as move_ops_pure, MoveRoots};
 use crate::object::model::Transform3x3;
@@ -386,6 +388,17 @@ pub fn synthesize_create_anchors(
     };
     let anchors = synthesize_create_anchors_pure(&created, &target, endpoint_x, endpoint_y);
     ok_json(&anchors)
+}
+
+/// `is_open_class_d(d) -> bool`.
+///
+/// Anchor-semantics v3 §1: the open/closed data-level dichotomy for a path
+/// string — true iff it parses to exactly one subpath and that subpath is open.
+/// Class-dependent shell branches (Alt-detach, fill-vs-stroke routing) consult
+/// THE core classifier instead of re-parsing geometry in TS.
+#[wasm_bindgen]
+pub fn is_open_class_d(d: &str) -> String {
+    ok_json(&is_open_class_d_pure(d))
 }
 
 /// A world-px point on the wire (`{x,y}`), used by [`endpoint_release_ops`]'s

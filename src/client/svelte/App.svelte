@@ -44,6 +44,7 @@
     THEME_DEFAULT_COLOR,
     type DragSpan,
     type CreateSnap,
+    altDetachOps,
     resolveCreateRelease,
     CREATE_ANCHOR_REUSE_TOLERANCE_PX
   } from "../lib/objectPrimitives";
@@ -268,7 +269,7 @@
       // can never freeze on a commit still waiting for its scene update.
       if (pendingCommit && pendingCommit.id !== id) pendingCommit = null;
     },
-    onTransformCommit: (id, matrix, _kind) => {
+    onTransformCommit: (id, matrix, kind, detach) => {
       // The canonical scene was never mutated during the drag, so op-apply
       // captures the correct inverse (original transform), satisfying D21 undo.
       const src = scene.objects.find((o) => o.id === id);
@@ -289,7 +290,18 @@
       // Null-guard (mirrors Tier-1's degrade): with no scene-core the cascade cannot
       // be authored — drop the GPU preview rather than commit shell-side matrix math.
       if (!sceneCore) return void host?.clearObjectPreview(id);
-      const allOps = sceneCore.moveOps(scene, roots, matrix);
+      // v3 §3 (DU4) Alt-detach: an Alt-held BODY translate of an anchored
+      // open-class object moves it whole and detaches its anchors — one set-anchor
+      // clear plus the move computed against the detached scene (so the endpoint
+      // routing sees no pins and keeps the SetTransform translate). The class
+      // judgment is the core's (isOpenClassD); single-root body drags only.
+      const detachable =
+        detach &&
+        kind === "translate" &&
+        roots.kind === "single" &&
+        (src.anchors?.length ?? 0) > 0 &&
+        sceneCore.isOpenClassD(src.geometry.d);
+      const allOps = detachable ? altDetachOps(sceneCore, scene, id, matrix) : sceneCore.moveOps(scene, roots, matrix);
       const op: ObjectOp = allOps.length === 1 ? allOps[0] : { kind: "batch", ops: allOps };
       // FC-16: pre-connect authorOp applies synchronously (the committed scene is on
       // return, so the rebake $effect drops the preview matrix immediately). In the
@@ -308,6 +320,34 @@
           pendingCommit = null;
           host?.clearObjectPreview(id);
         }
+      });
+    },
+    // v3 §2b: open-class endpoint drag. The chord deform is already live on the
+    // GPU (engine setObjectEndpointPreview); the preview event only drives the
+    // release-snap anchor ring through the SAME hover-ring mechanism as
+    // drag-create (createHoverSnap -> feedScene), honoring a snap only onto a
+    // real, OTHER canonical object (mirrors handleCreate #6).
+    onEndpointPreview: (id, _nodeIndex, world, snapped, targetId) => {
+      const target =
+        snapped && targetId !== null && targetId !== id && scene.objects.some((o) => o.id === targetId) ? targetId : null;
+      const next = target !== null ? { at: world, target } : null;
+      // Skip the null -> null write so an unsnapped drag never re-feeds the scene.
+      if (next !== null || createHoverSnap !== null) createHoverSnap = next;
+    },
+    // v3 §2b: the endpoint-drag release — ONE undoable batch from the core's
+    // endpointReleaseOps (chord-deform edit-geometry + the set-anchor whole-vector
+    // rebind/unbind). Mirrors onTransformCommit's moveOps pattern: the canonical
+    // scene was never mutated during the drag, so op-apply captures the correct
+    // inverse (D21); a no-op or failed release reverts the live GPU deform.
+    onEndpointCommit: (id, nodeIndex, world, snapped, targetId) => {
+      createHoverSnap = null;
+      if (!sceneCore) return void host?.clearObjectEndpointPreview(id);
+      const target =
+        snapped && targetId !== null && targetId !== id && scene.objects.some((o) => o.id === targetId) ? targetId : null;
+      const ops = sceneCore.endpointReleaseOps(scene, id, nodeIndex, world, target ? { targetId: target, at: world } : null);
+      if (ops.length === 0) return void host?.clearObjectEndpointPreview(id);
+      authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops }, true, (ok) => {
+        if (!ok) host?.clearObjectEndpointPreview(id);
       });
     },
     onMarquee: (ids) => {

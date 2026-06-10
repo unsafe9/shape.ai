@@ -22,6 +22,7 @@ export const GESTURE_ADDITIVE_SELECT_MOD = "additive-select-mod";
 export const GESTURE_NO_SNAP_ALT = "no-snap-alt";
 export const GESTURE_PARTIAL_ERASE_ALT = "partial-erase-alt";
 export const GESTURE_COARSE_ROTATE_SHIFT = "coarse-rotate-shift";
+export const GESTURE_DETACH_ALT = "detach-alt";
 
 /**
  * The frozen binding token for each routed gesture, mirrored from C2. `key`/
@@ -37,7 +38,8 @@ export const GESTURE_BINDINGS = {
   [GESTURE_ADDITIVE_SELECT_MOD]: { modifier: "Mod" },
   [GESTURE_NO_SNAP_ALT]: { modifier: "Alt" },
   [GESTURE_PARTIAL_ERASE_ALT]: { modifier: "Alt" },
-  [GESTURE_COARSE_ROTATE_SHIFT]: { modifier: "Shift", degrees: 15 }
+  [GESTURE_COARSE_ROTATE_SHIFT]: { modifier: "Shift", degrees: 15 },
+  [GESTURE_DETACH_ALT]: { modifier: "Alt" }
 } as const;
 
 /** DOM MouseEvent button value for the middle mouse button (C2 `pan-middle`). */
@@ -97,6 +99,14 @@ export function isPartialErase(event: { altKey: boolean }): boolean {
  */
 export function isCoarseRotate(event: { shiftKey: boolean }): boolean {
   return event.shiftKey;
+}
+
+/**
+ * The detach gesture (C2 `detach-alt`, anchor-semantics v3 §3/DU4): Alt held
+ * while dragging an anchored object moves it whole and detaches its anchors.
+ */
+export function isDetachDrag(event: { altKey: boolean }): boolean {
+  return event.altKey;
 }
 
 /**

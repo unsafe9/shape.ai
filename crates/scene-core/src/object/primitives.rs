@@ -21,6 +21,7 @@
 
 use core::fmt::Write as _;
 
+use super::deform::is_open_class;
 use super::model::{
     Fill, FillRule, Geometry, Object, Paint, Stroke, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
 };
@@ -320,8 +321,22 @@ fn drag_geometry(kind: PrimitiveKind, span: DragSpan) -> (String, f64, f64) {
 /// object did not have. An object with NEITHER fill nor stroke (the borderless
 /// text primitive) gets a fill so the recolor is still visible. The inverse (the
 /// old style) comes from the core apply path, keeping undo correct (D21).
+///
+/// Anchor-semantics v3 §1: an OPEN-CLASS object (one open subpath) carries no
+/// fill, so the color routes to its STROKE — recoloring it, or authoring the
+/// line-default stroke when missing — and a legacy fill is left untouched (the
+/// renderer skips open-class fills; the shell stays class-ignorant).
 pub fn build_set_style_op(object: &Object, color: &str) -> ObjectOp {
     let paint = paint_for_color(color);
+    if is_open_class(&object.geometry) {
+        let mut stroke = object.stroke.clone().unwrap_or_else(|| solid_stroke("#5b6472", 2.0));
+        stroke.paint = paint;
+        return ObjectOp::SetStyle {
+            id: object.id.clone(),
+            fill: None,
+            stroke: Some(FieldEdit::Set { value: stroke }),
+        };
+    }
     let mut fill_edit: Option<FieldEdit<Fill>> = None;
     let mut stroke_edit: Option<FieldEdit<Stroke>> = None;
     if let Some(fill) = &object.fill {
@@ -494,8 +509,9 @@ mod tests {
 
     #[test]
     fn set_style_recolors_both_fill_and_stroke_of_a_filled_shape() {
+        // Closed d: a fill-bearing shape is closed-class by definition (v3 §1).
         let o = obj_with(
-            "M 0 0 L 8 0",
+            "M 0 0 L 8 0 L 8 8 Z",
             Some(solid_fill("#000000")),
             Some(solid_stroke("#111111", 2.0)),
         );
@@ -524,13 +540,45 @@ mod tests {
 
     #[test]
     fn set_style_gives_a_styleless_object_a_fill() {
-        let o = obj_with("M 0 0 L 8 0", None, None);
+        // Closed d: the borderless text primitive is a closed rect (v3 §1 keeps
+        // the fill fallback for closed-class only).
+        let o = obj_with("M 0 0 L 8 0 L 8 8 Z", None, None);
         let op = build_set_style_op(&o, "#abcdef");
         let ObjectOp::SetStyle { fill, stroke, .. } = op else { panic!("set-style") };
         assert!(stroke.is_none());
         let FieldEdit::Set { value: f } = fill.unwrap() else { panic!("fill set") };
         assert_eq!(f.paint, Paint::Solid { color: "#abcdef".into() });
         assert_eq!(f.opacity, 1.0);
+    }
+
+    // -- v3 §1: open-class color routes to the stroke, never the fill ---------
+
+    #[test]
+    fn set_style_routes_open_class_color_to_stroke_never_fill() {
+        // A legacy open path carrying a fill: the recolor must not touch it.
+        let o = obj_with(
+            "M 0 0 L 8 0",
+            Some(solid_fill("#000000")),
+            Some(solid_stroke("#111111", 2.0)),
+        );
+        let op = build_set_style_op(&o, "#abcdef");
+        let ObjectOp::SetStyle { fill, stroke, .. } = op else { panic!("set-style") };
+        assert!(fill.is_none(), "open-class recolor must not author a fill edit");
+        let FieldEdit::Set { value: s } = stroke.unwrap() else { panic!("stroke set") };
+        assert_eq!(s.paint, Paint::Solid { color: "#abcdef".into() });
+        assert_eq!(s.width, q(2.0));
+    }
+
+    #[test]
+    fn set_style_gives_a_strokeless_open_path_a_stroke_not_a_fill() {
+        let o = obj_with("M 0 0 L 8 0", None, None);
+        let op = build_set_style_op(&o, "#abcdef");
+        let ObjectOp::SetStyle { fill, stroke, .. } = op else { panic!("set-style") };
+        assert!(fill.is_none(), "open-class never gains a fill");
+        let FieldEdit::Set { value: s } = stroke.unwrap() else { panic!("stroke set") };
+        assert_eq!(s.paint, Paint::Solid { color: "#abcdef".into() });
+        // The line-default stroke width (q(2px)) so the recolor is visible.
+        assert_eq!(s.width, q(2.0));
     }
 
     #[test]
