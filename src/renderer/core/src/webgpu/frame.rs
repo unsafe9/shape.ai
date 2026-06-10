@@ -359,7 +359,7 @@ impl ShapeWebGpuRenderer {
         let ids = self
             .object_scene
             .as_ref()
-            .map(outline_overlay_ids)
+            .map(|scene| outline_overlay_ids(scene, &self.object_regions))
             .unwrap_or_default();
         // W3-G10/#2: feed each id's LIVE preview transform so the outline ring tracks
         // the drag every frame like the resize handles, not just on commit. The G9

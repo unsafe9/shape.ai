@@ -1733,14 +1733,29 @@ pub(crate) fn build_handle_overlay_vertices(world_bbox: &WorldRect, zoom: f64) -
 /// multi-select is active, every member rings (single selection then keeps its
 /// 8-handle overlay too, but those are drawn separately). When the multi-select is
 /// empty, a lone selected object/group still gets ONE ring so a grouped selection
-/// shows a visible border, not just the 8 resize dots. Returns member-input order;
-/// empty when nothing is selected.
+/// shows a visible border, not just the 8 resize dots — UNLESS the selection is
+/// open-class (feedback #1): its whole selection surface is the two endpoint dots
+/// (Figma-style), so no bbox ring. The multi-select union keeps ringing open
+/// members. Returns member-input order; empty when nothing is selected.
 #[cfg(feature = "wgpu-probe")]
-pub(crate) fn outline_overlay_ids(scene: &RenderObjectScene) -> Vec<String> {
+pub(crate) fn outline_overlay_ids(
+    scene: &RenderObjectScene,
+    regions: &[ObjectRegion],
+) -> Vec<String> {
     if !scene.multi_select.is_empty() {
         return scene.multi_select.clone();
     }
-    scene.selection.iter().cloned().collect()
+    let Some(id) = &scene.selection else {
+        return Vec::new();
+    };
+    let open = regions
+        .iter()
+        .find(|region| &region.id == id)
+        .is_some_and(|region| region.open_endpoints.is_some());
+    if open {
+        return Vec::new();
+    }
+    vec![id.clone()]
 }
 
 /// W3-G7/#1: per-object outline highlight for the multi-select set. For each id
@@ -2232,31 +2247,39 @@ pub(crate) fn endpoint_handles(
     })
 }
 
-/// v3 §2b: build the endpoint-handle overlay (two squares at the open-class
-/// selection's endpoint WORLD positions) — same zoom-invariant sizing as
-/// [`build_handle_overlay_vertices`], reusing its buffer (12 of the 54-vertex
-/// capacity).
+/// v3 §2b + feedback #1: build the endpoint-handle overlay — two FILLED CIRCLES
+/// (Figma-style dots) at the open-class selection's endpoint WORLD positions.
+/// Same zoom-invariant sizing as [`build_handle_overlay_vertices`] (screen
+/// DIAMETER pins to `HANDLE_SIZE_PX` at any zoom); each dot is a
+/// [`ENDPOINT_HANDLE_SEGMENTS`]-triangle fan, the pair filling its shared buffer
+/// ([`HANDLE_OVERLAY_VERTEX_CAPACITY`]). Visual only: the grab/hover HIT zones
+/// stay the `HANDLE_SIZE_PX` screen squares in [`endpoint_handles`].
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn build_endpoint_handle_overlay_vertices(
     world: &[WorldPoint; 2],
     zoom: f64,
 ) -> Vec<GpuVertex> {
     use crate::hit_test_object::HANDLE_SIZE_PX;
-    let mut vertices = Vec::with_capacity(12);
+    let mut vertices = Vec::with_capacity(2 * ENDPOINT_HANDLE_SEGMENTS * 3);
     let z = zoom.max(0.025);
-    let size = HANDLE_SIZE_PX / z;
-    let half = size / 2.0;
+    let radius = (HANDLE_SIZE_PX / z / 2.0) as f32;
     for point in world {
-        add_rect(
-            &mut vertices,
-            &WorldRect {
-                x: point.x - half,
-                y: point.y - half,
-                width: size,
-                height: size,
-            },
-            HANDLE_FILL_COLOR,
-        );
+        let cx = point.x as f32;
+        let cy = point.y as f32;
+        let rim = |segment: usize| {
+            let angle =
+                segment as f32 / ENDPOINT_HANDLE_SEGMENTS as f32 * std::f32::consts::TAU;
+            [cx + radius * angle.cos(), cy + radius * angle.sin()]
+        };
+        for segment in 0..ENDPOINT_HANDLE_SEGMENTS {
+            for position in [[cx, cy], rim(segment), rim(segment + 1)] {
+                vertices.push(GpuVertex {
+                    position,
+                    uv: SOLID_UV[0],
+                    color: ENDPOINT_HANDLE_FILL_COLOR,
+                });
+            }
+        }
     }
     vertices
 }
@@ -3225,13 +3248,21 @@ pub(crate) const MARQUEE_FILL_COLOR: [f32; 4] = [0.231, 0.510, 0.965, 0.12];
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const MARQUEE_STROKE_COLOR: [f32; 4] = [0.231, 0.510, 0.965, 0.9];
 
-// W2-04: selection-handle overlay = 8 resize handles + 1 rotate zone, each a fill
-// quad (6 verts) = 9 * 6 = 54.
+// W2-04: selection-handle overlay buffer covers BOTH selection surfaces:
+// closed-class = 8 resize handles + 1 rotate zone, each a fill quad (6 verts)
+// = 54; open-class (v3 §2b) = two endpoint dots, each a triangle fan
+// (3 verts/segment) = 2 * 16 * 3 = 96.
 #[cfg(feature = "wgpu-probe")]
-pub(crate) const HANDLE_OVERLAY_VERTEX_CAPACITY: usize = 54;
+pub(crate) const HANDLE_OVERLAY_VERTEX_CAPACITY: usize = 2 * ENDPOINT_HANDLE_SEGMENTS * 3;
 // Solid focus-blue handle fill (#2f7ee6).
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const HANDLE_FILL_COLOR: [f32; 4] = [0.184, 0.494, 0.902, 1.0];
+// Feedback #1: open-class endpoint dots — fan segments per circle, filled with
+// the selection blue (#007aff).
+#[cfg(feature = "wgpu-probe")]
+pub(crate) const ENDPOINT_HANDLE_SEGMENTS: usize = 16;
+#[cfg(feature = "wgpu-probe")]
+pub(crate) const ENDPOINT_HANDLE_FILL_COLOR: [f32; 4] = [0.0, 0.478, 1.0, 1.0];
 
 // W3-G7/#1: multi-select outline = up to ~96 objects, each a 4-edge rectangle
 // (4 line quads * 6 verts = 24 verts/object).
@@ -4702,8 +4733,9 @@ mod tests {
         };
         for &zoom in &[1.0_f64, 4.0_f64] {
             let verts = build_handle_overlay_vertices(&world_bbox, zoom);
-            // 9 quads (8 resize + rotate), 6 verts each.
-            assert_eq!(verts.len(), HANDLE_OVERLAY_VERTEX_CAPACITY);
+            // 9 quads (8 resize + rotate), 6 verts each, within the shared buffer.
+            assert_eq!(verts.len(), 54);
+            assert!(verts.len() <= HANDLE_OVERLAY_VERTEX_CAPACITY);
             // First quad = NW handle: verts 0 (top-left) and 2 (bottom-right) of the
             // add_quad winding span the handle in world px.
             let world_w = (verts[2].position[0] - verts[0].position[0]) as f64;
@@ -4822,7 +4854,7 @@ mod tests {
         // a border, not just resize dots) even though multi_select is empty.
         scene.selection = Some("a".to_string());
         scene.multi_select = Vec::new();
-        let single = outline_overlay_ids(&scene);
+        let single = outline_overlay_ids(&scene, &regions);
         assert_eq!(single, vec!["a".to_string()]);
         let verts = build_multi_select_overlay_vertices(&regions, &single, 1.0, |_| None);
         assert!(!verts.is_empty(), "single selection must emit an outline ring");
@@ -4830,13 +4862,41 @@ mod tests {
 
         // A multi-select rings every member (the single selection is subsumed).
         scene.multi_select = vec!["a".to_string(), "b".to_string()];
-        let multi = outline_overlay_ids(&scene);
+        let multi = outline_overlay_ids(&scene, &regions);
         assert_eq!(multi, vec!["a".to_string(), "b".to_string()]);
 
         // Nothing selected => no ring.
         scene.selection = None;
         scene.multi_select = Vec::new();
-        assert!(outline_overlay_ids(&scene).is_empty());
+        assert!(outline_overlay_ids(&scene, &regions).is_empty());
+    }
+
+    #[test]
+    fn open_class_single_selection_has_no_outline_ring() {
+        // Feedback #1: a lone selected open line shows ONLY its endpoint dots — no
+        // bbox ring. The closed rect keeps its single-selection ring (regression),
+        // and the multi-select union ring keeps open members.
+        let mut scene = object_scene(vec![
+            line_object("l", 0.0, 0.0, 40),
+            rect_object("r", 100.0, 0.0, 20),
+        ]);
+        let regions = derive_object_regions(&scene);
+
+        scene.selection = Some("l".to_string());
+        assert!(
+            outline_overlay_ids(&scene, &regions).is_empty(),
+            "an open-class single selection must not ring"
+        );
+
+        scene.selection = Some("r".to_string());
+        assert_eq!(outline_overlay_ids(&scene, &regions), vec!["r".to_string()]);
+
+        scene.multi_select = vec!["l".to_string(), "r".to_string()];
+        assert_eq!(
+            outline_overlay_ids(&scene, &regions),
+            vec!["l".to_string(), "r".to_string()],
+            "the union ring keeps every multi-select member, open ones included"
+        );
     }
 
     #[test]
@@ -5014,16 +5074,36 @@ mod tests {
         assert!((handles.world[1].x - 140.0).abs() < 1e-9);
         assert!((handles.world[1].y - 50.0).abs() < 1e-9);
 
-        // The overlay quads stay HANDLE_SIZE_PX on screen at any zoom (the same
-        // 1/zoom sizing as the bbox handles), two quads * 6 verts.
+        // Feedback #1: the overlay dots are FILLED CIRCLES (triangle fans) whose
+        // screen DIAMETER stays HANDLE_SIZE_PX at any zoom (the same 1/zoom sizing
+        // as the bbox handles). Per dot: every triangle starts at the endpoint
+        // center and every rim vertex sits at exactly one radius — a circle, not
+        // the old square quad.
+        let fan = ENDPOINT_HANDLE_SEGMENTS * 3;
         for &zoom in &[1.0_f64, 4.0_f64] {
             let verts = build_endpoint_handle_overlay_vertices(&handles.world, zoom);
-            assert_eq!(verts.len(), 12);
-            let world_w = (verts[2].position[0] - verts[0].position[0]) as f64;
-            assert!(
-                (world_w * zoom - crate::hit_test_object::HANDLE_SIZE_PX).abs() < 1e-6,
-                "endpoint handle screen size must be constant at zoom {zoom}"
-            );
+            assert_eq!(verts.len(), 2 * fan);
+            assert!(verts.len() <= HANDLE_OVERLAY_VERTEX_CAPACITY);
+            for (slot, center) in handles.world.iter().enumerate() {
+                for triangle in verts[slot * fan..(slot + 1) * fan].chunks(3) {
+                    assert!(
+                        (triangle[0].position[0] as f64 - center.x).abs() < 1e-4
+                            && (triangle[0].position[1] as f64 - center.y).abs() < 1e-4,
+                        "each fan triangle must start at the endpoint center"
+                    );
+                    assert_eq!(triangle[0].color, ENDPOINT_HANDLE_FILL_COLOR);
+                    for vertex in &triangle[1..] {
+                        let dx = vertex.position[0] as f64 - center.x;
+                        let dy = vertex.position[1] as f64 - center.y;
+                        let screen_diameter = (dx * dx + dy * dy).sqrt() * 2.0 * zoom;
+                        assert!(
+                            (screen_diameter - crate::hit_test_object::HANDLE_SIZE_PX).abs()
+                                < 1e-3,
+                            "endpoint dot must stay circular at constant screen size, zoom {zoom}"
+                        );
+                    }
+                }
+            }
         }
     }
 
