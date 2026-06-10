@@ -6,7 +6,9 @@
 //! a recognized rect and a recognized line have no reason to share an object).
 //!
 //! Pipeline ([`recognize_stroke`]):
-//!   1. closure test — `dist(start, end) < CLOSE_RATIO · bbox diagonal`.
+//!   1. closure test — overshoot trim first ([`trim_overshoot`]: a tail that
+//!      crosses back over the head closes at the crossing, dangles dropped),
+//!      else `dist(start, end) < CLOSE_RATIO · bbox diagonal`.
 //!   2. canonical fits, adopted when the confidence threshold passes:
 //!      open   → straight line (max perpendicular deviation / chord ratio);
 //!      closed → circle/ellipse (least-squares radial residual against the
@@ -37,6 +39,16 @@ use super::model::{
 
 /// Closure threshold: the start→end gap as a fraction of the bbox diagonal.
 const CLOSE_RATIO: f64 = 0.15;
+/// Overshoot trim scans this arc-length fraction at each end of the stroke for
+/// a head/tail self-crossing (a closure overshoot lives near the ends).
+const OVERSHOOT_WINDOW_RATIO: f64 = 0.25;
+/// A crossing closes the stroke only when BOTH dangles (start→X and X→end arc
+/// lengths) stay under this fraction of the total arc — a long dangle is real
+/// geometry, not an overshot pen-up.
+const OVERSHOOT_MAX_DANGLE_RATIO: f64 = 0.25;
+/// Segments closer than this many indices never count as a crossing: adjacent
+/// segments share an endpoint and would "intersect" there.
+const OVERSHOOT_MIN_INDEX_GAP: usize = 2;
 /// Straight-line confidence: max perpendicular deviation / chord length.
 const LINE_MAX_DEV_RATIO: f64 = 0.05;
 /// Ellipse confidence: RMS of the normalized radial residual (|p−c| in
@@ -118,12 +130,17 @@ fn recognize_nodes(points: &[(f64, f64)]) -> (Vec<PathNode>, bool) {
     if points.len() < 3 {
         return (fit_beziers(points), false);
     }
+    let trimmed = trim_overshoot(points);
+    let (points, crossed) = match trimmed.as_deref() {
+        Some(loop_pts) => (loop_pts, true),
+        None => (points, false),
+    };
     let (min_x, min_y, max_x, max_y) = bbox(points);
     let diag = (max_x - min_x).hypot(max_y - min_y);
     let first = points[0];
     let last = points[points.len() - 1];
     let gap = (last.0 - first.0).hypot(last.1 - first.1);
-    let closed = diag > f64::EPSILON && gap < CLOSE_RATIO * diag;
+    let closed = crossed || (diag > f64::EPSILON && gap < CLOSE_RATIO * diag);
     if closed {
         if let Some(nodes) = fit_ellipse(points, (min_x, min_y, max_x, max_y)) {
             return (nodes, true);
@@ -146,6 +163,84 @@ fn bbox(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
         b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
     }
     b
+}
+
+// ---------------------------------------------------------------------------
+// Overshoot trim (cross-closure).
+// ---------------------------------------------------------------------------
+
+/// Pre-closure overshoot trim: a stroke whose tail crosses back over its head
+/// (a hand-drawn triangle overshooting its start) closes at the crossing X,
+/// not at the pen-up gap — without this the crossed tail survives as a spur.
+/// Tail segments scan end-inward against head segments start-outward, both
+/// within [`OVERSHOOT_WINDOW_RATIO`] of the arc; a crossing trims only when
+/// both dangles stay under [`OVERSHOOT_MAX_DANGLE_RATIO`], yielding the loop
+/// that starts at X (the dangles dropped). `None` = unchanged (the gap-based
+/// closure test decides as before).
+fn trim_overshoot(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
+    let n = points.len();
+    if n < 4 {
+        return None;
+    }
+    // cum[k] = arc length from the start to points[k].
+    let mut cum = Vec::with_capacity(n);
+    let mut total = 0.0;
+    cum.push(0.0);
+    for w in points.windows(2) {
+        total += (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+        cum.push(total);
+    }
+    if total <= f64::EPSILON {
+        return None;
+    }
+    let window = OVERSHOOT_WINDOW_RATIO * total;
+    let max_dangle = OVERSHOOT_MAX_DANGLE_RATIO * total;
+    for j in (0..n - 1).rev() {
+        if total - cum[j + 1] > window {
+            break;
+        }
+        for i in 0..n - 1 {
+            if cum[i] > window || j - i < OVERSHOOT_MIN_INDEX_GAP {
+                break;
+            }
+            let Some(x) =
+                segment_intersection(points[i], points[i + 1], points[j], points[j + 1])
+            else {
+                continue;
+            };
+            let head_dangle = cum[i] + (x.0 - points[i].0).hypot(x.1 - points[i].1);
+            let tail_dangle = total - cum[j] - (x.0 - points[j].0).hypot(x.1 - points[j].1);
+            if head_dangle >= max_dangle || tail_dangle >= max_dangle {
+                continue;
+            }
+            let mut loop_pts = Vec::with_capacity(j - i + 1);
+            loop_pts.push(x);
+            loop_pts.extend_from_slice(&points[i + 1..=j]);
+            return Some(loop_pts);
+        }
+    }
+    None
+}
+
+/// Intersection point of segments `a0→a1` and `b0→b1` (`None` when parallel
+/// or the crossing falls outside either segment).
+fn segment_intersection(
+    a0: (f64, f64),
+    a1: (f64, f64),
+    b0: (f64, f64),
+    b1: (f64, f64),
+) -> Option<(f64, f64)> {
+    let r = (a1.0 - a0.0, a1.1 - a0.1);
+    let s = (b1.0 - b0.0, b1.1 - b0.1);
+    let denom = r.0 * s.1 - r.1 * s.0;
+    if denom.abs() <= f64::EPSILON {
+        return None;
+    }
+    let q = (b0.0 - a0.0, b0.1 - a0.1);
+    let t = (q.0 * s.1 - q.1 * s.0) / denom;
+    let u = (q.0 * r.1 - q.1 * r.0) / denom;
+    ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u))
+        .then(|| (a0.0 + t * r.0, a0.1 + t * r.1))
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +618,69 @@ mod tests {
         let rec = recognize_stroke(&pts);
         assert!(rec.closed);
         assert_eq!(rec.d, format!("M 0 0 L {} 0 L {} {} Z", 100 * Q, 50 * Q, 80 * Q));
+    }
+
+    #[test]
+    fn triangle_with_crossing_overshoot_tail_trims_to_a_three_corner_polygon() {
+        // Triangle whose last edge overshoots PAST the start, crossing the
+        // first edge at (70/3, 0) and leaving a short tail to (15,-25). The
+        // pen-up gap (29.2px) exceeds CLOSE_RATIO·diag (21.8px), so without
+        // the overshoot trim this reads as an OPEN stroke with the tail kept.
+        let mut pts = Vec::new();
+        edge((0.0, 0.0), (100.0, 0.0), 10, &mut pts);
+        edge((100.0, 0.0), (50.0, 80.0), 10, &mut pts);
+        edge((50.0, 80.0), (15.0, -25.0), 10, &mut pts);
+        pts.push((15.0, -25.0));
+        let rec = recognize_stroke(&pts);
+        assert!(rec.closed, "cross-closure detected: {}", rec.d);
+        // The loop closes at the crossing: corners X=(70/3,0) -> (100,0) ->
+        // (50,80), the dangles on both sides trimmed away. 187 = round(8·70/3).
+        assert_eq!(rec.d, format!("M 187 0 L {} 0 L {} {} Z", 100 * Q, 50 * Q, 80 * Q));
+    }
+
+    #[test]
+    fn rect_with_crossing_overshoot_tail_trims_to_the_axis_rect() {
+        // Square whose closing edge overshoots through the bottom edge at
+        // (60/7, 0) and dangles to (12,-40): the gap (41.8px) fails the gap
+        // closure test, but the crossing closes it and the rect fit's axis
+        // bbox absorbs the mid-edge crossing corner.
+        let mut pts = Vec::new();
+        edge((0.0, 0.0), (100.0, 0.0), 10, &mut pts);
+        edge((100.0, 0.0), (100.0, 100.0), 10, &mut pts);
+        edge((100.0, 100.0), (0.0, 100.0), 10, &mut pts);
+        edge((0.0, 100.0), (12.0, -40.0), 10, &mut pts);
+        pts.push((12.0, -40.0));
+        let rec = recognize_stroke(&pts);
+        assert!(rec.closed, "cross-closure detected: {}", rec.d);
+        assert_eq!(
+            rec.d,
+            format!("M 0 0 L {} 0 L {} {} L 0 {} Z", 100 * Q, 100 * Q, 100 * Q, 100 * Q)
+        );
+    }
+
+    #[test]
+    fn crossing_with_a_long_dangle_does_not_trim() {
+        // Same triangle trajectory, but the tail runs on to (-10,-100): the
+        // tail dangle is ~27% of the arc (over OVERSHOOT_MAX_DANGLE_RATIO), so
+        // the crossing is real geometry, not overshoot — no trim, and the
+        // 100.5px gap keeps the stroke open.
+        let mut pts = Vec::new();
+        edge((0.0, 0.0), (100.0, 0.0), 10, &mut pts);
+        edge((100.0, 0.0), (50.0, 80.0), 10, &mut pts);
+        edge((50.0, 80.0), (-10.0, -100.0), 10, &mut pts);
+        pts.push((-10.0, -100.0));
+        let rec = recognize_stroke(&pts);
+        assert!(!rec.closed, "long dangle stays untrimmed: {}", rec.d);
+    }
+
+    #[test]
+    fn adjacent_segments_sharing_a_point_are_not_a_crossing() {
+        // A sharp staircase whose first and last segments both sit inside the
+        // scan windows: consecutive segments touch at their shared point, which
+        // must never read as a self-crossing (index-gap guard) — open stroke.
+        let pts = vec![(0.0, 0.0), (8.0, 0.0), (8.0, 4.0), (120.0, 4.0)];
+        let rec = recognize_stroke(&pts);
+        assert!(!rec.closed, "corner touch is not a closure: {}", rec.d);
     }
 
     #[test]
