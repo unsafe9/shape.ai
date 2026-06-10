@@ -1770,6 +1770,12 @@ pub(crate) fn outline_overlay_ids(
 /// frame like the resize handles, instead of snapping only on commit. Transform-
 /// only — `region_world_bounds` recomputes the bbox from the preview matrix, no
 /// re-tessellation.
+///
+/// Feedback (v3 §2b carry-over): an OPEN-CLASS member draws its two endpoint dots
+/// (the same filled fans as the single-selection overlay, via
+/// [`push_endpoint_dot_vertices`]) instead of a bbox ring — VISUAL only, the
+/// multi-drag/union semantics are untouched. The dots ride the same preview
+/// transform the boxes do, mirroring [`endpoint_handles`]'s world mapping.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn build_multi_select_overlay_vertices(
     regions: &[ObjectRegion],
@@ -1777,16 +1783,36 @@ pub(crate) fn build_multi_select_overlay_vertices(
     zoom: f64,
     preview: impl Fn(&str) -> Option<[[f64; 3]; 3]>,
 ) -> Vec<GpuVertex> {
+    use crate::hit_test_object::{apply_3x3, HANDLE_SIZE_PX};
     let mut vertices = Vec::new();
-    let thickness = (2.0 / zoom.max(0.025)) as f32;
+    let z = zoom.max(0.025);
+    let thickness = (2.0 / z) as f32;
+    let dot_radius = (HANDLE_SIZE_PX / z / 2.0) as f32;
     for id in ids {
-        if vertices.len() + 24 > MULTI_SELECT_OVERLAY_VERTEX_CAPACITY {
-            break;
-        }
         let Some(region) = regions.iter().find(|region| &region.id == id) else {
             continue;
         };
         let preview_t = preview(id);
+        if let Some(endpoints) = region.open_endpoints {
+            if vertices.len() + 2 * ENDPOINT_HANDLE_SEGMENTS * 3
+                > MULTI_SELECT_OVERLAY_VERTEX_CAPACITY
+            {
+                break;
+            }
+            let transform = preview_t.as_ref().unwrap_or(&region.transform);
+            let (sx, sy) = apply_3x3(transform, endpoints.start.0, endpoints.start.1);
+            let (ex, ey) = apply_3x3(transform, endpoints.end.0, endpoints.end.1);
+            if !(sx.is_finite() && sy.is_finite() && ex.is_finite() && ey.is_finite()) {
+                continue;
+            }
+            for point in [WorldPoint { x: sx, y: sy }, WorldPoint { x: ex, y: ey }] {
+                push_endpoint_dot_vertices(&mut vertices, &point, dot_radius);
+            }
+            continue;
+        }
+        if vertices.len() + 24 > MULTI_SELECT_OVERLAY_VERTEX_CAPACITY {
+            break;
+        }
         let Some(bounds) = region_world_bounds(region, preview_t.as_ref()) else {
             continue;
         };
@@ -2264,24 +2290,33 @@ pub(crate) fn build_endpoint_handle_overlay_vertices(
     let z = zoom.max(0.025);
     let radius = (HANDLE_SIZE_PX / z / 2.0) as f32;
     for point in world {
-        let cx = point.x as f32;
-        let cy = point.y as f32;
-        let rim = |segment: usize| {
-            let angle =
-                segment as f32 / ENDPOINT_HANDLE_SEGMENTS as f32 * std::f32::consts::TAU;
-            [cx + radius * angle.cos(), cy + radius * angle.sin()]
-        };
-        for segment in 0..ENDPOINT_HANDLE_SEGMENTS {
-            for position in [[cx, cy], rim(segment), rim(segment + 1)] {
-                vertices.push(GpuVertex {
-                    position,
-                    uv: SOLID_UV[0],
-                    color: ENDPOINT_HANDLE_FILL_COLOR,
-                });
-            }
-        }
+        push_endpoint_dot_vertices(&mut vertices, point, radius);
     }
     vertices
+}
+
+/// One endpoint dot: a filled [`ENDPOINT_HANDLE_SEGMENTS`]-triangle fan centered
+/// at `center` with the given WORLD radius, in [`ENDPOINT_HANDLE_FILL_COLOR`].
+/// The SINGLE fan emitter shared by the single-selection endpoint overlay
+/// ([`build_endpoint_handle_overlay_vertices`]) and the multi-select open-member
+/// dots ([`build_multi_select_overlay_vertices`]), so the two visuals can't drift.
+#[cfg(feature = "wgpu-probe")]
+fn push_endpoint_dot_vertices(vertices: &mut Vec<GpuVertex>, center: &WorldPoint, radius: f32) {
+    let cx = center.x as f32;
+    let cy = center.y as f32;
+    let rim = |segment: usize| {
+        let angle = segment as f32 / ENDPOINT_HANDLE_SEGMENTS as f32 * std::f32::consts::TAU;
+        [cx + radius * angle.cos(), cy + radius * angle.sin()]
+    };
+    for segment in 0..ENDPOINT_HANDLE_SEGMENTS {
+        for position in [[cx, cy], rim(segment), rim(segment + 1)] {
+            vertices.push(GpuVertex {
+                position,
+                uv: SOLID_UV[0],
+                color: ENDPOINT_HANDLE_FILL_COLOR,
+            });
+        }
+    }
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -3264,10 +3299,14 @@ pub(crate) const ENDPOINT_HANDLE_SEGMENTS: usize = 16;
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const ENDPOINT_HANDLE_FILL_COLOR: [f32; 4] = [0.0, 0.478, 1.0, 1.0];
 
-// W3-G7/#1: multi-select outline = up to ~96 objects, each a 4-edge rectangle
-// (4 line quads * 6 verts = 24 verts/object).
+// W3-G7/#1: multi-select overlay = up to ~96 members. A closed member is a 4-edge
+// rectangle outline (4 line quads * 6 verts = 24); an open-class member is two
+// endpoint dot fans instead (2 * ENDPOINT_HANDLE_SEGMENTS * 3 = 96, 4x a box), so
+// the cap sizes the ALL-OPEN worst case. One-time allocation at device init —
+// not a per-frame cost.
 #[cfg(feature = "wgpu-probe")]
-pub(crate) const MULTI_SELECT_OVERLAY_VERTEX_CAPACITY: usize = 96 * 24;
+pub(crate) const MULTI_SELECT_OVERLAY_VERTEX_CAPACITY: usize =
+    96 * 2 * ENDPOINT_HANDLE_SEGMENTS * 3;
 // Selection-ring blue (#007aff), opaque. Same sRGB-normalized convention as the
 // marquee/handle color consts above.
 #[cfg(feature = "wgpu-probe")]
@@ -4896,6 +4935,119 @@ mod tests {
             outline_overlay_ids(&scene, &regions),
             vec!["l".to_string(), "r".to_string()],
             "the union ring keeps every multi-select member, open ones included"
+        );
+    }
+
+    #[test]
+    fn multi_select_open_members_show_endpoint_dots_not_bbox() {
+        // Feedback: a mixed multi-select [closed rect, open line]. The rect keeps
+        // its 24-vert 4-edge outline (regression guard); the line member emits TWO
+        // filled endpoint dot fans — the same visual as the single-selection
+        // overlay — instead of a bbox ring.
+        let scene = object_scene(vec![
+            rect_object("r", 100.0, 0.0, 20),
+            line_object("l", 0.0, 0.0, 40),
+        ]);
+        let regions = derive_object_regions(&scene);
+        let ids = vec!["r".to_string(), "l".to_string()];
+        let fan = ENDPOINT_HANDLE_SEGMENTS * 3;
+
+        for &zoom in &[1.0_f64, 4.0_f64] {
+            let verts = build_multi_select_overlay_vertices(&regions, &ids, zoom, |_| None);
+            assert_eq!(
+                verts.len(),
+                24 + 2 * fan,
+                "rect = 24 box verts, line = two endpoint dot fans"
+            );
+            assert!(verts.len() <= MULTI_SELECT_OVERLAY_VERTEX_CAPACITY);
+            // Member order is input order: the rect's ring comes first, in blue.
+            assert_eq!(verts[0].color, MULTI_SELECT_OUTLINE_COLOR);
+            // The line's fans sit at its endpoints (0,0)/(40,0): every triangle
+            // starts at the center, every rim vertex is one radius out, and the
+            // screen DIAMETER pins to HANDLE_SIZE_PX at any zoom — identical math
+            // to the single-selection endpoint dots.
+            let centers = [
+                WorldPoint { x: 0.0, y: 0.0 },
+                WorldPoint { x: 40.0, y: 0.0 },
+            ];
+            for (slot, center) in centers.iter().enumerate() {
+                let base = 24 + slot * fan;
+                for triangle in verts[base..base + fan].chunks(3) {
+                    assert!(
+                        (triangle[0].position[0] as f64 - center.x).abs() < 1e-4
+                            && (triangle[0].position[1] as f64 - center.y).abs() < 1e-4,
+                        "each fan triangle must start at the endpoint center"
+                    );
+                    assert_eq!(triangle[0].color, ENDPOINT_HANDLE_FILL_COLOR);
+                    for vertex in &triangle[1..] {
+                        let dx = vertex.position[0] as f64 - center.x;
+                        let dy = vertex.position[1] as f64 - center.y;
+                        let screen_diameter = (dx * dx + dy * dy).sqrt() * 2.0 * zoom;
+                        assert!(
+                            (screen_diameter - crate::hit_test_object::HANDLE_SIZE_PX).abs()
+                                < 1e-3,
+                            "open-member dot must stay circular at constant screen size, zoom {zoom}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_select_open_member_dots_follow_live_preview_transform() {
+        // W3-G10/#2 pattern: an open member's dots must be built at the PREVIEWED
+        // endpoint positions during a live drag, tracking the pointer every frame
+        // like the closed-member rings — transform-only, no re-tessellation.
+        let scene = object_scene(vec![line_object("l", 0.0, 0.0, 40)]);
+        let regions = derive_object_regions(&scene);
+        let ids = vec!["l".to_string()];
+        let fan = ENDPOINT_HANDLE_SEGMENTS * 3;
+
+        let canonical = build_multi_select_overlay_vertices(&regions, &ids, 1.0, |_| None);
+        assert_eq!(canonical.len(), 2 * fan, "an open member emits dots only, no ring");
+
+        let preview = [[1.0, 0.0, 100.0], [0.0, 1.0, 50.0], [0.0, 0.0, 1.0]];
+        let previewed = build_multi_select_overlay_vertices(&regions, &ids, 1.0, |id| {
+            (id == "l").then_some(preview)
+        });
+        assert_eq!(previewed.len(), canonical.len());
+        // Every vertex translates by exactly the drag delta (+100,+50).
+        for (canon, live) in canonical.iter().zip(previewed.iter()) {
+            assert!(
+                (live.position[0] - canon.position[0] - 100.0).abs() < 1e-3
+                    && (live.position[1] - canon.position[1] - 50.0).abs() < 1e-3,
+                "open-member dots must track the live preview drag (+100,+50)"
+            );
+        }
+
+        // preview None reproduces the canonical dots.
+        let none_preview = build_multi_select_overlay_vertices(&regions, &ids, 1.0, |_| None);
+        assert_eq!(none_preview.len(), canonical.len());
+        for (canon, again) in canonical.iter().zip(none_preview.iter()) {
+            assert_eq!(canon.position, again.position);
+        }
+    }
+
+    #[test]
+    fn multi_select_overlay_caps_at_capacity_with_all_open_members() {
+        // Worst case: every member is open-class (96 dot verts each, 4x a box's
+        // 24). Feed MORE members than the one-time-allocated buffer holds and
+        // prove the emitter stops exactly at capacity instead of overflowing.
+        let member_verts = 2 * ENDPOINT_HANDLE_SEGMENTS * 3;
+        let count = MULTI_SELECT_OVERLAY_VERTEX_CAPACITY / member_verts + 8;
+        let objects: Vec<RenderObject> = (0..count)
+            .map(|i| line_object(&format!("l{i}"), i as f64 * 50.0, 0.0, 40))
+            .collect();
+        let ids: Vec<String> = objects.iter().map(|object| object.id.clone()).collect();
+        let scene = object_scene(objects);
+        let regions = derive_object_regions(&scene);
+
+        let verts = build_multi_select_overlay_vertices(&regions, &ids, 1.0, |_| None);
+        assert_eq!(
+            verts.len(),
+            MULTI_SELECT_OVERLAY_VERTEX_CAPACITY,
+            "fills to the buffer capacity exactly, never beyond"
         );
     }
 
