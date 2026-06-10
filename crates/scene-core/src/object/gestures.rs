@@ -29,6 +29,8 @@ pub enum ObjectGestureCategory {
     Erase,
     /// Coarsening a transform (rotation step) while a modifier is held.
     Transform,
+    /// Detaching anchors (move whole, ignoring attachments) while a modifier is held.
+    Anchor,
 }
 
 /// Which physical input must be HELD to engage a gesture. Serialized kebab-case;
@@ -173,6 +175,14 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
             HoldTrigger::modifier("Shift").with_degrees(15.0),
             "Hold Shift while rotating to snap to 15-degree steps (90 degrees = 6 ticks).",
         ),
+        // Anchor — hold to detach an anchored object and move it wholesale (DU4).
+        ObjectGesture::new(
+            "detach-alt",
+            "Detach Anchors (Alt)",
+            Anchor,
+            HoldTrigger::modifier("Alt"),
+            "Hold Alt while dragging an anchored object to move it whole, ignoring its anchors and detaching them.",
+        ),
     ]
 }
 
@@ -212,10 +222,11 @@ mod tests {
             "no-snap-alt",
             "partial-erase-alt",
             "coarse-rotate-shift",
+            "detach-alt",
         ];
-        // Exactly the 7 ids, each once.
+        // Exactly the 8 ids, each once.
         let ids: Vec<&str> = catalog.iter().map(|g| g.id.as_str()).collect();
-        assert_eq!(ids.len(), expected.len(), "catalog must hold exactly 7 gestures");
+        assert_eq!(ids.len(), expected.len(), "catalog must hold exactly 8 gestures");
         let mut seen = HashSet::new();
         for id in &ids {
             assert!(seen.insert(*id), "duplicate id: {id}");
@@ -264,6 +275,7 @@ mod tests {
     fn category_serializes_kebab_case() {
         assert_eq!(serde_json::to_string(&ObjectGestureCategory::Transform).unwrap(), "\"transform\"");
         assert_eq!(serde_json::to_string(&ObjectGestureCategory::Pan).unwrap(), "\"pan\"");
+        assert_eq!(serde_json::to_string(&ObjectGestureCategory::Anchor).unwrap(), "\"anchor\"");
     }
 
     #[test]
@@ -334,6 +346,13 @@ mod tests {
                 "category": "transform",
                 "trigger": { "input": "modifier", "modifier": "Shift", "degrees": 15.0 },
                 "description": "Hold Shift while rotating to snap to 15-degree steps (90 degrees = 6 ticks)."
+            },
+            {
+                "id": "detach-alt",
+                "label": "Detach Anchors (Alt)",
+                "category": "anchor",
+                "trigger": { "input": "modifier", "modifier": "Alt" },
+                "description": "Hold Alt while dragging an anchored object to move it whole, ignoring its anchors and detaching them."
             }
         ]);
         let actual: serde_json::Value =

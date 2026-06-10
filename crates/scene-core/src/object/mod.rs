@@ -12,6 +12,7 @@
 //! - [`anchors`] — anchor endpoint resolution + connection graph (OB3.S4/D5).
 //! - [`undo`] — per-actor undo/redo engine (OB3.S8/D21).
 //! - [`commands`] — object command catalog (OB3.S9).
+//! - [`deform`] — open-class classification + chord-similarity deform (anchor-semantics v3 §2a).
 //! - [`gestures`] — hold-key gesture catalog (W3-C2).
 //! - [`layout_solve`] — thin auto-layout solve (OB3.A1/D3).
 //! - [`validate`] — pure structural validators (OB3.S2).
@@ -21,6 +22,7 @@ pub mod anchors;
 pub mod apply;
 pub mod cascade;
 pub mod commands;
+pub mod deform;
 pub mod drawing;
 pub mod gestures;
 pub mod grouping;
@@ -43,6 +45,7 @@ pub use apply::{apply_object_op, apply_object_op_lww, apply_sequence, ApplyError
 pub use commands::{
     object_command_catalog, object_command_catalog_json, ObjectCommand, ObjectCommandCategory,
 };
+pub use deform::{deform_open_path, is_open_class, is_open_class_d};
 pub use drawing::{fit_beziers, pressure_to_width, rdp_simplify, Brush, DrawingSession};
 pub use gestures::{
     object_gesture_catalog, object_gesture_catalog_json, HoldInput, HoldTrigger, ObjectGesture,
