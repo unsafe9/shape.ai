@@ -414,6 +414,8 @@ impl ShapeWebGpuRenderer {
             object_renderer: None,
             object_scene: None,
             object_regions: Vec::new(),
+            preview_deformed: std::collections::HashSet::new(),
+            endpoint_preview: None,
             object_bindings: shape_scene_core::object::move_together::BindingGraph::default(),
             object_theme: crate::object_theme::Theme::light(),
             shadow_blur,

@@ -308,6 +308,31 @@ impl ShapeWebGpuRenderer {
                 .as_ref()
                 .and_then(|renderer| renderer.preview_transform(id))
         });
+        // v3 §2b: an open-class selection renders TWO endpoint handles instead of
+        // the bbox 8-handle + rotate overlay (`selection_handles` returns None for
+        // it). During a live endpoint drag the dragged handle rides the pointer
+        // (the geometry patch carries the silhouette; the regions stay canonical).
+        if let Some(handles) = endpoint_handles(
+            &self.object_regions,
+            &self.camera,
+            selection.as_deref(),
+            preview.as_ref(),
+        ) {
+            let mut world = handles.world;
+            if let Some((id, node_index, point)) = &self.endpoint_preview {
+                if Some(id.as_str()) == selection.as_deref() {
+                    let slot = usize::from(*node_index != 0);
+                    world[slot] = *point;
+                }
+            }
+            let vertices = build_endpoint_handle_overlay_vertices(&world, self.camera.zoom);
+            if vertices.is_empty() {
+                return 0;
+            }
+            self.queue
+                .write_buffer(&self.handle_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+            return vertices.len();
+        }
         let Some((_, world_bbox)) = selection_handles(
             &self.object_regions,
             &self.camera,

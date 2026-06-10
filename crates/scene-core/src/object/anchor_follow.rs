@@ -109,7 +109,9 @@ fn number_spans(d: &str) -> Vec<(usize, usize)> {
 /// order (M/L/C all contribute pairs). Mirrors the shell `localNodes`. Anchor
 /// `node_index` addresses THIS pair space (so 0 and `len()-1` are the open-path
 /// endpoints — control points are never first or last in the codec's output).
-pub(super) fn local_nodes(d: &str) -> Vec<(f64, f64)> {
+/// `pub` because the renderer-core consumes it via the rlib as the pair-space
+/// single source (endpoint handles + live chord deform, anchor-semantics v3 §2b).
+pub fn local_nodes(d: &str) -> Vec<(f64, f64)> {
     let spans = number_spans(d);
     let mut out = Vec::with_capacity(spans.len() / 2);
     let mut i = 0;

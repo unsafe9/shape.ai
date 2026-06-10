@@ -54,6 +54,13 @@ pub enum HoverAffordance {
     ResizeW,
     /// Over the rotate zone above the selection's top edge.
     Rotate,
+    /// Anchor-semantics v3 §2b: over an OPEN-CLASS selection's START endpoint
+    /// handle (geometry pair 0). Open-class selections surface only the two
+    /// endpoint handles — no resize/rotate affordances.
+    EndpointStart,
+    /// v3 §2b: over an OPEN-CLASS selection's END endpoint handle (the last
+    /// geometry coordinate pair).
+    EndpointEnd,
 }
 
 impl HoverAffordance {
@@ -72,6 +79,8 @@ impl HoverAffordance {
             HoverAffordance::ResizeSw => "resize-sw",
             HoverAffordance::ResizeW => "resize-w",
             HoverAffordance::Rotate => "rotate",
+            HoverAffordance::EndpointStart => "endpoint-start",
+            HoverAffordance::EndpointEnd => "endpoint-end",
         }
     }
 }
@@ -88,7 +97,7 @@ pub struct ScreenRect {
 }
 
 impl ScreenRect {
-    fn contains(&self, x: f64, y: f64) -> bool {
+    pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
     }
 }
@@ -874,6 +883,8 @@ mod tests {
         assert_eq!(HoverAffordance::ResizeSw.as_str(), "resize-sw");
         assert_eq!(HoverAffordance::ResizeW.as_str(), "resize-w");
         assert_eq!(HoverAffordance::Rotate.as_str(), "rotate");
+        assert_eq!(HoverAffordance::EndpointStart.as_str(), "endpoint-start");
+        assert_eq!(HoverAffordance::EndpointEnd.as_str(), "endpoint-end");
     }
 
     #[test]

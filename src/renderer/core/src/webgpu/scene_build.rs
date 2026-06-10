@@ -19,7 +19,9 @@ use crate::hit_test_object::{
 };
 use crate::outline::{derive_region, parse_path_string};
 use crate::render_object::{RenderObject, RenderObjectScene};
-use crate::stats::{CoreHitResult, CoreOverlayStyle, ObjectDoubleClick, ObjectTransformDelta};
+use crate::stats::{
+    CoreHitResult, CoreOverlayStyle, ObjectDoubleClick, ObjectEndpointDelta, ObjectTransformDelta,
+};
 use crate::text::{CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_SOLID_UV};
 
 use super::*;
@@ -2015,9 +2017,36 @@ pub(crate) fn derive_object_regions(scene: &RenderObjectScene) -> Vec<ObjectRegi
             transform: obj.transform,
             closed: region.closed,
             outline: region.outline,
+            open_endpoints: derive_open_endpoints(&obj.geometry_d),
         });
     }
     regions
+}
+
+/// v3 §2b: classify `d` through scene-core (`is_open_class_d`) and read its
+/// endpoint pair through the SAME pair-space parser anchors address
+/// (`local_nodes`), de-quantized to object-local px. `None` for closed-class /
+/// legacy multi-subpath / degenerate (< 2 pairs) geometry — those keep the
+/// closed-class selection surface (rule 5, no regression).
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn derive_open_endpoints(d: &str) -> Option<OpenEndpoints> {
+    use crate::hit_test_object::UNITS_PER_PX;
+    use shape_scene_core::object::{is_open_class_d, local_nodes};
+    if !is_open_class_d(d) {
+        return None;
+    }
+    let pairs = local_nodes(d);
+    if pairs.len() < 2 {
+        return None;
+    }
+    let last_index = i32::try_from(pairs.len() - 1).ok()?;
+    let (sx, sy) = pairs[0];
+    let (ex, ey) = pairs[pairs.len() - 1];
+    Some(OpenEndpoints {
+        start: (sx / UNITS_PER_PX, sy / UNITS_PER_PX),
+        end: (ex / UNITS_PER_PX, ey / UNITS_PER_PX),
+        last_index,
+    })
 }
 
 /// Object-local pad (px) for the RA3 body bbox fallback so a zero-size /
@@ -2121,6 +2150,12 @@ pub(crate) fn selection_handles(
 ) -> Option<(SelectionHandles, WorldRect)> {
     let id = selection?;
     let region = regions.iter().find(|region| region.id == id)?;
+    // v3 §2b: an open-class selection has NO bbox transform surface — its two
+    // endpoint handles ([`endpoint_handles`]) are the whole manipulation surface,
+    // so neither the 8 resize handles nor the rotate zone exist for it.
+    if region.open_endpoints.is_some() {
+        return None;
+    }
     let world_bbox = region_world_bounds(region, preview)?;
     let screen_rect = world_rect_to_screen_rect(&world_bbox, camera);
     let handles = SelectionHandles::from_screen_bbox(&ScreenRect {
@@ -2132,6 +2167,100 @@ pub(crate) fn selection_handles(
     Some((handles, world_bbox))
 }
 
+/// v3 §2b: the endpoint-handle layout for an OPEN-CLASS selection — the SINGLE
+/// source hover (cursor), pointer-down (grab) and the GPU handle render share,
+/// mirroring how [`SelectionHandles`] single-sources the closed-class surface.
+/// `world` holds the two endpoint WORLD positions (node 0, then the last node);
+/// `screen` the matching [`HANDLE_SIZE_PX`]-square hit zones; `last_index` the
+/// end node's geometry PAIR index (the `node_index` an endpoint drag reports).
+/// `None` when the selection is absent or not open-class.
+///
+/// RA1 carry-over: `preview` substitutes the live drag transform (`delta * base`)
+/// so the handles track a translate preview frame-by-frame.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) struct EndpointHandles {
+    pub(crate) world: [WorldPoint; 2],
+    pub(crate) screen: [ScreenRect; 2],
+    pub(crate) last_index: i32,
+}
+
+#[cfg(feature = "wgpu-probe")]
+impl EndpointHandles {
+    /// Classify a screen point against the two endpoint handles.
+    pub(crate) fn affordance_at(&self, x: f64, y: f64) -> Option<HoverAffordance> {
+        if self.screen[0].contains(x, y) {
+            return Some(HoverAffordance::EndpointStart);
+        }
+        if self.screen[1].contains(x, y) {
+            return Some(HoverAffordance::EndpointEnd);
+        }
+        None
+    }
+}
+
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn endpoint_handles(
+    regions: &[ObjectRegion],
+    camera: &CameraState,
+    selection: Option<&str>,
+    preview: Option<&[[f64; 3]; 3]>,
+) -> Option<EndpointHandles> {
+    use crate::hit_test_object::{apply_3x3, HANDLE_SIZE_PX};
+    let id = selection?;
+    let region = regions.iter().find(|region| region.id == id)?;
+    let endpoints = region.open_endpoints?;
+    let transform = preview.unwrap_or(&region.transform);
+    let mut world = [WorldPoint { x: 0.0, y: 0.0 }; 2];
+    for (slot, (lx, ly)) in [endpoints.start, endpoints.end].into_iter().enumerate() {
+        let (wx, wy) = apply_3x3(transform, lx, ly);
+        if !wx.is_finite() || !wy.is_finite() {
+            return None;
+        }
+        world[slot] = WorldPoint { x: wx, y: wy };
+    }
+    let half = HANDLE_SIZE_PX / 2.0;
+    let screen = world.map(|point| ScreenRect {
+        x: point.x * camera.zoom + camera.x - half,
+        y: point.y * camera.zoom + camera.y - half,
+        width: HANDLE_SIZE_PX,
+        height: HANDLE_SIZE_PX,
+    });
+    Some(EndpointHandles {
+        world,
+        screen,
+        last_index: endpoints.last_index,
+    })
+}
+
+/// v3 §2b: build the endpoint-handle overlay (two squares at the open-class
+/// selection's endpoint WORLD positions) — same zoom-invariant sizing as
+/// [`build_handle_overlay_vertices`], reusing its buffer (12 of the 54-vertex
+/// capacity).
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn build_endpoint_handle_overlay_vertices(
+    world: &[WorldPoint; 2],
+    zoom: f64,
+) -> Vec<GpuVertex> {
+    use crate::hit_test_object::HANDLE_SIZE_PX;
+    let mut vertices = Vec::with_capacity(12);
+    let z = zoom.max(0.025);
+    let size = HANDLE_SIZE_PX / z;
+    let half = size / 2.0;
+    for point in world {
+        add_rect(
+            &mut vertices,
+            &WorldRect {
+                x: point.x - half,
+                y: point.y - half,
+                width: size,
+                height: size,
+            },
+            HANDLE_FILL_COLOR,
+        );
+    }
+    vertices
+}
+
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn hover_affordance_at(
     regions: &[ObjectRegion],
@@ -2139,6 +2268,13 @@ pub(crate) fn hover_affordance_at(
     selection: Option<&str>,
     screen: WorldPoint,
 ) -> HoverAffordance {
+    // v3 §2b: an open-class selection's surface is its two endpoint handles; the
+    // bbox handles below return None for it (`selection_handles` guard).
+    if let Some(handles) = endpoint_handles(regions, camera, selection, None) {
+        if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
+            return affordance;
+        }
+    }
     if let Some((handles, _)) = selection_handles(regions, camera, selection, None) {
         if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
             return affordance;
@@ -2187,6 +2323,27 @@ pub(crate) fn step_object_pointer(
                     camera: camera.clone(),
                 });
                 return;
+            }
+            // v3 §2b: grabbing an endpoint handle of an OPEN-CLASS selection starts
+            // an Endpoint drag (no selection change) — the open-class analogue of
+            // the resize/rotate grab below, sharing the same layout hover/render
+            // read. Anchored endpoints are grabbable too: release-time rebind/
+            // unbind is the shell's commit (`endpoint_release_ops`).
+            if let Some(handles) = endpoint_handles(regions, camera, selection, None) {
+                if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
+                    let object_id = selection.expect("endpoint_handles requires a selection");
+                    let node_index = if affordance == HoverAffordance::EndpointStart {
+                        0
+                    } else {
+                        handles.last_index
+                    };
+                    *input_drag = Some(InputDragState::Endpoint {
+                        pointer_id,
+                        object_id: object_id.to_string(),
+                        node_index,
+                    });
+                    return;
+                }
             }
             // W2-04: grabbing a resize handle / the rotate zone of the CURRENT
             // selection starts a transform gesture (no selection change). Uses the
@@ -2295,6 +2452,22 @@ pub(crate) fn step_object_pointer(
                             (start.x, start.y),
                         ),
                         kind: "resize",
+                    });
+                }
+                InputDragState::Endpoint {
+                    pointer_id: drag_pointer_id,
+                    object_id,
+                    node_index,
+                } if drag_pointer_id == pointer_id => {
+                    // v3 §2b: the dragged endpoint's cumulative WORLD position. The
+                    // shell live-previews the chord deform per sample and commits
+                    // once on release — same contract shape as `transform_delta`.
+                    let world_now = screen_to_world(screen, camera);
+                    object_out.endpoint_delta = Some(ObjectEndpointDelta {
+                        id: object_id,
+                        node_index,
+                        x: world_now.x,
+                        y: world_now.y,
                     });
                 }
                 InputDragState::Rotate {
@@ -2778,7 +2951,8 @@ pub(crate) fn drag_pointer_id(drag: Option<&InputDragState>) -> Option<i32> {
         | Some(InputDragState::Marquee { pointer_id, .. })
         | Some(InputDragState::Object { pointer_id, .. })
         | Some(InputDragState::Resize { pointer_id, .. })
-        | Some(InputDragState::Rotate { pointer_id, .. }) => Some(*pointer_id),
+        | Some(InputDragState::Rotate { pointer_id, .. })
+        | Some(InputDragState::Endpoint { pointer_id, .. }) => Some(*pointer_id),
         None => None,
     }
 }
@@ -4731,6 +4905,213 @@ mod tests {
         );
         assert!(matches!(drag2, Some(InputDragState::Rotate { .. })));
         assert!(out2.selection.is_none());
+    }
+
+    // ----- anchor-semantics v3 §2b: open-class endpoint handles ---------------
+
+    /// An object whose local geometry is the canonical bezier open curve from the
+    /// scene-core deform fixture: 3 nodes, 5 coordinate PAIRS (control points
+    /// included), endpoints local px (0,0) and (8,0).
+    fn curve_object(id: &str) -> RenderObject {
+        RenderObject {
+            id: id.to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: object_identity(),
+            geometry_d: "M 0 0 C 8 -8 24 -8 32 0 L 64 0".to_string(),
+            fill: None,
+            stroke: None,
+            text: None,
+            anchors: Vec::new(),
+            clip: false,
+        }
+    }
+
+    #[test]
+    fn open_class_selection_surfaces_endpoint_handles_not_bbox() {
+        // An OPEN 40px line and a CLOSED 20px rect. The open selection gets TWO
+        // endpoint handles and NO bbox/rotate surface; the rect keeps the 8-handle
+        // overlay (regression guard) and has no endpoint surface.
+        let scene = object_scene(vec![
+            line_object("l", 0.0, 0.0, 40),
+            rect_object("r", 100.0, 0.0, 20),
+        ]);
+        let regions = derive_object_regions(&scene);
+        let camera = identity_camera();
+
+        // Open-class: bbox handles are GONE...
+        assert!(
+            selection_handles(&regions, &camera, Some("l"), None).is_none(),
+            "an open-class selection must not lay out bbox resize/rotate handles"
+        );
+        // ...and the endpoint pair is the surface (node 0 / last node world pos).
+        let handles =
+            endpoint_handles(&regions, &camera, Some("l"), None).expect("endpoint handles");
+        assert_eq!(handles.last_index, 1);
+        assert!((handles.world[0].x - 0.0).abs() < 1e-9 && handles.world[0].y.abs() < 1e-9);
+        assert!((handles.world[1].x - 40.0).abs() < 1e-9 && handles.world[1].y.abs() < 1e-9);
+
+        // Hover classifies the endpoints; the old rotate zone reads as EMPTY (no
+        // rotate affordance exists for open-class), and the body still reads Body.
+        assert_eq!(
+            hover_affordance_at(&regions, &camera, Some("l"), WorldPoint { x: 0.0, y: 0.0 }),
+            HoverAffordance::EndpointStart
+        );
+        assert_eq!(
+            hover_affordance_at(&regions, &camera, Some("l"), WorldPoint { x: 40.0, y: 0.0 }),
+            HoverAffordance::EndpointEnd
+        );
+        assert_eq!(
+            hover_affordance_at(
+                &regions,
+                &camera,
+                Some("l"),
+                WorldPoint {
+                    x: 20.0,
+                    y: 0.0 - crate::hit_test_object::ROTATE_ZONE_OFFSET_PX,
+                },
+            ),
+            HoverAffordance::Empty,
+            "no rotate affordance on an open-class selection"
+        );
+        assert_eq!(
+            hover_affordance_at(&regions, &camera, Some("l"), WorldPoint { x: 20.0, y: 0.0 }),
+            HoverAffordance::Body
+        );
+
+        // Closed-class regression: the rect keeps its 8-handle surface and has no
+        // endpoint surface.
+        assert!(selection_handles(&regions, &camera, Some("r"), None).is_some());
+        assert!(endpoint_handles(&regions, &camera, Some("r"), None).is_none());
+    }
+
+    #[test]
+    fn curve_endpoint_handles_use_pair_space_last_index() {
+        // Bezier control points count as PAIRS (anchors address pair space), so the
+        // curve's end handle reports pair index 4, not node index 2 — while the
+        // handle POSITION is still the last node's world point (8, 0)px.
+        let scene = object_scene(vec![curve_object("c")]);
+        let regions = derive_object_regions(&scene);
+        let handles = endpoint_handles(&regions, &identity_camera(), Some("c"), None)
+            .expect("endpoint handles");
+        assert_eq!(handles.last_index, 4, "pair-space index, control points included");
+        assert!((handles.world[1].x - 8.0).abs() < 1e-9 && handles.world[1].y.abs() < 1e-9);
+    }
+
+    #[test]
+    fn endpoint_handles_follow_preview_transform_and_stay_screen_sized() {
+        let scene = object_scene(vec![line_object("l", 0.0, 0.0, 40)]);
+        let regions = derive_object_regions(&scene);
+        let camera = identity_camera();
+
+        // RA1 carry-over: a live preview transform substitutes for the canonical
+        // region transform, so the handles track a translate drag frame-by-frame.
+        let preview = [[1.0, 0.0, 100.0], [0.0, 1.0, 50.0], [0.0, 0.0, 1.0]];
+        let handles = endpoint_handles(&regions, &camera, Some("l"), Some(&preview))
+            .expect("previewed handles");
+        assert!((handles.world[0].x - 100.0).abs() < 1e-9);
+        assert!((handles.world[0].y - 50.0).abs() < 1e-9);
+        assert!((handles.world[1].x - 140.0).abs() < 1e-9);
+        assert!((handles.world[1].y - 50.0).abs() < 1e-9);
+
+        // The overlay quads stay HANDLE_SIZE_PX on screen at any zoom (the same
+        // 1/zoom sizing as the bbox handles), two quads * 6 verts.
+        for &zoom in &[1.0_f64, 4.0_f64] {
+            let verts = build_endpoint_handle_overlay_vertices(&handles.world, zoom);
+            assert_eq!(verts.len(), 12);
+            let world_w = (verts[2].position[0] - verts[0].position[0]) as f64;
+            assert!(
+                (world_w * zoom - crate::hit_test_object::HANDLE_SIZE_PX).abs() < 1e-6,
+                "endpoint handle screen size must be constant at zoom {zoom}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_down_on_endpoint_starts_endpoint_drag_and_emits_world_signal() {
+        // An ANCHORED open line: the handle is grabbable regardless of the anchor
+        // (release-time rebind/unbind is the shell's commit, v3 §2b).
+        let mut line = line_object("l", 0.0, 0.0, 40);
+        line.anchors = vec![crate::render_object::RAnchor {
+            node_index: 1,
+            target: "t".to_string(),
+            at: crate::render_object::RLocalPoint { x: 0.0, y: 0.0 },
+        }];
+        let scene = object_scene(vec![line]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        // Down on the END endpoint handle -> Endpoint drag (pair index 1), no
+        // selection re-pick, no transform gesture.
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown {
+                pointer_id: 1,
+                screen: WorldPoint { x: 40.0, y: 0.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            Some("l"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert!(
+            matches!(drag, Some(InputDragState::Endpoint { node_index: 1, ref object_id, .. }) if object_id == "l"),
+            "grabbing the end handle starts an Endpoint drag"
+        );
+        assert!(out.selection.is_none());
+
+        // A move emits the cumulative WORLD endpoint sample — and no transform delta.
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove {
+                pointer_id: 1,
+                screen: WorldPoint { x: 55.0, y: 7.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            Some("l"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        let delta = out.endpoint_delta.take().expect("move emits an endpoint delta");
+        assert_eq!(delta.id, "l");
+        assert_eq!(delta.node_index, 1);
+        assert!((delta.x - 55.0).abs() < 1e-9 && (delta.y - 7.0).abs() < 1e-9);
+        assert!(out.transform_delta.is_none(), "an endpoint drag is not a transform");
+
+        // Up clears the drag (the shell commits endpoint_release_ops).
+        step_object_pointer(
+            &CanvasInputEvent::PointerUp {
+                pointer_id: 1,
+                screen: WorldPoint { x: 55.0, y: 7.0 },
+                edge_id: None,
+            },
+            &regions,
+            ActiveTool::Select,
+            Some("l"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert!(drag.is_none());
+
+        // The START handle reports pair index 0.
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown {
+                pointer_id: 2,
+                screen: WorldPoint { x: 0.0, y: 0.0 },
+            },
+            &regions,
+            ActiveTool::Select,
+            Some("l"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert!(matches!(drag, Some(InputDragState::Endpoint { node_index: 0, .. })));
     }
 
     #[test]

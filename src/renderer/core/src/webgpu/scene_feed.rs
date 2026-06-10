@@ -10,7 +10,7 @@ use crate::model::{
     SceneSnapshot,
 };
 use crate::object_pipeline::{ObjectPipeline, ObjectRenderer};
-use crate::render_object::RenderObjectScene;
+use crate::render_object::{RenderObject, RenderObjectScene};
 use crate::serde_wasm;
 use shape_scene_core::object::move_together::{BindingGraph, BindingNode};
 use crate::text::TextBuildStats;
@@ -108,6 +108,10 @@ impl ShapeWebGpuRenderer {
         // W3-G9/#5: precompute the move-together propagation graph ONCE per feed so
         // each drag preview is O(closure), not O(scene).
         self.object_bindings = BindingGraph::build(&binding_nodes(&scene));
+        // v3 §2b: the re-feed just rebuilt every baked geometry from the canonical
+        // scene, so no live chord deform survives it — reset the patch bookkeeping.
+        self.preview_deformed.clear();
+        self.endpoint_preview = None;
         self.object_scene = Some(scene);
         self.object_renderer = Some(renderer);
         serde_wasm(counts)
@@ -156,13 +160,51 @@ impl ShapeWebGpuRenderer {
         // instance-matrix preview above cannot express it; instead each follower's
         // geometry is rewritten with the reprojected node and re-expanded in place.
         let followers = preview_reproject_followers(scene, &self.object_bindings, id);
-        let reexpanded = self.reexpand_reprojected_followers(scene, Some(&delta), &followers);
+        let follower_patches = self.reexpand_reprojected_followers(scene, Some(&delta), &followers);
+        // v3 §2b/§3: route each moved member through the scene-core endpoint
+        // decision table. A pure-translate / closed-class / legacy member keeps the
+        // 0-rebake instance-matrix write; an open-class member under a non-translate
+        // delta (or with a pinned endpoint) chord-deforms instead — its instance
+        // matrix stays at BASE and its geometry rides the G14 reexpand+patch path.
+        let moved_ids: Vec<String> = write_set.iter().map(|(id, _)| id.clone()).collect();
+        let mut matrix_writes: Vec<(String, [[f64; 3]; 3])> = Vec::new();
+        let mut deform_ids: Vec<String> = Vec::new();
+        let mut patch_pairs: Vec<(String, String)> = Vec::new();
+        for (target, base) in write_set {
+            match route_preview_member(scene, &moved_ids, &target, &delta) {
+                PreviewMemberRoute::Deform { geometry_d } => {
+                    deform_ids.push(target.clone());
+                    patch_pairs.push((target, geometry_d));
+                }
+                route => {
+                    // A member leaving the deform route mid-gesture (e.g. a snapped
+                    // rotate passing back through identity) snaps its geometry back
+                    // to canonical; a member that was never deformed adds nothing,
+                    // so the pure-translate hot path stays patch-free.
+                    if self.preview_deformed.contains(&target) {
+                        if let Some(object) = scene.objects.iter().find(|o| o.id == target) {
+                            patch_pairs.push((target.clone(), object.geometry_d.clone()));
+                        }
+                    }
+                    if matches!(route, PreviewMemberRoute::Matrix) {
+                        matrix_writes.push((target, base));
+                    }
+                }
+            }
+        }
+        let member_patches = self.reexpand_geometries(scene, patch_pairs);
+        for moved in &moved_ids {
+            self.preview_deformed.remove(moved);
+        }
+        for deformed in deform_ids {
+            self.preview_deformed.insert(deformed);
+        }
         if let Some(renderer) = self.object_renderer.as_mut() {
-            for (target, base) in &write_set {
+            for (target, base) in &matrix_writes {
                 renderer.set_preview_transform(&self.queue, target, &delta, base);
             }
-            for (follower_id, rebuilt) in &reexpanded {
-                renderer.patch_follower_geometry(&self.queue, follower_id, rebuilt);
+            for (patched_id, rebuilt) in follower_patches.iter().chain(member_patches.iter()) {
+                renderer.patch_follower_geometry(&self.queue, patched_id, rebuilt);
             }
         }
         Ok(())
@@ -176,6 +218,11 @@ impl ShapeWebGpuRenderer {
     /// (group children + multi members), not just the picked id.
     #[wasm_bindgen(js_name = clearObjectPreview)]
     pub fn clear_object_preview(&mut self, id: &str) -> Result<(), JsValue> {
+        // v3 §2b/§3: every geometry a live chord deform patched (open-class moved
+        // members + any in-flight endpoint drag) snaps back to canonical with the
+        // same restore pass the followers get.
+        let deformed = std::mem::take(&mut self.preview_deformed);
+        self.endpoint_preview = None;
         let Some(scene) = self.object_scene.as_ref() else {
             return Ok(());
         };
@@ -185,12 +232,87 @@ impl ShapeWebGpuRenderer {
         // reproject too, not just the same-delta instance matrices.
         let followers = preview_reproject_followers(scene, &self.object_bindings, id);
         let restored = self.reexpand_reprojected_followers(scene, None, &followers);
+        let restore_pairs: Vec<(String, String)> = deformed
+            .iter()
+            .filter_map(|deformed_id| {
+                scene
+                    .objects
+                    .iter()
+                    .find(|o| &o.id == deformed_id)
+                    .map(|o| (deformed_id.clone(), o.geometry_d.clone()))
+            })
+            .collect();
+        let member_restores = self.reexpand_geometries(scene, restore_pairs);
         if let Some(renderer) = self.object_renderer.as_mut() {
             for (target, base) in &write_set {
                 renderer.clear_preview_transform(&self.queue, target, base);
             }
-            for (follower_id, rebuilt) in &restored {
-                renderer.patch_follower_geometry(&self.queue, follower_id, rebuilt);
+            for (patched_id, rebuilt) in restored.iter().chain(member_restores.iter()) {
+                renderer.patch_follower_geometry(&self.queue, patched_id, rebuilt);
+            }
+        }
+        Ok(())
+    }
+
+    /// v3 §2b endpoint-drag LIVE path: chord-deform ONE open-class object so its
+    /// dragged endpoint (`node_index`, geometry PAIR space: 0 | last) lands on the
+    /// live pointer WORLD position, then re-expand + in-place patch that single
+    /// object (the G14 `reexpand_single_object` + `patch_follower_geometry` path —
+    /// no new bypass). The deform itself is scene-core `endpoint_release_ops` /
+    /// `deform_open_path` — the SAME function the release commit runs, so the live
+    /// and committed bytes cannot drift. No-op when the scene is unloaded, the id
+    /// is unknown, or the target is not an open-class endpoint.
+    #[wasm_bindgen(js_name = setObjectEndpointPreview)]
+    pub fn set_object_endpoint_preview(
+        &mut self,
+        id: &str,
+        node_index: i32,
+        world_x: f64,
+        world_y: f64,
+    ) -> Result<(), JsValue> {
+        let Some(scene) = self.object_scene.as_ref() else {
+            return Ok(());
+        };
+        let Some(new_d) = endpoint_preview_geometry(scene, id, node_index, (world_x, world_y))
+        else {
+            return Ok(());
+        };
+        let patches = self.reexpand_geometries(scene, vec![(id.to_string(), new_d)]);
+        self.preview_deformed.insert(id.to_string());
+        self.endpoint_preview = Some((
+            id.to_string(),
+            node_index,
+            crate::model::WorldPoint { x: world_x, y: world_y },
+        ));
+        if let Some(renderer) = self.object_renderer.as_mut() {
+            for (patched_id, rebuilt) in &patches {
+                renderer.patch_follower_geometry(&self.queue, patched_id, rebuilt);
+            }
+        }
+        Ok(())
+    }
+
+    /// v3 §2b: symmetric clear — re-expand the object's CANONICAL geometry back in,
+    /// dropping the live endpoint deform (the shell calls this on release/cancel
+    /// after committing `endpoint_release_ops`). No-op when no endpoint preview
+    /// patched this id.
+    #[wasm_bindgen(js_name = clearObjectEndpointPreview)]
+    pub fn clear_object_endpoint_preview(&mut self, id: &str) -> Result<(), JsValue> {
+        self.endpoint_preview = None;
+        if !self.preview_deformed.remove(id) {
+            return Ok(());
+        }
+        let Some(scene) = self.object_scene.as_ref() else {
+            return Ok(());
+        };
+        let Some(object) = scene.objects.iter().find(|o| o.id == id) else {
+            return Ok(());
+        };
+        let patches =
+            self.reexpand_geometries(scene, vec![(id.to_string(), object.geometry_d.clone())]);
+        if let Some(renderer) = self.object_renderer.as_mut() {
+            for (patched_id, rebuilt) in &patches {
+                renderer.patch_follower_geometry(&self.queue, patched_id, rebuilt);
             }
         }
         Ok(())
@@ -213,21 +335,34 @@ impl ShapeWebGpuRenderer {
         delta: Option<&[[f64; 3]; 3]>,
         followers: &[(String, String)],
     ) -> Vec<(String, crate::object_pipeline::FollowerReexpand)> {
+        self.reexpand_geometries(scene, reprojected_follower_geometries(scene, delta, followers))
+    }
+
+    /// The shared G14 re-expand consumer: each `(id, geometry_d)` pair is the
+    /// scene object rebuilt with that geometry through `reexpand_single_object`
+    /// (live theme + camera), ready for an in-place `patch_follower_geometry`.
+    /// Used by the follower reproject, the v3 §2b/§3 member chord deforms, and
+    /// the endpoint preview — ONE patch pipeline, no bypass.
+    fn reexpand_geometries(
+        &self,
+        scene: &RenderObjectScene,
+        pairs: Vec<(String, String)>,
+    ) -> Vec<(String, crate::object_pipeline::FollowerReexpand)> {
         let Some(theme) = self.object_renderer.as_ref().map(|r| r.theme()) else {
             return Vec::new();
         };
-        reprojected_follower_geometries(scene, delta, followers)
+        pairs
             .into_iter()
-            .filter_map(|(follower_id, geometry_d)| {
-                let follower = scene.objects.iter().find(|o| o.id == follower_id)?;
-                let mut reprojected = follower.clone();
-                reprojected.geometry_d = geometry_d;
+            .filter_map(|(id, geometry_d)| {
+                let object = scene.objects.iter().find(|o| o.id == id)?;
+                let mut reshaped = object.clone();
+                reshaped.geometry_d = geometry_d;
                 let rebuilt = crate::object_pipeline::reexpand_single_object(
-                    &reprojected,
+                    &reshaped,
                     theme,
                     scene.camera.clone(),
                 );
-                Some((follower_id, rebuilt))
+                Some((id, rebuilt))
             })
             .collect()
     }
@@ -319,8 +454,15 @@ pub(crate) fn preview_reproject_followers(
 /// twice — restarting from the canonical path per pair would stomp the first
 /// target's rewrite). Returns one `(follower_id, geometry_d)` per unique follower in
 /// first-appearance order; with `delta = None` (the restore path) each unique
-/// follower comes back once with its CANONICAL geometry. The reproject math is
-/// scene-core's `reproject_geometry_node` — the same the commit path folds with.
+/// follower comes back once with its CANONICAL geometry.
+///
+/// Anchor-semantics v3 §3: an open-class follower whose anchors all bind ENDPOINTS
+/// deforms as ONE chord ([`open_follower_chord_d`] → scene-core `deform_open_path`)
+/// — the same route the commit's `anchor_follow_ops` takes, so the live patch and
+/// the committed `edit-geometry` stay byte-equivalent. Everything else (closed,
+/// legacy multi-subpath, an interior-node anchor) keeps the node-splice fold via
+/// scene-core's `reproject_geometry_node` (rule 5 — no regression).
+///
 /// Pure (no device/GPU), host-testable under `wgpu-probe`; the wasm32
 /// `reexpand_reprojected_followers` is a thin re-expand consumer.
 #[cfg(feature = "wgpu-probe")]
@@ -329,45 +471,276 @@ pub(crate) fn reprojected_follower_geometries(
     delta: Option<&[[f64; 3]; 3]>,
     followers: &[(String, String)],
 ) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+    // Group by follower, first-appearance order (the W3-G13 contract).
+    let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
     for (follower_id, target_id) in followers {
-        let Some(follower) = scene.objects.iter().find(|o| &o.id == follower_id) else {
+        match grouped.iter_mut().find(|(id, _)| *id == follower_id.as_str()) {
+            Some((_, targets)) => targets.push(target_id.as_str()),
+            None => grouped.push((follower_id.as_str(), vec![target_id.as_str()])),
+        }
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (follower_id, target_ids) in grouped {
+        let Some(follower) = scene.objects.iter().find(|o| o.id == follower_id) else {
             continue;
-        };
-        // One cumulative entry per follower; the first pair seeds it canonical.
-        let entry = match out.iter().position(|(id, _)| id == follower_id) {
-            Some(i) => &mut out[i],
-            None => {
-                out.push((follower_id.clone(), follower.geometry_d.clone()));
-                out.last_mut().expect("entry just pushed")
-            }
         };
         let Some(delta) = delta else {
+            out.push((follower_id.to_string(), follower.geometry_d.clone()));
             continue;
         };
+        let d = open_follower_chord_d(scene, follower, &target_ids, delta)
+            .unwrap_or_else(|| spliced_follower_d(scene, follower, &target_ids, delta));
+        out.push((follower_id.to_string(), d));
+    }
+    out
+}
+
+/// The §3 chord follow for ONE open-class endpoint-anchored follower, mirroring
+/// the `endpoint_deform` branch of scene-core's `anchor_follow_ops` with the SAME
+/// scene-core functions (`local_nodes` pair space, `reproject_geometry_node`
+/// quantization, `deform_open_path` similarity): each anchored ENDPOINT moves to
+/// its reprojected position, the un-anchored endpoint pins at its original
+/// position, and the whole silhouette rides the chord. Returns `None` when the
+/// follower is not an open-class endpoint case (the caller keeps the legacy
+/// splice, rule 5).
+#[cfg(feature = "wgpu-probe")]
+fn open_follower_chord_d(
+    scene: &RenderObjectScene,
+    follower: &RenderObject,
+    target_ids: &[&str],
+    delta: &[[f64; 3]; 3],
+) -> Option<String> {
+    use shape_scene_core::object::{deform_open_path, is_open_class_d, local_nodes};
+    let base = &follower.geometry_d;
+    let pairs = local_nodes(base);
+    if pairs.len() < 2 || !is_open_class_d(base) {
+        return None;
+    }
+    let last = pairs.len() - 1;
+    if follower.anchors.iter().any(|a| a.node_index != 0 && a.node_index != last) {
+        return None;
+    }
+    let mut new_start = pairs[0];
+    let mut new_end = pairs[last];
+    for anchor in &follower.anchors {
+        if !target_ids.contains(&anchor.target.as_str()) {
+            continue;
+        }
+        // The reproject through the SAME scene-core quantization the commit uses:
+        // splice the endpoint on the BASE path, then read the pair back. A `None`
+        // splice is a no-op rewrite — the endpoint already sits at its reprojected
+        // position, which the seeds above carry.
+        let point = reprojected_node_pair(scene, follower, anchor, delta);
+        if anchor.node_index == 0 {
+            new_start = point.unwrap_or(new_start);
+        } else {
+            new_end = point.unwrap_or(new_end);
+        }
+    }
+    deform_open_path(base, new_start, new_end)
+}
+
+/// One anchored node's reprojected pair-space position under `delta`, read back
+/// from scene-core's `reproject_geometry_node` splice of the CANONICAL path (so
+/// the quantization is byte-identical to the commit). `None` when the rewrite is
+/// a no-op (the node already sits there).
+#[cfg(feature = "wgpu-probe")]
+fn reprojected_node_pair(
+    scene: &RenderObjectScene,
+    follower: &RenderObject,
+    anchor: &crate::render_object::RAnchor,
+    delta: &[[f64; 3]; 3],
+) -> Option<(f64, f64)> {
+    use shape_scene_core::object::{local_nodes, reproject_geometry_node, LocalPoint, Transform3x3};
+    let target = scene.objects.iter().find(|o| o.id == anchor.target)?;
+    let rewritten = reproject_geometry_node(
+        &Transform3x3 { m: follower.transform },
+        &Transform3x3 { m: target.transform },
+        &Transform3x3 { m: *delta },
+        LocalPoint {
+            x: anchor.at.x.round() as i32,
+            y: anchor.at.y.round() as i32,
+        },
+        i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
+        &follower.geometry_d,
+    )?;
+    local_nodes(&rewritten).get(anchor.node_index).copied()
+}
+
+/// The legacy node-splice fold (rule 5): every moved-target anchor's node
+/// rewrites cumulatively through scene-core's `reproject_geometry_node`, exactly
+/// the pre-v3 behavior for closed-class / multi-subpath / interior-node cases.
+#[cfg(feature = "wgpu-probe")]
+fn spliced_follower_d(
+    scene: &RenderObjectScene,
+    follower: &RenderObject,
+    target_ids: &[&str],
+    delta: &[[f64; 3]; 3],
+) -> String {
+    use shape_scene_core::object::{reproject_geometry_node, LocalPoint, Transform3x3};
+    let mut d = follower.geometry_d.clone();
+    for target_id in target_ids {
         let Some(target) = scene.objects.iter().find(|o| &o.id == target_id) else {
             continue;
         };
         for anchor in &follower.anchors {
-            if &anchor.target != target_id {
+            if anchor.target != *target_id {
                 continue;
             }
-            if let Some(rewritten) = shape_scene_core::object::reproject_geometry_node(
-                &shape_scene_core::object::Transform3x3 { m: follower.transform },
-                &shape_scene_core::object::Transform3x3 { m: target.transform },
-                &shape_scene_core::object::Transform3x3 { m: *delta },
-                shape_scene_core::object::LocalPoint {
+            if let Some(rewritten) = reproject_geometry_node(
+                &Transform3x3 { m: follower.transform },
+                &Transform3x3 { m: target.transform },
+                &Transform3x3 { m: *delta },
+                LocalPoint {
                     x: anchor.at.x.round() as i32,
                     y: anchor.at.y.round() as i32,
                 },
                 i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
-                &entry.1,
+                &d,
             ) {
-                entry.1 = rewritten;
+                d = rewritten;
             }
         }
     }
-    out
+    d
+}
+
+/// How ONE moved member previews live — the renderer-side mirror of scene-core's
+/// `cascade::push_member_op` (§2b/§2c/§3 decision table, single source =
+/// scene-core `open_endpoint_pins` + `route_open_endpoints` + `deform_open_path`).
+#[cfg(feature = "wgpu-probe")]
+pub(crate) enum PreviewMemberRoute {
+    /// Rules 1/5: the existing 0-rebake instance-matrix write (pure-translate
+    /// fast path, closed-class, and every legacy case).
+    Matrix,
+    /// Rule 3 no-op: both endpoints pinned by unmoved anchor targets — write
+    /// nothing (the commit authors nothing either).
+    Pinned,
+    /// Rules 2/3: chord-deform the geometry to this path-string and patch it in
+    /// place; the instance matrix stays at BASE.
+    Deform { geometry_d: String },
+}
+
+/// Route one SameDelta-closure member of a live preview (`moved_ids` = the whole
+/// closure, the §3 `target_moved` predicate). Mirrors `push_member_op` branch for
+/// branch so the live frame and the commit ops route identically. Pure,
+/// host-testable under `wgpu-probe`.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn route_preview_member(
+    scene: &RenderObjectScene,
+    moved_ids: &[String],
+    id: &str,
+    delta: &[[f64; 3]; 3],
+) -> PreviewMemberRoute {
+    use shape_scene_core::object::{
+        deform_open_path, is_open_class_d, is_pure_translate, open_endpoint_pins,
+        route_open_endpoints, Anchor, EndpointRoute, LocalPoint, Transform3x3,
+    };
+    let Some(object) = scene.objects.iter().find(|o| o.id == id) else {
+        return PreviewMemberRoute::Matrix;
+    };
+    let delta_t = Transform3x3 { m: *delta };
+    // Rule 1 fast path: an unanchored pure-translate member keeps the 0-rebake
+    // instance write without parsing any geometry (the common drag).
+    if object.anchors.is_empty() && is_pure_translate(&delta_t) {
+        return PreviewMemberRoute::Matrix;
+    }
+    let d = &object.geometry_d;
+    if !is_open_class_d(d) {
+        return PreviewMemberRoute::Matrix;
+    }
+    let anchors: Vec<Anchor> = object
+        .anchors
+        .iter()
+        .map(|a| Anchor {
+            node_index: i32::try_from(a.node_index).unwrap_or(i32::MAX),
+            target: a.target.clone(),
+            at: LocalPoint {
+                x: a.at.x.round() as i32,
+                y: a.at.y.round() as i32,
+            },
+        })
+        .collect();
+    let target_moved = |target: &str| moved_ids.iter().any(|moved| moved == target);
+    let Some((start_pinned, end_pinned)) = open_endpoint_pins(d, &anchors, target_moved) else {
+        // Rule 5: an interior-node anchor (node-splice era) rides the whole
+        // transform exactly as before.
+        return PreviewMemberRoute::Matrix;
+    };
+    match route_open_endpoints(
+        d,
+        &Transform3x3 { m: object.transform },
+        &delta_t,
+        start_pinned,
+        end_pinned,
+    ) {
+        Some(EndpointRoute::Pinned) => PreviewMemberRoute::Pinned,
+        Some(EndpointRoute::Deform { new_start, new_end }) => {
+            match deform_open_path(d, new_start, new_end) {
+                Some(geometry_d) => PreviewMemberRoute::Deform { geometry_d },
+                None => PreviewMemberRoute::Matrix,
+            }
+        }
+        Some(EndpointRoute::Translate) | None => PreviewMemberRoute::Matrix,
+    }
+}
+
+/// v3 §2b: the live endpoint-drag geometry for `id` — the EditGeometry path-string
+/// scene-core's `endpoint_release_ops` (the release COMMIT function, run here
+/// against a one-object scene with no snap) authors for moving `node_index` to the
+/// WORLD point. A no-op rewrite (the pointer back at the start) returns the
+/// canonical geometry so the patch restores the canonical bytes mid-gesture.
+/// `None` when the id is unknown or not an open-class endpoint (closed-class,
+/// interior node) — the endpoint surface only exists on open-class ends.
+/// Pure, host-testable under `wgpu-probe`.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn endpoint_preview_geometry(
+    scene: &RenderObjectScene,
+    id: &str,
+    node_index: i32,
+    world: (f64, f64),
+) -> Option<String> {
+    use shape_scene_core::object::{
+        endpoint_release_ops, is_open_class_d, local_nodes, FillRule, Geometry, Object, ObjectOp,
+        ObjectScene, ObjectSelection, Transform3x3,
+    };
+    let object = scene.objects.iter().find(|o| o.id == id)?;
+    let d = &object.geometry_d;
+    if !is_open_class_d(d) {
+        return None;
+    }
+    let pairs = local_nodes(d);
+    if pairs.len() < 2 {
+        return None;
+    }
+    let last = i32::try_from(pairs.len() - 1).ok()?;
+    if node_index != 0 && node_index != last {
+        return None;
+    }
+    let mut core = Object::new(
+        &object.id,
+        &object.order,
+        Geometry {
+            path_string: d.clone(),
+            fill_rule: FillRule::EvenOdd,
+            subpaths: Vec::new(),
+        },
+    );
+    core.transform = Transform3x3 { m: object.transform };
+    let core_scene = ObjectScene {
+        scene_version: 1,
+        objects: vec![core],
+        tags: Vec::new(),
+        selection: ObjectSelection::Canvas,
+        updated_at: String::new(),
+    };
+    let deformed = endpoint_release_ops(&core_scene, id, node_index, world, None)
+        .into_iter()
+        .find_map(|op| match op {
+            ObjectOp::EditGeometry { geometry, .. } => Some(geometry.path_string),
+            _ => None,
+        });
+    Some(deformed.unwrap_or_else(|| d.clone()))
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -2109,5 +2482,389 @@ mod tests {
             restored,
             vec![("f".to_string(), f_obj.geometry_d.clone())]
         );
+    }
+
+    // ----- anchor-semantics v3 §2b/§3: live endpoint routing ------------------
+
+    use super::{endpoint_preview_geometry, route_preview_member, PreviewMemberRoute};
+    use crate::render_object::{RAnchor, RLocalPoint, RStroke, RStrokeCap, RStrokeJoin};
+
+    fn feed_scene(objects: Vec<RenderObject>) -> RenderObjectScene {
+        RenderObjectScene {
+            scene_id: "v3-endpoints".to_string(),
+            camera: CameraState {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+            objects,
+            selection: None,
+            multi_select: Vec::new(),
+        }
+    }
+
+    fn rot90() -> [[f64; 3]; 3] {
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    }
+
+    fn endpoint_anchor(node_index: usize, target: &str) -> RAnchor {
+        RAnchor {
+            node_index,
+            target: target.to_string(),
+            at: RLocalPoint { x: 0.0, y: 0.0 },
+        }
+    }
+
+    /// v3 §2b/§2c/§3 decision table, live side — each row mirrors scene-core's
+    /// commit `push_member_op` (the single source: `open_endpoint_pins` +
+    /// `route_open_endpoints` + `deform_open_path`).
+    #[test]
+    fn route_preview_member_follows_the_endpoint_decision_table() {
+        let ids = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let open = |anchors: Vec<RAnchor>| {
+            anchored_object("l", None, translate(0.0, 0.0), "M 0 0 L 320 0", anchors)
+        };
+
+        // Closed-class member: any delta keeps the instance-matrix write (rule 5).
+        let rect = anchored_object("l", None, translate(0.0, 0.0), "M 0 0 L 8 0 L 8 8 L 0 8 Z", Vec::new());
+        let scene = feed_scene(vec![rect]);
+        assert!(matches!(
+            route_preview_member(&scene, &ids(&["l"]), "l", &rot90()),
+            PreviewMemberRoute::Matrix
+        ));
+
+        // Rule 1: unanchored open member under a pure translate — 0-rebake matrix.
+        let scene = feed_scene(vec![open(Vec::new())]);
+        assert!(matches!(
+            route_preview_member(&scene, &ids(&["l"]), "l", &translate(10.0, 5.0)),
+            PreviewMemberRoute::Matrix
+        ));
+
+        // Rule 2: unanchored open member under a NON-translate delta deforms — a
+        // 90° rotation maps the (0,0)->(40,0)px chord to (0,0)->(0,40)px.
+        let PreviewMemberRoute::Deform { geometry_d } =
+            route_preview_member(&scene, &ids(&["l"]), "l", &rot90())
+        else {
+            panic!("a rotated open member must chord-deform");
+        };
+        assert_eq!(geometry_d, "M 0 0 L 0 320");
+
+        // Rule 3, pinned start: the free end takes the whole body delta, the
+        // anchored end (target NOT in the moved set) holds its glue point.
+        let scene = feed_scene(vec![open(vec![endpoint_anchor(0, "t")])]);
+        let PreviewMemberRoute::Deform { geometry_d } =
+            route_preview_member(&scene, &ids(&["l"]), "l", &translate(10.0, 0.0))
+        else {
+            panic!("a one-anchor body drag must rubber-band the free end");
+        };
+        assert_eq!(geometry_d, "M 0 0 L 400 0");
+
+        // Rule 3 reduction: the anchor's target moved in the SAME batch — the delta
+        // cancels, so the pure translate keeps the SetTransform fast path.
+        assert!(matches!(
+            route_preview_member(&scene, &ids(&["l", "t"]), "l", &translate(10.0, 0.0)),
+            PreviewMemberRoute::Matrix
+        ));
+
+        // Rule 3 no-op: both endpoints pinned by unmoved targets — nothing moves.
+        let scene = feed_scene(vec![open(vec![
+            endpoint_anchor(0, "t"),
+            endpoint_anchor(1, "u"),
+        ])]);
+        assert!(matches!(
+            route_preview_member(&scene, &ids(&["l"]), "l", &translate(10.0, 0.0)),
+            PreviewMemberRoute::Pinned
+        ));
+
+        // Rule 5: an interior-node anchor is the node-splice era — whole transform.
+        let wire = anchored_object(
+            "l",
+            None,
+            translate(0.0, 0.0),
+            "M 0 0 L 320 0 L 640 0",
+            vec![endpoint_anchor(1, "t")],
+        );
+        let scene = feed_scene(vec![wire]);
+        assert!(matches!(
+            route_preview_member(&scene, &ids(&["l"]), "l", &translate(10.0, 0.0)),
+            PreviewMemberRoute::Matrix
+        ));
+    }
+
+    /// COMMIT-LIVE EQUIVALENCE PIN (group rotate): the open member's LIVE deform
+    /// bytes equal the `edit-geometry` scene-core's commit cascade authors for the
+    /// same multi-rotate — and re-expanding that live geometry equals a FULL
+    /// rebake of the scene with the committed geometry applied. Both sides call
+    /// the same scene-core functions, so a drift in either fails here.
+    #[test]
+    fn open_member_group_rotate_live_matches_scene_core_commit_and_rebake() {
+        use crate::object_pipeline::{
+            build_scene_geometry_themed, follower_patch_plan, reexpand_single_object,
+        };
+        use crate::object_theme::Theme;
+        use shape_scene_core::object::{
+            cascade_multi_transform_ops, FillRule, Geometry, Object, ObjectOp, ObjectScene,
+            ObjectSelection, Transform3x3,
+        };
+
+        let stroke = RStroke {
+            paint: crate::render_object::RPaint::Solid {
+                color: "#00ff00".to_string(),
+            },
+            width: 4.0,
+            opacity: 1.0,
+            dash: Vec::new(),
+            cap: RStrokeCap::Butt,
+            join: RStrokeJoin::Miter,
+        };
+        let rect = anchored_object("r", None, translate(0.0, 0.0), "M 0 0 L 160 0 L 160 160 L 0 160 Z", Vec::new());
+        let mut line = anchored_object("l", None, translate(100.0, 0.0), "M 0 0 L 320 0", Vec::new());
+        line.stroke = Some(stroke);
+        let scene = feed_scene(vec![rect, line]);
+        let delta = rot90();
+
+        // LIVE: the multi-rotate routes the open member to a chord deform.
+        let moved = vec!["r".to_string(), "l".to_string()];
+        let PreviewMemberRoute::Deform { geometry_d: live_d } =
+            route_preview_member(&scene, &moved, "l", &delta)
+        else {
+            panic!("the open member of a rotated group must chord-deform");
+        };
+
+        // COMMIT: the scene-core cascade for the same roots + delta.
+        let core_object = |o: &RenderObject| {
+            let mut core = Object::new(
+                &o.id,
+                &o.order,
+                Geometry {
+                    path_string: o.geometry_d.clone(),
+                    fill_rule: FillRule::EvenOdd,
+                    subpaths: Vec::new(),
+                },
+            );
+            core.transform = Transform3x3 { m: o.transform };
+            core
+        };
+        let core_scene = ObjectScene {
+            scene_version: 1,
+            objects: scene.objects.iter().map(core_object).collect(),
+            tags: Vec::new(),
+            selection: ObjectSelection::Canvas,
+            updated_at: String::new(),
+        };
+        let ops = cascade_multi_transform_ops(&core_scene, &moved, &Transform3x3 { m: delta });
+        // The closed member keeps SetTransform; the open member commits ONE
+        // edit-geometry and NO set-transform (§2c slave rule).
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, ObjectOp::SetTransform { id, .. } if id == "r")));
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, ObjectOp::SetTransform { id, .. } if id == "l")));
+        let commit_d = ops
+            .iter()
+            .find_map(|op| match op {
+                ObjectOp::EditGeometry { id, geometry } if id == "l" => {
+                    Some(geometry.path_string.clone())
+                }
+                _ => None,
+            })
+            .expect("the open member commits an edit-geometry");
+        assert_eq!(live_d, commit_d, "live deform bytes == committed deform bytes");
+
+        // REBAKE PARITY: the live patch (reexpand of live_d over the canonical
+        // ranges) equals the full rebake of the committed scene.
+        let canonical_build = build_scene_geometry_themed(&scene, Theme::light());
+        let mut deformed_scene = scene.clone();
+        deformed_scene.objects[1].geometry_d = commit_d;
+        let full = build_scene_geometry_themed(&deformed_scene, Theme::light());
+        let rebuilt = reexpand_single_object(
+            &deformed_scene.objects[1],
+            Theme::light(),
+            scene.camera.clone(),
+        );
+        let plan = follower_patch_plan(&canonical_build.draws[1], &rebuilt)
+            .expect("a node-count-preserving deform is size-safe");
+        assert_eq!(
+            plan.stroke_vertex_byte_offset,
+            canonical_build.draws[1].stroke_range.start as u64
+                * std::mem::size_of::<crate::object_pipeline::StrokeVertex>() as u64
+        );
+        let full_stroke = &full.stroke_vertices[full.draws[1].stroke_range.start as usize
+            ..full.draws[1].stroke_range.end as usize];
+        assert!(!full_stroke.is_empty(), "the line has a stroke ribbon");
+        assert_eq!(rebuilt.stroke_vertices, full_stroke, "live patch == full rebake");
+        let canonical_stroke = &canonical_build.stroke_vertices
+            [canonical_build.draws[1].stroke_range.start as usize
+                ..canonical_build.draws[1].stroke_range.end as usize];
+        assert_ne!(
+            rebuilt.stroke_vertices, canonical_stroke,
+            "the rotate really moved the ribbon"
+        );
+    }
+
+    /// v3 §3 rule 4 (the spike fix), live side: an open-class follower whose
+    /// anchored ENDPOINT follows a moved target deforms the WHOLE chord — the
+    /// interior node rides along — and the bytes equal scene-core's commit
+    /// `anchor_follow_ops` for the same move (same functions, automatic).
+    #[test]
+    fn open_follower_live_chord_matches_anchor_follow_commit() {
+        use super::reprojected_follower_geometries;
+        use shape_scene_core::object::{
+            anchor_follow_ops, Anchor, FillRule, Geometry, LocalPoint, Object, ObjectOp,
+            ObjectScene, ObjectSelection, Transform3x3,
+        };
+
+        // The scene-core spike vector: target at (200,0), 3-node follower
+        // (0,0)->(100,0)->(200,0)px with its END anchored to the target's origin;
+        // the target moves +160px x (target_new = translate(360,0)).
+        let target = anchored_object("t", None, translate(200.0, 0.0), "M 0 0 L 0 0", Vec::new());
+        let follower = anchored_object(
+            "f",
+            None,
+            translate(0.0, 0.0),
+            "M 0 0 L 800 0 L 1600 0",
+            vec![endpoint_anchor(2, "t")],
+        );
+        let scene = feed_scene(vec![target, follower]);
+        let delta = translate(160.0, 0.0);
+
+        let live = reprojected_follower_geometries(
+            &scene,
+            Some(&delta),
+            &[("f".to_string(), "t".to_string())],
+        );
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0],
+            ("f".to_string(), "M 0 0 L 1440 0 L 2880 0".to_string()),
+            "the interior node rides the chord (the old splice left it at 800 — the spike)"
+        );
+
+        // The commit oracle: anchor_follow_ops for the same move authors the SAME d.
+        let core_object = |o: &RenderObject, anchors: Vec<Anchor>| {
+            let mut core = Object::new(
+                &o.id,
+                &o.order,
+                Geometry {
+                    path_string: o.geometry_d.clone(),
+                    fill_rule: FillRule::EvenOdd,
+                    subpaths: Vec::new(),
+                },
+            );
+            core.transform = Transform3x3 { m: o.transform };
+            core.anchors = anchors;
+            core
+        };
+        let core_scene = ObjectScene {
+            scene_version: 1,
+            objects: vec![
+                core_object(&scene.objects[0], Vec::new()),
+                core_object(
+                    &scene.objects[1],
+                    vec![Anchor {
+                        node_index: 2,
+                        target: "t".to_string(),
+                        at: LocalPoint { x: 0, y: 0 },
+                    }],
+                ),
+            ],
+            tags: Vec::new(),
+            selection: ObjectSelection::Canvas,
+            updated_at: String::new(),
+        };
+        let ops = anchor_follow_ops(
+            &core_scene,
+            &[ObjectOp::SetTransform {
+                id: "t".to_string(),
+                transform: Transform3x3::translate(360.0, 0.0),
+            }],
+        );
+        let ObjectOp::EditGeometry { id, geometry } = &ops[0] else {
+            panic!("expected the follow edit-geometry");
+        };
+        assert_eq!(id, "f");
+        assert_eq!(live[0].1, geometry.path_string, "live follower bytes == commit bytes");
+
+        // Rule 5 regression: an INTERIOR-node anchor keeps the legacy splice — only
+        // the bound node rewrites, the endpoints stay (and it still matches commit).
+        let mut interior_scene = scene.clone();
+        interior_scene.objects[1].anchors = vec![endpoint_anchor(1, "t")];
+        let live_interior = reprojected_follower_geometries(
+            &interior_scene,
+            Some(&delta),
+            &[("f".to_string(), "t".to_string())],
+        );
+        assert_eq!(live_interior[0].1, "M 0 0 L 2880 0 L 1600 0");
+    }
+
+    /// v3 §2b: the endpoint-drag live geometry comes from the SAME scene-core
+    /// commit function the release runs (`endpoint_release_ops`), pinned on the
+    /// deform-module vector; non-endpoint targets have no surface.
+    #[test]
+    fn endpoint_preview_geometry_matches_endpoint_release_ops() {
+        let edge = anchored_object("e", None, translate(0.0, 0.0), "M 0 0 L 800 0", Vec::new());
+        let rect = anchored_object("r", None, translate(0.0, 0.0), "M 0 0 L 8 0 L 8 8 L 0 8 Z", Vec::new());
+        let wire = anchored_object("w", None, translate(0.0, 0.0), "M 0 0 L 80 0 L 160 0", Vec::new());
+        let scene = feed_scene(vec![edge, rect, wire]);
+
+        // The deform.rs release vector: node 1 of the 100px edge to world (150,10).
+        assert_eq!(
+            endpoint_preview_geometry(&scene, "e", 1, (150.0, 10.0)),
+            Some("M 0 0 L 1200 80".to_string())
+        );
+        // Dragged back onto the start point: a no-op rewrite restores canonical.
+        assert_eq!(
+            endpoint_preview_geometry(&scene, "e", 1, (100.0, 0.0)),
+            Some("M 0 0 L 800 0".to_string())
+        );
+        // Closed-class, interior nodes, and unknown ids have no endpoint surface.
+        assert!(endpoint_preview_geometry(&scene, "r", 1, (0.0, 0.0)).is_none());
+        assert!(endpoint_preview_geometry(&scene, "w", 1, (50.0, 0.0)).is_none());
+        assert!(endpoint_preview_geometry(&scene, "ghost", 0, (0.0, 0.0)).is_none());
+    }
+
+    /// G14 parity, endpoint flavor: re-expanding the endpoint-preview geometry
+    /// fills the canonical baked ranges exactly (size-safe patch) and the bytes
+    /// equal a FULL rebake of the deformed scene.
+    #[test]
+    fn endpoint_preview_patch_matches_a_full_rebake() {
+        use crate::object_pipeline::{
+            build_scene_geometry_themed, follower_patch_plan, reexpand_single_object,
+        };
+        use crate::object_theme::Theme;
+
+        let mut edge = anchored_object("e", None, translate(0.0, 0.0), "M 0 0 L 800 0", Vec::new());
+        edge.stroke = Some(RStroke {
+            paint: crate::render_object::RPaint::Solid {
+                color: "#00ff00".to_string(),
+            },
+            width: 4.0,
+            opacity: 1.0,
+            dash: Vec::new(),
+            cap: RStrokeCap::Butt,
+            join: RStrokeJoin::Miter,
+        });
+        let scene = feed_scene(vec![edge]);
+        let canonical_build = build_scene_geometry_themed(&scene, Theme::light());
+
+        let deformed_d =
+            endpoint_preview_geometry(&scene, "e", 1, (150.0, 10.0)).expect("deform");
+        let mut deformed_scene = scene.clone();
+        deformed_scene.objects[0].geometry_d = deformed_d;
+        let rebuilt = reexpand_single_object(
+            &deformed_scene.objects[0],
+            Theme::light(),
+            scene.camera.clone(),
+        );
+        let plan = follower_patch_plan(&canonical_build.draws[0], &rebuilt)
+            .expect("an endpoint deform preserves the node count: size-safe");
+        assert_eq!(plan.fill_index_rebase, canonical_build.draws[0].fill_vertex_range.start);
+
+        let full = build_scene_geometry_themed(&deformed_scene, Theme::light());
+        let full_stroke = &full.stroke_vertices[full.draws[0].stroke_range.start as usize
+            ..full.draws[0].stroke_range.end as usize];
+        assert!(!full_stroke.is_empty());
+        assert_eq!(rebuilt.stroke_vertices, full_stroke, "endpoint patch == full rebake");
     }
 }

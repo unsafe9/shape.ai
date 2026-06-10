@@ -115,6 +115,18 @@ export type RustObjectTransformDelta = {
   kind: "translate" | "resize" | "rotate";
 };
 
+// v3 §2b: a live endpoint-drag sample for an OPEN-CLASS selection. `nodeIndex` is
+// the dragged endpoint in geometry PAIR space (0 | last — the same space anchors
+// and scene-core `endpoint_release_ops` address); (x, y) is the cumulative pointer
+// WORLD position. The shell live-previews via `setObjectEndpointPreview` and
+// commits one undoable batch on release (`endpoint_release_ops`, rebind/unbind).
+export type RustObjectEndpointDelta = {
+  id: string;
+  nodeIndex: number;
+  x: number;
+  y: number;
+};
+
 export type RustInputBatchResult = {
   camera: CameraState;
   hit: RustHitResult | null;
@@ -128,6 +140,9 @@ export type RustInputBatchResult = {
   // is loaded and the matching event occurred.
   objectSelection?: string | null;
   objectTransformDelta?: RustObjectTransformDelta | null;
+  // v3 §2b: non-null only on a move during an endpoint drag (open-class
+  // selection). Optional so a wasm build predating it still typechecks.
+  objectEndpointDelta?: RustObjectEndpointDelta | null;
   objectMarqueeIds?: string[] | null;
   // RA2b: a double-click that landed on an object. null (or absent) when the
   // double-click missed every object; `hasChildren` lets the shell drill into a
@@ -216,6 +231,14 @@ export type RustWebGpuRenderer = {
   // the host feature-detects before calling.
   setObjectPreviewTransform?(id: string, matrixJson: string): void;
   clearObjectPreview?(id: string): void;
+  // v3 §2b endpoint drag: `setObjectEndpointPreview` chord-deforms ONE open-class
+  // object's geometry so its dragged endpoint (`nodeIndex`, pair space: 0 | last)
+  // lands on the live pointer WORLD position — the G14 single-object
+  // reexpand+patch path, scene-core `deform_open_path` math (same as the release
+  // commit). `clearObjectEndpointPreview` restores the canonical baked geometry.
+  // Optional so a wasm build predating these stays valid.
+  setObjectEndpointPreview?(id: string, nodeIndex: number, worldX: number, worldY: number): void;
+  clearObjectEndpointPreview?(id: string): void;
   inputBatch(eventsJson: string): RustInputBatchResult;
   overlayRequest(cardId: string, field: string): DomOverlayRequest | null;
   debugSnapshot(): RustDebugSnapshot;

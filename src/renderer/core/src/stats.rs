@@ -148,6 +148,24 @@ pub struct ObjectTransformDelta {
     pub kind: &'static str,
 }
 
+/// Anchor-semantics v3 §2b: a live endpoint-drag sample for an OPEN-CLASS
+/// selection. `node_index` is the dragged endpoint in geometry PAIR space (0 or
+/// the LAST coordinate pair — the same space anchors and scene-core
+/// `endpoint_release_ops` address); `(x, y)` is the cumulative pointer WORLD
+/// position. The shell drives the live chord-deform preview
+/// (`setObjectEndpointPreview`) per sample and commits ONE undoable batch on
+/// release via scene-core `endpoint_release_ops` (rebind/unbind included); the
+/// renderer never mutates the geometry itself.
+#[cfg(feature = "wgpu-probe")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectEndpointDelta {
+    pub id: String,
+    pub node_index: i32,
+    pub x: f64,
+    pub y: f64,
+}
+
 /// RA2b (D6 Figma hierarchy): result of a double-click that hit an object. The
 /// shell branches on `has_children`: `true` => the object is a container, so drill
 /// in (set it as the active container, AP3); `false` => it is a leaf, so enter
@@ -189,6 +207,10 @@ pub struct CoreInputBatchResult {
     // and the corresponding event occurred. The legacy fields above stay populated.
     pub object_selection: Option<String>,
     pub object_transform_delta: Option<ObjectTransformDelta>,
+    // v3 §2b: a live endpoint-drag sample (open-class selections only), emitted
+    // from the same place as `object_transform_delta` but as its own field — an
+    // endpoint drag moves ONE endpoint (chord deform), not the whole transform.
+    pub object_endpoint_delta: Option<ObjectEndpointDelta>,
     pub object_marquee_ids: Option<Vec<String>>,
     // RA2b: non-null only when a double-click hit an object. `has_children`
     // discriminates the shell branch (drill-in vs text-edit).

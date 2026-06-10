@@ -59,6 +59,7 @@ impl ShapeWebGpuRenderer {
             marquee,
             object_selection: object_out.selection,
             object_transform_delta: object_out.transform_delta,
+            object_endpoint_delta: object_out.endpoint_delta,
             object_marquee_ids: object_out.marquee_ids,
             object_double_click: object_out.double_click,
             hover_affordance: object_out

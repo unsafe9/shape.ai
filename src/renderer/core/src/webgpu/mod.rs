@@ -34,8 +34,8 @@ use crate::render_object::RenderObjectScene;
 use crate::serde_wasm;
 use crate::stats::{
     CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreOverlayRequest, CoreOverlayStyle,
-    CoreOverlayTarget, ObjectDoubleClick, ObjectTransformDelta, WebGpuDebugSnapshot,
-    WebGpuFrameStats, WebGpuProbeReport,
+    CoreOverlayTarget, ObjectDoubleClick, ObjectEndpointDelta, ObjectTransformDelta,
+    WebGpuDebugSnapshot, WebGpuFrameStats, WebGpuProbeReport,
 };
 use crate::text::{
     CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_HEIGHT,
@@ -77,6 +77,22 @@ pub(crate) struct ObjectRegion {
     /// (line/freehand stroke). The nearest-point query (anchor snapping) includes
     /// the implicit closing edge only for closed shapes; hit-test/marquee ignore it.
     closed: bool,
+    /// Anchor-semantics v3 §2b: the OPEN-CLASS endpoint pair (scene-core
+    /// `is_open_class_d` + pair-space `local_nodes`), derived once per feed.
+    /// `Some` switches the selection surface to two endpoint handles (no bbox
+    /// 8-handle/rotate); `None` keeps the closed-class surface.
+    open_endpoints: Option<OpenEndpoints>,
+}
+
+/// v3 §2b: an open-class region's endpoints in OBJECT-LOCAL px, plus the END
+/// node's geometry PAIR index (node 0 is always pair 0) — the same pair space
+/// anchors and scene-core `endpoint_release_ops` address.
+#[cfg(feature = "wgpu-probe")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OpenEndpoints {
+    start: (f64, f64),
+    end: (f64, f64),
+    last_index: i32,
 }
 
 /// FC-07: per-batch accumulator for the object-path input results, threaded through
@@ -87,6 +103,10 @@ pub(crate) struct ObjectRegion {
 pub(crate) struct ObjectInputOut {
     selection: Option<String>,
     transform_delta: Option<ObjectTransformDelta>,
+    // v3 §2b: a live endpoint-drag sample (open-class selection), emitted from the
+    // same move handler as `transform_delta` but as its own signal — one endpoint
+    // moves (chord deform), not the whole transform.
+    endpoint_delta: Option<ObjectEndpointDelta>,
     marquee_ids: Option<Vec<String>>,
     // W2-02: hover affordance for the shell's cursor, set on a no-button move.
     // `None` outside object mode / when no hover move occurred in the batch.
@@ -280,6 +300,16 @@ pub(crate) enum InputDragState {
         start: WorldPoint,
         center: WorldPoint,
     },
+    // v3 §2b: dragging an OPEN-CLASS selection's endpoint handle. `node_index` is
+    // the endpoint's geometry PAIR index (0 | last). Each move emits a cumulative
+    // world-position `ObjectEndpointDelta`; the shell previews the chord deform
+    // live and commits once on release (`endpoint_release_ops`, rebind/unbind
+    // included) — the renderer never mutates the geometry.
+    Endpoint {
+        pointer_id: i32,
+        object_id: String,
+        node_index: i32,
+    },
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -368,6 +398,16 @@ pub struct ShapeWebGpuRenderer {
     // None the legacy 2D path stays authoritative.
     object_scene: Option<RenderObjectScene>,
     object_regions: Vec<ObjectRegion>,
+    // v3 §2b/§3: ids whose GPU-baked GEOMETRY currently deviates from canonical
+    // because a live chord deform patched it (a non-translate preview on an
+    // open-class moved member, or an endpoint drag). GPU-only transient state,
+    // like the instance-matrix previews: the next preview frame / `clearObjectPreview`
+    // / `clearObjectEndpointPreview` re-expands the canonical geometry back in
+    // (never rolled back — rollback leaves GPU previews alone too).
+    preview_deformed: std::collections::HashSet<String>,
+    // v3 §2b: the live endpoint-drag sample `(id, pair index, world point)`, held so
+    // the endpoint-handle overlay rides the pointer while the geometry patch lands.
+    endpoint_preview: Option<(String, i32, WorldPoint)>,
     // W3-G9/#5: the move-together propagation graph (parent->child SameDelta +
     // target->follower Reproject), built ONCE per `load_object_scene` from the
     // parsed scene and held here so a per-drag preview is O(closure), never

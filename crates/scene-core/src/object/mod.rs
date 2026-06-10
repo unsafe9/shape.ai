@@ -37,7 +37,9 @@ pub mod theme;
 pub mod undo;
 pub mod validate;
 
-pub use anchor_follow::{anchor_follow_ops, reproject_geometry_node, synthesize_create_anchors};
+pub use anchor_follow::{
+    anchor_follow_ops, local_nodes, reproject_geometry_node, synthesize_create_anchors,
+};
 pub use move_together::{BindingGraph, BindingNode, PropEdge, PropKind};
 pub use anchors::{connection_graph, neighbors, reproject_object_anchors, resolve_endpoint};
 pub use cascade::{cascade_multi_transform_ops, cascade_transform_ops, move_ops, MoveRoots};
