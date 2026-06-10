@@ -97,8 +97,10 @@ impl BindingGraph {
     /// descendant of another root appears ONCE), with the roots in input order and
     /// each root's whole subtree expanded parent-before-child BEFORE the next root —
     /// matching `cascadeMultiTransformOps` (per-root cascade, then union/dedup).
-    /// `reproject` is deduped by follower id (a follower anchored to two moved
-    /// targets reprojects once, against the first-seen moved target).
+    /// `reproject` is deduped by the `(follower, target)` PAIR (W3-G13): a follower
+    /// anchored to two moved targets yields one pair PER moved target (each bound
+    /// node reprojects through its own target), while duplicate anchors onto the
+    /// same target still collapse to one pair.
     pub fn propagation_closure(&self, roots: &[String]) -> (Vec<String>, Vec<(String, String)>) {
         let mut same_delta: Vec<String> = Vec::new();
         // Expand one root's full subtree before the next root, so the order matches
@@ -132,11 +134,15 @@ impl BindingGraph {
                     continue;
                 }
                 // A follower that is itself in the moved set rides the same delta and
-                // needs no separate reproject; and each follower reprojects once.
+                // needs no separate reproject; and each (follower, target) pair
+                // reprojects once (W3-G13).
                 if same_delta.iter().any(|seen| seen == &edge.id) {
                     continue;
                 }
-                if reproject.iter().any(|(follower, _)| follower == &edge.id) {
+                if reproject
+                    .iter()
+                    .any(|(follower, target)| follower == &edge.id && target == moved)
+                {
                     continue;
                 }
                 reproject.push((edge.id.clone(), moved.clone()));
@@ -232,6 +238,37 @@ mod tests {
         let (same_delta, reproject) = graph.propagation_closure(&["a".to_string()]);
         assert_eq!(same_delta, vec!["a", "b"]);
         assert_eq!(reproject, vec![("f".to_string(), "b".to_string())]);
+    }
+
+    // W3-G13 (RED before pair dedup): a follower anchored to TWO moved targets
+    // yields one pair PER target, so BOTH anchored nodes reproject in the live
+    // preview — the old follower-id dedup dropped the second target's pair.
+    #[test]
+    fn follower_anchored_to_two_moved_targets_pairs_with_each() {
+        let graph = BindingGraph::build(&[
+            node("a", None, Vec::new()),
+            node("b", None, Vec::new()),
+            node("f", None, vec!["a", "b"]),
+        ]);
+        let (same_delta, reproject) =
+            graph.propagation_closure(&["a".to_string(), "b".to_string()]);
+        assert_eq!(same_delta, vec!["a", "b"]);
+        assert_eq!(
+            reproject,
+            vec![("f".to_string(), "a".to_string()), ("f".to_string(), "b".to_string())]
+        );
+    }
+
+    // W3-G13: two anchors onto the SAME target are one `(follower, target)` pair —
+    // the pair dedup still collapses duplicates.
+    #[test]
+    fn duplicate_anchors_onto_one_target_collapse_to_one_pair() {
+        let graph = BindingGraph::build(&[
+            node("a", None, Vec::new()),
+            node("f", None, vec!["a", "a"]),
+        ]);
+        let (_, reproject) = graph.propagation_closure(&["a".to_string()]);
+        assert_eq!(reproject, vec![("f".to_string(), "a".to_string())]);
     }
 
     #[test]

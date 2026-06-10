@@ -221,6 +221,12 @@ fn reproject_node_local_quantized(
 /// returning the updated geometry — or `None` when the rewrite is a no-op (the
 /// node already sits where the target puts it) or the node is unaddressable.
 /// Mirrors the shell `reprojectAnchoredGeometry`.
+///
+/// W3-G13: the commit path ([`anchor_follow_ops`]) now folds EVERY moved-target
+/// anchor into one cumulative rewrite via the same two helpers; this single-anchor
+/// wrapper survives only as the cross-core pin's entry point
+/// (`reproject_matches_cross_core_vector`), hence test-only.
+#[cfg(test)]
 fn reproject_anchored_geometry(
     follower: &Object,
     anchor: &Anchor,
@@ -243,7 +249,7 @@ fn reproject_anchored_geometry(
 /// (the same `(target_base, delta)` shape its instance-matrix preview writes), so
 /// this composes `delta * target_transform` to form the target's NEW transform
 /// before the reproject, then drives the SAME two helpers the commit path's
-/// [`reproject_anchored_geometry`] uses ([`reproject_node_local_quantized`] +
+/// [`anchor_follow_ops`] uses ([`reproject_node_local_quantized`] +
 /// [`set_path_node`]). Sharing those helpers is what makes the renderer preview and
 /// the committed move byte-equivalent (pinned by `reproject_matches_cross_core_vector`).
 ///
@@ -263,45 +269,69 @@ pub fn reproject_geometry_node(
 }
 
 /// The `edit-geometry` ops a committed move produces so anchored objects follow
-/// their target. `transform_ops` are the move's `set-transform` ops (each a moved
-/// id + its NEW transform); for every moved object, each scene object anchored to
-/// it has its bound node reprojected through that NEW transform.
+/// their targets. `transform_ops` are the move's `set-transform` ops (each a moved
+/// id + its NEW transform); every follower anchor whose target moved reprojects
+/// through that target's NEW transform.
+///
+/// W3-G13: ONE cumulative `edit-geometry` per follower — each follower starts from
+/// its base path-string and folds in EVERY moved-target anchor (two anchors onto
+/// one moved target, or anchors onto two different moved targets, land in the SAME
+/// op), so a later rewrite can never stomp an earlier one when the Batch applies
+/// sequentially. Ops come out in scene-object (follower) order.
 ///
 /// A follower that is itself in the moved set is skipped (it rides its own
 /// transform), and an object anchored to nothing moved authors nothing — so an
 /// unanchored (Alt-created) move stays a no-op. The whole batch is returned in ONE
 /// call (the shell batches it). Mirrors the shell `anchorFollowOps`.
 pub fn anchor_follow_ops(scene: &ObjectScene, transform_ops: &[ObjectOp]) -> Vec<ObjectOp> {
-    let mut moved_ids: Vec<&str> = Vec::new();
+    // The moved set: each id paired with its NEW transform, last write winning (a
+    // Batch applies sequentially). A moved id absent from the scene anchors nothing
+    // (the shell's `find` miss is a continue).
+    let mut moved: Vec<(&str, &Transform3x3)> = Vec::new();
     for op in transform_ops {
-        if let ObjectOp::SetTransform { id, .. } = op {
-            moved_ids.push(id.as_str());
+        if let ObjectOp::SetTransform { id, transform } = op {
+            if scene.get(id).is_none() {
+                continue;
+            }
+            if let Some(entry) = moved.iter_mut().find(|(mid, _)| *mid == id.as_str()) {
+                entry.1 = transform;
+            } else {
+                moved.push((id.as_str(), transform));
+            }
         }
     }
     let mut ops = Vec::new();
-    for op in transform_ops {
-        let ObjectOp::SetTransform { id, transform } = op else {
-            continue;
-        };
-        // The moved target must exist in the scene to anchor against; if it does
-        // not the move authors nothing (the shell's `find` miss is a continue).
-        if scene.get(id).is_none() {
+    for follower in &scene.objects {
+        if moved.iter().any(|(id, _)| *id == follower.id) || follower.anchors.is_empty() {
             continue;
         }
-        for follower in &scene.objects {
-            if moved_ids.contains(&follower.id.as_str()) || follower.anchors.is_empty() {
-                continue;
-            }
-            let Some(anchor) = follower.anchors.iter().find(|a| a.target == *id) else {
+        let base = &follower.geometry.path_string;
+        // `Some` once any anchor's rewrite landed; later anchors fold into it.
+        let mut rewritten: Option<String> = None;
+        for anchor in &follower.anchors {
+            let Some((_, target_new)) = moved.iter().find(|(id, _)| *id == anchor.target) else {
                 continue;
             };
-            if let Some(geometry) = reproject_anchored_geometry(follower, anchor, transform) {
-                ops.push(ObjectOp::EditGeometry {
-                    id: follower.id.clone(),
-                    geometry,
-                });
+            let (qx, qy) =
+                reproject_node_local_quantized(&follower.transform, target_new, anchor.at);
+            let current = rewritten.as_deref().unwrap_or(base);
+            if let Some(d) = set_path_node(current, anchor.node_index, qx, qy) {
+                rewritten = Some(d);
             }
         }
+        // Author only when the cumulative result differs from the base — the
+        // no-op-authors-nothing contract.
+        let Some(d) = rewritten.filter(|d| d != base) else {
+            continue;
+        };
+        ops.push(ObjectOp::EditGeometry {
+            id: follower.id.clone(),
+            geometry: Geometry {
+                path_string: d,
+                fill_rule: follower.geometry.fill_rule,
+                subpaths: Vec::new(),
+            },
+        });
     }
     ops
 }
@@ -471,6 +501,85 @@ mod tests {
             "a follower moved in the same batch is not separately reprojected"
         );
         assert!(ops.is_empty(), "the only anchored follower is itself moved => no ops");
+    }
+
+    // W3-G13 (RED before the cumulative rewrite): TWO anchors onto the SAME moved
+    // target land in ONE edit-geometry with BOTH nodes rewritten — the old
+    // first-anchor `find` dropped the second bound node.
+    #[test]
+    fn two_anchors_to_one_moved_target_author_one_cumulative_edit() {
+        let target = line("rect-a", 0, 0, 200.0, 0.0);
+        // Both endpoints anchored to rect-a: node 0 at world (200,0), node 1 at
+        // world (200,30) (target-local (0,0) and (0,30) px).
+        let mut follower = Object::new("edge-1", "a1", polyline("M 1600 0 L 1600 240"));
+        follower.transform = Transform3x3::IDENTITY;
+        follower.anchors = vec![
+            Anchor { node_index: 0, target: "rect-a".into(), at: LocalPoint { x: 0, y: 0 } },
+            Anchor { node_index: 1, target: "rect-a".into(), at: LocalPoint { x: 0, y: 30 * Q } },
+        ];
+        let scene = scene_of(vec![target, follower]);
+        let ops = anchor_follow_ops(&scene, &[move_op("rect-a", translate(250.0, 20.0))]);
+        assert_eq!(ops.len(), 1, "one cumulative follow op");
+        let ObjectOp::EditGeometry { id, geometry } = &ops[0] else {
+            panic!("expected edit-geometry");
+        };
+        assert_eq!(id, "edge-1");
+        // Target new transform translate(250,20): node 0 -> world (250,20) ->
+        // quantized (2000,160); node 1 -> world (250,50) -> quantized (2000,400).
+        assert_eq!(geometry.path_string, "M 2000 160 L 2000 400");
+    }
+
+    // W3-G13 (RED before the cumulative rewrite): a follower anchored to two
+    // DIFFERENT targets, both moved in one batch, authors ONE edit-geometry with
+    // both nodes rewritten — the old per-target ops each started from the BASE
+    // geometry, so the second op stomped the first node rewrite on apply.
+    #[test]
+    fn anchors_to_two_moved_targets_author_one_cumulative_edit() {
+        let a = line("rect-a", 0, 0, 100.0, 0.0);
+        let b = line("rect-b", 0, 0, 300.0, 0.0);
+        // Node 0 anchored to rect-a at world (100,0); node 1 to rect-b at (300,0).
+        let mut follower = Object::new("edge-1", "a1", polyline("M 800 0 L 2400 0"));
+        follower.transform = Transform3x3::IDENTITY;
+        follower.anchors = vec![
+            Anchor { node_index: 0, target: "rect-a".into(), at: LocalPoint { x: 0, y: 0 } },
+            Anchor { node_index: 1, target: "rect-b".into(), at: LocalPoint { x: 0, y: 0 } },
+        ];
+        let scene = scene_of(vec![a, b, follower]);
+        let ops = anchor_follow_ops(
+            &scene,
+            &[move_op("rect-a", translate(110.0, 5.0)), move_op("rect-b", translate(310.0, 7.0))],
+        );
+        assert_eq!(ops.len(), 1, "one cumulative op, not one per moved target");
+        let ObjectOp::EditGeometry { id, geometry } = &ops[0] else {
+            panic!("expected edit-geometry");
+        };
+        assert_eq!(id, "edge-1");
+        // Node 0 -> world (110,5) -> quantized (880,40); node 1 -> world (310,7)
+        // -> quantized (2480,56). BOTH survive in the one op.
+        assert_eq!(geometry.path_string, "M 880 40 L 2480 56");
+    }
+
+    // W3-G13: with two different targets but only ONE moved, only its bound node
+    // rewrites; the other node stays byte-identical to the base.
+    #[test]
+    fn only_the_moved_target_node_is_rewritten() {
+        let a = line("rect-a", 0, 0, 100.0, 0.0);
+        let b = line("rect-b", 0, 0, 300.0, 0.0);
+        let mut follower = Object::new("edge-1", "a1", polyline("M 800 0 L 2400 0"));
+        follower.transform = Transform3x3::IDENTITY;
+        follower.anchors = vec![
+            Anchor { node_index: 0, target: "rect-a".into(), at: LocalPoint { x: 0, y: 0 } },
+            Anchor { node_index: 1, target: "rect-b".into(), at: LocalPoint { x: 0, y: 0 } },
+        ];
+        let scene = scene_of(vec![a, b, follower]);
+        let ops = anchor_follow_ops(&scene, &[move_op("rect-a", translate(110.0, 5.0))]);
+        assert_eq!(ops.len(), 1, "one follow op for the one moved target");
+        let ObjectOp::EditGeometry { id, geometry } = &ops[0] else {
+            panic!("expected edit-geometry");
+        };
+        assert_eq!(id, "edge-1");
+        // Node 0 follows rect-a; node 1 (anchored to unmoved rect-b) is untouched.
+        assert_eq!(geometry.path_string, "M 880 40 L 2400 0");
     }
 
     // (e) synthesize round-trip: a snapped create yields an Anchor whose `at` maps
