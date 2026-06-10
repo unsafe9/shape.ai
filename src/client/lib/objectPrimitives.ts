@@ -49,6 +49,13 @@ export type CreateSnap = { at: { x: number; y: number }; target: string };
 // this is wider. Caller divides by zoom to get world units.
 export const CREATE_ANCHOR_REUSE_TOLERANCE_PX = 24;
 
+// v3 §4 multi-stroke merge: screen-px radius within which a freehand release
+// END landing on an existing open-class object's ENDPOINT merges the stroke
+// into that object instead of inserting it. Caller divides by zoom to get the
+// world units the core's merge_open_stroke_ops takes (the same convention as
+// CREATE_ANCHOR_REUSE_TOLERANCE_PX); the judgment itself lives in the core.
+export const MERGE_ENDPOINT_TOLERANCE_PX = 12;
+
 // AP5/#4: resolve a shape drag-create RELEASE to its final endpoint + anchor target.
 // When the release itself snapped, honor it. Otherwise, when the release landed
 // within `reuseTolerance` (WORLD units) of the gesture's last snap, reuse that snap

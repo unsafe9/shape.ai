@@ -61,7 +61,8 @@ pub fn is_open_class_d(d: &str) -> bool {
 /// Round a deformed coordinate back to a quantized i32 unit (clamp into i32
 /// range; NaN maps to 0) — the same provably-safe narrowing as
 /// `drawing::quantize_px`, minus the px→unit scale (inputs are already units).
-fn round_unit(v: f64) -> i32 {
+/// Shared (`pub(super)`) with the multi-stroke merge's world→local rewrite.
+pub(super) fn round_unit(v: f64) -> i32 {
     if v.is_nan() {
         return 0;
     }

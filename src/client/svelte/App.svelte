@@ -47,7 +47,8 @@
     altDetachOps,
     resolveCreateRelease,
     synthesizeReleaseAnchors,
-    CREATE_ANCHOR_REUSE_TOLERANCE_PX
+    CREATE_ANCHOR_REUSE_TOLERANCE_PX,
+    MERGE_ENDPOINT_TOLERANCE_PX
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import Toolbar from "./Toolbar.svelte";
@@ -921,6 +922,24 @@
     const points = [...drawPoints, resolved.end];
     drawPoints = null;
     if (points.length < 2 || !sceneCore) return;
+    // v3 §4 multi-stroke merge — PRIORITY over insert + release anchoring: a
+    // stroke end landing on an existing open-class object's endpoint chains the
+    // stroke into that object (edit-geometry batch on the survivor, no insert,
+    // anchor authoring skipped). Every judgment (recognition, candidate match,
+    // chaining, re-recognition) lives in the core; the shell only branches on
+    // the returned ops. Null = no merge, the existing path below runs unchanged.
+    const mergeOps = sceneCore.mergeOpenStrokeOps(
+      scene,
+      points,
+      freeRecognition ? "free" : "basic",
+      MERGE_ENDPOINT_TOLERANCE_PX / camera.zoom
+    );
+    if (mergeOps && mergeOps.length > 0) {
+      authorOp(mergeOps.length === 1 ? mergeOps[0] : { kind: "batch", ops: mergeOps });
+      const survivor = mergeOps.find((op) => op.kind === "edit-geometry");
+      if (survivor && survivor.kind === "edit-geometry") selectObject({ kind: "object", id: survivor.id });
+      return;
+    }
     // S2 (#5): freehandToObject is a hex API, so the theme-default sentinel can't be
     // passed through it — lower with a placeholder hex, then swap the stroke paint to
     // the "text" token so the stroke flips with the theme like every other authored color.

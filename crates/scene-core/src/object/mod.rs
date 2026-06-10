@@ -14,6 +14,7 @@
 //! - [`commands`] — object command catalog (OB3.S9).
 //! - [`deform`] — open-class classification + chord-similarity deform (anchor-semantics v3 §2a).
 //! - [`recognize`] — pen-up stroke recognition (anchor-semantics v3 §4).
+//! - [`merge`] — multi-stroke endpoint merge into open-class paths (v3 §4).
 //! - [`gestures`] — hold-key gesture catalog (W3-C2).
 //! - [`layout_solve`] — thin auto-layout solve (OB3.A1/D3).
 //! - [`validate`] — pure structural validators (OB3.S2).
@@ -28,6 +29,7 @@ pub mod drawing;
 pub mod gestures;
 pub mod grouping;
 pub mod layout_solve;
+pub mod merge;
 pub mod model;
 pub mod move_together;
 pub mod op;
@@ -54,6 +56,7 @@ pub use deform::{
     open_endpoint_pins, route_open_endpoints, EndpointRoute,
 };
 pub use drawing::{fit_beziers, pressure_to_width, rdp_simplify, Brush};
+pub use merge::merge_open_stroke_ops;
 pub use recognize::{recognize_stroke, recognize_stroke_object, RecognizeMode, RecognizedStroke};
 pub use gestures::{
     object_gesture_catalog, object_gesture_catalog_json, HoldInput, HoldTrigger, ObjectGesture,

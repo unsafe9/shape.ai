@@ -65,6 +65,7 @@ use crate::object::grouping::{
     double_click_action as double_click_action_pure, has_children as has_children_pure,
     pop_out_op as pop_out_op_pure, ungroup_enabled as ungroup_enabled_pure,
 };
+use crate::object::merge::merge_open_stroke_ops as merge_open_stroke_ops_pure;
 use crate::object::model::{Geometry, Object, ObjectScene};
 use crate::object::op::ObjectOp;
 use crate::object::primitives::{
@@ -223,6 +224,41 @@ pub fn freehand_to_object(
         order.to_string(),
     );
     ok_json(&object)
+}
+
+/// `merge_open_stroke_ops(scene_json, points_json, mode, tolerance_px)
+/// -> ObjectOp[] | null | {error}`.
+///
+/// Multi-stroke endpoint merge (anchor-semantics v3 §4 follow-up): the ops
+/// merging a released freehand stroke (`points_json`, a JSON array of `[x, y]`
+/// world-px samples) into the open-class object(s) whose endpoint(s) its ends
+/// landed within `tolerance_px` (WORLD px — the shell converts its screen-px
+/// constant through the zoom) — one `edit-geometry` on the survivor plus the
+/// anchor release / absorbed-object delete, batch-ready. `null` = no merge
+/// (no endpoint hit, or the stroke recognizes closed by itself): the shell
+/// keeps its existing insert + release-anchoring path.
+#[wasm_bindgen]
+pub fn merge_open_stroke_ops(
+    scene_json: &str,
+    points_json: &str,
+    mode: &str,
+    tolerance_px: f64,
+) -> String {
+    let mode = match mode {
+        "basic" => RecognizeMode::Basic,
+        "free" => RecognizeMode::Free,
+        _ => return error_json("mode must be \"basic\" or \"free\""),
+    };
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let points: Vec<[f64; 2]> = match parse("points", points_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let pts: Vec<(f64, f64)> = points.iter().map(|p| (p[0], p[1])).collect();
+    ok_json(&merge_open_stroke_ops_pure(&scene, &pts, mode, tolerance_px))
 }
 
 /// `split_subpath_at(geometry_json, x, y, radius) -> Geometry | {error}`.
@@ -706,6 +742,22 @@ mod tests {
     fn freehand_rejects_too_few_points() {
         let json = freehand_to_object("[[0,0]]", "#000000", 1.0, "d", "a0", "basic");
         assert!(json.contains("\"error\""), "single point is an error");
+    }
+
+    #[test]
+    fn merge_open_stroke_ops_bridges_ops_or_null() {
+        // A scene with one open line (0,0)->(100,0)px: a stroke released ON its
+        // end merges (an edit-geometry batch, no insert); one far away is null.
+        let scene = r#"{"sceneVersion":1,"objects":[{"id":"seg","order":"a0","geometry":{"d":"M 0 0 L 800 0"}}],"tags":[],"selection":{"kind":"canvas"},"updatedAt":""}"#;
+        let merged =
+            merge_open_stroke_ops(scene, "[[101,1],[150,0],[200,0]]", "basic", 12.0);
+        let ops: Vec<ObjectOp> = serde_json::from_str(&merged).expect("merge returns ops");
+        assert_eq!(ops.len(), 1, "{merged}");
+        assert!(matches!(&ops[0], ObjectOp::EditGeometry { id, .. } if id == "seg"));
+        let far = merge_open_stroke_ops(scene, "[[500,500],[600,500]]", "basic", 12.0);
+        assert_eq!(far, "null", "no endpoint hit = no merge");
+        let bad = merge_open_stroke_ops(scene, "[[0,0],[1,1]]", "diagonal", 12.0);
+        assert!(bad.contains("\"error\""), "unknown mode is an error");
     }
 
     #[test]

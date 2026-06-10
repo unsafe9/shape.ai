@@ -140,6 +140,12 @@ type SceneCoreModule = {
   ) => string;
   build_set_style_op: (objectJson: string, color: string) => string;
   is_open_class_d: (d: string) => string;
+  merge_open_stroke_ops: (
+    sceneJson: string,
+    pointsJson: string,
+    mode: string,
+    tolerancePx: number
+  ) => string;
   split_subpath_at: (geometryJson: string, x: number, y: number, radius: number) => string;
   anchor_follow_ops: (sceneJson: string, transformOpsJson: string) => string;
   move_ops: (sceneJson: string, rootsJson: string, deltaJson: string) => string;
@@ -268,6 +274,19 @@ export type SceneCore = {
    *  shell branches (Alt-detach, fill-vs-stroke routing) consult THE core
    *  classifier instead of re-parsing geometry in TS. */
   isOpenClassD(d: string): boolean;
+  /** v3 §4 multi-stroke merge: the ops merging a released freehand stroke
+   *  (world-px points) into the open-class object(s) whose endpoint(s) its
+   *  ends landed within `tolerancePx` (WORLD px — divide the screen-px
+   *  constant by the zoom) — one `edit-geometry` on the survivor plus the
+   *  anchor release / absorbed-object delete, batch-ready, never an insert.
+   *  Null = no merge: the shell keeps its existing insert + release-anchoring
+   *  path. Merge takes priority over release-anchor authoring. */
+  mergeOpenStrokeOps(
+    scene: ObjectScene,
+    points: { x: number; y: number }[],
+    mode: RecognizeMode,
+    tolerancePx: number
+  ): ObjectOp[] | null;
   /** W2-08: partial erase — cut a stroke's geometry at an object-local quantized
    *  touch point + radius. Returns the new geometry (two open subpaths around the
    *  removed node), or null when the touch missed every node (nothing to cut). */
@@ -470,6 +489,17 @@ export async function loadSceneCore(): Promise<SceneCore> {
     },
     isOpenClassD(d) {
       return parseBridge<boolean>("is_open_class_d", mod.is_open_class_d(d));
+    },
+    mergeOpenStrokeOps(scene, points, mode, tolerancePx) {
+      return parseBridge<ObjectOp[] | null>(
+        "merge_open_stroke_ops",
+        mod.merge_open_stroke_ops(
+          JSON.stringify(scene),
+          JSON.stringify(points.map((p) => [p.x, p.y])),
+          mode,
+          tolerancePx
+        )
+      );
     },
     splitSubpathAt(geometry, x, y, radius) {
       // A missed touch comes back as `{error}` (nothing to cut); treat that as a
