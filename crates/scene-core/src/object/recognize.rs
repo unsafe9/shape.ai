@@ -6,9 +6,11 @@
 //! a recognized rect and a recognized line have no reason to share an object).
 //!
 //! Pipeline ([`recognize_stroke`]):
-//!   1. closure test — overshoot trim first ([`trim_overshoot`]: a tail that
-//!      crosses back over the head closes at the crossing, dangles dropped),
-//!      else `dist(start, end) < CLOSE_RATIO · bbox diagonal`.
+//!   1. closure test — trim ladder first ([`trim_overshoot`]: a tail that
+//!      crosses back over the head closes at the crossing, and a near-miss
+//!      T-junction — an endpoint almost touching the far end's segments —
+//!      closes at its projection; dangles dropped either way), else
+//!      `dist(start, end) < CLOSE_RATIO · bbox diagonal`.
 //!   2. canonical fits, adopted when the confidence threshold passes:
 //!      open   → straight line (max perpendicular deviation / chord ratio);
 //!      closed → circle/ellipse (least-squares radial residual against the
@@ -49,6 +51,12 @@ const OVERSHOOT_MAX_DANGLE_RATIO: f64 = 0.25;
 /// Segments closer than this many indices never count as a crossing: adjacent
 /// segments share an endpoint and would "intersect" there.
 const OVERSHOOT_MIN_INDEX_GAP: usize = 2;
+/// Near-miss T-junction: an endpoint whose projection onto a window segment
+/// falls within this fraction of the bbox diagonal counts as touching the
+/// stroke (a final edge ENDING on the first edge without crossing it)…
+const NEAR_JUNCTION_RATIO: f64 = 0.06;
+/// …floored at this many px so tiny strokes can still near-miss close.
+const MIN_NEAR_JUNCTION_PX: f64 = 4.0;
 /// Straight-line confidence: max perpendicular deviation / chord length.
 const LINE_MAX_DEV_RATIO: f64 = 0.05;
 /// Ellipse confidence: RMS of the normalized radial residual (|p−c| in
@@ -166,30 +174,53 @@ fn bbox(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
 }
 
 // ---------------------------------------------------------------------------
-// Overshoot trim (cross-closure).
+// Closure ladder (cross-closure + near-miss T-junction).
 // ---------------------------------------------------------------------------
 
-/// Pre-closure overshoot trim: a stroke whose tail crosses back over its head
-/// (a hand-drawn triangle overshooting its start) closes at the crossing X,
-/// not at the pen-up gap — without this the crossed tail survives as a spur.
-/// Tail segments scan end-inward against head segments start-outward, both
-/// within [`OVERSHOOT_WINDOW_RATIO`] of the arc; a crossing trims only when
-/// both dangles stay under [`OVERSHOOT_MAX_DANGLE_RATIO`], yielding the loop
-/// that starts at X (the dangles dropped). `None` = unchanged (the gap-based
-/// closure test decides as before).
+/// Pre-closure trim ladder, tried in order; `None` = unchanged (the gap-based
+/// closure test decides as before):
+///   (a) [`trim_crossing`] — the tail crosses back over the head exactly;
+///   (b) [`trim_near_junction`] — the pen-up END lands ON a head segment
+///       without crossing it (a near-miss T-junction);
+///   (c) the symmetric START-onto-tail case — (b) on the reversed stroke.
 fn trim_overshoot(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
-    let n = points.len();
-    if n < 4 {
-        return None;
+    if let Some(loop_pts) = trim_crossing(points) {
+        return Some(loop_pts);
     }
-    // cum[k] = arc length from the start to points[k].
-    let mut cum = Vec::with_capacity(n);
+    if let Some(loop_pts) = trim_near_junction(points) {
+        return Some(loop_pts);
+    }
+    let reversed: Vec<(f64, f64)> = points.iter().rev().copied().collect();
+    let mut loop_pts = trim_near_junction(&reversed)?;
+    loop_pts.reverse();
+    Some(loop_pts)
+}
+
+/// `cum[k]` = arc length from the start to `points[k]`, plus the total.
+fn arc_lengths(points: &[(f64, f64)]) -> (Vec<f64>, f64) {
+    let mut cum = Vec::with_capacity(points.len());
     let mut total = 0.0;
     cum.push(0.0);
     for w in points.windows(2) {
         total += (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
         cum.push(total);
     }
+    (cum, total)
+}
+
+/// Cross-closure overshoot trim: a stroke whose tail crosses back over its
+/// head (a hand-drawn triangle overshooting its start) closes at the crossing
+/// X, not at the pen-up gap — without this the crossed tail survives as a
+/// spur. Tail segments scan end-inward against head segments start-outward,
+/// both within [`OVERSHOOT_WINDOW_RATIO`] of the arc; a crossing trims only
+/// when both dangles stay under [`OVERSHOOT_MAX_DANGLE_RATIO`], yielding the
+/// loop that starts at X (the dangles dropped).
+fn trim_crossing(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
+    let n = points.len();
+    if n < 4 {
+        return None;
+    }
+    let (cum, total) = arc_lengths(points);
     if total <= f64::EPSILON {
         return None;
     }
@@ -220,6 +251,64 @@ fn trim_overshoot(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
         }
     }
     None
+}
+
+/// Near-miss T-junction trim: the pen-up END almost touches an early head
+/// segment without crossing it (the browser repro — a rect whose start
+/// dangles left of where the final edge lands on the top edge: no exact
+/// intersection, and the start→end gap fails CLOSE_RATIO because of the
+/// dangle). The nearest projection within [`NEAR_JUNCTION_RATIO`]·diag
+/// (floored at [`MIN_NEAR_JUNCTION_PX`]) becomes the junction X: the head
+/// dangle (start→X) is dropped and END snaps to X — an exactly-closed loop.
+/// Window, dangle, and index-gap rules match [`trim_crossing`].
+fn trim_near_junction(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
+    let n = points.len();
+    if n < 4 {
+        return None;
+    }
+    let (cum, total) = arc_lengths(points);
+    if total <= f64::EPSILON {
+        return None;
+    }
+    let window = OVERSHOOT_WINDOW_RATIO * total;
+    let max_dangle = OVERSHOOT_MAX_DANGLE_RATIO * total;
+    let (min_x, min_y, max_x, max_y) = bbox(points);
+    let tol =
+        (NEAR_JUNCTION_RATIO * (max_x - min_x).hypot(max_y - min_y)).max(MIN_NEAR_JUNCTION_PX);
+    let end = points[n - 1];
+    let mut best: Option<(f64, usize, (f64, f64))> = None;
+    for i in 0..n - 1 {
+        if cum[i] > window || n - 2 - i < OVERSHOOT_MIN_INDEX_GAP {
+            break;
+        }
+        let (x, dist) = project_to_segment(end, points[i], points[i + 1]);
+        if dist >= tol || best.is_some_and(|(d, ..)| dist >= d) {
+            continue;
+        }
+        let head_dangle = cum[i] + (x.0 - points[i].0).hypot(x.1 - points[i].1);
+        if head_dangle < max_dangle {
+            best = Some((dist, i, x));
+        }
+    }
+    let (_, i, x) = best?;
+    let mut loop_pts = Vec::with_capacity(n - i);
+    loop_pts.push(x);
+    loop_pts.extend_from_slice(&points[i + 1..n - 1]);
+    loop_pts.push(x); // END snapped onto the junction.
+    Some(loop_pts)
+}
+
+/// Closest point on segment `a→b` to `p`, with its distance.
+fn project_to_segment(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> ((f64, f64), f64) {
+    let ab = (b.0 - a.0, b.1 - a.1);
+    let len2 = ab.0 * ab.0 + ab.1 * ab.1;
+    let t = if len2 <= f64::EPSILON {
+        0.0
+    } else {
+        (((p.0 - a.0) * ab.0 + (p.1 - a.1) * ab.1) / len2).clamp(0.0, 1.0)
+    };
+    let x = (a.0 + t * ab.0, a.1 + t * ab.1);
+    (x, (p.0 - x.0).hypot(p.1 - x.1))
 }
 
 /// Intersection point of segments `a0→a1` and `b0→b1` (`None` when parallel
@@ -681,6 +770,88 @@ mod tests {
         let pts = vec![(0.0, 0.0), (8.0, 0.0), (8.0, 4.0), (120.0, 4.0)];
         let rec = recognize_stroke(&pts);
         assert!(!rec.closed, "corner touch is not a closure: {}", rec.d);
+    }
+
+    #[test]
+    fn rect_with_start_dangle_and_t_touching_end_closes_at_the_junction() {
+        // The browser repro: the stroke starts on a dangle LEFT of the square
+        // ((-30,0)→(0,0)), walks the perimeter, and the final edge ENDS 3px off
+        // the top edge at (8,3) — a T-junction near-miss with no exact
+        // self-intersection anywhere. The pen-up gap (38.1px) exceeds
+        // CLOSE_RATIO·diag (24.6px) BECAUSE of the dangle, so without the
+        // projection rung this survives as an open path. The near-junction rung
+        // snaps END onto (8,0), drops the dangle, and the rect fit's axis bbox
+        // absorbs the mid-edge junction corner.
+        let mut pts = Vec::new();
+        edge((-30.0, 0.0), (0.0, 0.0), 3, &mut pts);
+        edge((0.0, 0.0), (100.0, 0.0), 10, &mut pts);
+        edge((100.0, 0.0), (100.0, 100.0), 10, &mut pts);
+        edge((100.0, 100.0), (0.0, 100.0), 10, &mut pts);
+        edge((0.0, 100.0), (8.0, 3.0), 10, &mut pts);
+        pts.push((8.0, 3.0));
+        let rec = recognize_stroke(&pts);
+        assert!(rec.closed, "T-junction near-miss closes: {}", rec.d);
+        assert_eq!(
+            rec.d,
+            format!("M 0 0 L {} 0 L {} {} L 0 {} Z", 100 * Q, 100 * Q, 100 * Q, 100 * Q)
+        );
+    }
+
+    #[test]
+    fn start_t_touch_on_a_tail_segment_closes_symmetrically() {
+        // The mirror case (the same square drawn in reverse): the stroke STARTS
+        // 3px off the top edge, which gets drawn LAST, and the pen-up tail
+        // dangles off past the square. START projects onto a tail-window
+        // segment with no crossing anywhere — the symmetric rung trims the tail
+        // dangle and snaps START onto the junction.
+        let mut pts = Vec::new();
+        edge((8.0, 3.0), (0.0, 100.0), 10, &mut pts);
+        edge((0.0, 100.0), (100.0, 100.0), 10, &mut pts);
+        edge((100.0, 100.0), (100.0, 0.0), 10, &mut pts);
+        edge((100.0, 0.0), (0.0, 0.0), 10, &mut pts);
+        edge((0.0, 0.0), (-30.0, 0.0), 3, &mut pts);
+        pts.push((-30.0, 0.0));
+        let rec = recognize_stroke(&pts);
+        assert!(rec.closed, "tail-side T-junction closes: {}", rec.d);
+        assert_eq!(
+            rec.d,
+            format!("M 0 0 L {} 0 L {} {} L 0 {} Z", 100 * Q, 100 * Q, 100 * Q, 100 * Q)
+        );
+    }
+
+    #[test]
+    fn near_touch_outside_the_projection_tolerance_stays_open() {
+        // Same dangling square, but the final edge stops 12px short of the top
+        // edge — outside NEAR_JUNCTION_RATIO·diag (9.84px). Not a touch, and
+        // the 39.9px gap fails the gap test too: the stroke stays open.
+        let mut pts = Vec::new();
+        edge((-30.0, 0.0), (0.0, 0.0), 3, &mut pts);
+        edge((0.0, 0.0), (100.0, 0.0), 10, &mut pts);
+        edge((100.0, 0.0), (100.0, 100.0), 10, &mut pts);
+        edge((100.0, 100.0), (0.0, 100.0), 10, &mut pts);
+        edge((0.0, 100.0), (8.0, 12.0), 10, &mut pts);
+        pts.push((8.0, 12.0));
+        let rec = recognize_stroke(&pts);
+        assert!(!rec.closed, "out-of-tolerance near-miss stays open: {}", rec.d);
+    }
+
+    #[test]
+    fn t_touch_with_an_oversized_dangle_does_not_trim() {
+        // A 140px plumb line INTO the square's top edge (26% of the arc), then
+        // the perimeter, ending with a T-touch at (46,3) mid-top-edge: the
+        // would-be head dangle exceeds OVERSHOOT_MAX_DANGLE_RATIO, so it is
+        // real geometry (a balloon on a string), not an overshot pen-up — no
+        // trim, and the 143px gap keeps the stroke open.
+        let mut pts = Vec::new();
+        edge((40.0, -140.0), (40.0, 0.0), 7, &mut pts);
+        edge((40.0, 0.0), (100.0, 0.0), 6, &mut pts);
+        edge((100.0, 0.0), (100.0, 100.0), 10, &mut pts);
+        edge((100.0, 100.0), (0.0, 100.0), 10, &mut pts);
+        edge((0.0, 100.0), (0.0, 0.0), 10, &mut pts);
+        edge((0.0, 0.0), (46.0, 3.0), 10, &mut pts);
+        pts.push((46.0, 3.0));
+        let rec = recognize_stroke(&pts);
+        assert!(!rec.closed, "oversized dangle stays untrimmed: {}", rec.d);
     }
 
     #[test]
