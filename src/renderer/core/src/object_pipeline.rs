@@ -1218,14 +1218,14 @@ impl ObjectRenderer {
         written
     }
 
-    /// W3-G9/#4 LIVE anchor reproject: patch a follower's baked fill + stroke
-    /// vertices in place so its anchored node tracks a moved target DURING the drag
-    /// (the follower is NOT uniformly transformed — one node moves, so its shape
-    /// changes and the instance-matrix preview path cannot express it). `rebuilt` is
-    /// the follower re-expanded with the reprojected node ([`reexpand_single_object`]);
-    /// this writes its fill vertices, fill indices (rebased into the megabuffer), and
-    /// stroke ribbon vertices over the follower's EXISTING ranges — zero full rebake,
-    /// O(one small object).
+    /// W3-G9/#4 LIVE anchor reproject: patch a follower's baked vertices in place so
+    /// its anchored node tracks a moved target DURING the drag (the follower is NOT
+    /// uniformly transformed — one node moves, so its shape changes and the
+    /// instance-matrix preview path cannot express it). `rebuilt` is the follower
+    /// re-expanded with the reprojected node ([`reexpand_single_object`]); this
+    /// writes its fill vertices, fill indices (rebased into the megabuffer), stroke
+    /// ribbon vertices and — W3-G13 — its drop-shadow silhouette + glyph quads over
+    /// the follower's EXISTING ranges — zero full rebake, O(one small object).
     ///
     /// DEFENSIVE (GPU-blind): a vertex/index COUNT that no longer matches the baked
     /// range (a topology/LOD edge case) makes [`follower_patch_plan`] return `None`,
@@ -1272,6 +1272,25 @@ impl ObjectRenderer {
                 &self.stroke_vertex_buffer,
                 plan.stroke_vertex_byte_offset,
                 bytemuck::cast_slice(&rebuilt.stroke_vertices),
+            );
+        }
+        // W3-G13: drop-shadow silhouette vertices (fill-derived, or stroke-ribbon-
+        // derived for fill-less open strokes per W3-G10/#3) — without this write the
+        // follower's shadow stayed at the OLD geometry until the commit rebake.
+        if !rebuilt.shadow_vertices.is_empty() {
+            queue.write_buffer(
+                &self.shadow_vertex_buffer,
+                plan.shadow_vertex_byte_offset,
+                bytemuck::cast_slice(&rebuilt.shadow_vertices),
+            );
+        }
+        // W3-G13: glyph quads — text layout depends on the region bbox, so a
+        // reprojected node moves the glyphs too.
+        if !rebuilt.text_vertices.is_empty() {
+            queue.write_buffer(
+                &self.text_vertex_buffer,
+                plan.text_vertex_byte_offset,
+                bytemuck::cast_slice(&rebuilt.text_vertices),
             );
         }
         true
@@ -1992,14 +2011,19 @@ pub fn preview_instance_strides() -> [u64; 4] {
     ]
 }
 
-/// W3-G9/#4: the re-expanded fill + stroke geometry for ONE object, used to patch
-/// a follower's baked vertices in place during a live anchor reproject. The fill
-/// indices are object-LOCAL (0-based); the caller rebases them by the follower's
-/// vertex base in the shared megabuffer before writing.
+/// W3-G9/#4: the re-expanded geometry for ONE object, used to patch a follower's
+/// baked vertices in place during a live anchor reproject. The fill indices are
+/// object-LOCAL (0-based); the caller rebases them by the follower's vertex base
+/// in the shared megabuffer before writing. W3-G13: carries EVERY per-object baked
+/// vertex artifact — fill, stroke, shadow silhouette, text glyph quads — so no
+/// sub-visual lags at the old geometry until the commit rebake (the dragged-target
+/// follower-shadow bug).
 pub struct FollowerReexpand {
     pub fill_vertices: Vec<FillVertex>,
     pub fill_indices: Vec<u32>,
     pub stroke_vertices: Vec<StrokeVertex>,
+    pub shadow_vertices: Vec<ShadowVertex>,
+    pub text_vertices: Vec<TextVertex>,
 }
 
 /// W3-G9/#4: re-expand a SINGLE object's fill + stroke geometry, reusing the exact
@@ -2023,18 +2047,37 @@ pub fn reexpand_single_object(
         selection: None,
         multi_select: Vec::new(),
     };
-    let build = build_scene_geometry_themed(&scene, theme);
-    let fill_vertices: Vec<FillVertex> = build
-        .fill
+    // W3-G13 ENFORCED artifact contract: every per-object BAKED VERTEX artifact
+    // must reach the follower patch (a dropped one lags at the old geometry until
+    // the commit rebake — the shadow bug). Instance matrices/colors belong to the
+    // instance-preview write-set (`preview_instance_strides`), and `draws` is the
+    // canonical bake's index, rebuilt only on a full re-feed. Destructuring WITHOUT
+    // `..` makes adding a SceneGeometry artifact a COMPILE ERROR here until its
+    // patch story is decided.
+    let SceneGeometry {
+        fill,
+        fill_edges,
+        fill_instances: _,
+        shadow_vertices,
+        shadow_instances: _,
+        stroke_vertices,
+        stroke_instances: _,
+        text_vertices,
+        text_instances: _,
+        draws: _,
+    } = build_scene_geometry_themed(&scene, theme);
+    let fill_vertices: Vec<FillVertex> = fill
         .vertices
         .iter()
-        .zip(&build.fill_edges)
+        .zip(&fill_edges)
         .map(|(&position, &edge)| FillVertex { position, edge })
         .collect();
     FollowerReexpand {
         fill_vertices,
-        fill_indices: build.fill.indices,
-        stroke_vertices: build.stroke_vertices,
+        fill_indices: fill.indices,
+        stroke_vertices,
+        shadow_vertices,
+        text_vertices,
     }
 }
 
@@ -2054,29 +2097,61 @@ pub struct FollowerPatchPlan {
     pub fill_index_rebase: u32,
     /// Byte offset of the follower's stroke vertices in the shared stroke buffer.
     pub stroke_vertex_byte_offset: u64,
+    /// W3-G13: byte offset of the follower's drop-shadow silhouette vertices in the
+    /// shared shadow buffer.
+    pub shadow_vertex_byte_offset: u64,
+    /// W3-G13: byte offset of the follower's glyph-quad vertices in the shared text
+    /// buffer.
+    pub text_vertex_byte_offset: u64,
 }
 
 /// W3-G9/#4: validate that `rebuilt` exactly fills the follower `draw`'s existing
-/// megabuffer ranges (same fill vertex count, fill index count, stroke vertex count)
-/// and, if so, return the [`FollowerPatchPlan`] byte offsets. Returns `None` on ANY
-/// count mismatch so the caller SKIPS the patch this frame rather than writing a
-/// mismatched range. The node COUNT is unchanged during a drag (only positions move)
-/// and the LOD bucket is fixed, so the counts normally match; a `None` is the rare
-/// topology edge case the guard exists for. Pure + falsifiable without a device.
+/// megabuffer ranges (same fill vertex count, fill index count, stroke vertex count,
+/// and — W3-G13 — shadow + text vertex counts) and, if so, return the
+/// [`FollowerPatchPlan`] byte offsets. Returns `None` on ANY count mismatch so the
+/// caller SKIPS the patch this frame rather than writing a mismatched range. The
+/// node COUNT is unchanged during a drag (only positions move) and the LOD bucket
+/// is fixed, so the counts normally match; a `None` is the rare topology edge case
+/// the guard exists for. Pure + falsifiable without a device.
 pub fn follower_patch_plan(draw: &ObjectDraw, rebuilt: &FollowerReexpand) -> Option<FollowerPatchPlan> {
-    if rebuilt.fill_vertices.len() as u32 != draw.fill_vertex_range.len()
-        || rebuilt.fill_indices.len() as u32 != draw.fill_range.len()
-        || rebuilt.stroke_vertices.len() as u32 != draw.stroke_range.len()
+    // W3-G13 ENFORCED artifact contract (the ObjectDraw side): destructuring WITHOUT
+    // `..` binds every field, so a new per-object vertex RANGE is a COMPILE ERROR
+    // here until it is guarded + planned. The non-range fields are explicitly not
+    // the patch's business: instances are the instance-preview write-set's
+    // (`preview_instance_strides`), and id/focus/tokens are draw-record metadata.
+    let ObjectDraw {
+        id: _,
+        fill_range,
+        fill_vertex_range,
+        fill_instance: _,
+        shadow_range,
+        shadow_instance: _,
+        stroke_range,
+        stroke_instance: _,
+        text_range,
+        focus_ring: _,
+        fill_token: _,
+        stroke_token: _,
+    } = draw;
+    if rebuilt.fill_vertices.len() as u32 != fill_vertex_range.len()
+        || rebuilt.fill_indices.len() as u32 != fill_range.len()
+        || rebuilt.stroke_vertices.len() as u32 != stroke_range.len()
+        || rebuilt.shadow_vertices.len() as u32 != shadow_range.len()
+        || rebuilt.text_vertices.len() as u32 != text_range.len()
     {
         return None;
     }
     Some(FollowerPatchPlan {
-        fill_vertex_byte_offset: draw.fill_vertex_range.start as u64
+        fill_vertex_byte_offset: fill_vertex_range.start as u64
             * std::mem::size_of::<FillVertex>() as u64,
-        fill_index_byte_offset: draw.fill_range.start as u64 * std::mem::size_of::<u32>() as u64,
-        fill_index_rebase: draw.fill_vertex_range.start,
-        stroke_vertex_byte_offset: draw.stroke_range.start as u64
+        fill_index_byte_offset: fill_range.start as u64 * std::mem::size_of::<u32>() as u64,
+        fill_index_rebase: fill_vertex_range.start,
+        stroke_vertex_byte_offset: stroke_range.start as u64
             * std::mem::size_of::<StrokeVertex>() as u64,
+        shadow_vertex_byte_offset: shadow_range.start as u64
+            * std::mem::size_of::<ShadowVertex>() as u64,
+        text_vertex_byte_offset: text_range.start as u64
+            * std::mem::size_of::<TextVertex>() as u64,
     })
 }
 
@@ -3619,6 +3694,168 @@ mod tests {
         assert!(
             follower_patch_plan(draw, &rebuilt).is_none(),
             "a topology/LOD count change must SKIP the patch, not corrupt the buffer"
+        );
+    }
+
+    /// W3-G13: the count guard covers the NEW artifacts too — a rebuilt whose
+    /// shadow or text vertex count no longer matches the baked range must refuse
+    /// the whole plan, exactly like a fill/stroke mismatch.
+    #[test]
+    fn follower_patch_plan_is_none_on_a_shadow_or_text_count_change() {
+        // A filled rect casts a fill-derived shadow, so its shadow_range is
+        // non-empty and the tamper below is a real mismatch, not 1-vs-0 noise.
+        let canonical = rect_object("f");
+        let scene = scene_with(vec![canonical.clone()], None);
+        let build = build_scene_geometry_themed(&scene, Theme::light());
+        let draw = &build.draws[0];
+        assert!(!draw.shadow_range.is_empty(), "filled rect casts a shadow");
+
+        let intact = reexpand_single_object(&canonical, Theme::light(), scene.camera.clone());
+        assert!(follower_patch_plan(draw, &intact).is_some(), "untampered plan holds");
+
+        let mut bad_shadow = reexpand_single_object(&canonical, Theme::light(), scene.camera.clone());
+        bad_shadow.shadow_vertices.push(ShadowVertex {
+            position: [0.0, 0.0],
+            feather: 0.0,
+        });
+        assert!(
+            follower_patch_plan(draw, &bad_shadow).is_none(),
+            "a shadow vertex count change must SKIP the patch"
+        );
+
+        let mut bad_text = reexpand_single_object(&canonical, Theme::light(), scene.camera.clone());
+        bad_text.text_vertices.push(TextVertex {
+            position: [0.0, 0.0],
+            uv: [0.0, 0.0],
+            color: [0.0, 0.0, 0.0, 0.0],
+        });
+        assert!(
+            follower_patch_plan(draw, &bad_text).is_none(),
+            "a text vertex count change must SKIP the patch"
+        );
+    }
+
+    /// W3-G13 PARITY GUARD (the dragged-target follower-shadow bug): a follower
+    /// re-expanded with a reprojected node must carry shadow + text vertices that
+    /// EQUAL the corresponding `shadow_range`/`text_range` slices of a FULL rebake
+    /// of the whole deformed scene. Two followers cover both shadow sources: a
+    /// CLOSED filled follower with a text run (fill-derived shadow + glyph quads)
+    /// and an OPEN fill-less stroke follower (stroke-ribbon-derived shadow,
+    /// W3-G10/#3). FAILS if shadow or text is dropped from [`FollowerReexpand`]
+    /// (the plan refuses, or the slices diverge) — the live drag then shows a
+    /// stale shadow until the commit rebake, the user-reported bug.
+    #[test]
+    fn reexpanded_follower_shadow_and_text_match_a_full_rebake() {
+        use crate::render_object::{RAnchor, RLocalPoint};
+        use shape_scene_core::object::{reproject_geometry_node, LocalPoint, Transform3x3};
+
+        let translate =
+            |tx: f64, ty: f64| [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]];
+
+        // Target A at (10,20); the drag delta reuses the pinned cross-core vector
+        // (`translate(5,7)`, see anchor_follower_closure_agrees_with_scene_core_vector).
+        let mut target = rect_object("t");
+        target.transform = translate(10.0, 20.0);
+
+        // CLOSED filled follower with a text run; node 0 anchored to the target at
+        // a point that drags the region MIN negative, so the glyph layout moves too.
+        let mut closed = text_rect("fc", "AB", 128.0, "#ff8800");
+        closed.anchors = vec![RAnchor {
+            node_index: 0,
+            target: "t".to_string(),
+            at: RLocalPoint { x: -240.0, y: -480.0 },
+        }];
+
+        // OPEN fill-less stroke follower: the EXACT pinned cross-core vector object.
+        let mut open = open_stroke_object("fo", "M 0 0 L 64 0");
+        open.transform = translate(100.0, 0.0);
+        open.anchors = vec![RAnchor {
+            node_index: 1,
+            target: "t".to_string(),
+            at: RLocalPoint { x: 16.0, y: 8.0 },
+        }];
+
+        let scene = scene_with(vec![target, closed, open], None);
+        let canonical_build = build_scene_geometry_themed(&scene, Theme::light());
+        let delta = translate(5.0, 7.0);
+
+        // Reproject each follower's anchored node through the moved target — the
+        // same scene-core math the live preview path drives.
+        let mut deformed = scene.clone();
+        for obj in deformed.objects.iter_mut() {
+            let Some(anchor) = obj.anchors.first().cloned() else {
+                continue;
+            };
+            let target_base = scene.objects[0].transform;
+            obj.geometry_d = reproject_geometry_node(
+                &Transform3x3 { m: obj.transform },
+                &Transform3x3 { m: target_base },
+                &Transform3x3 { m: delta },
+                LocalPoint {
+                    x: anchor.at.x.round() as i32,
+                    y: anchor.at.y.round() as i32,
+                },
+                i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
+                &obj.geometry_d,
+            )
+            .expect("addressable, changed");
+        }
+        // The open follower lands on the pinned cross-core vector.
+        assert_eq!(deformed.objects[2].geometry_d, "M 0 0 L -664 224");
+
+        // FULL rebake of the whole deformed scene = the parity oracle.
+        let full = build_scene_geometry_themed(&deformed, Theme::light());
+
+        for i in [1usize, 2usize] {
+            let id = &scene.objects[i].id;
+            let rebuilt = reexpand_single_object(
+                &deformed.objects[i],
+                Theme::light(),
+                scene.camera.clone(),
+            );
+            let plan = follower_patch_plan(&canonical_build.draws[i], &rebuilt)
+                .unwrap_or_else(|| panic!("size-safe patch for {id}"));
+            assert_eq!(
+                plan.shadow_vertex_byte_offset,
+                canonical_build.draws[i].shadow_range.start as u64
+                    * std::mem::size_of::<ShadowVertex>() as u64
+            );
+
+            // Shadow parity: the re-expand equals the full-rebake slice, and the
+            // deformation really moved it (a stale canonical copy is caught).
+            let full_shadow =
+                &full.shadow_vertices[full.draws[i].shadow_range.start as usize
+                    ..full.draws[i].shadow_range.end as usize];
+            assert!(!full_shadow.is_empty(), "{id} casts a shadow");
+            assert_eq!(rebuilt.shadow_vertices, full_shadow, "{id} shadow parity");
+            let canonical_shadow = &canonical_build.shadow_vertices
+                [canonical_build.draws[i].shadow_range.start as usize
+                    ..canonical_build.draws[i].shadow_range.end as usize];
+            assert_ne!(
+                rebuilt.shadow_vertices, canonical_shadow,
+                "{id} reproject must move the shadow silhouette"
+            );
+
+            // Text parity (the closed follower carries glyphs; the open one none).
+            let full_text = &full.text_vertices[full.draws[i].text_range.start as usize
+                ..full.draws[i].text_range.end as usize];
+            assert_eq!(rebuilt.text_vertices, full_text, "{id} text parity");
+        }
+
+        // The text follower's glyphs are non-empty AND moved by the reproject
+        // (its region min changed), so a stale canonical text copy is caught too.
+        let fc_rebuilt = reexpand_single_object(
+            &deformed.objects[1],
+            Theme::light(),
+            scene.camera.clone(),
+        );
+        assert!(!fc_rebuilt.text_vertices.is_empty(), "fc has glyph quads");
+        let fc_canonical_text = &canonical_build.text_vertices
+            [canonical_build.draws[1].text_range.start as usize
+                ..canonical_build.draws[1].text_range.end as usize];
+        assert_ne!(
+            fc_rebuilt.text_vertices, fc_canonical_text,
+            "the reprojected region min must move the glyphs"
         );
     }
 }

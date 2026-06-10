@@ -196,17 +196,17 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
-    /// W3-G9/#4: re-expand each follower's fill + stroke geometry for an in-place GPU
-    /// patch. With `Some(delta)` (the live preview), every node of the follower
-    /// anchored onto its moved `target` is rewritten to track the target's PREVIEWED
-    /// transform (`delta * target_base`) before the re-expand. With `None` (the
-    /// restore on cancel/commit), the follower's CANONICAL geometry is re-expanded
-    /// untouched, so the live reproject is patched back out exactly.
+    /// W3-G9/#4: re-expand each follower's geometry for an in-place GPU patch. With
+    /// `Some(delta)` (the live preview), every node of the follower anchored onto a
+    /// moved target is rewritten to track the target's PREVIEWED transform
+    /// (`delta * target_base`) before the re-expand. With `None` (the restore on
+    /// cancel/commit), the follower's CANONICAL geometry is re-expanded untouched,
+    /// so the live reproject is patched back out exactly.
     ///
-    /// O(followers), each a single small object — never a full-scene rebake. The
-    /// reproject math + the node rewrite are pure (scene-core
-    /// `reproject_geometry_node`); only the re-expand is touched here, and the GPU
-    /// write lives in `patch_follower_geometry`.
+    /// W3-G13: the pairs are GROUPED by follower first ([`reprojected_follower_geometries`])
+    /// — a follower anchored to TWO moved targets accumulates both rewrites into ONE
+    /// geometry, then ONE re-expand + ONE patch. O(unique followers), each a single
+    /// small object — never a full-scene rebake.
     fn reexpand_reprojected_followers(
         &self,
         scene: &RenderObjectScene,
@@ -216,47 +216,20 @@ impl ShapeWebGpuRenderer {
         let Some(theme) = self.object_renderer.as_ref().map(|r| r.theme()) else {
             return Vec::new();
         };
-        let mut out = Vec::with_capacity(followers.len());
-        for (follower_id, target_id) in followers {
-            let Some(follower) = scene.objects.iter().find(|o| &o.id == follower_id) else {
-                continue;
-            };
-            let Some(target) = scene.objects.iter().find(|o| &o.id == target_id) else {
-                continue;
-            };
-            // Rewrite every node of the follower anchored onto this moved target; a
-            // `None` delta means restore, so the canonical geometry is left as-is.
-            let mut geometry_d = follower.geometry_d.clone();
-            if let Some(delta) = delta {
-                for anchor in &follower.anchors {
-                    if &anchor.target != target_id {
-                        continue;
-                    }
-                    if let Some(rewritten) = shape_scene_core::object::reproject_geometry_node(
-                        &shape_scene_core::object::Transform3x3 { m: follower.transform },
-                        &shape_scene_core::object::Transform3x3 { m: target.transform },
-                        &shape_scene_core::object::Transform3x3 { m: *delta },
-                        shape_scene_core::object::LocalPoint {
-                            x: anchor.at.x.round() as i32,
-                            y: anchor.at.y.round() as i32,
-                        },
-                        i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
-                        &geometry_d,
-                    ) {
-                        geometry_d = rewritten;
-                    }
-                }
-            }
-            let mut reprojected = follower.clone();
-            reprojected.geometry_d = geometry_d;
-            let rebuilt = crate::object_pipeline::reexpand_single_object(
-                &reprojected,
-                theme,
-                scene.camera.clone(),
-            );
-            out.push((follower_id.clone(), rebuilt));
-        }
-        out
+        reprojected_follower_geometries(scene, delta, followers)
+            .into_iter()
+            .filter_map(|(follower_id, geometry_d)| {
+                let follower = scene.objects.iter().find(|o| o.id == follower_id)?;
+                let mut reprojected = follower.clone();
+                reprojected.geometry_d = geometry_d;
+                let rebuilt = crate::object_pipeline::reexpand_single_object(
+                    &reprojected,
+                    theme,
+                    scene.camera.clone(),
+                );
+                Some((follower_id, rebuilt))
+            })
+            .collect()
     }
 
 }
@@ -338,6 +311,63 @@ pub(crate) fn preview_reproject_followers(
     let roots = preview_roots(scene, dragged);
     let (_same_delta, reproject_followers) = bindings.propagation_closure(&roots);
     reproject_followers
+}
+
+/// W3-G13: GROUP the `(follower, target)` reproject pairs by FOLLOWER and fold every
+/// paired target's node rewrites into ONE cumulative `geometry_d` per follower (the
+/// closure dedupes by PAIR, so a follower anchored to two moved targets arrives
+/// twice — restarting from the canonical path per pair would stomp the first
+/// target's rewrite). Returns one `(follower_id, geometry_d)` per unique follower in
+/// first-appearance order; with `delta = None` (the restore path) each unique
+/// follower comes back once with its CANONICAL geometry. The reproject math is
+/// scene-core's `reproject_geometry_node` — the same the commit path folds with.
+/// Pure (no device/GPU), host-testable under `wgpu-probe`; the wasm32
+/// `reexpand_reprojected_followers` is a thin re-expand consumer.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn reprojected_follower_geometries(
+    scene: &RenderObjectScene,
+    delta: Option<&[[f64; 3]; 3]>,
+    followers: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (follower_id, target_id) in followers {
+        let Some(follower) = scene.objects.iter().find(|o| &o.id == follower_id) else {
+            continue;
+        };
+        // One cumulative entry per follower; the first pair seeds it canonical.
+        let entry = match out.iter().position(|(id, _)| id == follower_id) {
+            Some(i) => &mut out[i],
+            None => {
+                out.push((follower_id.clone(), follower.geometry_d.clone()));
+                out.last_mut().expect("entry just pushed")
+            }
+        };
+        let Some(delta) = delta else {
+            continue;
+        };
+        let Some(target) = scene.objects.iter().find(|o| &o.id == target_id) else {
+            continue;
+        };
+        for anchor in &follower.anchors {
+            if &anchor.target != target_id {
+                continue;
+            }
+            if let Some(rewritten) = shape_scene_core::object::reproject_geometry_node(
+                &shape_scene_core::object::Transform3x3 { m: follower.transform },
+                &shape_scene_core::object::Transform3x3 { m: target.transform },
+                &shape_scene_core::object::Transform3x3 { m: *delta },
+                shape_scene_core::object::LocalPoint {
+                    x: anchor.at.x.round() as i32,
+                    y: anchor.at.y.round() as i32,
+                },
+                i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
+                &entry.1,
+            ) {
+                entry.1 = rewritten;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -1981,5 +2011,103 @@ mod tests {
         let bindings = BindingGraph::build(&binding_nodes(&scene));
         let followers = preview_reproject_followers(&scene, &bindings, "a");
         assert_eq!(followers, vec![("b".to_string(), "a".to_string())]);
+    }
+
+    /// W3-G13 GROUPING GUARD: the closure dedupes by (follower, target) PAIR, so a
+    /// follower anchored to TWO moved targets arrives twice. The grouping must fold
+    /// BOTH targets' rewrites into ONE cumulative geometry per follower — RED if it
+    /// restarts from the canonical path per pair (the second pair would stomp the
+    /// first target's rewrite, exactly the per-pair patch bug).
+    #[cfg(feature = "wgpu-probe")]
+    #[test]
+    fn follower_paired_with_two_moved_targets_accumulates_one_geometry() {
+        use super::reprojected_follower_geometries;
+        use crate::render_object::{RAnchor, RLocalPoint};
+        use shape_scene_core::object::{reproject_geometry_node, LocalPoint, Transform3x3};
+
+        let a = anchored_object("a", None, translate(10.0, 20.0), "M 0 0 L 8 0 L 8 8 L 0 8 Z", Vec::new());
+        let b = anchored_object("b", None, translate(30.0, 40.0), "M 0 0 L 8 0 L 8 8 L 0 8 Z", Vec::new());
+        let f = anchored_object(
+            "f",
+            None,
+            translate(100.0, 0.0),
+            "M 0 0 L 64 0",
+            vec![
+                RAnchor {
+                    node_index: 0,
+                    target: "a".to_string(),
+                    at: RLocalPoint { x: 16.0, y: 8.0 },
+                },
+                RAnchor {
+                    node_index: 1,
+                    target: "b".to_string(),
+                    at: RLocalPoint { x: 16.0, y: 8.0 },
+                },
+            ],
+        );
+        let scene = RenderObjectScene {
+            scene_id: "multi-anchor".to_string(),
+            camera: CameraState {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+            objects: vec![a, b, f],
+            selection: None,
+            multi_select: Vec::new(),
+        };
+        let delta = translate(5.0, 7.0);
+        let pairs = vec![
+            ("f".to_string(), "a".to_string()),
+            ("f".to_string(), "b".to_string()),
+        ];
+
+        let grouped = reprojected_follower_geometries(&scene, Some(&delta), &pairs);
+        assert_eq!(grouped.len(), 1, "one entry per follower, not one per pair");
+        assert_eq!(grouped[0].0, "f");
+
+        // The oracle: fold the two rewrites by hand through the same scene-core
+        // math, each starting from the PREVIOUS pair's result.
+        let f_obj = scene.objects.iter().find(|o| o.id == "f").unwrap();
+        let mut expected = f_obj.geometry_d.clone();
+        for (target_id, anchor_index) in [("a", 0usize), ("b", 1usize)] {
+            let target = scene.objects.iter().find(|o| o.id == target_id).unwrap();
+            let anchor = &f_obj.anchors[anchor_index];
+            expected = reproject_geometry_node(
+                &Transform3x3 { m: f_obj.transform },
+                &Transform3x3 { m: target.transform },
+                &Transform3x3 { m: delta },
+                LocalPoint {
+                    x: anchor.at.x.round() as i32,
+                    y: anchor.at.y.round() as i32,
+                },
+                i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
+                &expected,
+            )
+            .expect("addressable, changed");
+        }
+        assert_eq!(grouped[0].1, expected, "BOTH nodes rewritten cumulatively");
+
+        // A canonical-restart bug yields only the LAST pair's rewrite — node 0
+        // back at its base. Pin that the cumulative result differs from it.
+        let b_obj = scene.objects.iter().find(|o| o.id == "b").unwrap();
+        let only_last = reproject_geometry_node(
+            &Transform3x3 { m: f_obj.transform },
+            &Transform3x3 { m: b_obj.transform },
+            &Transform3x3 { m: delta },
+            LocalPoint { x: 16, y: 8 },
+            1,
+            &f_obj.geometry_d,
+        )
+        .expect("addressable, changed");
+        assert_ne!(grouped[0].1, only_last, "node 0's rewrite must survive pair 2");
+
+        // Restore path (`delta = None`): each unique follower comes back ONCE with
+        // its canonical geometry, so the snap-back patch also runs once.
+        let restored = reprojected_follower_geometries(&scene, None, &pairs);
+        assert_eq!(
+            restored,
+            vec![("f".to_string(), f_obj.geometry_d.clone())]
+        );
     }
 }
