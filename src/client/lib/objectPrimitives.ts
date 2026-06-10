@@ -10,6 +10,7 @@
 import type { CameraState } from "../../shared/geometry";
 import {
   GEOMETRY_QUANTUM_PER_PX,
+  type Anchor,
   type Object as SceneObject,
   type ObjectOp,
   type ObjectScene,
@@ -69,6 +70,39 @@ export function resolveCreateRelease(
     }
   }
   return { end: release.end, target: null };
+}
+
+// AP5 (#14)/#4/v3 §4: the release-time anchor authoring shared by shape drag-create
+// AND the freehand pen — BOTH gesture corners (start + end) bind the created
+// object's node nearest that corner to the snapped target's outline (G13's
+// both-corner loop). Pure composition over the core's synthesizeCreateAnchors (the
+// geometry judgment stays in the core); a null corner (never snapped) or a corner
+// whose target is no longer in the scene authors nothing. The caller decides
+// eligibility (e.g. v3 DU7(b): a recognized CLOSED stroke never calls this).
+export function synthesizeReleaseAnchors(
+  core: {
+    synthesizeCreateAnchors(
+      created: SceneObject,
+      target: SceneObject,
+      endpoint: { x: number; y: number }
+    ): Anchor[] | null;
+  },
+  objects: readonly SceneObject[],
+  created: SceneObject,
+  corners: ReadonlyArray<{ target: string; at: { x: number; y: number } } | null>
+): Anchor[] {
+  const anchors: Anchor[] = [];
+  for (const corner of corners) {
+    if (!corner) continue;
+    const target = objects.find((o) => o.id === corner.target);
+    if (!target) continue;
+    const a = core.synthesizeCreateAnchors(created, target, corner.at);
+    // One anchor per node (the D5 invariant): a degenerate gesture whose corners
+    // resolve to the SAME nearest node (e.g. a pen tap on an edge) keeps only the
+    // first binding instead of authoring a conflicting duplicate.
+    if (a) anchors.push(...a.filter((anchor) => !anchors.some((prior) => prior.nodeIndex === anchor.nodeIndex)));
+  }
+  return anchors;
 }
 
 // v3 §3 (DU4) Alt-detach: the commit ops of an Alt-held body drag of an ANCHORED

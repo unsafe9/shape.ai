@@ -1,20 +1,16 @@
-//! OB3.D1/D2 — freehand drawing capture -> object (pure geometry).
+//! OB3.D1/D2 — freehand drawing capture primitives (pure geometry).
 //!
-//! Pen-and-ink capture in the Rust core. A *drawing session* (D12/D13) is the
-//! span from the first pen-down until the caller commits it: every stroke drawn
-//! during that span (pen-down -> pen-up) becomes one open [`SubPath`], and the
-//! whole session commits to a single [`Object`] carrying those subpaths and one
-//! stroke style. Granularity guessing is 0 here — a session is always one object;
-//! splitting a sketch into multiple objects is a later, separate concern.
+//! Pen-and-ink capture math in the Rust core: RDP simplification, tangent-
+//! estimated bezier fitting, the pen [`Brush`], and the partial-erase subpath
+//! split. The pen-up COMMIT lives in [`super::recognize`] (anchor-semantics v3
+//! §4): one stroke = one recognized object, which replaced the D12/D13 drawing
+//! session (a multi-stroke span committing to a single multi-subpath object).
 //!
 //! Pipeline per stroke:
-//!   raw points (transient, world px) --pen-up--> [`rdp_simplify`] (drop
-//!   near-collinear samples) --> [`fit_beziers`] (tangent-estimated cubic
-//!   handles) --> one open [`SubPath`] appended to the session.
-//! On [`DrawingSession::commit`] the accumulated subpaths become a
-//! [`Geometry`], the brush becomes a [`Stroke`], and the session origin becomes
-//! the object's transform translate (P4 zero-rebake: geometry is object-local,
-//! position lives in the transform).
+//!   raw points (transient, world px) --pen-up--> recognition
+//!   ([`super::recognize::recognize_stroke`], which reuses [`rdp_simplify`] +
+//!   [`fit_beziers`] for its silhouette-preserving fallback) --> one committed
+//!   [`super::model::Object`].
 //!
 //! Conventions (CLAUDE.md): pure (no time/rng/IO — all inputs passed in, the
 //! commit id/order are caller-supplied); pointer-width-agnostic (coords are i32
@@ -23,14 +19,14 @@
 //! making the narrowing provably safe under a scoped `#[allow]`).
 
 use super::model::{
-    FillRule, Geometry, HandlePoint, LineCap, LineJoin, Object, Paint, PathNode, Stroke, SubPath,
-    Transform3x3, GEOMETRY_QUANTUM_PER_PX,
+    Geometry, HandlePoint, LineCap, LineJoin, Paint, PathNode, Stroke, SubPath,
+    GEOMETRY_QUANTUM_PER_PX,
 };
 
 /// World-px -> quantized i32 (round to nearest, clamp into i32 range). The clamp
 /// makes the final narrowing safe: `value` is bounded to `[i32::MIN, i32::MAX]`
 /// as f64 before the cast, so no truncation/wrap can occur. NaN maps to 0.
-fn quantize_px(px: f64) -> i32 {
+pub(crate) fn quantize_px(px: f64) -> i32 {
     if px.is_nan() {
         return 0;
     }
@@ -50,7 +46,7 @@ fn quantize_px(px: f64) -> i32 {
 
 /// Perpendicular distance from `p` to the infinite line through `a`..`b`. If
 /// `a == b` the "line" degenerates to a point, so this is the point distance.
-fn perpendicular_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+pub(crate) fn perpendicular_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     let (px, py) = p;
     let (ax, ay) = a;
     let (bx, by) = b;
@@ -249,6 +245,20 @@ impl Brush {
     pub fn new(color: impl Into<String>, width_px: f64) -> Self {
         Brush { color: color.into(), width_px, dash: Vec::new() }
     }
+
+    /// Lower the brush to a [`Stroke`] (D2): solid paint, width + dash in
+    /// quantized units, round cap/join (freehand ink reads better round). The
+    /// per-node `width` slot stays open for pressure data (D2/D13).
+    pub(crate) fn to_stroke(&self) -> Stroke {
+        Stroke {
+            paint: Paint::Solid { color: self.color.clone() },
+            width: quantize_px(self.width_px),
+            opacity: 1.0,
+            dash: self.dash.iter().map(|&px| px * GEOMETRY_QUANTUM_PER_PX).collect(),
+            cap: LineCap::Round,
+            join: LineJoin::Round,
+        }
+    }
 }
 
 /// Map a normalized pen pressure (`0.0..=1.0`) to a per-node stroke width in
@@ -260,130 +270,13 @@ pub fn pressure_to_width(pressure: f64, base_width_px: f64) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Drawing session (D12/D13).
-// ---------------------------------------------------------------------------
-
-/// Accumulates the strokes of one freehand drawing session into a set of open
-/// subpaths, ready to commit as a single [`Object`]. Raw per-stroke points are
-/// captured in **world px** (transient — held only until `end_stroke`); on
-/// commit they are translated to object-local quantized coords relative to the
-/// session origin (the object's transform carries the origin translate).
-#[derive(Clone, Debug)]
-pub struct DrawingSession {
-    brush: Brush,
-    /// Completed strokes, each an open subpath of fitted nodes (world-px coords,
-    /// not yet origin-relative — the origin offset is applied at `commit`).
-    subpaths: Vec<SubPath>,
-    /// In-flight raw points for the stroke currently being drawn (world px).
-    current: Option<Vec<(f64, f64)>>,
-}
-
-impl DrawingSession {
-    /// Start a session with the given brush. No strokes yet.
-    pub fn new(brush: Brush) -> Self {
-        DrawingSession { brush, subpaths: Vec::new(), current: None }
-    }
-
-    /// Pen-down: open a new transient stroke buffer. A stroke already in
-    /// progress is discarded (a fresh pen-down supersedes it).
-    pub fn begin_stroke(&mut self) {
-        self.current = Some(Vec::new());
-    }
-
-    /// Push a raw sample (world px) into the in-flight stroke. No-op if no
-    /// stroke is open (no preceding `begin_stroke`).
-    pub fn push_point(&mut self, x: f64, y: f64) {
-        if let Some(buf) = self.current.as_mut() {
-            buf.push((x, y));
-        }
-    }
-
-    /// Pen-up: simplify (RDP at `epsilon`) and bezier-fit the in-flight raw
-    /// points into one open [`SubPath`], appended to the session. A stroke with
-    /// fewer than 2 points produces nothing (a single tap has no extent). No-op
-    /// if no stroke is open.
-    pub fn end_stroke(&mut self, epsilon: f64) {
-        let Some(raw) = self.current.take() else {
-            return;
-        };
-        if raw.len() < 2 {
-            return;
-        }
-        let simplified = rdp_simplify(&raw, epsilon);
-        let nodes = fit_beziers(&simplified);
-        self.subpaths.push(SubPath { closed: false, nodes });
-    }
-
-    /// True when no committed strokes have accumulated (an in-flight stroke does
-    /// not count until `end_stroke`).
-    pub fn is_empty(&self) -> bool {
-        self.subpaths.is_empty()
-    }
-
-    /// Commit the session to one [`Object`]: geometry from the accumulated open
-    /// subpaths, translated so coords are object-local relative to
-    /// `(origin_x, origin_y)` (world px); the brush lowers to a [`Stroke`]; the
-    /// origin becomes the object's transform translate. `id`/`order` are
-    /// caller-supplied (purity: no id/time generation here). The session's
-    /// subpath coords are world-px-quantized, so the origin is subtracted in
-    /// quantized units.
-    pub fn commit(
-        &self,
-        id: String,
-        order: String,
-        origin_x: f64,
-        origin_y: f64,
-    ) -> Object {
-        let ox = quantize_px(origin_x);
-        let oy = quantize_px(origin_y);
-        let local_subpaths: Vec<SubPath> = self
-            .subpaths
-            .iter()
-            .map(|sp| SubPath {
-                closed: sp.closed,
-                nodes: sp
-                    .nodes
-                    .iter()
-                    .map(|n| PathNode {
-                        x: n.x - ox,
-                        y: n.y - oy,
-                        in_handle: n.in_handle,
-                        out_handle: n.out_handle,
-                        width: n.width,
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        let geometry = Geometry::from_subpaths(local_subpaths, FillRule::NonZero);
-        let mut object = Object::new(id, order, geometry);
-        object.transform = Transform3x3::translate(origin_x, origin_y);
-        object.stroke = Some(self.brush_to_stroke());
-        object
-    }
-
-    /// Lower the brush to a [`Stroke`] (D2): solid paint, width + dash in
-    /// quantized units, round cap/join (freehand ink reads better round). The
-    /// per-node `width` slot stays open for pressure data (D2/D13).
-    fn brush_to_stroke(&self) -> Stroke {
-        Stroke {
-            paint: Paint::Solid { color: self.brush.color.clone() },
-            width: quantize_px(self.brush.width_px),
-            opacity: 1.0,
-            dash: self.brush.dash.iter().map(|&px| px * GEOMETRY_QUANTUM_PER_PX).collect(),
-            cap: LineCap::Round,
-            join: LineJoin::Round,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::model::FillRule;
 
     #[test]
     fn rdp_drops_collinear_midpoint() {
@@ -438,69 +331,13 @@ mod tests {
     }
 
     #[test]
-    fn session_two_strokes_commit_to_object_with_two_open_subpaths_and_stroke() {
-        let mut session = DrawingSession::new(Brush::new("#112233", 2.0));
-        assert!(session.is_empty());
-
-        // Stroke 1.
-        session.begin_stroke();
-        session.push_point(0.0, 0.0);
-        session.push_point(5.0, 0.0);
-        session.push_point(10.0, 0.0);
-        session.end_stroke(0.5);
-
-        // Stroke 2.
-        session.begin_stroke();
-        session.push_point(0.0, 20.0);
-        session.push_point(5.0, 25.0);
-        session.push_point(10.0, 20.0);
-        session.end_stroke(0.5);
-
-        assert!(!session.is_empty());
-
-        let obj = session.commit("draw-1".into(), "a0".into(), 0.0, 0.0);
-        assert_eq!(obj.id, "draw-1");
-        assert_eq!(obj.geometry.subpaths.len(), 2);
-        assert!(obj.geometry.subpaths.iter().all(|sp| !sp.closed));
-        // The committed geometry has a stroke style derived from the brush.
-        let stroke = obj.stroke.expect("commit sets a stroke");
+    fn brush_lowers_to_a_round_quantized_stroke() {
+        let stroke = Brush::new("#112233", 2.0).to_stroke();
         assert_eq!(stroke.paint, Paint::Solid { color: "#112233".into() });
         assert_eq!(stroke.width, 16); // 2px * 8 units/px
         assert_eq!(stroke.cap, LineCap::Round);
-        // Identity origin => identity-ish translate transform.
-        assert_eq!(obj.transform, Transform3x3::translate(0.0, 0.0));
-    }
-
-    #[test]
-    fn commit_translates_coords_relative_to_origin() {
-        // A stroke at world (100,100)->(110,100), committed at origin (100,100),
-        // becomes object-local (0,0)->(80,0) with the origin in the transform.
-        let mut session = DrawingSession::new(Brush::new("#000000", 1.0));
-        session.begin_stroke();
-        session.push_point(100.0, 100.0);
-        session.push_point(105.0, 100.0);
-        session.push_point(110.0, 100.0);
-        session.end_stroke(0.5);
-
-        let obj = session.commit("d".into(), "a0".into(), 100.0, 100.0);
-        let sp = &obj.geometry.subpaths[0];
-        assert_eq!((sp.nodes[0].x, sp.nodes[0].y), (0, 0));
-        let last = sp.nodes.last().unwrap();
-        assert_eq!((last.x, last.y), (80, 0));
-        assert_eq!(obj.transform, Transform3x3::translate(100.0, 100.0));
-    }
-
-    #[test]
-    fn end_stroke_ignores_degenerate_taps() {
-        let mut session = DrawingSession::new(Brush::new("#000000", 1.0));
-        // Pen-up with no begin: no-op.
-        session.end_stroke(0.5);
-        assert!(session.is_empty());
-        // A single-point tap has no extent: no subpath.
-        session.begin_stroke();
-        session.push_point(3.0, 3.0);
-        session.end_stroke(0.5);
-        assert!(session.is_empty());
+        assert_eq!(stroke.join, LineJoin::Round);
+        assert!(stroke.dash.is_empty());
     }
 
     #[test]

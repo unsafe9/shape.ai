@@ -13,6 +13,7 @@
 //! - [`undo`] — per-actor undo/redo engine (OB3.S8/D21).
 //! - [`commands`] — object command catalog (OB3.S9).
 //! - [`deform`] — open-class classification + chord-similarity deform (anchor-semantics v3 §2a).
+//! - [`recognize`] — pen-up stroke recognition (anchor-semantics v3 §4).
 //! - [`gestures`] — hold-key gesture catalog (W3-C2).
 //! - [`layout_solve`] — thin auto-layout solve (OB3.A1/D3).
 //! - [`validate`] — pure structural validators (OB3.S2).
@@ -31,6 +32,7 @@ pub mod model;
 pub mod move_together;
 pub mod op;
 pub mod primitives;
+pub mod recognize;
 pub mod region;
 pub mod templates;
 pub mod theme;
@@ -51,7 +53,8 @@ pub use deform::{
     deform_open_path, endpoint_release_ops, is_open_class, is_open_class_d, is_pure_translate,
     open_endpoint_pins, route_open_endpoints, EndpointRoute,
 };
-pub use drawing::{fit_beziers, pressure_to_width, rdp_simplify, Brush, DrawingSession};
+pub use drawing::{fit_beziers, pressure_to_width, rdp_simplify, Brush};
+pub use recognize::{recognize_stroke, recognize_stroke_object, RecognizedStroke};
 pub use gestures::{
     object_gesture_catalog, object_gesture_catalog_json, HoldInput, HoldTrigger, ObjectGesture,
     ObjectGestureCategory,

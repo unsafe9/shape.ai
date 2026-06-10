@@ -54,7 +54,7 @@ import {
 
 let core: SceneCore;
 
-const PEN = { color: "#1f2933", widthPx: 2, epsilon: 2.0 };
+const PEN = { color: "#1f2933", widthPx: 2 };
 const STROKE_POINTS = [
   { x: 100, y: 100 },
   { x: 140, y: 130 },
@@ -119,7 +119,7 @@ beforeAll(async () => {
 
 describe("(a) freehandToObject lowers a stroke to an insert-able open-path object", () => {
   it("yields an open path carrying a stroke positioned at the first point", () => {
-    const object = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a0");
+    const object = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
 
     expect(object.id).toBe("draw-1");
     expect(object.order).toBe("a0");
@@ -144,7 +144,7 @@ describe("(b) objectSceneToRenderObjectScene projects a heterogeneous scene", ()
     // W2-10: the text primitive is borderless + style-less (no default "Note"); set
     // text explicitly to verify the projection preserves an object's text runs.
     const note: SceneObject = { ...core.buildPrimitive("text", { x: 400, y: 0 }, "note-1", "a1"), text: { runs: [{ text: "Note" }] } };
-    const freehand = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a2");
+    const freehand = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a2");
 
     const scene: ObjectScene = { ...emptyObjectScene(), objects: [rectangle, note, freehand] };
     const projected = objectSceneToRenderObjectScene(scene, { x: 0, y: 0, zoom: 1 }, { kind: "canvas" }, "test-scene");
@@ -175,7 +175,7 @@ describe("(b) objectSceneToRenderObjectScene projects a heterogeneous scene", ()
 
 describe("(c) apply_object_op inserts the freehand object without errors", () => {
   it("applies an insert-object and captures the inverse delete (D21)", () => {
-    const freehand = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a0");
+    const freehand = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
     const op = { kind: "insert-object", object: freehand } as const;
 
     const result = core.applyObjectOp(emptyObjectScene(), op);
@@ -287,7 +287,7 @@ describe("(f) drag-create + snap-bypass + select-after-create (W2-07)", () => {
 
 describe("(g) draw + eraser (whole/partial), all undoable (W2-08, FC-11)", () => {
   it("whole-stroke erase deletes the object and the inverse re-inserts it (D21)", () => {
-    const stroke = core.freehandToObject(ZIGZAG_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a0");
+    const stroke = core.freehandToObject(ZIGZAG_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
     const scene: ObjectScene = { ...emptyObjectScene(), objects: [stroke] };
 
     const deleted = core.applyObjectOp(scene, { kind: "delete", id: "draw-1" });
@@ -299,7 +299,7 @@ describe("(g) draw + eraser (whole/partial), all undoable (W2-08, FC-11)", () =>
   });
 
   it("partial erase cuts the stroke into two open subpaths via an edit-geometry op", () => {
-    const stroke = core.freehandToObject(ZIGZAG_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a0");
+    const stroke = core.freehandToObject(ZIGZAG_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
     // The middle sample (80,0 world) maps to object-local (origin is min over the
     // points = (0,0)) then quantized; a generous radius tolerates RDP/bezier nudging.
     const touchX = 80 * GEOMETRY_QUANTUM_PER_PX;
@@ -321,7 +321,7 @@ describe("(g) draw + eraser (whole/partial), all undoable (W2-08, FC-11)", () =>
     // The shell coalesces a continuous gesture into one undo entry. Drive the core's
     // UndoStack the way the shell does: author -> record inside a coalesce window,
     // then undo by re-authoring the handed-out inverse through the SAME apply path.
-    const stroke = core.freehandToObject(ZIGZAG_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a0");
+    const stroke = core.freehandToObject(ZIGZAG_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
     let scene: ObjectScene = { ...emptyObjectScene(), objects: [stroke] };
     const undo = core.createUndoStack("tester");
 

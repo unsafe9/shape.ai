@@ -59,7 +59,8 @@ use crate::object::cascade::{move_ops as move_ops_pure, MoveRoots};
 use crate::object::model::Transform3x3;
 use crate::object::commands::object_command_catalog_json;
 use crate::object::gestures::object_gesture_catalog_json;
-use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush, DrawingSession};
+use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush};
+use crate::object::recognize::recognize_stroke_object;
 use crate::object::grouping::{
     double_click_action as double_click_action_pure, has_children as has_children_pure,
     pop_out_op as pop_out_op_pure, ungroup_enabled as ungroup_enabled_pure,
@@ -181,19 +182,20 @@ pub fn build_object_template(
     ok_json(&objects)
 }
 
-/// `freehand_to_object(points_json, color, width_px, epsilon, id, order) -> Object | {error}`.
+/// `freehand_to_object(points_json, color, width_px, id, order) -> Object | {error}`.
 ///
-/// Capture a single freehand stroke (FC-11): `points_json` is a JSON array of
-/// `[x, y]` world-px samples. The session origin is the min (x, y) over the
-/// points, so the committed object's geometry is object-local and the origin
-/// rides the transform translate (P4 zero-rebake). Returns `{error}` for fewer
-/// than 2 points (a tap has no extent) or a malformed input.
+/// Commit a single freehand stroke (FC-11 / anchor-semantics v3 §4):
+/// `points_json` is a JSON array of `[x, y]` world-px samples. The pen-up
+/// stroke is RECOGNIZED into its canonical form (line / ellipse / rect /
+/// polygon / normalized silhouette, open or closed) — one stroke = one
+/// object. The geometry is object-local with the origin (the stroke's bbox
+/// min) riding the transform translate (P4 zero-rebake). Returns `{error}`
+/// for fewer than 2 points (a tap has no extent) or a malformed input.
 #[wasm_bindgen]
 pub fn freehand_to_object(
     points_json: &str,
     color: &str,
     width_px: f64,
-    epsilon: f64,
     id: &str,
     order: &str,
 ) -> String {
@@ -204,15 +206,13 @@ pub fn freehand_to_object(
     if points.len() < 2 {
         return error_json("freehand needs at least 2 points");
     }
-    let origin_x = points.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
-    let origin_y = points.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
-    let mut session = DrawingSession::new(Brush::new(color, width_px));
-    session.begin_stroke();
-    for [x, y] in &points {
-        session.push_point(*x, *y);
-    }
-    session.end_stroke(epsilon);
-    let object = session.commit(id.to_string(), order.to_string(), origin_x, origin_y);
+    let pts: Vec<(f64, f64)> = points.iter().map(|p| (p[0], p[1])).collect();
+    let object = recognize_stroke_object(
+        &pts,
+        &Brush::new(color, width_px),
+        id.to_string(),
+        order.to_string(),
+    );
     ok_json(&object)
 }
 
@@ -660,26 +660,25 @@ mod tests {
     use crate::object::model::Object;
 
     #[test]
-    fn freehand_round_trips_to_open_path_object_with_stroke() {
+    fn freehand_recognizes_a_straight_stroke_as_a_two_node_open_line() {
         let json = freehand_to_object(
             "[[0,0],[5,0],[10,0]]",
             "#1f2933",
-            2.0,
             2.0,
             "draw-1",
             "a0",
         );
         let object: Object = serde_json::from_str(&json).expect("freehand returns a valid Object");
         assert_eq!(object.id, "draw-1");
-        let d = &object.geometry.path_string;
-        assert!(!d.is_empty(), "geometry path is non-empty");
-        assert!(d.starts_with('M') && !d.contains('Z'), "open path");
+        // v3 §4: pen-up recognition — a straight stroke commits as the
+        // canonical 2-node line (object-local, origin on the transform).
+        assert_eq!(object.geometry.path_string, "M 0 0 L 80 0");
         assert!(object.stroke.is_some(), "freehand commit carries a stroke");
     }
 
     #[test]
     fn freehand_rejects_too_few_points() {
-        let json = freehand_to_object("[[0,0]]", "#000000", 1.0, 1.0, "d", "a0");
+        let json = freehand_to_object("[[0,0]]", "#000000", 1.0, "d", "a0");
         assert!(json.contains("\"error\""), "single point is an error");
     }
 

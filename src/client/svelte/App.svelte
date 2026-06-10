@@ -46,6 +46,7 @@
     type CreateSnap,
     altDetachOps,
     resolveCreateRelease,
+    synthesizeReleaseAnchors,
     CREATE_ANCHOR_REUSE_TOLERANCE_PX
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
@@ -87,10 +88,15 @@
   //       preview object so the stroke is visible before it commits. On pointer-up
   //       the points lower to a committed `Object` via the wasm core. -----
   let drawPoints = $state<{ x: number; y: number }[] | null>(null);
+  // v3 §4 freehand anchoring: the stroke's snap bookkeeping, mirroring createDrag's
+  // startSnap/lastSnap — `start` is the snap the stroke BEGAN on (the press's own
+  // snap, or the hover ring the user aimed at), `last` the most recent in-flight
+  // snap (sticky, for the near-miss release reuse). Both feed the release's
+  // endpoint-anchor authoring when the recognized result is OPEN.
+  let drawSnap = $state<{ start: CreateSnap | null; last: CreateSnap | null } | null>(null);
   // W2-08: pen brush settings are now reactive state the draw-mode sub-toolbar
-  // drives (color + width); epsilon (RDP simplification) stays a constant. The
-  // freehand commit + the live preview both read the current brush.
-  const PEN_EPSILON = 2.0;
+  // drives (color + width). The freehand commit + the live preview both read the
+  // current brush; simplification thresholds live in scene-core recognition.
   let penWidthPx = $state(2);
   // D1/#5: the toolbar's always-visible selected color. It is the default fill/
   // stroke for the next NEW shape; recoloring a selected object authors a SetStyle
@@ -360,10 +366,11 @@
     // RA2b/AP3: a double-click on a container drills in (sets activeContainer); a
     // leaf enters inline text edit through the existing path.
     onObjectDoubleClick: (payload) => handleObjectDoubleClick(payload),
-    // FC-11: freehand pen capture. Accumulate world points across start/move; on
-    // end, lower the stroke to an object via the wasm core and author an
-    // insert-object op (the tool stays sticky in "draw"); cancel discards.
-    onDraw: (phase, world) => handleDraw(phase, world),
+    // FC-11/v3 §4: freehand pen capture. Accumulate world points across start/move;
+    // on end, RECOGNIZE the stroke into an object via the wasm core, author its
+    // endpoint anchors when the result is open, and insert it (the tool stays
+    // sticky in "draw"); cancel discards.
+    onDraw: (phase, world, snap) => handleDraw(phase, world, snap),
     // W2-07: shape drag-create rubber-band + commit + select-after-create.
     onCreate: (phase, world, snapped, targetId) => handleCreate(phase, world, snapped, targetId),
     // W3-G9 (#3): pre-drag hover snap probe — drives the persistent anchor ring.
@@ -819,19 +826,13 @@
     // an edge), each binding the object node nearest that world point. The bound node
     // then reprojects through the target's transform, so the new object moves WITH the
     // target. (Alt-create bypasses snap upstream, so both targets are null = no anchor.)
+    // The corner loop is the same synthesizeReleaseAnchors the freehand pen commits
+    // through (v3 §4) — one release-anchor source for both tools.
     if (!tooSmall && sceneCore) {
-      const corners = [
-        startSnap ? { id: startSnap.target, at: span.start } : null,
-        snapTarget ? { id: snapTarget, at: span.end } : null
-      ];
-      const anchors = [];
-      for (const corner of corners) {
-        if (!corner) continue;
-        const target = scene.objects.find((o) => o.id === corner.id);
-        if (!target) continue;
-        const a = sceneCore.synthesizeCreateAnchors(object, target, corner.at);
-        if (a) anchors.push(...a);
-      }
+      const anchors = synthesizeReleaseAnchors(sceneCore, scene.objects, object, [
+        startSnap ? { target: startSnap.target, at: span.start } : null,
+        snapTarget ? { target: snapTarget, at: span.end } : null
+      ]);
       if (anchors.length) object.anchors = anchors;
     }
     authorOp({ kind: "insert-object", object });
@@ -849,32 +850,71 @@
   // clears it. The canonicalization mirrors handleCreate (#6): honor a snap ONLY
   // when its target is a REAL canonical object, so the ring never shows over the
   // preview's own outline. The ring renders from feedScene while createDrag is null.
+  // v3 §4: the DRAW tool rides the same probe — a stroke started on the ring
+  // anchors its start, so the pen shows the ring before pen-down too.
   function handleCreateHover(world: { x: number; y: number }, snappedIn: boolean, targetIdIn: string | null): void {
-    if (!createKind) return void (createHoverSnap = null);
+    if (!createKind && activeTool !== "draw") return void (createHoverSnap = null);
     const target = targetIdIn !== null && scene.objects.some((o) => o.id === targetIdIn) ? targetIdIn : null;
     createHoverSnap = snappedIn && target !== null ? { at: world, target } : null;
   }
 
-  // FC-11: drive the freehand pen. Accumulate world points across start/move; on
-  // end, lower the stroke to an object through the wasm core and author an
+  // FC-11/v3 §4: drive the freehand pen. Accumulate world points across start/move;
+  // on end, RECOGNIZE the stroke into its canonical object through the wasm core
+  // (pen-up shape recognition — one stroke = one object) and author an
   // insert-object op. The tool stays sticky in "draw". A cancel discards the
-  // in-progress stroke.
-  function handleDraw(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }): void {
+  // in-progress stroke. Anchoring mirrors handleCreate: the snap probe rides every
+  // phase; a snap is honored only onto a real canonical object (#6).
+  function handleDraw(
+    phase: "start" | "move" | "end" | "cancel",
+    world: { x: number; y: number },
+    snap: { at: { x: number; y: number }; targetId: string } | null
+  ): void {
+    const canon: CreateSnap | null =
+      snap && scene.objects.some((o) => o.id === snap.targetId) ? { at: snap.at, target: snap.targetId } : null;
     if (phase === "start") {
-      drawPoints = [world];
+      // A stroke STARTED on an edge anchors its start (G13 start-corner pattern):
+      // seed from the press's own snap OR the hover ring the user aimed at, and
+      // pull the first sample onto the edge so node 0 sits ON the outline.
+      const hover = createHoverSnap;
+      createHoverSnap = null;
+      const hoverSnap: CreateSnap | null =
+        hover && hover.target && scene.objects.some((o) => o.id === hover.target)
+          ? { at: hover.at, target: hover.target }
+          : null;
+      const startSnap = canon ?? hoverSnap;
+      drawSnap = { start: startSnap, last: startSnap };
+      drawPoints = [startSnap ? startSnap.at : world];
       return;
     }
     if (phase === "cancel") {
       drawPoints = null;
+      drawSnap = null;
+      createHoverSnap = null;
       return;
     }
     if (!drawPoints) return;
-    const points = [...drawPoints, world];
     if (phase === "move") {
-      drawPoints = points;
+      drawPoints = [...drawPoints, world];
+      // Keep the last successful snap sticky (AP5/#4) and ride the SAME hover-ring
+      // state as create so the ring shows where the stroke's END would anchor.
+      // Mid-stroke samples themselves stay raw — recognition normalizes the
+      // silhouette; only the start/release endpoints pull onto an edge.
+      if (canon) drawSnap = { start: drawSnap?.start ?? null, last: canon };
+      if (canon !== null || createHoverSnap !== null) createHoverSnap = canon;
       return;
     }
-    // phase === "end": commit the stroke to an object (>=2 points have extent).
+    // phase === "end": resolve the release against the gesture's last snap (a
+    // near-miss pointer-up still anchors, endpoint pulled onto the edge), then
+    // commit the recognized stroke (>=2 points have extent).
+    const startSnap = drawSnap?.start ?? null;
+    const resolved = resolveCreateRelease(
+      { end: canon ? canon.at : world, snapped: canon !== null, target: canon?.target ?? null },
+      drawSnap?.last ?? null,
+      CREATE_ANCHOR_REUSE_TOLERANCE_PX / camera.zoom
+    );
+    drawSnap = null;
+    createHoverSnap = null;
+    const points = [...drawPoints, resolved.end];
     drawPoints = null;
     if (points.length < 2 || !sceneCore) return;
     // S2 (#5): freehandToObject is a hex API, so the theme-default sentinel can't be
@@ -882,8 +922,18 @@
     // the "text" token so the stroke flips with the theme like every other authored color.
     // The pen draws with the single toolbar color (selectedColor); there is no separate pen color.
     const strokeHex = selectedColor === THEME_DEFAULT_COLOR ? "#000000" : selectedColor;
-    const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, PEN_EPSILON, freshId("draw"), nextOrderKey());
+    const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, freshId("draw"), nextOrderKey());
     if (selectedColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = previewPaint(selectedColor);
+    // v3 §4 freehand anchoring: an OPEN recognition authors endpoint anchors through
+    // the same release path as drag-create (both corners); a CLOSED recognition
+    // never anchors (DU7=(b): anchors live only on open-class endpoints).
+    if (sceneCore.isOpenClassD(object.geometry.d)) {
+      const anchors = synthesizeReleaseAnchors(sceneCore, scene.objects, object, [
+        startSnap ? { target: startSnap.target, at: startSnap.at } : null,
+        resolved.target ? { target: resolved.target, at: resolved.end } : null
+      ]);
+      if (anchors.length) object.anchors = anchors;
+    }
     authorOp({ kind: "insert-object", object });
     // Request 6: select the freshly-drawn stroke after creating it. The pen tool
     // stays sticky in "draw" so the next stroke draws immediately.
@@ -1265,7 +1315,11 @@
     // W2-10: a pending Escape first cancels an in-progress inline text edit.
     if (textEdit) return void cancelTextEdit();
     // FC-11: a pending Escape first cancels an in-progress pen stroke.
-    if (drawPoints) return void (drawPoints = null);
+    if (drawPoints) {
+      drawPoints = null;
+      drawSnap = null;
+      return;
+    }
     // W2-07: cancel an in-progress shape drag-create, then disarm the tool.
     if (createDrag) return void (createDrag = null);
     if (createKind) {

@@ -14,7 +14,7 @@ import { GEOMETRY_QUANTUM_PER_PX, emptyObjectScene, type Object as SceneObject }
 
 let core: SceneCore;
 
-const PEN = { color: "#1f2933", widthPx: 2, epsilon: 2.0 };
+const PEN = { color: "#1f2933", widthPx: 2 };
 // A zigzag stroke: the interior peaks deviate off any chord, so RDP keeps them
 // (a straight polyline would simplify to its 2 endpoints, leaving no interior
 // node to cut). Origin is min(x, y) over the points; geometry is object-local.
@@ -34,7 +34,7 @@ beforeAll(async () => {
 
 describe("(1) whole-stroke delete authors a delete op with an inverse re-insert", () => {
   it("removes the stroke and captures the inverse that restores it (D21)", () => {
-    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a0");
+    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
     const scene = { ...emptyObjectScene(), objects: [stroke] };
 
     const deleted = core.applyObjectOp(scene, { kind: "delete", id: "draw-1" });
@@ -51,7 +51,7 @@ describe("(1) whole-stroke delete authors a delete op with an inverse re-insert"
 
 describe("(2) partial erase cuts the touched subpath into two open pieces", () => {
   it("splits the stroke geometry at the touched node (object-local quantized)", () => {
-    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a0");
+    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
     // The middle sample (80,0 world) maps to object-local (80 - origin.x, 0 -
     // origin.y) px, then quantized. A generous radius tolerates RDP/bezier-fit
     // nudging the interior node slightly.
@@ -75,7 +75,7 @@ describe("(2) partial erase cuts the touched subpath into two open pieces", () =
   });
 
   it("returns null when the touch misses every stroke node (no-op)", () => {
-    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, PEN.epsilon, "draw-1", "a0");
+    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0");
     const cut = core.splitSubpathAt(stroke.geometry, 9999, 9999, 12 * GEOMETRY_QUANTUM_PER_PX);
     expect(cut).toBeNull();
   });

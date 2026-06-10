@@ -82,8 +82,15 @@ export type ShapeCanvasHostCallbacks = {
   // event, so a host that omits this loses nothing.
   onContextPick?: (id: string | null) => void;
   // FC-11: freehand pen capture phases (world px). The shell accumulates the
-  // points across start/move and commits the stroke to an object on `end`.
-  onDraw: (phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }) => void;
+  // points across start/move and commits the RECOGNIZED stroke to an object on
+  // `end`. v3 §4: `snap` is the outline snap probe under the cursor (null when
+  // off any edge / Alt held) so the shell can seed/author endpoint anchors for
+  // an open result.
+  onDraw: (
+    phase: "start" | "move" | "end" | "cancel",
+    world: { x: number; y: number },
+    snap: { at: { x: number; y: number }; targetId: string } | null
+  ) => void;
   // W2-07: shape drag-create phases. `world` is the dragged corner (already snapped
   // to the nearest outline anchor when `snapped`); the shell rubber-bands a bbox
   // preview and commits a sized primitive on `end`. AP5 (#14): `targetId` is the
@@ -466,7 +473,7 @@ export class ShapeCanvasHost {
     }
     // FC-11: freehand pen capture phase routes to the shell's draw controller.
     if (event.type === "draw") {
-      this.callbacks.onDraw(event.phase, event.world);
+      this.callbacks.onDraw(event.phase, event.world, event.snap);
       return;
     }
     // W2-07: shape drag-create phase routes to the shell's create controller.

@@ -1,0 +1,618 @@
+//! Anchor-semantics v3 §4 — pen-up stroke recognition (freehand → shape input).
+//!
+//! Freehand is a SHAPE INPUT device, not ink: at pen-up the raw stroke is
+//! converted to its nearest canonical form, and one stroke commits as ONE
+//! object (replacing the D13 "session = one multi-subpath object" policy —
+//! a recognized rect and a recognized line have no reason to share an object).
+//!
+//! Pipeline ([`recognize_stroke`]):
+//!   1. closure test — `dist(start, end) < CLOSE_RATIO · bbox diagonal`.
+//!   2. canonical fits, adopted when the confidence threshold passes:
+//!      open   → straight line (max perpendicular deviation / chord ratio);
+//!      closed → circle/ellipse (least-squares radial residual against the
+//!               bbox ellipse), rect (rotated min-area + 0°/90° angle snap),
+//!               triangle/polygon (coarse-RDP corner detection, 3–8 sides).
+//!   3. fallback — silhouette-preserving normalize: coarse
+//!      [`rdp_simplify`] + corner detection + per-run [`fit_beziers`]
+//!      smoothing (sharp turns stay corners, smooth runs stay curves; this is
+//!      also the open "smooth curve" fit when no corner is detected), capped
+//!      at [`MAX_FALLBACK_NODES`]; closed per the step-1 test.
+//!
+//! The recognizer's geometry helpers REUSE `drawing.rs` ([`rdp_simplify`],
+//! [`fit_beziers`], `perpendicular_distance`, `quantize_px`) — no duplicates.
+//! Endpoints of OPEN results are preserved exactly (the quantization of the
+//! input start/end), the premise the freehand anchoring path builds on.
+//!
+//! Pure (no time/rng/IO), pointer-width-agnostic; inputs are world-px samples,
+//! the emitted path-string is world-px-quantized (Q=8) — the commit
+//! ([`recognize_stroke_object`]) subtracts the origin so geometry stays
+//! object-local with the position riding the transform translate (P4).
+
+use super::drawing::{
+    fit_beziers, perpendicular_distance, quantize_px, rdp_simplify, Brush,
+};
+use super::model::{
+    path_string, FillRule, Geometry, HandlePoint, Object, PathNode, SubPath, Transform3x3,
+};
+
+/// Closure threshold: the start→end gap as a fraction of the bbox diagonal.
+const CLOSE_RATIO: f64 = 0.15;
+/// Straight-line confidence: max perpendicular deviation / chord length.
+const LINE_MAX_DEV_RATIO: f64 = 0.05;
+/// Ellipse confidence: RMS of the normalized radial residual (|p−c| in
+/// bbox-ellipse units minus 1).
+const ELLIPSE_MAX_RMS: f64 = 0.10;
+/// Ellipse fit needs real extent on both axes (a flat closed scribble is not
+/// an ellipse).
+const MIN_ELLIPSE_RADIUS_PX: f64 = 2.0;
+/// Coarse RDP epsilon as a fraction of the bbox diagonal (scale-free), with a
+/// 1.5px floor so tiny strokes don't keep every sample.
+const NORMALIZE_EPSILON_RATIO: f64 = 0.04;
+const MIN_EPSILON_PX: f64 = 1.5;
+/// Corner sharpness is measured over a path-distance window of this many
+/// epsilons on the RAW samples — a sharp corner keeps its full turn at a small
+/// window while a smooth curve spreads it out.
+const CORNER_WINDOW_FACTOR: f64 = 2.0;
+/// Ring vertices turning less than this are merged away (e.g. a closed stroke
+/// STARTED mid-edge always keeps its start sample — it is not a corner).
+const COLLINEAR_MERGE_DEG: f64 = 15.0;
+/// Minimum windowed turn for a vertex to count as a corner (an octagon's
+/// exterior angle is 45°, the polygon ceiling).
+const CORNER_MIN_DEG: f64 = 40.0;
+/// Rect confidence: every ring turn within this of 90°.
+const RECT_ANGLE_TOL_DEG: f64 = 20.0;
+/// Rect orientation within this of an axis snaps to 0°/90° (axis-aligned).
+const AXIS_SNAP_DEG: f64 = 10.0;
+/// Polygon side ceiling (3..=8 per the design).
+const POLYGON_MAX_SIDES: usize = 8;
+/// Fallback node ceiling: a complex blob normalizes, it does not balloon.
+const MAX_FALLBACK_NODES: usize = 24;
+/// Cubic-arc circle constant (matches the primitive ellipse builders).
+const KAPPA: f64 = 0.5523;
+
+/// A recognized stroke: the canonical SVG-subset path-string (world-px
+/// quantized units, exactly one subpath) plus whether it is closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecognizedStroke {
+    pub d: String,
+    pub closed: bool,
+}
+
+/// Recognize one freehand stroke (raw world-px samples) into its canonical
+/// form (module pipeline). Fewer than 3 points skip recognition and fit as-is
+/// (a 2-point stroke IS already a line; 0/1 points have no extent).
+pub fn recognize_stroke(points: &[(f64, f64)]) -> RecognizedStroke {
+    let (nodes, closed) = recognize_nodes(points);
+    RecognizedStroke { d: path_string::serialize(&[SubPath { closed, nodes }]), closed }
+}
+
+/// Recognize + commit one stroke to an [`Object`]: the recognized geometry is
+/// translated to object-local coords relative to the stroke's bbox min (the
+/// origin rides the transform translate, P4 zero-rebake) and the brush lowers
+/// to the stroke style. `id`/`order` are caller-supplied (purity).
+pub fn recognize_stroke_object(
+    points: &[(f64, f64)],
+    brush: &Brush,
+    id: String,
+    order: String,
+) -> Object {
+    let (nodes, closed) = recognize_nodes(points);
+    let origin_x = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let origin_y = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let ox = quantize_px(origin_x);
+    let oy = quantize_px(origin_y);
+    let local: Vec<PathNode> = nodes
+        .into_iter()
+        .map(|n| PathNode { x: n.x - ox, y: n.y - oy, ..n })
+        .collect();
+    let geometry =
+        Geometry::from_subpaths(vec![SubPath { closed, nodes: local }], FillRule::NonZero);
+    let mut object = Object::new(id, order, geometry);
+    object.transform = Transform3x3::translate(origin_x, origin_y);
+    object.stroke = Some(brush.to_stroke());
+    object
+}
+
+/// The recognition core: canonical-fit nodes (world-px quantized) + closure.
+fn recognize_nodes(points: &[(f64, f64)]) -> (Vec<PathNode>, bool) {
+    if points.len() < 3 {
+        return (fit_beziers(points), false);
+    }
+    let (min_x, min_y, max_x, max_y) = bbox(points);
+    let diag = (max_x - min_x).hypot(max_y - min_y);
+    let first = points[0];
+    let last = points[points.len() - 1];
+    let gap = (last.0 - first.0).hypot(last.1 - first.1);
+    let closed = diag > f64::EPSILON && gap < CLOSE_RATIO * diag;
+    if closed {
+        if let Some(nodes) = fit_ellipse(points, (min_x, min_y, max_x, max_y)) {
+            return (nodes, true);
+        }
+        if let Some(nodes) = fit_polygon(points, diag) {
+            return (nodes, true);
+        }
+        (normalize(points, diag, true), true)
+    } else {
+        if let Some(nodes) = fit_line(points) {
+            return (nodes, false);
+        }
+        (normalize(points, diag, false), false)
+    }
+}
+
+fn bbox(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+    let mut b = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in points {
+        b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+    }
+    b
+}
+
+// ---------------------------------------------------------------------------
+// Canonical fits.
+// ---------------------------------------------------------------------------
+
+/// Straight line: every sample within `LINE_MAX_DEV_RATIO · chord` of the
+/// start→end chord. The endpoints are the INPUT endpoints, untouched —
+/// the anchoring premise.
+fn fit_line(points: &[(f64, f64)]) -> Option<Vec<PathNode>> {
+    let a = points[0];
+    let b = points[points.len() - 1];
+    let chord = (b.0 - a.0).hypot(b.1 - a.1);
+    if chord <= f64::EPSILON {
+        return None;
+    }
+    let max_dev = points.iter().map(|&p| perpendicular_distance(p, a, b)).fold(0.0, f64::max);
+    (max_dev / chord <= LINE_MAX_DEV_RATIO).then(|| {
+        vec![
+            PathNode::corner(quantize_px(a.0), quantize_px(a.1)),
+            PathNode::corner(quantize_px(b.0), quantize_px(b.1)),
+        ]
+    })
+}
+
+/// Circle/ellipse: least-squares radial residual against the axis-aligned
+/// bbox ellipse (a circle is the rx≈ry case — no separate fit). Emits the
+/// standard four-cubic-arc closed ring.
+fn fit_ellipse(
+    points: &[(f64, f64)],
+    (min_x, min_y, max_x, max_y): (f64, f64, f64, f64),
+) -> Option<Vec<PathNode>> {
+    let rx = (max_x - min_x) / 2.0;
+    let ry = (max_y - min_y) / 2.0;
+    if rx < MIN_ELLIPSE_RADIUS_PX || ry < MIN_ELLIPSE_RADIUS_PX {
+        return None;
+    }
+    let cx = (min_x + max_x) / 2.0;
+    let cy = (min_y + max_y) / 2.0;
+    let mse = points
+        .iter()
+        .map(|&(x, y)| {
+            let r = ((x - cx) / rx).hypot((y - cy) / ry);
+            (r - 1.0) * (r - 1.0)
+        })
+        .sum::<f64>()
+        / points.len() as f64;
+    if mse.sqrt() > ELLIPSE_MAX_RMS {
+        return None;
+    }
+    let kx = KAPPA * rx;
+    let ky = KAPPA * ry;
+    let handle = |dx: f64, dy: f64| Some(HandlePoint { dx: quantize_px(dx), dy: quantize_px(dy) });
+    let node = |x: f64, y: f64, in_h: Option<HandlePoint>, out_h: Option<HandlePoint>| PathNode {
+        x: quantize_px(x),
+        y: quantize_px(y),
+        in_handle: in_h,
+        out_handle: out_h,
+        width: None,
+    };
+    // The parse-canonical closed-curve form: the closing arc's landing node is
+    // explicit (last == first position), so `subpaths` and a re-parse of the
+    // serialized `d` are byte-identical (no runtime-mirror divergence).
+    Some(vec![
+        node(cx - rx, cy, None, handle(0.0, -ky)),
+        node(cx, cy - ry, handle(-kx, 0.0), handle(kx, 0.0)),
+        node(cx + rx, cy, handle(0.0, -ky), handle(0.0, ky)),
+        node(cx, cy + ry, handle(kx, 0.0), handle(-kx, 0.0)),
+        node(cx - rx, cy, handle(0.0, ky), None),
+    ])
+}
+
+/// Triangle/rect/polygon: coarse-RDP vertices, near-collinear ones merged
+/// away (a mid-edge stroke start is not a corner), every survivor sharp, 3–8
+/// sides. Four right-angled corners route to the rect fit first.
+fn fit_polygon(points: &[(f64, f64)], diag: f64) -> Option<Vec<PathNode>> {
+    let eps = normalize_epsilon(diag);
+    let kept = rdp_simplify(points, eps);
+    if kept.len() < 4 {
+        return None;
+    }
+    // Drop the pen-up endpoint: on a closed stroke it rides next to the start
+    // and the closing segment re-links the ring.
+    let ring = &kept[..kept.len() - 1];
+    let idx = kept_indices(points, ring);
+    let w = CORNER_WINDOW_FACTOR * eps;
+    let vertices: Vec<((f64, f64), f64)> = ring
+        .iter()
+        .zip(&idx)
+        .map(|(&p, &i)| (p, window_turn_deg(points, i, w, true)))
+        .filter(|&(_, t)| t >= COLLINEAR_MERGE_DEG)
+        .collect();
+    if !(3..=POLYGON_MAX_SIDES).contains(&vertices.len())
+        || vertices.iter().any(|&(_, t)| t < CORNER_MIN_DEG)
+    {
+        return None;
+    }
+    let corners: Vec<(f64, f64)> = vertices.into_iter().map(|(p, _)| p).collect();
+    if corners.len() == 4 {
+        if let Some(nodes) = fit_rect(&corners) {
+            return Some(nodes);
+        }
+    }
+    Some(corners.iter().map(|&(x, y)| PathNode::corner(quantize_px(x), quantize_px(y))).collect())
+}
+
+/// Rect from 4 ring corners: every turn ~90°, oriented by the longest edge —
+/// within `AXIS_SNAP_DEG` of an axis it snaps to the axis-aligned bbox of the
+/// corners; otherwise the min-area rect at that orientation (rotate, bbox,
+/// rotate back). `None` when the quad is not right-angled (stays a polygon).
+fn fit_rect(corners: &[(f64, f64)]) -> Option<Vec<PathNode>> {
+    let n = corners.len();
+    for i in 0..n {
+        let t = turn_deg(corners[(i + n - 1) % n], corners[i], corners[(i + 1) % n]);
+        if (t - 90.0).abs() > RECT_ANGLE_TOL_DEG {
+            return None;
+        }
+    }
+    let mut best = (0.0_f64, 0.0_f64); // (edge length, edge angle deg)
+    for i in 0..n {
+        let a = corners[i];
+        let b = corners[(i + 1) % n];
+        let len = (b.0 - a.0).hypot(b.1 - a.1);
+        if len > best.0 {
+            best = (len, (b.1 - a.1).atan2(b.0 - a.0).to_degrees());
+        }
+    }
+    // Fold the orientation into [-45°, 45°): rect symmetry is mod 90°.
+    let mut theta = best.1.rem_euclid(90.0);
+    if theta >= 45.0 {
+        theta -= 90.0;
+    }
+    let frame_theta = if theta.abs() <= AXIS_SNAP_DEG { 0.0 } else { theta.to_radians() };
+    let (sin, cos) = frame_theta.sin_cos();
+    // Min-area at the chosen orientation: bbox in the rotated frame, corners
+    // mapped back. frame_theta == 0 degenerates to the axis-aligned bbox.
+    let frame: Vec<(f64, f64)> =
+        corners.iter().map(|&(x, y)| (x * cos + y * sin, -x * sin + y * cos)).collect();
+    let (fx0, fy0, fx1, fy1) = bbox(&frame);
+    let back = |fx: f64, fy: f64| (fx * cos - fy * sin, fx * sin + fy * cos);
+    Some(
+        [back(fx0, fy0), back(fx1, fy0), back(fx1, fy1), back(fx0, fy1)]
+            .iter()
+            .map(|&(x, y)| PathNode::corner(quantize_px(x), quantize_px(y)))
+            .collect(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Silhouette-preserving fallback normalize.
+// ---------------------------------------------------------------------------
+
+fn normalize_epsilon(diag: f64) -> f64 {
+    (NORMALIZE_EPSILON_RATIO * diag).max(MIN_EPSILON_PX)
+}
+
+/// Coarse RDP + corner detection + per-run [`fit_beziers`]: sharp turns stay
+/// corner nodes (each smooth run is fitted independently, so the tangents on
+/// either side of a corner never smooth across it), smooth runs get
+/// Catmull-Rom handles. Doubles epsilon until the node count fits the cap.
+fn normalize(points: &[(f64, f64)], diag: f64, closed: bool) -> Vec<PathNode> {
+    let mut eps = normalize_epsilon(diag);
+    loop {
+        let mut kept = rdp_simplify(points, eps);
+        if closed && kept.len() > 2 {
+            kept.pop(); // pen-up endpoint rides next to the start; Z closes.
+        }
+        if kept.len() > MAX_FALLBACK_NODES && eps < diag {
+            eps *= 2.0;
+            continue;
+        }
+        let idx = kept_indices(points, &kept);
+        let w = CORNER_WINDOW_FACTOR * eps;
+        let mut cuts: Vec<usize> = vec![0];
+        for k in 1..kept.len().saturating_sub(1) {
+            if window_turn_deg(points, idx[k], w, closed) >= CORNER_MIN_DEG {
+                cuts.push(k);
+            }
+        }
+        cuts.push(kept.len() - 1);
+        let mut nodes: Vec<PathNode> = Vec::with_capacity(kept.len());
+        for pair in cuts.windows(2) {
+            let fitted = fit_beziers(&kept[pair[0]..=pair[1]]);
+            match nodes.last_mut() {
+                None => nodes.extend(fitted),
+                Some(corner) => {
+                    // The shared corner keeps the previous run's one-sided
+                    // in-handle and takes the next run's out-handle — the
+                    // tangents stay independent, so the corner stays sharp.
+                    corner.out_handle = fitted[0].out_handle;
+                    nodes.extend(fitted.into_iter().skip(1));
+                }
+            }
+        }
+        return nodes;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Corner detection over the RAW samples.
+// ---------------------------------------------------------------------------
+
+/// Indices into `raw` of each member of `kept` (RDP keeps exact input points,
+/// in order, so an advancing bit-equality scan recovers them).
+fn kept_indices(raw: &[(f64, f64)], kept: &[(f64, f64)]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(kept.len());
+    let mut cursor = 0;
+    for &k in kept {
+        while cursor < raw.len() && raw[cursor] != k {
+            cursor += 1;
+        }
+        out.push(cursor.min(raw.len().saturating_sub(1)));
+        cursor += 1;
+    }
+    out
+}
+
+/// Direction change (degrees, 0 = straight) from `a→b` to `b→c`.
+fn turn_deg(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+    let (ux, uy) = (b.0 - a.0, b.1 - a.1);
+    let (vx, vy) = (c.0 - b.0, c.1 - b.1);
+    (ux * vy - uy * vx).atan2(ux * vx + uy * vy).abs().to_degrees()
+}
+
+/// The turn at raw sample `idx` measured over a path-distance window `w` on
+/// each side (wrapping across the seam when `closed`). A sharp corner keeps
+/// its full angle at a small window; a smooth curve's turn over `2w` stays
+/// shallow — this separates a hexagon's vertex from a circle's RDP residue.
+fn window_turn_deg(raw: &[(f64, f64)], idx: usize, w: f64, closed: bool) -> f64 {
+    let n = raw.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let walk = |backward: bool| -> Option<(f64, f64)> {
+        let mut i = idx;
+        let mut dist = 0.0;
+        for _ in 0..n {
+            let next = if backward {
+                if i == 0 {
+                    if !closed {
+                        break;
+                    }
+                    n - 1
+                } else {
+                    i - 1
+                }
+            } else if i + 1 >= n {
+                if !closed {
+                    break;
+                }
+                0
+            } else {
+                i + 1
+            };
+            dist += (raw[next].0 - raw[i].0).hypot(raw[next].1 - raw[i].1);
+            i = next;
+            if dist >= w {
+                return Some(raw[i]);
+            }
+        }
+        (i != idx).then(|| raw[i])
+    };
+    match (walk(true), walk(false)) {
+        (Some(a), Some(b)) => turn_deg(a, raw[idx], b),
+        _ => 0.0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — synthetic-stroke goldens (deterministic, no rng).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::model::GEOMETRY_QUANTUM_PER_PX;
+
+    const Q: i32 = GEOMETRY_QUANTUM_PER_PX;
+
+    fn parse(d: &str) -> Vec<SubPath> {
+        path_string::parse(d).expect("recognized d parses")
+    }
+
+    /// Samples along the segment `a -> b` (excluding `b`), `n` per edge.
+    fn edge(a: (f64, f64), b: (f64, f64), n: usize, out: &mut Vec<(f64, f64)>) {
+        for i in 0..n {
+            let t = i as f64 / n as f64;
+            out.push((a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
+        }
+    }
+
+    #[test]
+    fn noisy_straight_stroke_recognizes_as_a_two_node_line() {
+        // 21 samples along (0,0)->(200,10) with alternating ±1px wiggle on the
+        // interior: deviation/chord ≈ 0.005, well under the line threshold.
+        let pts: Vec<(f64, f64)> = (0..=20)
+            .map(|i| {
+                let t = f64::from(i) / 20.0;
+                let wiggle =
+                    if i == 0 || i == 20 { 0.0 } else if i % 2 == 0 { 1.0 } else { -1.0 };
+                (200.0 * t, 10.0 * t + wiggle)
+            })
+            .collect();
+        let rec = recognize_stroke(&pts);
+        assert!(!rec.closed);
+        // Exactly two nodes at the EXACT quantized input endpoints.
+        assert_eq!(rec.d, format!("M 0 0 L {} {}", 200 * Q, 10 * Q));
+    }
+
+    #[test]
+    fn rough_circle_recognizes_as_a_closed_four_arc_ellipse() {
+        // r(θ) = 50 + 2·sin(7θ) around (100,100): radial noise ±2px on r=50.
+        let pts: Vec<(f64, f64)> = (0..72)
+            .map(|i| {
+                let theta = f64::from(i) * 5.0_f64.to_radians();
+                let r = 50.0 + 2.0 * (7.0 * theta).sin();
+                (100.0 + r * theta.cos(), 100.0 + r * theta.sin())
+            })
+            .collect();
+        let rec = recognize_stroke(&pts);
+        assert!(rec.closed);
+        let subpaths = parse(&rec.d);
+        assert_eq!(subpaths.len(), 1);
+        let sp = &subpaths[0];
+        assert!(sp.closed);
+        // Four cubic arcs in the parse-canonical form: the closing arc's
+        // landing node is explicit, so 5 nodes with last == first.
+        assert_eq!(sp.nodes.len(), 5, "four-arc ellipse: {}", rec.d);
+        let (l, t, r, b) = (&sp.nodes[0], &sp.nodes[1], &sp.nodes[2], &sp.nodes[3]);
+        let last = &sp.nodes[4];
+        assert_eq!((last.x, last.y), (l.x, l.y));
+        assert!(sp.nodes[1..4].iter().all(|n| n.in_handle.is_some() && n.out_handle.is_some()));
+        // Cardinal layout: left/right share the center y, top/bottom the
+        // center x (the bbox-ellipse center).
+        assert_eq!(l.y, r.y);
+        assert_eq!(t.x, b.x);
+        assert!(l.x < t.x && t.x < r.x);
+        assert!(t.y < l.y && l.y < b.y);
+    }
+
+    #[test]
+    fn rough_rect_recognizes_as_an_axis_snapped_rect() {
+        // Perimeter walk of (0,0)-(120,80) with ±1.2px edge noise, ending a
+        // little short of the start (the pen-up gap). The noise is under the
+        // coarse epsilon, the corners are exact, the orientation is 0° — so
+        // the result is the EXACT axis-aligned rect.
+        let pts = vec![
+            (0.0, 0.0),
+            (30.0, 1.2),
+            (60.0, -1.0),
+            (90.0, 1.0),
+            (120.0, 0.0),
+            (121.0, 26.0),
+            (119.0, 53.0),
+            (120.0, 80.0),
+            (90.0, 81.0),
+            (60.0, 79.0),
+            (30.0, 80.8),
+            (0.0, 80.0),
+            (-1.0, 55.0),
+            (1.0, 30.0),
+            (0.0, 10.0),
+        ];
+        let rec = recognize_stroke(&pts);
+        assert!(rec.closed);
+        assert_eq!(rec.d, format!("M 0 0 L {} 0 L {} {} L 0 {} Z", 120 * Q, 120 * Q, 80 * Q, 80 * Q));
+    }
+
+    #[test]
+    fn triangle_stroke_recognizes_as_a_three_corner_polygon() {
+        let mut pts = Vec::new();
+        edge((0.0, 0.0), (100.0, 0.0), 10, &mut pts);
+        edge((100.0, 0.0), (50.0, 80.0), 10, &mut pts);
+        edge((50.0, 80.0), (0.0, 0.0), 9, &mut pts); // stops short of the start
+        let rec = recognize_stroke(&pts);
+        assert!(rec.closed);
+        assert_eq!(rec.d, format!("M 0 0 L {} 0 L {} {} Z", 100 * Q, 50 * Q, 80 * Q));
+    }
+
+    #[test]
+    fn l_bend_open_stroke_falls_back_with_the_corner_preserved() {
+        // (100,0) -> (0,0) -> (0,100): not a line (deviation ratio 0.5), open.
+        let mut pts: Vec<(f64, f64)> =
+            (0..=10).map(|i| (100.0 - 10.0 * f64::from(i), 0.0)).collect();
+        pts.extend((1..=10).map(|i| (0.0, 10.0 * f64::from(i))));
+        let rec = recognize_stroke(&pts);
+        assert!(!rec.closed);
+        let sp = &parse(&rec.d)[0];
+        assert!(!sp.closed);
+        // The elbow survives as an interior corner node at exactly (0,0).
+        assert!(
+            sp.nodes[1..sp.nodes.len() - 1].iter().any(|n| n.x == 0 && n.y == 0),
+            "corner preserved: {}",
+            rec.d
+        );
+        // Endpoints preserved exactly (anchoring premise).
+        let first = sp.nodes.first().unwrap();
+        let last = sp.nodes.last().unwrap();
+        assert_eq!((first.x, first.y), (100 * Q, 0));
+        assert_eq!((last.x, last.y), (0, 100 * Q));
+    }
+
+    #[test]
+    fn complex_closed_blob_normalizes_closed_under_the_node_cap() {
+        // A five-petal flower r(θ) = 60 + 18·sin(5θ): too lumpy for the
+        // ellipse fit, too many extrema for a polygon — the closed fallback.
+        let pts: Vec<(f64, f64)> = (0..72)
+            .map(|i| {
+                let theta = f64::from(i) * 5.0_f64.to_radians();
+                let r = 60.0 + 18.0 * (5.0 * theta).sin();
+                (200.0 + r * theta.cos(), 200.0 + r * theta.sin())
+            })
+            .collect();
+        let rec = recognize_stroke(&pts);
+        assert!(rec.closed);
+        let sp = &parse(&rec.d)[0];
+        assert!(sp.closed);
+        assert!(sp.nodes.len() <= MAX_FALLBACK_NODES, "capped: {} nodes", sp.nodes.len());
+        assert!(sp.nodes.len() > 4, "still a blob silhouette, not a primitive");
+    }
+
+    #[test]
+    fn smooth_open_curve_preserves_its_input_endpoints_exactly() {
+        // A sine bump from (0,0) to (100,0): smooth (no corner), not a line.
+        let pts: Vec<(f64, f64)> = (0..=20)
+            .map(|i| {
+                let t = f64::from(i) / 20.0;
+                (100.0 * t, 40.0 * (core::f64::consts::PI * t).sin())
+            })
+            .collect();
+        let rec = recognize_stroke(&pts);
+        assert!(!rec.closed);
+        let sp = &parse(&rec.d)[0];
+        assert!(sp.nodes.len() > 2, "a curve, not a collapsed line: {}", rec.d);
+        let first = sp.nodes.first().unwrap();
+        let last = sp.nodes.last().unwrap();
+        assert_eq!((first.x, first.y), (0, 0));
+        assert_eq!((last.x, last.y), (100 * Q, 0));
+        // Interior nodes carry smoothing handles (fit_beziers ran).
+        assert!(sp.nodes[1..sp.nodes.len() - 1].iter().all(|n| n.in_handle.is_some()));
+    }
+
+    #[test]
+    fn recognize_stroke_object_commits_object_local_geometry_with_origin_translate() {
+        let pts: Vec<(f64, f64)> = (0..=10)
+            .map(|i| (100.0 + 10.0 * f64::from(i), 110.0 + f64::from(i)))
+            .collect();
+        let object = recognize_stroke_object(
+            &pts,
+            &Brush::new("#112233", 2.0),
+            "draw-1".into(),
+            "a0".into(),
+        );
+        assert_eq!(object.id, "draw-1");
+        // A straight stroke at (100,110)->(200,120): line, object-local from
+        // the bbox min with the origin riding the transform.
+        assert_eq!(object.geometry.path_string, format!("M 0 0 L {} {}", 100 * Q, 10 * Q));
+        assert_eq!(object.transform, Transform3x3::translate(100.0, 110.0));
+        assert!(object.stroke.is_some());
+        assert!(object.fill.is_none());
+    }
+
+    #[test]
+    fn degenerate_inputs_fit_as_is_without_recognition() {
+        assert_eq!(recognize_stroke(&[]), RecognizedStroke { d: String::new(), closed: false });
+        let two = recognize_stroke(&[(0.0, 0.0), (10.0, 0.0)]);
+        assert_eq!(two.d, format!("M 0 0 L {} 0", 10 * Q));
+        assert!(!two.closed);
+    }
+}
