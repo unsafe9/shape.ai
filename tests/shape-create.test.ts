@@ -4,7 +4,11 @@
 // they pin without a renderer or a Svelte mount (the engine/App only wire them).
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { type DragSpan } from "../src/client/lib/objectPrimitives";
+import {
+  type DragSpan,
+  type CreateSnap,
+  resolveCreateRelease
+} from "../src/client/lib/objectPrimitives";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
 import { isDragCreateShape } from "../src/client/lib/toolbar";
 import { shouldQuerySnap } from "../src/client/renderer/engine";
@@ -92,5 +96,63 @@ describe("shouldQuerySnap (W2-07 modifier nullifies snap)", () => {
 
   it("the cancel phase never snaps (no preview to snap)", () => {
     expect(shouldQuerySnap({ altHeld: false, phase: "cancel" })).toBe(false);
+  });
+});
+
+describe("resolveCreateRelease (AP5/#4 anchor-on-release reuse)", () => {
+  const lastSnap: CreateSnap = { at: { x: 200, y: 30 }, target: "rect-a" };
+
+  it("honors the release-time snap when it hit (no reuse needed)", () => {
+    const r = resolveCreateRelease(
+      { end: { x: 201, y: 31 }, snapped: true, target: "rect-a" },
+      null,
+      24
+    );
+    expect(r).toEqual({ end: { x: 201, y: 31 }, target: "rect-a" });
+  });
+
+  it("reuses the gesture's last snap when the release MISSED but landed within tolerance", () => {
+    // Release at (205,33) missed the 8px snap but is ~6.4 world units from the last
+    // snap (200,30) — inside tolerance 24 — so the anchor is still authored and the
+    // endpoint is pulled onto the edge point.
+    const r = resolveCreateRelease(
+      { end: { x: 205, y: 33 }, snapped: false, target: null },
+      lastSnap,
+      24
+    );
+    expect(r).toEqual({ end: { x: 200, y: 30 }, target: "rect-a" });
+  });
+
+  it("does NOT reuse when the release missed and is FAR from the last snap (deliberate empty release)", () => {
+    const r = resolveCreateRelease(
+      { end: { x: 400, y: 400 }, snapped: false, target: null },
+      lastSnap,
+      24
+    );
+    expect(r).toEqual({ end: { x: 400, y: 400 }, target: null });
+  });
+
+  it("authors nothing when the gesture never snapped and the release missed", () => {
+    const r = resolveCreateRelease(
+      { end: { x: 50, y: 50 }, snapped: false, target: null },
+      null,
+      24
+    );
+    expect(r).toEqual({ end: { x: 50, y: 50 }, target: null });
+  });
+
+  it("reuse boundary is the tolerance radius (just inside = reuse, just outside = drop)", () => {
+    const justInside = resolveCreateRelease(
+      { end: { x: 200 + 23, y: 30 }, snapped: false, target: null },
+      lastSnap,
+      24
+    );
+    expect(justInside.target).toBe("rect-a");
+    const justOutside = resolveCreateRelease(
+      { end: { x: 200 + 25, y: 30 }, snapped: false, target: null },
+      lastSnap,
+      24
+    );
+    expect(justOutside.target).toBeNull();
   });
 });

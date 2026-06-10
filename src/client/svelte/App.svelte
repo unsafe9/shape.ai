@@ -42,7 +42,10 @@
     MIN_DRAG_EXTENT_PX,
     textOverlayScreenRect,
     THEME_DEFAULT_COLOR,
-    type DragSpan
+    type DragSpan,
+    type CreateSnap,
+    resolveCreateRelease,
+    CREATE_ANCHOR_REUSE_TOLERANCE_PX
   } from "../lib/objectPrimitives";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
   import Toolbar from "./Toolbar.svelte";
@@ -110,7 +113,10 @@
   // AP5 (#14): `target` is the id of the object whose outline the dragged corner
   // snapped to (null when not snapped); it is captured per phase so the commit can
   // synthesize a persistent anchor binding the created endpoint to that target.
-  let createDrag = $state<{ span: DragSpan; snapped: boolean; target: string | null } | null>(null);
+  // AP5/#4: `lastSnap` is the most recent successful outline snap seen DURING this
+  // drag (sticky — kept across moves that fall off the edge), so a release that
+  // itself misses the 8px snap can still reuse it to author the anchor.
+  let createDrag = $state<{ span: DragSpan; snapped: boolean; target: string | null; startSnap: CreateSnap | null; lastSnap: CreateSnap | null } | null>(null);
   // W3-G9 (#3): the pre-drag hover snap. While the create tool is armed and no
   // button is down, a bare hover over an existing object's edge sets this to the
   // snapped world point + target id; `feedScene` renders a PERSISTENT anchor ring
@@ -715,9 +721,24 @@
     const snapped = snappedIn && targetId !== null;
     if (phase === "start") {
       // W3-G9 (#3): a drag takes over the ring (its own snap-indicator rides the
-      // preview), so drop the pre-drag hover snap to avoid a doubled ring.
+      // preview), so drop the pre-drag hover snap to avoid a doubled ring — but FIRST
+      // capture it: AP5/#4, a create STARTED on an edge (the user pressed where the
+      // hover ring showed) should anchor its START corner, so seed startSnap from the
+      // press's own snap OR, failing that, the hover ring the user aimed at.
+      const hover = createHoverSnap;
       createHoverSnap = null;
-      createDrag = { span: { start: world, end: world }, snapped, target: targetId };
+      const hoverTarget =
+        hover && hover.target && scene.objects.some((o) => o.id === hover.target) ? hover.target : null;
+      const startSnap: CreateSnap | null =
+        snapped && targetId
+          ? { at: world, target: targetId }
+          : hoverTarget
+            ? { at: hover!.at, target: hoverTarget }
+            : null;
+      // Pull the start corner onto the edge it snapped to (so node 0 sits ON the
+      // outline and its anchor binds cleanly); otherwise it's just the press point.
+      const start = startSnap ? startSnap.at : world;
+      createDrag = { span: { start, end: start }, snapped, target: targetId, startSnap, lastSnap: startSnap };
       return;
     }
     if (phase === "cancel") {
@@ -727,12 +748,24 @@
     }
     if (!createDrag) return;
     if (phase === "move") {
-      createDrag = { span: { start: createDrag.span.start, end: world }, snapped, target: targetId };
+      // Keep the last successful snap sticky: a move that falls off the edge does NOT
+      // clear it, so a release just past the 8px tolerance can still reuse it. The
+      // start-corner snap is fixed for the gesture and carried unchanged.
+      const moveSnap: CreateSnap | null = snapped && targetId ? { at: world, target: targetId } : createDrag.lastSnap;
+      createDrag = { span: { start: createDrag.span.start, end: world }, snapped, target: targetId, startSnap: createDrag.startSnap, lastSnap: moveSnap };
       return;
     }
-    // phase === "end": commit a sized primitive (or a default at a click).
-    const span: DragSpan = { start: createDrag.span.start, end: world };
-    const snapTarget = targetId;
+    // phase === "end": commit a sized primitive (or a default at a click). AP5/#4: a
+    // release that missed the snap reuses the gesture's last snap when it landed near
+    // it, so a near-miss pointer-up still authors the anchor (endpoint pulled to edge).
+    const resolved = resolveCreateRelease(
+      { end: world, snapped, target: targetId },
+      createDrag.lastSnap,
+      CREATE_ANCHOR_REUSE_TOLERANCE_PX / camera.zoom
+    );
+    const startSnap = createDrag.startSnap;
+    const span: DragSpan = { start: createDrag.span.start, end: resolved.end };
+    const snapTarget = resolved.target;
     createDrag = null;
     const dx = Math.abs(span.end.x - span.start.x);
     const dy = Math.abs(span.end.y - span.start.y);
@@ -740,14 +773,26 @@
     const object = tooSmall
       ? sceneCore.buildPrimitive(kind, span.start, freshId(kind), nextOrderKey(), selectedColor)
       : sceneCore.buildPrimitiveFromDrag(kind, span, freshId(kind), nextOrderKey(), selectedColor);
-    // AP5 (#14): a snapped drag-create binds the dragged endpoint to the target's
-    // outline with a persistent D5 anchor (Alt-create bypasses snap upstream, so
-    // `snapTarget` is null and no anchor is authored). The endpoint then reprojects
-    // through the target's transform, so the new object moves WITH the target.
-    if (!tooSmall && snapTarget && sceneCore) {
-      const target = scene.objects.find((o) => o.id === snapTarget);
-      const anchors = target ? sceneCore.synthesizeCreateAnchors(object, target, span.end) : null;
-      if (anchors) object.anchors = anchors;
+    // AP5 (#14)/#4: a snapped drag-create binds the snapped CORNER(s) to the target's
+    // outline with a persistent D5 anchor. BOTH ends count: the START corner (drawn
+    // FROM an edge — the user pressed on the hover ring) and the END corner (drawn TO
+    // an edge), each binding the object node nearest that world point. The bound node
+    // then reprojects through the target's transform, so the new object moves WITH the
+    // target. (Alt-create bypasses snap upstream, so both targets are null = no anchor.)
+    if (!tooSmall && sceneCore) {
+      const corners = [
+        startSnap ? { id: startSnap.target, at: span.start } : null,
+        snapTarget ? { id: snapTarget, at: span.end } : null
+      ];
+      const anchors = [];
+      for (const corner of corners) {
+        if (!corner) continue;
+        const target = scene.objects.find((o) => o.id === corner.id);
+        if (!target) continue;
+        const a = sceneCore.synthesizeCreateAnchors(object, target, corner.at);
+        if (a) anchors.push(...a);
+      }
+      if (anchors.length) object.anchors = anchors;
     }
     authorOp({ kind: "insert-object", object });
     // Select-after-create (request 6) and return to the select tool so the new
