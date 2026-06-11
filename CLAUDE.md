@@ -44,14 +44,14 @@ shell routes off its mirrored binding predicate; never branch behavior on a raw
 never reaches the modal. Verify by confirming the entry appears in the settings
 (Cmd+,) list with no modal edit.
 
+Every behavior change ships a falsifiable assertion — a test that fails when the
+behavior is wrong, not merely one that compiles.
+
 ## Operating Notes
 
-Applying operations has one source of truth — the Rust core — and the client runs
-that same core. A separate reference implementation of op-apply survives only as
-an independent oracle proving the port stays equivalent; it must never be
-regenerated from the core's own output, or the equivalence check becomes circular.
-Template lowering is the one piece of canvas logic still living in the shell
-rather than the core.
+Op-apply has exactly one implementation — the Rust core, which both the server
+and the client (via wasm) run. Never add a second op-apply in any language,
+including in tests: tests must drive the real core.
 
 ## Commands
 
