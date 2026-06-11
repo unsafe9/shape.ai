@@ -7,21 +7,21 @@ that agents can review and extend through MCP.
 
 shape.ai is an infinite canvas built in Rust on `wgpu`. The canvas is the
 product, so everything performance-sensitive — drawing, navigation, hit testing,
-layout, LOD — lives in the Rust core.
+layout, LOD — lives in the Rust cores.
 
-The one rule: **keep canvas logic in the Rust core and keep every platform layer
-thin.** The boundary runs core → platform adapter → app shell: a platform layer
-carries only what the OS forces it to (product UI, plus OS integration like
-input, IME, clipboard, and the GPU surface); everything else belongs in the core.
-This is the design intent, not something the code fully enforces yet — pushing
-canvas behavior up into the shell, or leaking platform assumptions down into the
-core, both erode the portability the boundary exists to protect.
+The one rule: **keep canvas logic in the Rust cores, keep every shell thin.**
+`crates/` holds the cores: `scene-core` (model + the one op-apply),
+`client-runtime` (collaboration semantics no shell reimplements),
+`renderer-core` (pure CPU) + `renderer-wgpu` (GPU) render seam, `storage-core`,
+`server`, and `platform-contract` — what a shell may see, so a new shell needs
+no core change. `platforms/` holds one shell per OS: `web/`
+is live, `macos/`/`ios/`/`android/` reserved empty dirs. A shell only forwards OS
+input, gives a surface, implements host ports, draws product UI. Directory-scoped
+rules live in each dir's `CLAUDE.md`.
 
-Both server and client should be pure Rust, with the non-Rust shell (today
-Svelte) kept as thin as possible. The core stays portable because native targets
-(macOS Metal, iOS) are intended — which is why it holds no time, randomness,
-threads, or I/O. The server should stay as stateless as possible, for high
-parallelism and future scale-out.
+The cores stay portable because native targets (macOS Metal, iOS) are intended —
+hence no time, randomness, threads, or I/O in them. The server stays as
+stateless as possible for scale-out.
 
 ## Conventions
 
@@ -31,7 +31,8 @@ Performance is the top-priority target in every change: never ship a known-slow
 on the hot path).
 
 The pure cores stay pointer-width-agnostic: no 32-bit address assumptions, so a
-future 64-bit wasm (Memory64) port is a target-triple flip, not a rewrite.
+future 64-bit wasm (Memory64) port is a target-triple flip, not a rewrite —
+workspace lints (`Cargo.toml`) deny width-narrowing casts.
 
 Shortcuts and gestures have a single source: a click/shortcut command lives in
 scene-core `commands.rs` (`object_command_catalog`); a hold-key gesture lives in

@@ -1,16 +1,8 @@
 # shape_server
 
-The native (tokio/axum) platform seam for shape.ai. It orchestrates **transport,
-persistence, and fan-out** in front of the pure scene core — it never reimplements
-canvas logic. Op-apply, layout, hit testing, and graph/export rendering all live in
-`shape_scene_core`; this crate calls into them.
-
-- **Native-only.** Depends on the sibling crates (`shape_scene_core`,
-  `shape_storage_core`) by path without adding any deps to them, so their
-  `wasm32-unknown-unknown` builds stay intact.
-- **Identity is `userId`-only, no auth (C13).** A single-line `TODO(auth)` marks
-  every spot where real authn/authz would attach (see `lib.rs`, `canvas_actor.rs`,
-  `mcp.rs`).
+The native (tokio/axum) platform seam for shape.ai: it orchestrates **transport,
+persistence, and fan-out** in front of the pure scene core. Agent rules for this
+crate live in `CLAUDE.md`.
 
 ## Running
 
