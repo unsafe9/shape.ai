@@ -582,8 +582,13 @@ fn basic_triangle_corners(points: &[(f64, f64)], diag: f64) -> [(f64, f64); 3] {
     let (min_x, min_y, max_x, max_y) = bbox(points);
     let cx = (min_x + max_x) / 2.0;
     let cy = (min_y + max_y) / 2.0;
-    // Apex direction: the vertex opposite the longest edge of the max-area triple,
-    // measured from that edge's midpoint, then snapped to a cardinal.
+    // Apex direction over the max-area triple: of the three candidate apexes,
+    // the one whose median vector (vertex → opposite-edge midpoint) is the most
+    // AXIS-ALIGNED — `max(|dx|,|dy|) / |median|`, largest for the corner that
+    // points straightest along a cardinal. This is a scale-free ratio, so the
+    // near-equilateral case (three near-equal edges) no longer rides the
+    // longest-edge argmax, which flips under sub-pixel sample noise. Exact ties
+    // break by a fixed vertex order (the strict `>` keeps the first candidate).
     let kept = rdp_simplify(points, normalize_epsilon(diag));
     let ring: &[(f64, f64)] = if kept.len() > 3 { &kept[..kept.len() - 1] } else { &kept };
     let (adx, ady) = if ring.len() >= 3 {
@@ -602,17 +607,23 @@ fn basic_triangle_corners(points: &[(f64, f64)], diag: f64) -> [(f64, f64); 3] {
             }
         }
         let [a, b, c] = best.1;
-        let ab = (a.0 - b.0).hypot(a.1 - b.1);
-        let bc = (b.0 - c.0).hypot(b.1 - c.1);
-        let ca = (c.0 - a.0).hypot(c.1 - a.1);
-        let (mid, apex) = if ab >= bc && ab >= ca {
-            (((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0), c)
-        } else if bc >= ca {
-            (((b.0 + c.0) / 2.0, (b.1 + c.1) / 2.0), a)
-        } else {
-            (((c.0 + a.0) / 2.0, (c.1 + a.1) / 2.0), b)
+        let median = |apex: (f64, f64), p: (f64, f64), q: (f64, f64)| {
+            (apex.0 - (p.0 + q.0) / 2.0, apex.1 - (p.1 + q.1) / 2.0)
         };
-        (apex.0 - mid.0, apex.1 - mid.1)
+        let axis_ratio = |(dx, dy): (f64, f64)| {
+            let len = dx.hypot(dy);
+            if len <= f64::EPSILON { 0.0 } else { dx.abs().max(dy.abs()) / len }
+        };
+        let mut apex_dir = median(a, b, c);
+        let mut best_ratio = axis_ratio(apex_dir);
+        for cand in [median(b, c, a), median(c, a, b)] {
+            let r = axis_ratio(cand);
+            if r > best_ratio {
+                best_ratio = r;
+                apex_dir = cand;
+            }
+        }
+        apex_dir
     } else {
         (0.0, -1.0) // degenerate scribble: default apex up
     };
@@ -1309,6 +1320,69 @@ mod tests {
         assert!(
             (bx[0] - min_x).abs() < 1e-6 && (bx[1] - max_x).abs() < 1e-6,
             "base spans the full bbox width: {t:?}"
+        );
+    }
+
+    #[test]
+    fn basic_triangle_apex_cardinal_is_stable_under_subpixel_jitter() {
+        // A NEAR-EQUILATERAL apex-up triangle (base 100, height 86 — the three
+        // edges are near-equal, the base only marginally the longest) and a copy
+        // with ≤1px per-sample jitter MUST resolve to the SAME apex cardinal. The
+        // jitter nudges the base run down 1px (lengthening the two sides past the
+        // base): under the old "vertex opposite the longest edge" rule that flips
+        // the apex onto a base corner (a right-pointing isosceles), diverging from
+        // the clean up result — removing the axis-ratio stabilization makes this
+        // golden RED. The axis-ratio rule keeps both pointing up.
+        let apex = (50.0, 0.0);
+        let bl = (0.0, 86.0);
+        let br = (100.0, 86.0);
+        let build = |jitter: &dyn Fn(usize) -> (f64, f64)| -> Vec<(f64, f64)> {
+            let mut raw = Vec::new();
+            edge(bl, br, 12, &mut raw); // base [0..12)
+            edge(br, apex, 12, &mut raw); // up the right side [12..24)
+            edge(apex, bl, 11, &mut raw); // back down, short of the start [24..35)
+            raw.iter()
+                .enumerate()
+                .map(|(i, &(x, y))| {
+                    let (jx, jy) = jitter(i);
+                    (x + jx, y + jy)
+                })
+                .collect()
+        };
+        // The cardinal of a canonical isosceles output: the AXIS-ALIGNED base edge
+        // is the pair of corners sharing an extreme coordinate, and the apex is the
+        // lone vertex opposite it.
+        let cardinal = |t: &[(f64, f64); 3]| -> &'static str {
+            let (min_x, min_y, max_x, max_y) = bbox(t);
+            let on = |v: f64, edge: f64| (v - edge).abs() < 1e-6;
+            if t.iter().filter(|p| on(p.1, max_y)).count() == 2 {
+                "up" // base on the bbox bottom, apex on top
+            } else if t.iter().filter(|p| on(p.1, min_y)).count() == 2 {
+                "down"
+            } else if t.iter().filter(|p| on(p.0, max_x)).count() == 2 {
+                "left" // base on the bbox right, apex on the left
+            } else if t.iter().filter(|p| on(p.0, min_x)).count() == 2 {
+                "right"
+            } else {
+                "none"
+            }
+        };
+        let diag_of = |pts: &[(f64, f64)]| {
+            let (x0, y0, x1, y1) = bbox(pts);
+            (x1 - x0).hypot(y1 - y0)
+        };
+        let clean = build(&|_| (0.0, 0.0));
+        // ≤1px per-sample jitter: a coherent 1px downward nudge on the base run
+        // (the directional component that disambiguates the near-tie).
+        let jittered = build(&|i| if i < 12 { (0.0, 1.0) } else { (0.0, 0.0) });
+        let clean_tri = basic_triangle_corners(&clean, diag_of(&clean));
+        let jitter_tri = basic_triangle_corners(&jittered, diag_of(&jittered));
+        let clean_card = cardinal(&clean_tri);
+        let jitter_card = cardinal(&jitter_tri);
+        assert_eq!(clean_card, "up", "clean near-equilateral points up: {clean_tri:?}");
+        assert_eq!(
+            jitter_card, clean_card,
+            "apex cardinal must be jitter-stable: clean={clean_tri:?} jittered={jitter_tri:?}"
         );
     }
 }
