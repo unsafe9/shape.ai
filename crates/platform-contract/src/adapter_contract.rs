@@ -26,9 +26,9 @@
 //!   - Ephemeral state (viewport, hover, active tool) is adapter/shell-local.
 
 #[cfg(feature = "wgpu-probe")]
-use crate::model::{CameraState, SceneSnapshot, WorldRect};
+use shape_renderer_core::model::{CameraState, SceneSnapshot, WorldRect};
 #[cfg(feature = "wgpu-probe")]
-use crate::stats::{
+use shape_renderer_core::stats::{
     CoreInputBatchResult, CoreOverlayRequest, WebGpuDebugSnapshot, WebGpuFrameStats,
     WebGpuProbeReport,
 };

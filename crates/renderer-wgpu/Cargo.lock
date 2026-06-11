@@ -535,19 +535,37 @@ name = "shape_canvas_core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "fontdue",
- "js-sys",
- "lyon_tessellation",
- "rustybuzz",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "shape_platform_contract",
+ "shape_renderer_core",
  "shape_scene_core",
- "unicode-segmentation",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
  "wgpu",
+]
+
+[[package]]
+name = "shape_platform_contract"
+version = "0.1.0"
+dependencies = [
+ "shape_renderer_core",
+]
+
+[[package]]
+name = "shape_renderer_core"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "fontdue",
+ "lyon_tessellation",
+ "rustybuzz",
+ "serde",
+ "serde_json",
+ "shape_scene_core",
+ "unicode-segmentation",
 ]
 
 [[package]]

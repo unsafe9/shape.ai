@@ -8,21 +8,21 @@
 
 use std::f32::consts::PI;
 
-use crate::lod::{apparent_px, lod_tier, LodTier};
-use crate::model::{
+use shape_renderer_core::lod::{apparent_px, lod_tier, LodTier};
+use shape_renderer_core::model::{
     ActiveTool, CameraState, CanvasInputEvent, CubicRoute, RenderCard, RenderEdge, RenderGroup,
     SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken, WorldPoint, WorldRect,
 };
-use crate::hit_test_object::{
+use shape_renderer_core::hit_test_object::{
     hit_test_object_or_bbox, resize_delta_matrix, rotate_delta_matrix, swept_segment_hits_object,
     translate_3x3, HoverAffordance, ScreenRect, SelectionHandles,
 };
-use crate::outline::{derive_region, parse_path_string};
-use crate::render_object::{RenderObject, RenderObjectScene};
-use crate::stats::{
+use shape_renderer_core::outline::{derive_region, parse_path_string};
+use shape_renderer_core::render_object::{RenderObject, RenderObjectScene};
+use shape_renderer_core::stats::{
     CoreHitResult, CoreOverlayStyle, ObjectDoubleClick, ObjectEndpointDelta, ObjectTransformDelta,
 };
-use crate::text::{CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_SOLID_UV};
+use shape_renderer_core::text::{CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_SOLID_UV};
 
 use super::*;
 
@@ -1693,7 +1693,7 @@ pub(crate) fn marquee_overlay_for_drag(
 /// [`HANDLE_OVERLAY_VERTEX_CAPACITY`] vertices.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn build_handle_overlay_vertices(world_bbox: &WorldRect, zoom: f64) -> Vec<GpuVertex> {
-    use crate::hit_test_object::{HANDLE_SIZE_PX, ROTATE_ZONE_OFFSET_PX};
+    use shape_renderer_core::hit_test_object::{HANDLE_SIZE_PX, ROTATE_ZONE_OFFSET_PX};
     let mut vertices = Vec::with_capacity(HANDLE_OVERLAY_VERTEX_CAPACITY);
     let z = zoom.max(0.025);
     let size = HANDLE_SIZE_PX / z;
@@ -1783,7 +1783,7 @@ pub(crate) fn build_multi_select_overlay_vertices(
     zoom: f64,
     preview: impl Fn(&str) -> Option<[[f64; 3]; 3]>,
 ) -> Vec<GpuVertex> {
-    use crate::hit_test_object::{apply_3x3, HANDLE_SIZE_PX};
+    use shape_renderer_core::hit_test_object::{apply_3x3, HANDLE_SIZE_PX};
     let mut vertices = Vec::new();
     let z = zoom.max(0.025);
     let thickness = (2.0 / z) as f32;
@@ -2071,7 +2071,7 @@ pub(crate) fn derive_object_regions(scene: &RenderObjectScene) -> Vec<ObjectRegi
 /// closed-class selection surface (rule 5, no regression).
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn derive_open_endpoints(d: &str) -> Option<OpenEndpoints> {
-    use crate::hit_test_object::UNITS_PER_PX;
+    use shape_renderer_core::hit_test_object::UNITS_PER_PX;
     use shape_scene_core::object::{is_open_class_d, local_nodes};
     if !is_open_class_d(d) {
         return None;
@@ -2246,7 +2246,7 @@ pub(crate) fn endpoint_handles(
     selection: Option<&str>,
     preview: Option<&[[f64; 3]; 3]>,
 ) -> Option<EndpointHandles> {
-    use crate::hit_test_object::{apply_3x3, HANDLE_SIZE_PX};
+    use shape_renderer_core::hit_test_object::{apply_3x3, HANDLE_SIZE_PX};
     let id = selection?;
     let region = regions.iter().find(|region| region.id == id)?;
     let endpoints = region.open_endpoints?;
@@ -2285,7 +2285,7 @@ pub(crate) fn build_endpoint_handle_overlay_vertices(
     world: &[WorldPoint; 2],
     zoom: f64,
 ) -> Vec<GpuVertex> {
-    use crate::hit_test_object::HANDLE_SIZE_PX;
+    use shape_renderer_core::hit_test_object::HANDLE_SIZE_PX;
     let mut vertices = Vec::with_capacity(2 * ENDPOINT_HANDLE_SEGMENTS * 3);
     let z = zoom.max(0.025);
     let radius = (HANDLE_SIZE_PX / z / 2.0) as f32;
@@ -2655,7 +2655,7 @@ pub(crate) fn region_world_bounds(
     region: &ObjectRegion,
     preview: Option<&[[f64; 3]; 3]>,
 ) -> Option<WorldRect> {
-    use crate::hit_test_object::apply_3x3;
+    use shape_renderer_core::hit_test_object::apply_3x3;
     let transform = preview.unwrap_or(&region.transform);
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
@@ -2712,8 +2712,8 @@ pub(crate) fn nearest_outline_point(
     tol_world: f64,
     exclude: &[&str],
 ) -> Option<(String, f64, f64)> {
-    use crate::hit_test_object::{apply_3x3, world_to_local};
-    use crate::outline::nearest_point_on_polyline;
+    use shape_renderer_core::hit_test_object::{apply_3x3, world_to_local};
+    use shape_renderer_core::outline::nearest_point_on_polyline;
 
     let tol2 = tol_world * tol_world;
     let mut best: Option<(&str, f64, f64, f64)> = None; // (id, world_x, world_y, d2)
@@ -4042,7 +4042,7 @@ mod tests {
 
     // ----- FC-04..FC-07 object live-path helpers -----------------------------
 
-    use crate::render_object::RenderObject;
+    use shape_renderer_core::render_object::RenderObject;
 
     fn object_identity() -> [[f64; 3]; 3] {
         [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
@@ -4642,7 +4642,7 @@ mod tests {
             Some("o1"),
             WorldPoint {
                 x: 10.0,
-                y: 0.0 - crate::hit_test_object::ROTATE_ZONE_OFFSET_PX,
+                y: 0.0 - shape_renderer_core::hit_test_object::ROTATE_ZONE_OFFSET_PX,
             },
         );
         assert_eq!(rotate, HoverAffordance::Rotate);
@@ -4780,7 +4780,7 @@ mod tests {
             let world_w = (verts[2].position[0] - verts[0].position[0]) as f64;
             let screen_w = world_w * zoom;
             assert!(
-                (screen_w - crate::hit_test_object::HANDLE_SIZE_PX).abs() < 1e-6,
+                (screen_w - shape_renderer_core::hit_test_object::HANDLE_SIZE_PX).abs() < 1e-6,
                 "handle screen size must be constant HANDLE_SIZE_PX at zoom {zoom}, got {screen_w}"
             );
         }
@@ -4984,7 +4984,7 @@ mod tests {
                         let dy = vertex.position[1] as f64 - center.y;
                         let screen_diameter = (dx * dx + dy * dy).sqrt() * 2.0 * zoom;
                         assert!(
-                            (screen_diameter - crate::hit_test_object::HANDLE_SIZE_PX).abs()
+                            (screen_diameter - shape_renderer_core::hit_test_object::HANDLE_SIZE_PX).abs()
                                 < 1e-3,
                             "open-member dot must stay circular at constant screen size, zoom {zoom}"
                         );
@@ -5105,7 +5105,7 @@ mod tests {
                 pointer_id: 2,
                 screen: WorldPoint {
                     x: 10.0,
-                    y: 0.0 - crate::hit_test_object::ROTATE_ZONE_OFFSET_PX,
+                    y: 0.0 - shape_renderer_core::hit_test_object::ROTATE_ZONE_OFFSET_PX,
                 },
             },
             &regions,
@@ -5180,7 +5180,7 @@ mod tests {
                 Some("l"),
                 WorldPoint {
                     x: 20.0,
-                    y: 0.0 - crate::hit_test_object::ROTATE_ZONE_OFFSET_PX,
+                    y: 0.0 - shape_renderer_core::hit_test_object::ROTATE_ZONE_OFFSET_PX,
                 },
             ),
             HoverAffordance::Empty,
@@ -5249,7 +5249,7 @@ mod tests {
                         let dy = vertex.position[1] as f64 - center.y;
                         let screen_diameter = (dx * dx + dy * dy).sqrt() * 2.0 * zoom;
                         assert!(
-                            (screen_diameter - crate::hit_test_object::HANDLE_SIZE_PX).abs()
+                            (screen_diameter - shape_renderer_core::hit_test_object::HANDLE_SIZE_PX).abs()
                                 < 1e-3,
                             "endpoint dot must stay circular at constant screen size, zoom {zoom}"
                         );
@@ -5264,10 +5264,10 @@ mod tests {
         // An ANCHORED open line: the handle is grabbable regardless of the anchor
         // (release-time rebind/unbind is the shell's commit, v3 §2b).
         let mut line = line_object("l", 0.0, 0.0, 40);
-        line.anchors = vec![crate::render_object::RAnchor {
+        line.anchors = vec![shape_renderer_core::render_object::RAnchor {
             node_index: 1,
             target: "t".to_string(),
-            at: crate::render_object::RLocalPoint { x: 0.0, y: 0.0 },
+            at: shape_renderer_core::render_object::RLocalPoint { x: 0.0, y: 0.0 },
         }];
         let scene = object_scene(vec![line]);
         let regions = derive_object_regions(&scene);

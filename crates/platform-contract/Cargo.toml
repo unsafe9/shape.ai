@@ -1,0 +1,17 @@
+[package]
+name = "shape_platform_contract"
+version = "0.1.0"
+edition = "2021"
+description = "Native platform adapter contract for the shape.ai renderer."
+
+[lints]
+workspace = true
+
+[features]
+default = ["wgpu-probe"]
+# Gates the adapter contract types, which reference the renderer-core render-model
+# and stats structs that are themselves gated behind the same feature there.
+wgpu-probe = ["shape_renderer_core/wgpu-probe"]
+
+[dependencies]
+shape_renderer_core = { path = "../renderer-core" }

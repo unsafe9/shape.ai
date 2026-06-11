@@ -1,0 +1,38 @@
+# The renderer-wgpu crate stays standalone (the root workspace `exclude`s it) so
+# its pinned `wgpu` lockfile is not folded into the workspace lock. Inside a git
+# worktree, cargo otherwise walks up to the main checkout's root Cargo.toml, which
+# only excludes the canonical path, so it claims this crate. An empty `[workspace]`
+# table makes this crate its own workspace root; harmless to the root workspace and
+# the root lock.
+[workspace]
+
+[package]
+name = "shape_canvas_core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust/WASM WebGPU renderer for shape.ai infinite canvas."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["wgpu-probe"]
+wgpu-probe = [
+    "dep:wasm-bindgen-futures",
+    "dep:wgpu",
+    "shape_renderer_core/wgpu-probe",
+    "shape_platform_contract/wgpu-probe",
+]
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
+shape_renderer_core = { path = "../renderer-core" }
+shape_platform_contract = { path = "../platform-contract" }
+shape_scene_core = { path = "../scene-core" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "console", "HtmlCanvasElement"] }
+wgpu = { version = "29.0.3", default-features = false, features = ["std", "webgpu", "wgsl"], optional = true }

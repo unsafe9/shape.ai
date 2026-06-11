@@ -14,8 +14,8 @@
     "pretest:unit": "npm run scene:wasm:build",
     "test:unit": "vitest run",
     "renderer:test": "vitest run tests/infinite-canvas-renderer.test.ts",
-    "renderer:rust:test": "scripts/renderer-toolchain.sh cargo test --manifest-path src/renderer/core/Cargo.toml --features wgpu-probe",
-    "renderer:wasm:build": "scripts/renderer-toolchain.sh wasm-pack build src/renderer/core --target web --out-dir ../../client/renderer/wasm --out-name shape_canvas_core",
+    "renderer:rust:test": "scripts/renderer-toolchain.sh cargo test --manifest-path crates/renderer-wgpu/Cargo.toml --features wgpu-probe",
+    "renderer:wasm:build": "scripts/renderer-toolchain.sh wasm-pack build crates/renderer-wgpu --target web --out-dir ../../src/client/renderer/wasm --out-name shape_canvas_core",
     "scene:wasm:build": "scripts/renderer-toolchain.sh wasm-pack build crates/scene-core --target web --out-dir ../../src/client/scene/wasm --out-name shape_scene_core --features wasm"
   },
   "dependencies": {

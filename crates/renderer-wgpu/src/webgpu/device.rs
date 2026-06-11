@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 
-use crate::model::{ActiveTool, CameraState};
+use shape_renderer_core::model::{ActiveTool, CameraState};
 use crate::serde_wasm;
-use crate::stats::WebGpuProbeReport;
-use crate::text::{TextEngine, TextLayoutCache, TEXT_ATLAS_HEIGHT, TEXT_ATLAS_WIDTH};
+use shape_renderer_core::stats::WebGpuProbeReport;
+use shape_renderer_core::text::{TextEngine, TextLayoutCache, TEXT_ATLAS_HEIGHT, TEXT_ATLAS_WIDTH};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
@@ -417,7 +417,7 @@ impl ShapeWebGpuRenderer {
             preview_deformed: std::collections::HashSet::new(),
             endpoint_preview: None,
             object_bindings: shape_scene_core::object::move_together::BindingGraph::default(),
-            object_theme: crate::object_theme::Theme::light(),
+            object_theme: shape_renderer_core::object_theme::Theme::light(),
             shadow_blur,
         };
         renderer.write_uniform();

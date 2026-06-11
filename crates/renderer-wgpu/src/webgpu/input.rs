@@ -4,12 +4,12 @@
 //! tool + multi-select setters, the overlay/debug queries, and the batch
 //! rollback. `target_arch = "wasm32"` gated.
 
-use crate::hit_test_object::HoverAffordance;
-use crate::model::{
+use shape_renderer_core::hit_test_object::HoverAffordance;
+use shape_renderer_core::model::{
     ActiveTool, CameraState, CanvasInputEvent, RenderScenePatch, SceneSelection, WorldPoint,
 };
 use crate::serde_wasm;
-use crate::stats::{
+use shape_renderer_core::stats::{
     CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreNearestOutlinePoint,
     CoreOverlayRequest, CoreOverlayTarget, WebGpuDebugSnapshot,
 };
@@ -115,7 +115,7 @@ impl ShapeWebGpuRenderer {
     pub fn set_object_theme(&mut self, dark: bool) {
         // W3-G6/#3: persist the bit FIRST so it survives a `load_object_scene`
         // re-feed even if no renderer is live yet — the rebuilt renderer reads it.
-        self.object_theme = crate::object_theme::Theme { dark };
+        self.object_theme = shape_renderer_core::object_theme::Theme { dark };
         if let Some(renderer) = self.object_renderer.as_mut() {
             renderer.set_theme(&self.queue, dark);
         }

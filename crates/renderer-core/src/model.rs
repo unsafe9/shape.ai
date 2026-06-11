@@ -19,17 +19,17 @@ pub struct WorldRect {
 
 #[cfg(feature = "wgpu-probe")]
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub(crate) struct WorldPoint {
-    pub(crate) x: f64,
-    pub(crate) y: f64,
+pub struct WorldPoint {
+    pub x: f64,
+    pub y: f64,
 }
 
 #[cfg(feature = "wgpu-probe")]
-pub(crate) struct CubicRoute {
-    pub(crate) start: WorldPoint,
-    pub(crate) cp1: WorldPoint,
-    pub(crate) cp2: WorldPoint,
-    pub(crate) end: WorldPoint,
+pub struct CubicRoute {
+    pub start: WorldPoint,
+    pub cp1: WorldPoint,
+    pub cp2: WorldPoint,
+    pub end: WorldPoint,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -364,7 +364,7 @@ pub enum SceneSelection {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub(crate) enum RenderScenePatch {
+pub enum RenderScenePatch {
     CreateGroup {
         group: RenderGroup,
     },
@@ -420,7 +420,7 @@ pub(crate) enum RenderScenePatch {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum ActiveTool {
+pub enum ActiveTool {
     #[default]
     Select,
     Hand,
@@ -430,7 +430,7 @@ pub(crate) enum ActiveTool {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub(crate) enum CanvasInputEvent {
+pub enum CanvasInputEvent {
     PointerDown {
         #[serde(rename = "pointerId")]
         pointer_id: i32,

@@ -21,23 +21,23 @@
 
 use std::{collections::HashMap, f32::consts::PI};
 
-use crate::lod::{apparent_px, lod_tier, LodTier};
-use crate::model::{
+use shape_renderer_core::lod::{apparent_px, lod_tier, LodTier};
+use shape_renderer_core::model::{
     ActiveTool, CameraState, CanvasInputEvent, CubicRoute, RenderCard, RenderEdge, RenderGroup,
     RenderScenePatch, SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken,
     WorldPoint, WorldRect,
 };
-use crate::hit_test_object::{hit_test_object, HoverAffordance};
+use shape_renderer_core::hit_test_object::{hit_test_object, HoverAffordance};
 use crate::object_pipeline::{ObjectPipeline, ObjectRenderer};
-use crate::outline::{derive_region, parse_path_string};
-use crate::render_object::RenderObjectScene;
+use shape_renderer_core::outline::{derive_region, parse_path_string};
+use shape_renderer_core::render_object::RenderObjectScene;
 use crate::serde_wasm;
-use crate::stats::{
+use shape_renderer_core::stats::{
     CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreOverlayRequest, CoreOverlayStyle,
     CoreOverlayTarget, ObjectDoubleClick, ObjectEndpointDelta, ObjectTransformDelta,
     WebGpuDebugSnapshot, WebGpuFrameStats, WebGpuProbeReport,
 };
-use crate::text::{
+use shape_renderer_core::text::{
     CachedTextLine, TextBuildStats, TextEngine, TextLayoutCache, TEXT_ATLAS_HEIGHT,
     TEXT_ATLAS_SOLID_UV, TEXT_ATLAS_WIDTH,
 };
@@ -66,7 +66,7 @@ struct ObjectSceneLoadResult {
 /// boundary polygon in OBJECT-LOCAL pixels (D6); `transform` maps object-local px
 /// to world px (D7). The outline is local so a moving transform never forces a
 /// region rebuild — the query point is inverse-transformed into local space at
-/// hit time (D8, see [`crate::hit_test_object`]).
+/// hit time (D8, see [`shape_renderer_core::hit_test_object`]).
 #[cfg(feature = "wgpu-probe")]
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectRegion {
@@ -420,7 +420,7 @@ pub struct ShapeWebGpuRenderer {
     // lost on each re-feed. Holding it here (like `multi_select`/`active_tool`) lets
     // `set_object_theme` remember the last-set theme and `load_object_scene` rebuild
     // every renderer directly in that theme — sticky across reloads, zero rebake.
-    object_theme: crate::object_theme::Theme,
+    object_theme: shape_renderer_core::object_theme::Theme,
     // W3-G8/A: offscreen targets + pipelines for the real separable-Gaussian drop-
     // shadow blur. Surface-sized (config.width x config.height); recreated in
     // `resize` after the config updates. Isolated underlay — a fault here can at

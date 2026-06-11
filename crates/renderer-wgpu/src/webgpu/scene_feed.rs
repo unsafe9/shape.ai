@@ -5,15 +5,15 @@
 
 use std::collections::HashMap;
 
-use crate::model::{
+use shape_renderer_core::model::{
     CameraState, RenderCard, RenderEdge, RenderGroup, RenderScenePatch, SceneSelection,
     SceneSnapshot,
 };
 use crate::object_pipeline::{ObjectPipeline, ObjectRenderer};
-use crate::render_object::{RenderObject, RenderObjectScene};
+use shape_renderer_core::render_object::{RenderObject, RenderObjectScene};
 use crate::serde_wasm;
 use shape_scene_core::object::move_together::{BindingGraph, BindingNode};
-use crate::text::TextBuildStats;
+use shape_renderer_core::text::TextBuildStats;
 use wasm_bindgen::prelude::*;
 
 use super::*;
@@ -282,7 +282,7 @@ impl ShapeWebGpuRenderer {
         self.endpoint_preview = Some((
             id.to_string(),
             node_index,
-            crate::model::WorldPoint { x: world_x, y: world_y },
+            shape_renderer_core::model::WorldPoint { x: world_x, y: world_y },
         ));
         if let Some(renderer) = self.object_renderer.as_mut() {
             for (patched_id, rebuilt) in &patches {
@@ -548,7 +548,7 @@ fn open_follower_chord_d(
 fn reprojected_node_pair(
     scene: &RenderObjectScene,
     follower: &RenderObject,
-    anchor: &crate::render_object::RAnchor,
+    anchor: &shape_renderer_core::render_object::RAnchor,
     delta: &[[f64; 3]; 3],
 ) -> Option<(f64, f64)> {
     use shape_scene_core::object::{local_nodes, reproject_geometry_node, LocalPoint, Transform3x3};
@@ -2137,8 +2137,8 @@ impl ShapeWebGpuRenderer {
 #[cfg(test)]
 mod tests {
     use super::{binding_nodes, preview_roots, preview_write_set};
-    use crate::model::CameraState;
-    use crate::render_object::{RenderObject, RenderObjectScene};
+    use shape_renderer_core::model::CameraState;
+    use shape_renderer_core::render_object::{RenderObject, RenderObjectScene};
     use shape_scene_core::object::move_together::BindingGraph;
 
     fn scene_with_multi_select(multi_select: Vec<&str>) -> RenderObjectScene {
@@ -2237,7 +2237,7 @@ mod tests {
         parent: Option<&str>,
         transform: [[f64; 3]; 3],
         geometry_d: &str,
-        anchors: Vec<crate::render_object::RAnchor>,
+        anchors: Vec<shape_renderer_core::render_object::RAnchor>,
     ) -> RenderObject {
         RenderObject {
             id: id.to_string(),
@@ -2265,7 +2265,7 @@ mod tests {
     #[test]
     fn anchor_follower_closure_agrees_with_scene_core_vector() {
         use super::preview_reproject_followers;
-        use crate::render_object::{RAnchor, RLocalPoint};
+        use shape_renderer_core::render_object::{RAnchor, RLocalPoint};
         use shape_scene_core::object::{reproject_geometry_node, LocalPoint, Transform3x3};
 
         // Target A (the dragged object) and follower B anchored to A. Numbers reuse
@@ -2395,7 +2395,7 @@ mod tests {
     #[test]
     fn follower_paired_with_two_moved_targets_accumulates_one_geometry() {
         use super::reprojected_follower_geometries;
-        use crate::render_object::{RAnchor, RLocalPoint};
+        use shape_renderer_core::render_object::{RAnchor, RLocalPoint};
         use shape_scene_core::object::{reproject_geometry_node, LocalPoint, Transform3x3};
 
         let a = anchored_object("a", None, translate(10.0, 20.0), "M 0 0 L 8 0 L 8 8 L 0 8 Z", Vec::new());
@@ -2487,7 +2487,7 @@ mod tests {
     // ----- anchor-semantics v3 §2b/§3: live endpoint routing ------------------
 
     use super::{endpoint_preview_geometry, route_preview_member, PreviewMemberRoute};
-    use crate::render_object::{RAnchor, RLocalPoint, RStroke, RStrokeCap, RStrokeJoin};
+    use shape_renderer_core::render_object::{RAnchor, RLocalPoint, RStroke, RStrokeCap, RStrokeJoin};
 
     fn feed_scene(objects: Vec<RenderObject>) -> RenderObjectScene {
         RenderObjectScene {
@@ -2601,14 +2601,14 @@ mod tests {
         use crate::object_pipeline::{
             build_scene_geometry_themed, follower_patch_plan, reexpand_single_object,
         };
-        use crate::object_theme::Theme;
+        use shape_renderer_core::object_theme::Theme;
         use shape_scene_core::object::{
             cascade_multi_transform_ops, FillRule, Geometry, Object, ObjectOp, ObjectScene,
             ObjectSelection, Transform3x3,
         };
 
         let stroke = RStroke {
-            paint: crate::render_object::RPaint::Solid {
+            paint: shape_renderer_core::render_object::RPaint::Solid {
                 color: "#00ff00".to_string(),
             },
             width: 4.0,
@@ -2832,11 +2832,11 @@ mod tests {
         use crate::object_pipeline::{
             build_scene_geometry_themed, follower_patch_plan, reexpand_single_object,
         };
-        use crate::object_theme::Theme;
+        use shape_renderer_core::object_theme::Theme;
 
         let mut edge = anchored_object("e", None, translate(0.0, 0.0), "M 0 0 L 800 0", Vec::new());
         edge.stroke = Some(RStroke {
-            paint: crate::render_object::RPaint::Solid {
+            paint: shape_renderer_core::render_object::RPaint::Solid {
                 color: "#00ff00".to_string(),
             },
             width: 4.0,

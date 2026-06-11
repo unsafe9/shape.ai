@@ -5,11 +5,14 @@ members = [
     "crates/scene-core",
     "crates/server",
     "crates/coordination",
+    "crates/renderer-core",
+    "crates/platform-contract",
 ]
-# renderer/core stays standalone until MG0.3 wires it to scene-core; member-izing
-# it here would fold its pinned wgpu lockfile into the workspace lock prematurely.
+# renderer-wgpu stays standalone: member-izing it would fold its pinned wgpu
+# lockfile into the workspace lock. It depends on the pure renderer-core member by
+# path, which is fine for an excluded crate.
 exclude = [
-    "src/renderer/core",
+    "crates/renderer-wgpu",
 ]
 
 # Pointer-width-agnostic discipline for the wasm32+native pure cores (scene-core,

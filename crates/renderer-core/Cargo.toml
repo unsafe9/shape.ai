@@ -1,0 +1,25 @@
+[package]
+name = "shape_renderer_core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure CPU renderer core for shape.ai infinite canvas (no wgpu/web_sys)."
+
+[lints]
+workspace = true
+
+[features]
+default = ["wgpu-probe"]
+# Compilation gate (no wgpu dependency): toggles the extra CPU render-model and
+# stats structs the GPU/native adapter layers consume. Named to mirror the
+# renderer-wgpu feature so the two stay in lockstep.
+wgpu-probe = []
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+fontdue = { version = "0.9.3", default-features = false, features = ["std"] }
+lyon_tessellation = "1.0"
+rustybuzz = "0.20.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shape_scene_core = { path = "../scene-core" }
+unicode-segmentation = "1"

@@ -5,10 +5,10 @@
 
 use std::collections::HashMap;
 
-use crate::model::{RenderCard, RenderEdge, RenderGroup, WorldRect};
+use shape_renderer_core::model::{RenderCard, RenderEdge, RenderGroup, WorldRect};
 use crate::serde_wasm;
-use crate::stats::WebGpuFrameStats;
-use crate::text::{TEXT_ATLAS_HEIGHT, TEXT_ATLAS_WIDTH};
+use shape_renderer_core::stats::WebGpuFrameStats;
+use shape_renderer_core::text::{TEXT_ATLAS_HEIGHT, TEXT_ATLAS_WIDTH};
 use wasm_bindgen::prelude::*;
 
 use super::*;
