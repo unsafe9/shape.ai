@@ -7,6 +7,7 @@ members = [
     "crates/coordination",
     "crates/renderer-core",
     "crates/platform-contract",
+    "crates/client-runtime",
 ]
 # renderer-wgpu stays standalone: member-izing it would fold its pinned wgpu
 # lockfile into the workspace lock. It depends on the pure renderer-core member by

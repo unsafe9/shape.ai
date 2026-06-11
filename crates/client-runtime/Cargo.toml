@@ -1,0 +1,17 @@
+[package]
+name = "shape_client_runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust collaboration session core for shape.ai shells: durable outbox bookkeeping, peer presence registry, viewport windowing decisions, and the optimistic sync engine over scene-core op-apply. No ambient time/rng/threads/IO — clock, persistence, and transport are injected seams."
+
+[lib]
+name = "shape_client_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+shape_scene_core = { path = "../scene-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

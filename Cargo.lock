@@ -1320,6 +1320,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shape_client_runtime"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shape_scene_core",
+]
+
+[[package]]
 name = "shape_coordination"
 version = "0.1.0"
 dependencies = [
