@@ -16,10 +16,17 @@
 // engine/benchmark/fixture path and its tests. They carry NO domain op-apply (the
 // object op-apply is the scene-core wasm).
 
-import type { SceneSelection } from "../../shared/schema";
 import type { CameraState, WorldPoint, WorldRect } from "../../shared/geometry";
 
-export type { CameraState, WorldPoint, WorldRect, SceneSelection };
+/** Legacy 2D harness selection (canvas/group/node/edge/multi). Used by SceneSnapshot and FrameStats. */
+export type SceneSelection =
+  | { kind: "canvas" }
+  | { kind: "group"; id: string }
+  | { kind: "node"; id: string }
+  | { kind: "edge"; id: string }
+  | { kind: "multi"; ids: string[] };
+
+export type { CameraState, WorldPoint, WorldRect };
 
 // ---------------------------------------------------------------------------
 // Object render feed — the object-substrate render view the renderer draws.

@@ -176,7 +176,7 @@ export interface DocumentShellState {
    * and the persisted selection.  Loaded from the WS welcome snapshot and
    * mutated through the WS transport client (`sceneClient.ts`).
    *
-   * @see src/shared/schema.ts `Scene`
+   * @see src/shared/object.ts `ObjectScene`
    */
   scene: unknown; // typed as Scene in the shell — kept `unknown` here to avoid a circular dep
 
@@ -191,7 +191,7 @@ export interface DocumentShellState {
    * Broadcast as presence on every change via the WS client (selection is not
    * a document op).
    *
-   * @see src/shared/schema.ts `SceneSelection`
+   * @see src/shared/object.ts `ObjectSelection`
    */
   selection: unknown; // typed as SceneSelection in App.tsx
 }
