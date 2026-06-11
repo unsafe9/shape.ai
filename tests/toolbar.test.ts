@@ -286,10 +286,14 @@ describe("toolbar pen recognition toggle (Basic/Free)", () => {
     expect(toolbar).toMatch(/onToggleFreeRecognition:\s*\(\)\s*=>\s*void;/);
   });
 
-  it("App owns the state, defaulting to Basic (false), and forwards only the mode bool", () => {
+  it("App owns the state, defaulting to Basic (false), and forwards the toggle OR a held Shift", () => {
     expect(app).toMatch(/let freeRecognition = \$state\(false\)/);
     expect(app).toMatch(/onToggleFreeRecognition=\{\(\)\s*=>\s*\(freeRecognition = !freeRecognition\)\}/);
-    expect(app).toMatch(/freeRecognition \? "free" : "basic"/);
+    // Hold-to-Free: a held Shift selects Free recognition even with the toggle off,
+    // mirrored from key events and consumed only at pen-up.
+    expect(app).toMatch(/let freeRecognitionHeld = \$state\(false\)/);
+    expect(app).toMatch(/freeRecognition \|\| freeRecognitionHeld \? "free" : "basic"/);
+    expect(app).toMatch(/freeRecognitionHeld = event\.shiftKey/);
   });
 });
 

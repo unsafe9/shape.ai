@@ -103,6 +103,11 @@
   // default — every stroke snaps to a basic shape), true = Free (the full
   // pipeline with polygon/curve fallbacks). The shell only forwards the bool.
   let freeRecognition = $state(false);
+  // Hold-to-Free: while Shift is held, a pen stroke recognizes in Free mode even
+  // when the toolbar toggle is off (press-and-hold to draw free-form, release to
+  // snap back to Basic). Mirrored from every key event; consumed only at pen-up,
+  // so it never collides with Shift's rotate/select roles (different contexts).
+  let freeRecognitionHeld = $state(false);
   // D1/#5: the toolbar's always-visible selected color. It is the default fill/
   // stroke for the next NEW shape; recoloring a selected object authors a SetStyle
   // op (applySelectedColor). The native picker passes a CSS hex through verbatim.
@@ -452,6 +457,7 @@
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
       const typing = target ? ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName) || target.isContentEditable : false;
+      freeRecognitionHeld = event.shiftKey;
       if (event.key === "Escape") {
         event.preventDefault();
         handleEscape();
@@ -471,6 +477,7 @@
       dispatch(event);
     }
     function handleKeyUp(event: KeyboardEvent) {
+      freeRecognitionHeld = event.shiftKey;
       if (event.code === "Space" && spaceHeld) {
         event.preventDefault();
         spaceHeld = false;
@@ -912,6 +919,8 @@
     // near-miss pointer-up still anchors, endpoint pulled onto the edge), then
     // commit the recognized stroke (>=2 points have extent).
     const startSnap = drawSnap?.start ?? null;
+    // Hold-to-Free: the toolbar toggle OR a held Shift selects Free recognition.
+    const recognizeMode = freeRecognition || freeRecognitionHeld ? "free" : "basic";
     const resolved = resolveCreateRelease(
       { end: canon ? canon.at : world, snapped: canon !== null, target: canon?.target ?? null },
       drawSnap?.last ?? null,
@@ -931,7 +940,7 @@
     const mergeOps = sceneCore.mergeOpenStrokeOps(
       scene,
       points,
-      freeRecognition ? "free" : "basic",
+      recognizeMode,
       MERGE_ENDPOINT_TOLERANCE_PX / camera.zoom
     );
     if (mergeOps && mergeOps.length > 0) {
@@ -945,7 +954,7 @@
     // the "text" token so the stroke flips with the theme like every other authored color.
     // The pen draws with the single toolbar color (selectedColor); there is no separate pen color.
     const strokeHex = selectedColor === THEME_DEFAULT_COLOR ? "#000000" : selectedColor;
-    const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, freshId("draw"), nextOrderKey(), freeRecognition ? "free" : "basic");
+    const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, freshId("draw"), nextOrderKey(), recognizeMode);
     if (selectedColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = previewPaint(selectedColor);
     // v3 §4 freehand anchoring: an OPEN recognition authors endpoint anchors through
     // the same release path as drag-create (both corners); a CLOSED recognition
