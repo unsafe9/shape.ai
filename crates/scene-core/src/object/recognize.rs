@@ -546,7 +546,7 @@ fn basic_closed_fit(
             (cx + rx * t.cos(), cy + ry * t.sin())
         })
         .collect();
-    let rect = basic_rect_corners(points, diag);
+    let rect = basic_rect_corners(points);
     let tri = basic_triangle_corners(points, diag);
     let scale = diag.max(f64::EPSILON);
     let ellipse_res = outline_rms(points, &ellipse_ring) / scale;
@@ -564,20 +564,12 @@ fn basic_closed_fit(
     }
 }
 
-/// Basic-mode rect candidate: the longest coarse-RDP edge sets the
-/// orientation (axis-snapped, as in [`fit_rect`]) and the rect is the min
-/// bbox of ALL samples at that orientation — it always exists, no corner
-/// detection required.
-fn basic_rect_corners(points: &[(f64, f64)], diag: f64) -> [(f64, f64); 4] {
-    let kept = rdp_simplify(points, normalize_epsilon(diag));
-    let mut best = (0.0_f64, 0.0_f64); // (edge length, edge angle deg)
-    for w in kept.windows(2) {
-        let len = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
-        if len > best.0 {
-            best = (len, (w[1].1 - w[0].1).atan2(w[1].0 - w[0].0).to_degrees());
-        }
-    }
-    oriented_rect_corners(points, best.1)
+/// Basic-mode rect candidate: the AXIS-ALIGNED min bbox of all samples. Basic
+/// strokes resolve flat (no rotation) — a tilted box is a Free-mode result; the
+/// user rotates the flat rect by hand (the rotate handle) if they want it
+/// angled. (Free's [`fit_rect`] still orients by the longest edge.)
+fn basic_rect_corners(points: &[(f64, f64)]) -> [(f64, f64); 4] {
+    oriented_rect_corners(points, 0.0)
 }
 
 /// Basic-mode triangle candidate: the max-area triple over the coarse-RDP
@@ -1220,5 +1212,45 @@ mod tests {
         let rec = recognize_stroke(&pts, RecognizeMode::Basic);
         assert!(rec.closed);
         assert_eq!(rec.d, format!("M 0 0 L {} 0 L {} {} Z", 100 * Q, 50 * Q, 80 * Q));
+    }
+
+    #[test]
+    fn basic_rect_candidate_is_always_axis_aligned() {
+        // A clean square rotated 30° about its center. Free's fit_rect would
+        // orient the box to the stroke; the Basic candidate must resolve it FLAT
+        // — the axis-aligned bbox of the samples (every edge horizontal or
+        // vertical), leaving any rotation to the user's rotate handle.
+        let c = (100.0, 100.0);
+        let (s, co) = 30.0_f64.to_radians().sin_cos();
+        let rot = |x: f64, y: f64| (c.0 + (x - c.0) * co - (y - c.0) * s, c.1 + (x - c.0) * s + (y - c.0) * co);
+        let corners = [(40.0, 40.0), (160.0, 40.0), (160.0, 160.0), (40.0, 160.0)];
+        let mut pts = Vec::new();
+        for i in 0..4 {
+            let a = corners[i];
+            let b = corners[(i + 1) % 4];
+            edge(rot(a.0, a.1), rot(b.0, b.1), 12, &mut pts);
+        }
+        let r = basic_rect_corners(&pts);
+        // Every edge is axis-aligned (consecutive corners share an x or a y).
+        for i in 0..4 {
+            let a = r[i];
+            let b = r[(i + 1) % 4];
+            assert!(
+                (a.0 - b.0).abs() < 1e-6 || (a.1 - b.1).abs() < 1e-6,
+                "edge {i} not axis-aligned: {a:?} -> {b:?}"
+            );
+        }
+        // And it IS the sample bbox.
+        let (bx0, by0, bx1, by1) = bbox(&pts);
+        let xs = [r[0].0, r[1].0, r[2].0, r[3].0];
+        let ys = [r[0].1, r[1].1, r[2].1, r[3].1];
+        let x0 = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let x1 = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let y0 = ys.iter().cloned().fold(f64::INFINITY, f64::min);
+        let y1 = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (x0 - bx0).abs() < 1e-6 && (y0 - by0).abs() < 1e-6 && (x1 - bx1).abs() < 1e-6 && (y1 - by1).abs() < 1e-6,
+            "axis rect must equal the sample bbox"
+        );
     }
 }
