@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { ShapeCanvasEngine, type EngineEvent } from "../src/client/renderer/engine";
-import { createBenchmarkFixture } from "../src/client/renderer/fixtures";
+import { ShapeCanvasEngine, type EngineEvent } from "../platforms/web/renderer/engine";
+import { createBenchmarkFixture } from "../platforms/web/renderer/fixtures";
 import {
   applyScenePatch,
   type CameraState,
@@ -9,8 +9,8 @@ import {
   type SceneSnapshot,
   type WorldRect,
   validateScenePatch
-} from "../src/client/renderer/scene";
-import type { RustDebugSnapshot, RustWebGpuFrameStats, RustWebGpuRenderer } from "../src/client/renderer/wasmLoader";
+} from "../platforms/web/renderer/scene";
+import type { RustDebugSnapshot, RustWebGpuFrameStats, RustWebGpuRenderer } from "../platforms/web/bridge/wasmLoader";
 
 describe("infinite canvas renderer contract", () => {
   it("generates deterministic 1,000+ card and edge fixtures", () => {

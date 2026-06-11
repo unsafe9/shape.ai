@@ -5,9 +5,9 @@
   // cameras still point at the same canvas location. Pure presentation — it owns
   // no presence state; the SceneClient's PeerRegistry feeds it the live set.
   import { MousePointer2 } from "lucide-svelte";
-  import type { CameraState } from "../../shared/geometry";
+  import type { CameraState } from "../shared/geometry";
   import { worldToScreen } from "../renderer/scene";
-  import type { PeerPresence } from "../lib/peers";
+  import type { PeerPresence } from "../runtime/peers";
 
   type Props = {
     peers: PeerPresence[];

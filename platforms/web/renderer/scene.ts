@@ -16,7 +16,7 @@
 // engine/benchmark/fixture path and its tests. They carry NO domain op-apply (the
 // object op-apply is the scene-core wasm).
 
-import type { CameraState, WorldPoint, WorldRect } from "../../shared/geometry";
+import type { CameraState, WorldPoint, WorldRect } from "../shared/geometry";
 
 /** Legacy 2D harness selection (canvas/group/node/edge/multi). Used by SceneSnapshot and FrameStats. */
 export type SceneSelection =

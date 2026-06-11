@@ -15,14 +15,14 @@ import {
   ensureSceneCore,
   loadSceneCore,
   type SceneCore
-} from "../src/client/scene/sceneCoreWasm";
+} from "../platforms/web/bridge/sceneCoreWasm";
 import {
   emptyObjectScene,
   IDENTITY_TRANSFORM,
   type Anchor,
   type Object as SceneObject,
   type ObjectOp
-} from "../src/shared/object";
+} from "../platforms/web/shared/object";
 
 let core: SceneCore;
 

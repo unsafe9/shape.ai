@@ -29,10 +29,10 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { objectSceneToRenderObjectScene } from "../src/client/lib/canvasHost";
-import { type DragSpan } from "../src/client/lib/objectPrimitives";
-import { applyDocumentTheme } from "../src/client/renderer/scene";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
+import { objectSceneToRenderObjectScene } from "../platforms/web/controller/canvasHost";
+import { type DragSpan } from "../platforms/web/controller/objectPrimitives";
+import { applyDocumentTheme } from "../platforms/web/renderer/scene";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
 import {
   GEOMETRY_QUANTUM_PER_PX,
   emptyObjectScene,
@@ -43,7 +43,7 @@ import {
   type ObjectScene,
   type ObjectSelection,
   type Transform3x3
-} from "../src/shared/object";
+} from "../platforms/web/shared/object";
 
 let core: SceneCore;
 

@@ -7,7 +7,7 @@
 // threshold, the inline-text overlay placement math, and the theme-default UI
 // sentinel (the *selection* value; its mapping to a Paint lives in the core).
 
-import type { CameraState } from "../../shared/geometry";
+import type { CameraState } from "../shared/geometry";
 import {
   GEOMETRY_QUANTUM_PER_PX,
   type Anchor,
@@ -15,7 +15,7 @@ import {
   type ObjectOp,
   type ObjectScene,
   type Transform3x3
-} from "../../shared/object";
+} from "../shared/object";
 import { worldToScreen, type WorldRect } from "../renderer/scene";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;

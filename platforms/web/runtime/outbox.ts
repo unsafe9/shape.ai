@@ -10,7 +10,7 @@
 // An entry is a `WireOp` (the exact wire envelope, `propDelta` carrying the
 // `ObjectOp` delta), so a row can be re-sent verbatim with no re-encoding.
 
-import type { WireOp } from "../../shared/object";
+import type { WireOp } from "../shared/object";
 
 /** `(clientId, localSeq)` idempotency key — mirrors the server `OpId`. */
 export type OpId = {

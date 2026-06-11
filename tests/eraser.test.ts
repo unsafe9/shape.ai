@@ -9,8 +9,8 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { GEOMETRY_QUANTUM_PER_PX, emptyObjectScene, type Object as SceneObject } from "../src/shared/object";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { GEOMETRY_QUANTUM_PER_PX, emptyObjectScene, type Object as SceneObject } from "../platforms/web/shared/object";
 
 let core: SceneCore;
 

@@ -22,7 +22,7 @@ import type {
   Unsubscribe,
   WelcomeResult
 } from "./transport";
-import type { FeatureRequest } from "../../shared/object";
+import type { FeatureRequest } from "../shared/object";
 import type { OutboxEntry } from "./outbox";
 import type { EngineTransport } from "./syncEngine";
 

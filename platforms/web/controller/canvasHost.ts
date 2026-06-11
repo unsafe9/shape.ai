@@ -22,11 +22,11 @@
 // browser. The legacy `ShapeCanvasEngine` keeps the camera/input/stats loop alive.
 // This is the flagged live-pixels gap: build-verified, GPU-runtime-deferred.
 
-import type { CameraState } from "../../shared/geometry";
-import { GEOMETRY_QUANTUM_PER_PX, type ObjectScene, type ObjectSelection, type Stroke } from "../../shared/object";
+import type { CameraState } from "../shared/geometry";
+import { GEOMETRY_QUANTUM_PER_PX, type ObjectScene, type ObjectSelection, type Stroke } from "../shared/object";
 import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions, type TransformKind } from "../renderer/engine";
 import type { FrameStats, RenderTransform3x3, WorldRect } from "../renderer/scene";
-import { loadRustCore, type HoverAffordance, type RustCoreStatus, type RustWebGpuRenderer } from "../renderer/wasmLoader";
+import { loadRustCore, type HoverAffordance, type RustCoreStatus, type RustWebGpuRenderer } from "../bridge/wasmLoader";
 
 export type RendererStats = FrameStats;
 

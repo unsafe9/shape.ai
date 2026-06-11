@@ -21,7 +21,7 @@ import type {
   RustMarqueeResult,
   RustWebGpuFrameStats,
   RustWebGpuRenderer
-} from "./wasmLoader";
+} from "../bridge/wasmLoader";
 import {
   COARSE_ROTATE_SNAP_DEG,
   isAdditiveSelect,
@@ -30,8 +30,8 @@ import {
   isPanGesture,
   isPartialErase,
   isSnapBypass
-} from "../lib/gestureBindings";
-import { detectMac } from "../lib/shortcuts";
+} from "../controller/gestureBindings";
+import { detectMac } from "../controller/shortcuts";
 
 /** W2-03: the active pointer tool. One unified "select" Move/Select pointer
  *  (picks/drags/marquees), "draw" (freehand capture, FC-11), "create" (W2-07

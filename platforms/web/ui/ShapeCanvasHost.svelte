@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import type { CameraState } from "../../shared/geometry";
-  import { ShapeCanvasHost, type ShapeCanvasHostCallbacks } from "../lib/canvasHost";
+  import type { CameraState } from "../shared/geometry";
+  import { ShapeCanvasHost, type ShapeCanvasHostCallbacks } from "../controller/canvasHost";
 
   type Props = {
     initialCamera: CameraState;

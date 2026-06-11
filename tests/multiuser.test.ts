@@ -13,12 +13,12 @@
 
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { SceneClient } from "../src/client/lib/sceneClient";
-import { InMemoryOutboxStore } from "../src/client/lib/outbox";
-import { ensureSceneCore } from "../src/client/scene/sceneCoreWasm";
-import type { WebSocketLike } from "../src/client/lib/wsTransport";
-import type { ClientMessage, ServerMessage, WelcomeMessage } from "../src/client/lib/transport";
-import type { PeerPresence } from "../src/client/lib/peers";
+import { SceneClient } from "../platforms/web/runtime/sceneClient";
+import { InMemoryOutboxStore } from "../platforms/web/runtime/outbox";
+import { ensureSceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import type { WebSocketLike } from "../platforms/web/runtime/wsTransport";
+import type { ClientMessage, ServerMessage, WelcomeMessage } from "../platforms/web/runtime/transport";
+import type { PeerPresence } from "../platforms/web/runtime/peers";
 import {
   emptyObjectScene,
   translateTransform,
@@ -26,7 +26,7 @@ import {
   type ObjectOp,
   type ObjectScene,
   type WireOp
-} from "../src/shared/object";
+} from "../platforms/web/shared/object";
 
 class MockWebSocket implements WebSocketLike {
   onopen: ((ev: unknown) => void) | null = null;

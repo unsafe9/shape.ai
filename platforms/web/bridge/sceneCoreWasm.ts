@@ -12,9 +12,9 @@
 // callers can use plain try/catch. Domain failures (unknown id, invalid patch)
 // are NOT thrown: they ride in the `errors: string[]` field of the result.
 
-import type { Anchor, Object as SceneObject, ObjectOp, ObjectScene, Transform3x3 } from "../../shared/object";
-import type { DragSpan } from "../lib/objectPrimitives";
-import type { PrimitiveKindId } from "../lib/toolbar";
+import type { Anchor, Object as SceneObject, ObjectOp, ObjectScene, Transform3x3 } from "../shared/object";
+import type { DragSpan } from "../controller/objectPrimitives";
+import type { PrimitiveKindId } from "../controller/toolbar";
 
 /**
  * Tier-2 `move_ops` roots: a single dragged object, or a multi-select set. The

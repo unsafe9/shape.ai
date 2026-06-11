@@ -12,7 +12,7 @@
 // an `ObjectScene` snapshot. The single `feature` request/response RPC frame
 // replaces the retired bespoke REST surface (OB4.5).
 
-import type { ObjectScene, WireOp, FeatureRequest, FeatureResponse } from "../../shared/object";
+import type { ObjectScene, WireOp, FeatureRequest, FeatureResponse } from "../shared/object";
 import type { OpId } from "./outbox";
 
 export type { OpId };

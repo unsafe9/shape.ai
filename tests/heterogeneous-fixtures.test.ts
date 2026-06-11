@@ -4,7 +4,7 @@ import {
   type FixtureCommentMarker,
   type FixtureActorMarker,
   type HeterogeneousFixture
-} from "../src/client/renderer/fixtures";
+} from "../platforms/web/renderer/fixtures";
 
 describe("heterogeneous fixture generator", () => {
   it("generates a deterministic heterogeneous 1k+ workspace mix", () => {

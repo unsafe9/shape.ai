@@ -13,7 +13,7 @@ import {
   loadSceneCore,
   applyObjectOpSync,
   type SceneCore
-} from "../src/client/scene/sceneCoreWasm";
+} from "../platforms/web/bridge/sceneCoreWasm";
 import {
   emptyObjectScene,
   translateTransform,
@@ -21,7 +21,7 @@ import {
   type Object as SceneObject,
   type ObjectOp,
   type ObjectScene
-} from "../src/shared/object";
+} from "../platforms/web/shared/object";
 
 let core: SceneCore;
 

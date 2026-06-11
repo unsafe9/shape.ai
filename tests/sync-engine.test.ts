@@ -13,15 +13,15 @@ import {
   COALESCE_MS,
   SyncEngine,
   type EngineTransport
-} from "../src/client/lib/syncEngine";
+} from "../platforms/web/runtime/syncEngine";
 import {
   InMemoryOutboxStore,
   opIdKey,
   type OpId,
   type OutboxEntry
-} from "../src/client/lib/outbox";
-import { WsTransport, type WebSocketLike } from "../src/client/lib/wsTransport";
-import { ensureSceneCore } from "../src/client/scene/sceneCoreWasm";
+} from "../platforms/web/runtime/outbox";
+import { WsTransport, type WebSocketLike } from "../platforms/web/runtime/wsTransport";
+import { ensureSceneCore } from "../platforms/web/bridge/sceneCoreWasm";
 import {
   emptyObjectScene,
   translateTransform,
@@ -29,8 +29,8 @@ import {
   type Object as SceneObject,
   type ObjectOp,
   type ObjectScene
-} from "../src/shared/object";
-import type { ClientMessage, ServerMessage, WelcomeMessage } from "../src/client/lib/transport";
+} from "../platforms/web/shared/object";
+import type { ClientMessage, ServerMessage, WelcomeMessage } from "../platforms/web/runtime/transport";
 
 beforeAll(async () => {
   await ensureSceneCore();

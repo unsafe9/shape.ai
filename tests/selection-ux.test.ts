@@ -18,8 +18,8 @@ import {
   type ObjectOp,
   type ObjectScene,
   type ObjectSelection
-} from "../src/shared/object";
-import { loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
+} from "../platforms/web/shared/object";
+import { loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
 
 // The pure mirror of App.svelte's onSelectObject routing (W3-G5 #10). A plain pick
 // on a member of the current Multi keeps the Multi (so a group-drag does not
@@ -204,7 +204,7 @@ describe("App.svelte selection-UX wiring (AP2)", () => {
   // No DOM in the node test env: assert the wiring against the .svelte source.
   // Falsifiable — dropping the additive toggle, the marquee apply, or the cascade
   // route all fail these.
-  const source = readFileSync(fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)), "utf8");
+  const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
 
   it("routes the engine's C2 additive flag through toggleObjectSelection on pick", () => {
     expect(source).toMatch(/onSelectObject:\s*\(id,\s*additive\)\s*=>/);

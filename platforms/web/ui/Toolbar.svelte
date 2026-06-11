@@ -20,11 +20,11 @@
     WifiOff
   } from "lucide-svelte";
   import type { ActiveTool } from "../renderer/engine";
-  import { toolbarShapeKinds, toggleColorPopup, toggleStrokePopup, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
-  import { THEME_DEFAULT_COLOR } from "../lib/objectPrimitives";
-  import type { CanvasSummary } from "../lib/sceneClient";
-  import type { ConnectionStatus } from "../lib/wsTransport";
-  import type { Object as SceneObject } from "../../shared/object";
+  import { toolbarShapeKinds, toggleColorPopup, toggleStrokePopup, type DragCreateShape, type PrimitiveKindId } from "../controller/toolbar";
+  import { THEME_DEFAULT_COLOR } from "../controller/objectPrimitives";
+  import type { CanvasSummary } from "../runtime/sceneClient";
+  import type { ConnectionStatus } from "../runtime/wsTransport";
+  import type { Object as SceneObject } from "../shared/object";
 
   // U1 — the single persistent floating UI: the bottom-center toolbar (tools,
   // object-primitive inserters, template trigger, zoom) plus the absorbed canvas

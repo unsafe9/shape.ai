@@ -10,7 +10,7 @@
 // a contenteditable region, EXCEPT a small allowlist that must always reach the
 // app.
 
-import type { ObjectCommand } from "../scene/sceneCoreWasm";
+import type { ObjectCommand } from "../bridge/sceneCoreWasm";
 
 export type CommandId = string;
 

@@ -1,21 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { ShapeCanvasEngine } from "../src/client/renderer/engine";
+import { ShapeCanvasEngine } from "../platforms/web/renderer/engine";
 import {
   runInteractionLatency,
   runInteractionLatencyUnderFollow,
   INTERACTION_LATENCY_BUDGET_MS,
   type InteractionKind,
   type InteractionLatencyResult
-} from "../src/client/renderer/benchmark";
-import { createHeterogeneousFixture } from "../src/client/renderer/fixtures";
-import { applyScenePatch } from "../src/client/renderer/scene";
-import type { CameraState, ScenePatch, SceneSnapshot, WorldRect } from "../src/client/renderer/scene";
+} from "../platforms/web/renderer/benchmark";
+import { createHeterogeneousFixture } from "../platforms/web/renderer/fixtures";
+import { applyScenePatch } from "../platforms/web/renderer/scene";
+import type { CameraState, ScenePatch, SceneSnapshot, WorldRect } from "../platforms/web/renderer/scene";
 import type {
   RustDebugSnapshot,
   RustInputBatchResult,
   RustWebGpuFrameStats,
   RustWebGpuRenderer
-} from "../src/client/renderer/wasmLoader";
+} from "../platforms/web/bridge/wasmLoader";
 
 // T3.4 interaction-under-load harness tests. They drive the seven direct-
 // manipulation flows through the real engine input-batch/camera/overlay seams

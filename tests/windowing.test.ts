@@ -19,23 +19,23 @@ import {
   windowFromViewport,
   DEFAULT_VIEWPORT_MARGIN,
   type CanvasSummary
-} from "../src/client/lib/sceneClient";
+} from "../platforms/web/runtime/sceneClient";
 import {
   WsTransport,
   backoffDelay,
   type ReconnectOptions,
   type WebSocketLike
-} from "../src/client/lib/wsTransport";
-import { InMemoryOutboxStore } from "../src/client/lib/outbox";
-import { ensureSceneCore } from "../src/client/scene/sceneCoreWasm";
-import type { Bbox, ClientMessage, ServerMessage, WelcomeMessage } from "../src/client/lib/transport";
+} from "../platforms/web/runtime/wsTransport";
+import { InMemoryOutboxStore } from "../platforms/web/runtime/outbox";
+import { ensureSceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import type { Bbox, ClientMessage, ServerMessage, WelcomeMessage } from "../platforms/web/runtime/transport";
 import {
   emptyObjectScene,
   translateTransform,
   type Object as SceneObject,
   type ObjectOp,
   type ObjectScene
-} from "../src/shared/object";
+} from "../platforms/web/shared/object";
 
 beforeAll(async () => {
   await ensureSceneCore();

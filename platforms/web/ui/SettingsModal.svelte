@@ -1,8 +1,8 @@
 <script lang="ts">
   import { Keyboard, X } from "lucide-svelte";
-  import { detectMac, formatShortcut } from "../lib/shortcuts";
-  import { formatGestureTrigger } from "../lib/gestures";
-  import type { ObjectCommand, ObjectGesture } from "../scene/sceneCoreWasm";
+  import { detectMac, formatShortcut } from "../controller/shortcuts";
+  import { formatGestureTrigger } from "../controller/gestures";
+  import type { ObjectCommand, ObjectGesture } from "../bridge/sceneCoreWasm";
 
   // CC5.1 / U4 — settings overlay (Cmd+,). Shows the READ-ONLY shortcut list from
   // the object command catalog (the wasm core's `object_command_catalog()`, P1 —

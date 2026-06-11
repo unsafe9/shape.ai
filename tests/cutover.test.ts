@@ -12,18 +12,18 @@
 
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { SceneClient } from "../src/client/lib/sceneClient";
-import { InMemoryOutboxStore } from "../src/client/lib/outbox";
-import { ensureSceneCore } from "../src/client/scene/sceneCoreWasm";
-import type { WebSocketLike } from "../src/client/lib/wsTransport";
-import type { ClientMessage, ServerMessage, WelcomeMessage } from "../src/client/lib/transport";
+import { SceneClient } from "../platforms/web/runtime/sceneClient";
+import { InMemoryOutboxStore } from "../platforms/web/runtime/outbox";
+import { ensureSceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import type { WebSocketLike } from "../platforms/web/runtime/wsTransport";
+import type { ClientMessage, ServerMessage, WelcomeMessage } from "../platforms/web/runtime/transport";
 import {
   emptyObjectScene,
   translateTransform,
   type Object as SceneObject,
   type ObjectOp,
   type ObjectScene
-} from "../src/shared/object";
+} from "../platforms/web/shared/object";
 
 beforeAll(async () => {
   await ensureSceneCore();

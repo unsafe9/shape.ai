@@ -8,9 +8,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
-import { THEME_DEFAULT_COLOR, type DragSpan } from "../src/client/lib/objectPrimitives";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import type { Object as SceneObject } from "../src/shared/object";
+import { THEME_DEFAULT_COLOR, type DragSpan } from "../platforms/web/controller/objectPrimitives";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import type { Object as SceneObject } from "../platforms/web/shared/object";
 
 const COLOR = "#abcdef";
 
@@ -179,7 +179,7 @@ describe("App.svelte color wiring (AP1)", () => {
   // No DOM in the node test env: assert the wiring against the .svelte source.
   // Falsifiable — dropping the selectedColor arg from the insert path, the
   // onSelectColor route, or the set-style authoring all fail these.
-  const source = readFileSync(fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)), "utf8");
+  const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
 
   it("threads selectedColor into the immediate-insert core builder", () => {
     expect(source).toMatch(/sceneCore\.buildPrimitive\(kind, center, freshId\(kind\), nextOrderKey\(\), selectedColor\)/);

@@ -2,7 +2,7 @@
   import { onDestroy } from "svelte";
   import { BrainCircuit, Loader2, Copy, Trash2, Group as GroupIcon, Ungroup, MessageSquarePlus, LayoutTemplate, Sun, Moon } from "lucide-svelte";
   import { screenToWorld, applyDocumentTheme, readStoredTheme, type Theme } from "../renderer/scene";
-  import type { CameraState } from "../../shared/geometry";
+  import type { CameraState } from "../shared/geometry";
   import {
     emptyObjectScene,
     translateTransform,
@@ -15,19 +15,19 @@
     type ObjectSelection,
     type Paint,
     type FeatureResponse
-  } from "../../shared/object";
+  } from "../shared/object";
   import {
     ShapeCanvasHost,
     type RendererHealth,
     type RendererStats,
     type ShapeCanvasHostCallbacks
-  } from "../lib/canvasHost";
-  import { SceneClient, type CanvasSummary } from "../lib/sceneClient";
-  import type { PeerPresence } from "../lib/peers";
-  import type { ConnectionStatus } from "../lib/wsTransport";
+  } from "../controller/canvasHost";
+  import { SceneClient, type CanvasSummary } from "../runtime/sceneClient";
+  import type { PeerPresence } from "../runtime/peers";
+  import type { ConnectionStatus } from "../runtime/wsTransport";
   import type { ActiveTool, TransformKind } from "../renderer/engine";
-  import { cursorAffordance as deriveCursorAffordance } from "../lib/cursor";
-  import type { HoverAffordance } from "../renderer/wasmLoader";
+  import { cursorAffordance as deriveCursorAffordance } from "../controller/cursor";
+  import type { HoverAffordance } from "../bridge/wasmLoader";
   import {
     loadSceneCore,
     type MoveRoots,
@@ -35,10 +35,10 @@
     type ObjectGesture,
     type SceneCore,
     type UndoStack
-  } from "../scene/sceneCoreWasm";
-  import { createShortcutDispatcher } from "../lib/shortcuts";
-  import { isFreeRecognizeHold } from "../lib/gestureBindings";
-  import { ToastChannel } from "../lib/statusChannel";
+  } from "../bridge/sceneCoreWasm";
+  import { createShortcutDispatcher } from "../controller/shortcuts";
+  import { isFreeRecognizeHold } from "../controller/gestureBindings";
+  import { ToastChannel } from "../runtime/statusChannel";
   import {
     MIN_DRAG_EXTENT_PX,
     textOverlayScreenRect,
@@ -50,8 +50,8 @@
     synthesizeReleaseAnchors,
     CREATE_ANCHOR_REUSE_TOLERANCE_PX,
     MERGE_ENDPOINT_TOLERANCE_PX
-  } from "../lib/objectPrimitives";
-  import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../lib/toolbar";
+  } from "../controller/objectPrimitives";
+  import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../controller/toolbar";
   import Toolbar from "./Toolbar.svelte";
   import SettingsModal from "./SettingsModal.svelte";
   import CanvasHost from "./ShapeCanvasHost.svelte";

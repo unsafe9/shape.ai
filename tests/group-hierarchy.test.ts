@@ -16,8 +16,8 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../src/shared/object";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../platforms/web/shared/object";
 
 let core: SceneCore;
 
@@ -88,7 +88,7 @@ describe("popOutOp (pop a child out one level, #18) — core query", () => {
 });
 
 describe("App.svelte wiring (AP3)", () => {
-  const appSource = readFileSync(fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)), "utf8");
+  const appSource = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
 
   it("group works on 1+ objects — the guard is `< 1`, not `< 2`", () => {
     // The group guard must reject only the empty set.

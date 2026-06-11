@@ -5,8 +5,8 @@
 // mount (the engine/App only wire them).
 
 import { describe, expect, it } from "vitest";
-import { isPanIntent } from "../src/client/renderer/engine";
-import { toggleObjectSelection, type ObjectSelection } from "../src/shared/object";
+import { isPanIntent } from "../platforms/web/renderer/engine";
+import { toggleObjectSelection, type ObjectSelection } from "../platforms/web/shared/object";
 
 describe("isPanIntent (W2-03 pan classification)", () => {
   it("middle button always pans, regardless of Space", () => {

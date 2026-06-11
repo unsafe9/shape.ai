@@ -50,7 +50,7 @@ export type { EngineEvent, FocusBoundsOptions } from "./renderer/engine";
 
 import type { EngineEvent } from "./renderer/engine";
 import type { RenderObjectScene } from "./renderer/scene";
-import type { CameraState, WorldPoint, WorldRect } from "../shared/geometry";
+import type { CameraState, WorldPoint, WorldRect } from "./shared/geometry";
 import type { FocusBoundsOptions } from "./renderer/engine";
 
 /**

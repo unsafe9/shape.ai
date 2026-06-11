@@ -7,14 +7,14 @@
 // like object-op-apply.test.ts.
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { type DragSpan } from "../src/client/lib/objectPrimitives";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { type DragSpan } from "../platforms/web/controller/objectPrimitives";
 import {
   GEOMETRY_QUANTUM_PER_PX,
   translateTransform,
   type Object as SceneObject,
   type ObjectOp
-} from "../src/shared/object";
+} from "../platforms/web/shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 

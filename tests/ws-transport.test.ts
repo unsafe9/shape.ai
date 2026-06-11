@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { WsTransport, type WebSocketLike } from "../src/client/lib/wsTransport";
+import { WsTransport, type WebSocketLike } from "../platforms/web/runtime/wsTransport";
 import type {
   AckMessage,
   ClientMessage,
@@ -9,9 +9,9 @@ import type {
   PresenceServerMessage,
   ServerMessage,
   WelcomeMessage
-} from "../src/client/lib/transport";
-import type { OutboxEntry } from "../src/client/lib/outbox";
-import { emptyObjectScene, translateTransform, type ObjectOp, type WireOp } from "../src/shared/object";
+} from "../platforms/web/runtime/transport";
+import type { OutboxEntry } from "../platforms/web/runtime/outbox";
+import { emptyObjectScene, translateTransform, type ObjectOp, type WireOp } from "../platforms/web/shared/object";
 
 // A minimal WebSocket double implementing the slice WsTransport drives. Tests
 // drive the lifecycle manually: `open()` fires onopen, `emit(frame)` delivers a

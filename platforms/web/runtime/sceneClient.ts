@@ -23,11 +23,11 @@
 //   - LWW / stale-snapshot guards live in `SyncEngine.reconcileSnapshot`, which
 //     rebases on the freshest `welcome` and replays the unacked outbox on top.
 
-import type { ObjectScene, ObjectOp, ObjectSelection, FeatureRequest, FeatureResponse } from "../../shared/object";
-import type { WorldPoint, WorldRect } from "../../shared/geometry";
+import type { ObjectScene, ObjectOp, ObjectSelection, FeatureRequest, FeatureResponse } from "../shared/object";
+import type { WorldPoint, WorldRect } from "../shared/geometry";
 import { WsTransport, type ConnectionStatus, type ReconnectOptions, type WebSocketFactory } from "./wsTransport";
 import { SyncEngine, type AuthorResult } from "./syncEngine";
-import { ensureSceneCore } from "../scene/sceneCoreWasm";
+import { ensureSceneCore } from "../bridge/sceneCoreWasm";
 import { InMemoryOutboxStore, type OutboxStore } from "./outbox";
 import { PeerRegistry, type PeerPresence } from "./peers";
 import type { Bbox, FeatureServerMessage, PatchMessage, Region } from "./transport";

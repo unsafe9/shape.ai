@@ -6,7 +6,7 @@
 // `formatShortcut`) so the test exercises it without mounting a Svelte tree.
 
 import { detectMac, formatShortcut } from "./shortcuts";
-import type { HoldTrigger } from "../scene/sceneCoreWasm";
+import type { HoldTrigger } from "../bridge/sceneCoreWasm";
 
 /** Title-case a single bare token (e.g. `middle` -> `Middle`). */
 function capitalize(token: string): string {

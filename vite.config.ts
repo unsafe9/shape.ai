@@ -27,7 +27,7 @@ function copyRendererWasm(): Plugin {
     name: "copy-shape-renderer-wasm",
     apply: "build" as const,
     closeBundle() {
-      const sourceDir = resolve(root, "src/client/renderer/wasm");
+      const sourceDir = resolve(root, "platforms/web/bridge/wasm");
       const requiredFiles = ["shape_canvas_core.js", "shape_canvas_core_bg.wasm"];
       const missingFile = requiredFiles.find((fileName) => !existsSync(join(sourceDir, fileName)));
       if (missingFile) {
@@ -55,7 +55,7 @@ function copySceneCoreWasm(): Plugin {
     name: "copy-shape-scene-core-wasm",
     apply: "build" as const,
     closeBundle() {
-      const sourceDir = resolve(root, "src/client/scene/wasm");
+      const sourceDir = resolve(root, "platforms/web/bridge/wasm");
       const requiredFiles = ["shape_scene_core.js", "shape_scene_core_bg.wasm"];
       const missingFile = requiredFiles.find((fileName) => !existsSync(join(sourceDir, fileName)));
       if (missingFile) {

@@ -32,12 +32,12 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { objectSceneToRenderObjectScene } from "../src/client/lib/canvasHost";
-import { textOverlayScreenRect, type DragSpan } from "../src/client/lib/objectPrimitives";
-import { isPanIntent, shouldQuerySnap } from "../src/client/renderer/engine";
-import type { RenderTransform3x3 } from "../src/client/renderer/scene";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { isDragCreateShape } from "../src/client/lib/toolbar";
+import { objectSceneToRenderObjectScene } from "../platforms/web/controller/canvasHost";
+import { textOverlayScreenRect, type DragSpan } from "../platforms/web/controller/objectPrimitives";
+import { isPanIntent, shouldQuerySnap } from "../platforms/web/renderer/engine";
+import type { RenderTransform3x3 } from "../platforms/web/renderer/scene";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { isDragCreateShape } from "../platforms/web/controller/toolbar";
 import {
   GEOMETRY_QUANTUM_PER_PX,
   IDENTITY_TRANSFORM,
@@ -50,7 +50,7 @@ import {
   type ObjectSelection,
   type Stroke,
   type Transform3x3
-} from "../src/shared/object";
+} from "../platforms/web/shared/object";
 
 let core: SceneCore;
 

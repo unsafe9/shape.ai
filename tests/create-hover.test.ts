@@ -13,13 +13,13 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { ShapeCanvasEngine, createMoveEmission, type EngineEvent } from "../src/client/renderer/engine";
+import { ShapeCanvasEngine, createMoveEmission, type EngineEvent } from "../platforms/web/renderer/engine";
 import type {
   RustDebugSnapshot,
   RustInputBatchResult,
   RustWebGpuFrameStats,
   RustWebGpuRenderer
-} from "../src/client/renderer/wasmLoader";
+} from "../platforms/web/bridge/wasmLoader";
 
 // A single horizontal outline segment at world y=200, spanning x in [100, 300],
 // belonging to object "rect-1". The mock snaps a WORLD query to the nearest point
@@ -234,7 +234,7 @@ describe("handleCreateHover canonicalization (W3-G9 #3)", () => {
   });
 
   it("App.svelte handleCreateHover filters the snap target to canonical objects and clears on no-snap", () => {
-    const source = readFileSync(fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)), "utf8");
+    const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
     expect(source).toMatch(/function handleCreateHover\(/);
     expect(source).toMatch(/scene\.objects\.some\(\(o\)\s*=>\s*o\.id\s*===\s*targetIdIn\)\s*\?\s*targetIdIn\s*:\s*null/);
     expect(source).toMatch(/createHoverSnap\s*=\s*snappedIn\s*&&\s*target\s*!==\s*null\s*\?\s*\{\s*at:\s*world,\s*target\s*\}\s*:\s*null/);
@@ -243,7 +243,7 @@ describe("handleCreateHover canonicalization (W3-G9 #3)", () => {
 
 describe("buildFeedScene renders the persistent hover ring (W3-G9 #3)", () => {
   it("App.svelte buildFeedScene appends a snap-indicator from the hover snap when no drag is in progress", () => {
-    const source = readFileSync(fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)), "utf8");
+    const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
     // The ring renders from createHoverSnap ONLY in the no-drag branch (else-if after
     // the drag-preview branch), so a drag's own ring is never doubled.
     expect(source).toMatch(/}\s*else if \(hoverSnap\) \{\s*[\s\S]*?snapIndicatorObject\(hoverSnap\.at\)/);

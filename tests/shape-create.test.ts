@@ -8,11 +8,11 @@ import {
   type DragSpan,
   type CreateSnap,
   resolveCreateRelease
-} from "../src/client/lib/objectPrimitives";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { isDragCreateShape } from "../src/client/lib/toolbar";
-import { shouldQuerySnap } from "../src/client/renderer/engine";
-import { GEOMETRY_QUANTUM_PER_PX } from "../src/shared/object";
+} from "../platforms/web/controller/objectPrimitives";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { isDragCreateShape } from "../platforms/web/controller/toolbar";
+import { shouldQuerySnap } from "../platforms/web/renderer/engine";
+import { GEOMETRY_QUANTUM_PER_PX } from "../platforms/web/shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 

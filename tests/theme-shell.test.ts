@@ -19,7 +19,7 @@ import {
   THEME_ROOT_ATTRIBUTE,
   DEFAULT_OBJECT_STYLE_TOKENS,
   type Theme
-} from "../src/client/renderer/scene";
+} from "../platforms/web/renderer/scene";
 
 // The C1 contract token names (scene-core `object::theme::ALL_TOKENS`). The C1
 // table is not wasm-exported to JS, so the contract is mirrored here; a drift in
@@ -111,11 +111,11 @@ describe("default object style tokens reference the C1 token set", () => {
 
 describe("App.svelte + styles.css wiring", () => {
   const appSource = readFileSync(
-    fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)),
+    fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)),
     "utf8"
   );
   const cssSource = readFileSync(
-    fileURLToPath(new URL("../src/client/styles.css", import.meta.url)),
+    fileURLToPath(new URL("../platforms/web/styles.css", import.meta.url)),
     "utf8"
   );
 

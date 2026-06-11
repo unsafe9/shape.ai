@@ -11,9 +11,9 @@
 // ㄱ (top + right), then the bottom bar — ends as ONE closed rect object.
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { MERGE_ENDPOINT_TOLERANCE_PX, synthesizeReleaseAnchors } from "../src/client/lib/objectPrimitives";
-import { GEOMETRY_QUANTUM_PER_PX, type Object as SceneObject, type ObjectOp, type ObjectScene } from "../src/shared/object";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { MERGE_ENDPOINT_TOLERANCE_PX, synthesizeReleaseAnchors } from "../platforms/web/controller/objectPrimitives";
+import { GEOMETRY_QUANTUM_PER_PX, type Object as SceneObject, type ObjectOp, type ObjectScene } from "../platforms/web/shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 

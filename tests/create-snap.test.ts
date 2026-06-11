@@ -10,13 +10,13 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { ShapeCanvasEngine, type EngineEvent } from "../src/client/renderer/engine";
+import { ShapeCanvasEngine, type EngineEvent } from "../platforms/web/renderer/engine";
 import type {
   RustDebugSnapshot,
   RustInputBatchResult,
   RustWebGpuFrameStats,
   RustWebGpuRenderer
-} from "../src/client/renderer/wasmLoader";
+} from "../platforms/web/bridge/wasmLoader";
 
 // A single horizontal outline segment at world y=200, spanning x in [100, 300],
 // belonging to object "rect-1". The mock snaps a WORLD query to the nearest point
@@ -251,7 +251,7 @@ describe("handleCreate snap-target canonicalization (W3-G5 #6)", () => {
   });
 
   it("App.svelte handleCreate filters the snap target to canonical objects", () => {
-    const source = readFileSync(fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)), "utf8");
+    const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
     expect(source).toMatch(/scene\.objects\.some\(\(o\)\s*=>\s*o\.id\s*===\s*targetIdIn\)\s*\?\s*targetIdIn\s*:\s*null/);
     expect(source).toMatch(/snappedIn\s*&&\s*targetId\s*!==\s*null/);
   });

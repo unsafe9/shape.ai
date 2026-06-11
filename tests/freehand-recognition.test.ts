@@ -10,9 +10,9 @@
 //       (DU7=(b): anchors live only on open-class endpoints).
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { synthesizeReleaseAnchors } from "../src/client/lib/objectPrimitives";
-import { GEOMETRY_QUANTUM_PER_PX, type Object as SceneObject } from "../src/shared/object";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { synthesizeReleaseAnchors } from "../platforms/web/controller/objectPrimitives";
+import { GEOMETRY_QUANTUM_PER_PX, type Object as SceneObject } from "../platforms/web/shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 

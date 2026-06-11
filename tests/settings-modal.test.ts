@@ -15,8 +15,8 @@ import {
   ensureSceneCore,
   loadSceneCore,
   type ObjectGesture
-} from "../src/client/scene/sceneCoreWasm";
-import { formatGestureTrigger } from "../src/client/lib/gestures";
+} from "../platforms/web/bridge/sceneCoreWasm";
+import { formatGestureTrigger } from "../platforms/web/controller/gestures";
 
 let gestures: ObjectGesture[];
 
@@ -27,7 +27,7 @@ beforeAll(async () => {
 });
 
 const source = readFileSync(
-  fileURLToPath(new URL("../src/client/svelte/SettingsModal.svelte", import.meta.url)),
+  fileURLToPath(new URL("../platforms/web/ui/SettingsModal.svelte", import.meta.url)),
   "utf8"
 );
 

@@ -17,7 +17,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
-import { ensureSceneCore, loadSceneCore, type ObjectGesture } from "../src/client/scene/sceneCoreWasm";
+import { ensureSceneCore, loadSceneCore, type ObjectGesture } from "../platforms/web/bridge/sceneCoreWasm";
 import {
   COARSE_ROTATE_SNAP_DEG,
   GESTURE_BINDINGS,
@@ -27,11 +27,11 @@ import {
   isPanGesture,
   isSnapBypass,
   verifyGestureBindings
-} from "../src/client/lib/gestureBindings";
-import { AFFORDANCE_CURSOR, affordanceToCursor, cursorAffordance } from "../src/client/lib/cursor";
-import { isPanIntent, shouldQuerySnap, snapRotateDeltaMatrix } from "../src/client/renderer/engine";
-import type { HoverAffordance } from "../src/client/renderer/wasmLoader";
-import type { RenderTransform3x3 } from "../src/client/renderer/scene";
+} from "../platforms/web/controller/gestureBindings";
+import { AFFORDANCE_CURSOR, affordanceToCursor, cursorAffordance } from "../platforms/web/controller/cursor";
+import { isPanIntent, shouldQuerySnap, snapRotateDeltaMatrix } from "../platforms/web/renderer/engine";
+import type { HoverAffordance } from "../platforms/web/bridge/wasmLoader";
+import type { RenderTransform3x3 } from "../platforms/web/renderer/scene";
 
 let gestures: ObjectGesture[];
 
@@ -42,7 +42,7 @@ beforeAll(async () => {
 });
 
 const stylesCss = readFileSync(
-  fileURLToPath(new URL("../src/client/styles.css", import.meta.url)),
+  fileURLToPath(new URL("../platforms/web/styles.css", import.meta.url)),
   "utf8"
 );
 

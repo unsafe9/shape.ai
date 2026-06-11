@@ -22,9 +22,9 @@
 // initialized via `ensureSceneCore` before the engine authors. It is transport-
 // shaped via the `EngineTransport` seam so tests drive it with a mock socket.
 
-import type { ObjectScene, ObjectOp, WireOp } from "../../shared/object";
-import { opPrimaryTargetId } from "../../shared/object";
-import { applyObjectOpSync, type ObjectApplyResult } from "../scene/sceneCoreWasm";
+import type { ObjectScene, ObjectOp, WireOp } from "../shared/object";
+import { opPrimaryTargetId } from "../shared/object";
+import { applyObjectOpSync, type ObjectApplyResult } from "../bridge/sceneCoreWasm";
 import {
   opIdKey,
   type OpId,

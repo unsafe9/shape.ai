@@ -10,7 +10,7 @@
 // armed, the assertions below fail.
 
 import { describe, expect, it } from "vitest";
-import { ToastChannel, TOAST_DISMISS_MS, type ToastTimer } from "../src/client/lib/statusChannel";
+import { ToastChannel, TOAST_DISMISS_MS, type ToastTimer } from "../platforms/web/runtime/statusChannel";
 
 // A controllable timer: `set` queues a callback under a fresh id; `clear` drops
 // it; `fire` invokes the pending callback for an id (simulating the timeout

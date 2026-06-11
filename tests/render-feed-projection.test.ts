@@ -6,14 +6,14 @@
 // Node-only, no GPU.
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { objectSceneToRenderObjectScene } from "../src/client/lib/canvasHost";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
+import { objectSceneToRenderObjectScene } from "../platforms/web/controller/canvasHost";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
 import {
   GEOMETRY_QUANTUM_PER_PX,
   emptyObjectScene,
   type ObjectScene,
   type Stroke
-} from "../src/shared/object";
+} from "../platforms/web/shared/object";
 
 describe("objectSceneToRenderObjectScene stroke units", () => {
   let core: SceneCore;

@@ -13,9 +13,9 @@ import {
   isTypingTarget,
   matchCommand,
   parseShortcut
-} from "../src/client/lib/shortcuts";
-import { ensureSceneCore, loadSceneCore, type ObjectCommand } from "../src/client/scene/sceneCoreWasm";
-import { insertCommandToPrimitive, primitiveForCommand, primitiveOrder, toggleColorPopup, toggleStrokePopup, toolbarShapeKinds } from "../src/client/lib/toolbar";
+} from "../platforms/web/controller/shortcuts";
+import { ensureSceneCore, loadSceneCore, type ObjectCommand } from "../platforms/web/bridge/sceneCoreWasm";
+import { insertCommandToPrimitive, primitiveForCommand, primitiveOrder, toggleColorPopup, toggleStrokePopup, toolbarShapeKinds } from "../platforms/web/controller/toolbar";
 
 let catalog: ObjectCommand[];
 
@@ -219,7 +219,7 @@ describe("toolbar Stroke popup UI (S1 / #4)", () => {
   // Falsifiable — re-adding the auto draw sub-toolbar, dropping the toggle button,
   // or losing the size/color controls inside the popup all fail these.
   const source = readFileSync(
-    fileURLToPath(new URL("../src/client/svelte/Toolbar.svelte", import.meta.url)),
+    fileURLToPath(new URL("../platforms/web/ui/Toolbar.svelte", import.meta.url)),
     "utf8"
   );
 
@@ -258,11 +258,11 @@ describe("pen recognition mode (Basic default, Shift-hold Free)", () => {
   // state, dropping the Shift mirror, or not forwarding the mode to the freehand
   // commit all fail these.
   const toolbar = readFileSync(
-    fileURLToPath(new URL("../src/client/svelte/Toolbar.svelte", import.meta.url)),
+    fileURLToPath(new URL("../platforms/web/ui/Toolbar.svelte", import.meta.url)),
     "utf8"
   );
   const app = readFileSync(
-    fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)),
+    fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)),
     "utf8"
   );
 
@@ -291,7 +291,7 @@ describe("toolbar color-popup UI (TB1 / #3)", () => {
   // the single toggle button, the popup-gated swatches, the native <input
   // type="color">, the selectedColor prop, or the onSelectColor wiring fails this.
   const source = readFileSync(
-    fileURLToPath(new URL("../src/client/svelte/Toolbar.svelte", import.meta.url)),
+    fileURLToPath(new URL("../platforms/web/ui/Toolbar.svelte", import.meta.url)),
     "utf8"
   );
 

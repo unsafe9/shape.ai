@@ -12,7 +12,7 @@
 // cursor; the crosshair tools own their own cursor (no affordance override);
 // otherwise the core's hover affordance drives it. Pure + framework-neutral.
 
-import type { HoverAffordance } from "../renderer/wasmLoader";
+import type { HoverAffordance } from "../bridge/wasmLoader";
 import type { ActiveTool } from "../renderer/engine";
 
 /** The cursor wired to the `pan` hold gesture (Space / middle-button). */

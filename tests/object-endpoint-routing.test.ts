@@ -20,16 +20,16 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { ShapeCanvasEngine, type EngineEvent } from "../src/client/renderer/engine";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
+import { ShapeCanvasEngine, type EngineEvent } from "../platforms/web/renderer/engine";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
 import {
   emptyObjectScene,
   translateTransform,
   type Object as SceneObject,
   type ObjectScene
-} from "../src/shared/object";
-import type { RustInputBatchResult, RustWebGpuRenderer } from "../src/client/renderer/wasmLoader";
-import type { CameraState } from "../src/client/renderer/scene";
+} from "../platforms/web/shared/object";
+import type { RustInputBatchResult, RustWebGpuRenderer } from "../platforms/web/bridge/wasmLoader";
+import type { CameraState } from "../platforms/web/renderer/scene";
 
 const CAMERA: CameraState = { x: 0, y: 0, zoom: 1 };
 const LINE_ID = "line-1";
@@ -279,7 +279,7 @@ describe("endpointReleaseOps commit contract (the App onEndpointCommit call)", (
 });
 
 describe("App.svelte endpoint wiring (source pins)", () => {
-  const source = readFileSync(fileURLToPath(new URL("../src/client/svelte/App.svelte", import.meta.url)), "utf8");
+  const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
 
   it("authors the release through the core endpointReleaseOps in onEndpointCommit", () => {
     expect(source).toMatch(/onEndpointCommit:/);

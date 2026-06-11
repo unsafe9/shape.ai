@@ -12,11 +12,11 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { ShapeCanvasEngine, type EngineEvent } from "../src/client/renderer/engine";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../src/shared/object";
-import type { RustInputBatchResult, RustWebGpuRenderer } from "../src/client/renderer/wasmLoader";
-import type { CameraState } from "../src/client/renderer/scene";
+import { ShapeCanvasEngine, type EngineEvent } from "../platforms/web/renderer/engine";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../platforms/web/shared/object";
+import type { RustInputBatchResult, RustWebGpuRenderer } from "../platforms/web/bridge/wasmLoader";
+import type { CameraState } from "../platforms/web/renderer/scene";
 
 const CAMERA: CameraState = { x: 0, y: 0, zoom: 1 };
 

@@ -12,7 +12,7 @@
 //
 // Pure + framework-neutral so the test pins the routing without a renderer.
 
-import type { ObjectGesture } from "../scene/sceneCoreWasm";
+import type { ObjectGesture } from "../bridge/sceneCoreWasm";
 
 /** The frozen C2 gesture ids the shell routes pointer behavior off. */
 export const GESTURE_PAN_SPACE = "pan-space";

@@ -1,4 +1,4 @@
-import type { CameraState, DomOverlayRequest, RenderTransform3x3, ScenePatch, SceneSelection, WorldRect, WorldPoint } from "./scene";
+import type { CameraState, DomOverlayRequest, RenderTransform3x3, ScenePatch, SceneSelection, WorldRect, WorldPoint } from "../renderer/scene";
 
 export type RustCoreStatus = {
   available: boolean;

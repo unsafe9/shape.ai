@@ -5,9 +5,9 @@
 // Framework-neutral so they pin without a renderer or a Svelte mount.
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { textOverlayScreenRect, type DragSpan } from "../src/client/lib/objectPrimitives";
-import { ensureSceneCore, loadSceneCore, type SceneCore } from "../src/client/scene/sceneCoreWasm";
-import { GEOMETRY_QUANTUM_PER_PX } from "../src/shared/object";
+import { textOverlayScreenRect, type DragSpan } from "../platforms/web/controller/objectPrimitives";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { GEOMETRY_QUANTUM_PER_PX } from "../platforms/web/shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 

@@ -54,7 +54,7 @@ import type {
   RustCanvasInputEvent,
   RustInputBatchResult,
   RustDebugSnapshot
-} from "./wasmLoader";
+} from "../bridge/wasmLoader";
 
 import type {
   RenderObjectScene,
@@ -67,7 +67,7 @@ import type {
   WorldRect
 } from "./scene";
 
-import type { ObjectOp } from "../../shared/object";
+import type { ObjectOp } from "../shared/object";
 
 // ─── re-exports (convenience) ─────────────────────────────────────────────────
 
@@ -332,7 +332,7 @@ export type WebAdapterClipboardContract = {
  */
 export type CanvasClipboardPayload = {
   kind: "objects";
-  objects: import("../../shared/object").Object[];
+  objects: import("../shared/object").Object[];
 };
 
 // ─── Surface 6 — Diagnostics bridge ──────────────────────────────────────────
