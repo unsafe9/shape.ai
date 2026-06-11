@@ -99,14 +99,11 @@
   // drives (color + width). The freehand commit + the live preview both read the
   // current brush; simplification thresholds live in scene-core recognition.
   let penWidthPx = $state(2);
-  // Pen recognition mode toggle (toolbar, next to the Pen): false = Basic (the
-  // default — every stroke snaps to a basic shape), true = Free (the full
-  // pipeline with polygon/curve fallbacks). The shell only forwards the bool.
-  let freeRecognition = $state(false);
-  // Hold-to-Free: while Shift is held, a pen stroke recognizes in Free mode even
-  // when the toolbar toggle is off (press-and-hold to draw free-form, release to
-  // snap back to Basic). Mirrored from every key event; consumed only at pen-up,
-  // so it never collides with Shift's rotate/select roles (different contexts).
+  // Pen recognition mode: Basic by default (every stroke snaps to a canonical
+  // basic shape). Hold Shift while drawing for Free recognition (polygon/curve
+  // fallbacks): mirrored from every key event, consumed only at pen-up — so it
+  // never collides with Shift's rotate/select roles (mutually exclusive contexts).
+  // Press-and-hold to draw free-form, release snaps back to Basic.
   let freeRecognitionHeld = $state(false);
   // D1/#5: the toolbar's always-visible selected color. It is the default fill/
   // stroke for the next NEW shape; recoloring a selected object authors a SetStyle
@@ -919,8 +916,8 @@
     // near-miss pointer-up still anchors, endpoint pulled onto the edge), then
     // commit the recognized stroke (>=2 points have extent).
     const startSnap = drawSnap?.start ?? null;
-    // Hold-to-Free: the toolbar toggle OR a held Shift selects Free recognition.
-    const recognizeMode = freeRecognition || freeRecognitionHeld ? "free" : "basic";
+    // Hold-to-Free: a held Shift selects Free recognition, else Basic.
+    const recognizeMode = freeRecognitionHeld ? "free" : "basic";
     const resolved = resolveCreateRelease(
       { end: canon ? canon.at : world, snapped: canon !== null, target: canon?.target ?? null },
       drawSnap?.last ?? null,
@@ -1891,7 +1888,6 @@
           {penWidthPx}
           penPalette={PEN_PALETTE}
           penWidths={PEN_WIDTHS}
-          {freeRecognition}
           {selectedColor}
           dark={theme === "dark"}
           {busy}
@@ -1903,7 +1899,6 @@
           {connectionStatus}
           {canvasBusy}
           onSetTool={setActiveTool}
-          onToggleFreeRecognition={() => (freeRecognition = !freeRecognition)}
           onSetPenWidth={(width) => (penWidthPx = width)}
           onSelectColor={applySelectedColor}
           onInsertPrimitive={insertPrimitive}

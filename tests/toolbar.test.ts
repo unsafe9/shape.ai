@@ -252,10 +252,10 @@ describe("toolbar Stroke popup UI (S1 / #4)", () => {
   });
 });
 
-describe("toolbar pen recognition toggle (Basic/Free)", () => {
+describe("pen recognition mode (Basic default, Shift-hold Free)", () => {
   // No DOM in the node test env: assert the wiring against the .svelte sources.
-  // Falsifiable — dropping the toggle button, moving it away from the Pen,
-  // flipping the default to Free, or not forwarding the mode to the freehand
+  // Falsifiable — re-adding the removed toggle button/prop, keeping the toggle
+  // state, dropping the Shift mirror, or not forwarding the mode to the freehand
   // commit all fail these.
   const toolbar = readFileSync(
     fileURLToPath(new URL("../src/client/svelte/Toolbar.svelte", import.meta.url)),
@@ -266,34 +266,20 @@ describe("toolbar pen recognition toggle (Basic/Free)", () => {
     "utf8"
   );
 
-  it("renders the Free-form recognition toggle right next to the Pen button", () => {
-    const pen = toolbar.indexOf('aria-label="Pen tool"');
-    const toggle = toolbar.indexOf('aria-label="Free-form recognition"');
-    const eraser = toolbar.indexOf('aria-label="Eraser tool"');
-    expect(pen).toBeGreaterThan(-1);
-    expect(toggle).toBeGreaterThan(pen);
-    expect(eraser).toBeGreaterThan(toggle); // Pen -> toggle -> Eraser, same Draw group
+  it("the toolbar carries no Free-form toggle button or prop", () => {
+    expect(toolbar).not.toContain('aria-label="Free-form recognition"');
+    expect(toolbar).not.toContain("freeRecognition");
+    expect(toolbar).not.toContain("onToggleFreeRecognition");
   });
 
-  it("uses the standard toggle visual pattern (is-active + aria-pressed)", () => {
-    expect(toolbar).toMatch(/class="icon-button \{freeRecognition \? 'is-active' : ''\}"/);
-    expect(toolbar).toMatch(/aria-pressed=\{freeRecognition\}/);
-    expect(toolbar).toMatch(/onclick=\{onToggleFreeRecognition\}/);
-  });
-
-  it("declares the freeRecognition prop and onToggleFreeRecognition callback", () => {
-    expect(toolbar).toMatch(/freeRecognition:\s*boolean;/);
-    expect(toolbar).toMatch(/onToggleFreeRecognition:\s*\(\)\s*=>\s*void;/);
-  });
-
-  it("App owns the state, defaulting to Basic (false), and forwards the toggle OR a held Shift", () => {
-    expect(app).toMatch(/let freeRecognition = \$state\(false\)/);
-    expect(app).toMatch(/onToggleFreeRecognition=\{\(\)\s*=>\s*\(freeRecognition = !freeRecognition\)\}/);
-    // Hold-to-Free: a held Shift selects Free recognition even with the toggle off,
-    // mirrored from key events and consumed only at pen-up.
+  it("App drives Free recognition from a held Shift, defaulting to Basic", () => {
+    // No toolbar toggle state remains — only the keydown/keyup Shift mirror, read
+    // at pen-up to pick the freehand recognition mode.
+    expect(app).not.toMatch(/let freeRecognition\b/);
+    expect(app).not.toContain("onToggleFreeRecognition");
     expect(app).toMatch(/let freeRecognitionHeld = \$state\(false\)/);
-    expect(app).toMatch(/freeRecognition \|\| freeRecognitionHeld \? "free" : "basic"/);
     expect(app).toMatch(/freeRecognitionHeld = event\.shiftKey/);
+    expect(app).toMatch(/freeRecognitionHeld \? "free" : "basic"/);
   });
 });
 
