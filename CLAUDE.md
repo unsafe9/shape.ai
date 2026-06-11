@@ -13,6 +13,7 @@ The one rule: **keep canvas logic in the Rust cores, keep every shell thin.**
 `crates/` holds the cores: `scene-core` (model + the one op-apply),
 `client-runtime` (collaboration semantics no shell reimplements),
 `renderer-core` (pure CPU) + `renderer-wgpu` (GPU) render seam, `storage-core`,
+`coordination` (the scale-out lease/presence/pubsub `Coordinator` seam),
 `server`, and `platform-contract` — what a shell may see, so a new shell needs
 no core change. `platforms/` holds one shell per OS: `web/`
 is live, `macos/`/`ios/`/`android/` reserved empty dirs. A shell only forwards OS

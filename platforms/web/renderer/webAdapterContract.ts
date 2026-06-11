@@ -327,7 +327,7 @@ export type WebAdapterClipboardContract = {
 
 /**
  * The adapter's clipboard wire format.
- * Carries only canvas objects (`src/shared/object.ts` `Object`); no business
+ * Carries only canvas objects (`../shared/object` `Object`); no business
  * fields (the object substrate has none) cross the clipboard.
  */
 export type CanvasClipboardPayload = {

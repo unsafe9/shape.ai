@@ -2,7 +2,7 @@
 //
 // The single source of truth for the canvas model and op-apply is the Rust
 // scene-core crate; the client loads the SAME logic compiled to wasm
-// (`src/client/scene/wasm`). These TS types are a transport mirror of the
+// (`platforms/web/bridge/wasm`). These TS types are a transport mirror of the
 // crate's serde surface (`crates/scene-core/src/object/{model,op}.rs` and
 // `crates/scene-core/src/wire.rs`), so a JSON value crossing the wasm/WS
 // boundary is typed without any TS-side domain logic (P1). They carry NO

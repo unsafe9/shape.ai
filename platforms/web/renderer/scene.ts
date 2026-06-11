@@ -1,13 +1,13 @@
 // Renderer adapter scene types (object-native).
 //
-// The canonical canvas model is the object substrate (`src/shared/object.ts`,
+// The canonical canvas model is the object substrate (`platforms/web/shared/object.ts`,
 // D1). The renderer's object draw entry consumes a `RenderObjectScene` — the
 // object-substrate render view that mirrors the renderer-core
 // `render_object::RenderObjectScene` serde shape (camelCase keys; `geometryD` for
 // the path-string; bare 3x3 transform). The host (`lib/canvasHost.ts`) projects an
 // `ObjectScene` into this shape before handing it to the renderer.
 //
-// Camera/coordinate primitives live in `src/shared/geometry.ts` (render-time
+// Camera/coordinate primitives live in `platforms/web/shared/geometry.ts` (render-time
 // camera/coords, not domain). The screen<->world helpers here are pure projection.
 //
 // The legacy 2D render-primitive types (`SceneSnapshot`/`ScenePatch` + friends)

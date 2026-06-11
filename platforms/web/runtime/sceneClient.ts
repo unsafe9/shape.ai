@@ -27,7 +27,7 @@ import type { ObjectScene, ObjectOp, ObjectSelection, FeatureRequest, FeatureRes
 import type { WorldPoint, WorldRect } from "../shared/geometry";
 import { WsTransport, type ConnectionStatus, type ReconnectOptions, type WebSocketFactory } from "./wsTransport";
 import { SyncEngine, type AuthorResult } from "./syncEngine";
-import { ensureSceneCore } from "../bridge/sceneCoreWasm";
+import { ensureSceneCore, createWasmWindow, type WasmWindow } from "../bridge/sceneCoreWasm";
 import { InMemoryOutboxStore, type OutboxStore } from "./outbox";
 import { PeerRegistry, type PeerPresence } from "./peers";
 import type { Bbox, FeatureServerMessage, PatchMessage, Region } from "./transport";
@@ -61,7 +61,8 @@ export type SceneClientOptions = {
   /**
    * Window margin factor (MG9.4). The viewport bbox is grown by this fraction of
    * its width/height on each side before it becomes the subscribed region, so a
-   * small pan/zoom does not immediately re-subscribe. Default {@link DEFAULT_VIEWPORT_MARGIN}.
+   * small pan/zoom does not immediately re-subscribe. Omit to use the core default
+   * (`client-runtime` `DEFAULT_VIEWPORT_MARGIN`).
    */
   viewportMargin?: number;
   /**
@@ -80,33 +81,8 @@ export type Unsubscribe = () => void;
 /** A camera-derived viewport in WORLD coordinates (before the window margin). */
 export type Viewport = Bbox;
 
-/** Default fraction the viewport is grown on each side to form the window. */
-export const DEFAULT_VIEWPORT_MARGIN = 0.5;
 /** Default debounce for viewport-driven re-subscribes. */
 export const DEFAULT_VIEWPORT_DEBOUNCE_MS = 200;
-
-/**
- * Grow a viewport bbox by `margin` of its size on each side. This is the
- * data-layer WINDOW the client subscribes to — distinct from renderer culling:
- * windowing controls which objects the client HOLDS at all; renderer culling
- * decides which of the held objects to draw each frame.
- */
-export function windowFromViewport(viewport: Viewport, margin: number): Bbox {
-  const padX = viewport.width * margin;
-  const padY = viewport.height * margin;
-  return {
-    x: viewport.x - padX,
-    y: viewport.y - padY,
-    width: viewport.width + padX * 2,
-    height: viewport.height + padY * 2
-  };
-}
-
-/** True when two bboxes are equal enough that a re-subscribe would be a no-op. */
-function bboxEquals(a: Bbox | undefined, b: Bbox | undefined): boolean {
-  if (!a || !b) return a === b;
-  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
-}
 
 /** Default window after which a silent peer's cursor is expired. */
 export const DEFAULT_PEER_TTL_MS = 10_000;
@@ -130,6 +106,7 @@ export class SceneClient {
   private readonly clearTimer: (handle: unknown) => void;
   private readonly reconnect?: ReconnectOptions;
   private readonly random?: () => number;
+  /** Window margin handed to the core decision state; `-1` = core default. */
   private readonly viewportMargin: number;
   private readonly viewportDebounceMs: number;
 
@@ -138,8 +115,12 @@ export class SceneClient {
   private detachEngine: Unsubscribe | null = null;
   private canvasId: string | null = null;
 
-  /** The window bbox currently subscribed (undefined = whole canvas). */
-  private window: Bbox | undefined;
+  /**
+   * The viewport-windowing DECISION state, owned by the core (client-runtime
+   * `WindowState`). Null before {@link connect} initializes the wasm; the shell
+   * only drives the debounce timer + transport off its decisions.
+   */
+  private windowState: WasmWindow | null = null;
   /** Debounce handle for the pending viewport-driven re-subscribe. */
   private viewportTimer: unknown = null;
 
@@ -170,7 +151,7 @@ export class SceneClient {
     this.clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
     this.reconnect = opts.reconnect;
     this.random = opts.random;
-    this.viewportMargin = opts.viewportMargin ?? DEFAULT_VIEWPORT_MARGIN;
+    this.viewportMargin = opts.viewportMargin ?? -1;
     this.viewportDebounceMs = opts.viewportDebounceMs ?? DEFAULT_VIEWPORT_DEBOUNCE_MS;
     this.peerTtlMs = opts.peerTtlMs ?? DEFAULT_PEER_TTL_MS;
     this.nowMs = opts.nowMs ?? (() => Date.now());
@@ -191,7 +172,7 @@ export class SceneClient {
   async connect(canvasId: string, region?: Region): Promise<ObjectScene> {
     if (this.transport) throw new Error("SceneClient already connected");
     this.canvasId = canvasId;
-    this.window = region?.bbox;
+    const seed = region?.bbox;
     const transport = new WsTransport({
       url: this.url,
       createSocket: this.createSocket,
@@ -206,8 +187,11 @@ export class SceneClient {
     // The engine's optimistic op-apply is the scene-core wasm object core (the
     // same Rust the server runs); init it before the engine can author.
     const sceneCoreReady = ensureSceneCore();
-    const welcome = await transport.connect(canvasId, this.regionFor(this.window));
+    const welcome = await transport.connect(canvasId, this.regionFor(seed));
     await sceneCoreReady;
+    // The windowing decisions live in the core; seed its state from the connect
+    // region now that the wasm is initialized.
+    this.windowState = createWasmWindow({ seed, margin: this.viewportMargin });
 
     const engine = new SyncEngine(welcome.scene, {
       clientId: this.clientId,
@@ -240,15 +224,17 @@ export class SceneClient {
   /**
    * Windowed replica (MG9.4): re-aim the subscription to the bbox derived from a
    * camera viewport plus the window margin, debounced so a continuous pan/zoom
-   * does not spam re-subscribes. The server replies with a region-filtered
-   * welcome (the resnapshot); the engine reconciles it.
+   * does not spam re-subscribes. The margin + re-subscribe DECISION lives in the
+   * core (`WindowState`); the shell only drives the debounce timer here. The
+   * server replies with a region-filtered welcome (the resnapshot); the engine
+   * reconciles it.
    */
   setViewport(viewport: Viewport): void {
-    const next = windowFromViewport(viewport, this.viewportMargin);
     if (this.viewportTimer != null) this.clearTimer(this.viewportTimer);
     this.viewportTimer = this.setTimer(() => {
       this.viewportTimer = null;
-      this.applyWindow(next);
+      const next = this.windowState?.on_viewport(JSON.stringify(viewport));
+      this.subscribeWindowDecision(next);
     }, this.viewportDebounceMs);
   }
 
@@ -258,7 +244,7 @@ export class SceneClient {
       this.clearTimer(this.viewportTimer);
       this.viewportTimer = null;
     }
-    this.applyWindow(bbox);
+    this.subscribeWindowDecision(this.windowState?.set_window(JSON.stringify(bbox)));
   }
 
   /** Drop the window: re-subscribe to the whole canvas (no bbox). */
@@ -267,20 +253,26 @@ export class SceneClient {
       this.clearTimer(this.viewportTimer);
       this.viewportTimer = null;
     }
-    if (this.window === undefined) return;
-    this.window = undefined;
+    if (!this.windowState?.subscribe_whole_canvas()) return;
     if (this.canvasId) this.transport?.subscribe({ canvasId: this.canvasId });
   }
 
-  private applyWindow(bbox: Bbox): void {
-    if (bboxEquals(this.window, bbox)) return;
-    this.window = bbox;
+  /**
+   * Act on a core windowing decision: the bbox JSON (`"null"` / undefined = no
+   * change, emit nothing) the `WindowState` returned. A non-null bbox is the new
+   * window to `subscribe` to.
+   */
+  private subscribeWindowDecision(decisionJson: string | undefined): void {
+    if (decisionJson === undefined) return;
+    const bbox = JSON.parse(decisionJson) as Bbox | null;
+    if (bbox === null) return;
     if (this.canvasId) this.transport?.subscribe({ canvasId: this.canvasId, bbox });
   }
 
   /** The window bbox currently subscribed, or null for whole-canvas. */
   get currentWindow(): Bbox | null {
-    return this.window ?? null;
+    if (!this.windowState) return null;
+    return JSON.parse(this.windowState.current_window()) as Bbox | null;
   }
 
   /** The current optimistic object scene, or null before {@link connect}. */
@@ -402,7 +394,7 @@ export class SceneClient {
    * canvas's welcome snapshot.
    */
   async switchCanvas(canvasId: string, outbox?: OutboxStore): Promise<ObjectScene> {
-    const window = this.window;
+    const window = this.currentWindow;
     this.teardown();
     this.outbox = outbox ?? new InMemoryOutboxStore();
     return this.connect(canvasId, window ? { canvasId, bbox: window } : undefined);

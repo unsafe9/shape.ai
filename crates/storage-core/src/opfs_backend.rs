@@ -16,7 +16,7 @@
 //!
 //! # The worker / postMessage bridge plan (the `OutboxStore` seam)
 //!
-//! The wider client data layer (`src/client/lib/{sceneClient,outbox,syncEngine}.ts`)
+//! The wider client data layer (`platforms/web/runtime/{sceneClient,outbox,syncEngine}.ts`)
 //! is structured behind an `OutboxStore` interface (today an in-memory backend).
 //! D15/D17 say the async [`AsyncStorageAdapter`](crate::AsyncStorageAdapter) trait
 //! is the seam, and the **sync↔async bridge lives at the call site / worker, never

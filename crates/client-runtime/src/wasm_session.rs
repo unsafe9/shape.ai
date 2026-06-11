@@ -35,6 +35,7 @@ use shape_scene_core::wire::{OpId, WireOp};
 
 use crate::outbox::{InMemoryOutboxStore, OutboxEntry};
 use crate::peers::PeerRegistry;
+use crate::scene_client::{Bbox, WindowState};
 use crate::sync_engine::{EngineTransport, SyncEngine};
 
 /// Serialize `value`, or fall back to an `{"error": ...}` JSON if serialization
@@ -321,6 +322,74 @@ impl WasmSession {
     pub fn clear_peers(&mut self) {
         self.peers.clear();
     }
+}
+
+/// wasm-bindgen wrapper over [`WindowState`](crate::scene_client::WindowState):
+/// the viewport-windowing DECISION layer the web shell drives. It owns the
+/// currently-subscribed window and the margin; the shell owns the debounce timer
+/// and the transport. Bboxes cross the boundary as `{x,y,width,height}` JSON; an
+/// empty string / `"null"` is whole-canvas (the `None` window).
+#[wasm_bindgen]
+pub struct WasmWindow {
+    state: WindowState,
+}
+
+#[wasm_bindgen]
+impl WasmWindow {
+    /// Seed the window from the connect region's bbox JSON (`""` = whole canvas)
+    /// with an explicit margin fraction (`margin < 0` uses the default).
+    #[wasm_bindgen(constructor)]
+    pub fn new(seed_bbox_json: &str, margin: f64) -> Result<WasmWindow, String> {
+        let seed = parse_window_bbox("seed bbox", seed_bbox_json)?;
+        let state = if margin >= 0.0 {
+            WindowState::with_margin(seed, margin)
+        } else {
+            WindowState::new(seed)
+        };
+        Ok(WasmWindow { state })
+    }
+
+    /// Grow a camera `viewport_json` into the window bbox (margin applied) and
+    /// decide whether to re-aim. Returns the bbox JSON to `subscribe` to, `"null"`
+    /// when unchanged (no frame), or `{error}` on malformed input.
+    pub fn on_viewport(&mut self, viewport_json: &str) -> String {
+        let viewport: Bbox = match parse("viewport", viewport_json) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        ok_json(&self.state.on_viewport(viewport))
+    }
+
+    /// Re-aim the window to `bbox_json` directly (no margin). Returns the bbox JSON
+    /// to `subscribe` to, `"null"` when unchanged, or `{error}` on malformed input.
+    pub fn set_window(&mut self, bbox_json: &str) -> String {
+        let bbox: Bbox = match parse("bbox", bbox_json) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        ok_json(&self.state.set_window(bbox))
+    }
+
+    /// Drop the window: decide whether to re-subscribe to the whole canvas. Returns
+    /// `true` when a whole-canvas `subscribe` must be sent, `false` when already
+    /// whole-canvas (no frame).
+    pub fn subscribe_whole_canvas(&mut self) -> bool {
+        self.state.subscribe_whole_canvas()
+    }
+
+    /// The window bbox currently subscribed as JSON, or `"null"` for whole-canvas.
+    pub fn current_window(&self) -> String {
+        ok_json(&self.state.current_window())
+    }
+}
+
+/// Parse an optional window bbox: `""` is the whole-canvas window (`None`),
+/// otherwise the `{x,y,width,height}` JSON.
+fn parse_window_bbox(label: &str, json: &str) -> Result<Option<Bbox>, String> {
+    if json.is_empty() {
+        return Ok(None);
+    }
+    parse(label, json).map(Some)
 }
 
 /// Wire shape for a tracked peer (camelCase, mirroring the TS `PeerPresence`).

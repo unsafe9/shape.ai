@@ -64,10 +64,13 @@ The stack is one Rust workspace plus a thin Svelte shell:
     successor recovers with no data loss.
   - **MCP (`/mcp`).** Streamable HTTP MCP (rmcp) mounted on the same router, plus
     a companion dock (`/api/mcp/clients`, `/api/mcp/trace`).
-- `src/renderer/core` (`shape_canvas_core`) — the standalone WGPU renderer core,
-  built to WASM for the web canvas. Stays out of the workspace until it is wired
-  to scene-core.
-- `src/client` — the Svelte shell. It owns product UI and orchestration and
+- `crates/renderer-core` (`shape_renderer_core`) — the pure CPU renderer core:
+  tessellation, stroke expansion, curve LOD, text layout, hit testing, and the
+  render model. No `wgpu`, no `web_sys`.
+- `crates/renderer-wgpu` (`shape_canvas_core`) — the WebGPU half: the `wgpu`
+  pipelines, web surface lifecycle, and the `#[wasm_bindgen]` renderer surface,
+  built to WASM for the web canvas. Depends on `renderer-core` by path.
+- `platforms/web` — the Svelte shell. It owns product UI and orchestration and
   talks to the canvas only through a narrow imperative handle plus an event
   stream. The client uses scene-core-WASM for optimistic op-apply and reaches the
   server over `/ws` and the `/api/*` routes.

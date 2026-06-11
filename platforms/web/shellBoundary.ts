@@ -26,9 +26,8 @@
  *
  * 2. **Canvas never calls product I/O.**  The adapter/core never call HTTP/WS,
  *    never know MCP/export/proposal semantics.  Persistence stays in the WS
- *    transport client (`src/client/lib/sceneClient.ts`) plus the residual
- *    server-side ops (`src/client/lib/sceneServerApi.ts`); business semantics
- *    stay in the Svelte shell + server.
+ *    transport client (`platforms/web/runtime/sceneClient.ts`); business
+ *    semantics stay in the Svelte shell + server.
  *
  * 3. **One bridge, two directions.**  All shell→canvas traffic goes through the
  *    {@link RendererCanvasHostHandle}-shaped methods; all canvas→shell traffic
@@ -42,7 +41,7 @@
  * ## Document vs ephemeral state partition
  *
  * See {@link DocumentShellState} and {@link EphemeralShellState} for the
- * classification of every state field currently in `App.tsx`.
+ * classification of every state field currently in `App.svelte`.
  */
 
 // Re-export the real event union from its canonical location.
@@ -130,7 +129,7 @@ export interface ShapeCanvasHost {
 
   /**
    * Synthesise a wheel-zoom event at a screen-space point.
-   * Used by the shell zoom-in/zoom-out buttons (`App.tsx#zoomAtCanvasCenter`).
+   * Used by the shell zoom-in/zoom-out buttons (`App.svelte#zoomAtCanvasCenter`).
    */
   wheelAtScreen(screen: WorldPoint, deltaY: number): void;
 
@@ -167,7 +166,7 @@ export interface ShapeCanvasHost {
  * NOT be inlined into Rust core or the canvas adapter; they live in the
  * Svelte shell + server.
  *
- * Derived from `App.tsx` state at T1.4 time; extended by downstream tasks
+ * Derived from `App.svelte` state at T1.4 time; extended by downstream tasks
  * (P4 template, P5 MCP/companion) as their fields become document state.
  */
 export interface DocumentShellState {
@@ -176,7 +175,7 @@ export interface DocumentShellState {
    * and the persisted selection.  Loaded from the WS welcome snapshot and
    * mutated through the WS transport client (`sceneClient.ts`).
    *
-   * @see src/shared/object.ts `ObjectScene`
+   * @see ./shared/object `ObjectScene`
    */
   scene: unknown; // typed as Scene in the shell — kept `unknown` here to avoid a circular dep
 
@@ -191,9 +190,9 @@ export interface DocumentShellState {
    * Broadcast as presence on every change via the WS client (selection is not
    * a document op).
    *
-   * @see src/shared/object.ts `ObjectSelection`
+   * @see ./shared/object `ObjectSelection`
    */
-  selection: unknown; // typed as SceneSelection in App.tsx
+  selection: unknown; // typed as SceneSelection in App.svelte
 }
 
 /**
@@ -203,7 +202,7 @@ export interface DocumentShellState {
  *
  * These fields must NOT enter `SceneSnapshot` or the op model.
  *
- * Derived from `App.tsx` state at T1.4 time.  MCP/companion presence and
+ * Derived from `App.svelte` state at T1.4 time.  MCP/companion presence and
  * spectator state (P5) are also ephemeral; their slots are noted below.
  */
 export interface EphemeralShellState {
@@ -250,13 +249,13 @@ export interface EphemeralShellState {
    * The last node copied by the user (for paste operations).  Local clipboard
    * only; not synced to the server.
    */
-  copiedNode: unknown; // typed as SceneNode | null in App.tsx
+  copiedNode: unknown; // typed as SceneNode | null in App.svelte
 
   /**
    * Export preview content shown after `exportGroup` completes.  Cleared when
    * the user closes the preview or navigates away.
    */
-  exportPreview: unknown; // typed as ExportPreview | null in App.tsx
+  exportPreview: unknown; // typed as ExportPreview | null in App.svelte
 
   /**
    * Camera mirror — derived read of `FrameStats.rustCameraX/Y/Zoom` emitted
@@ -272,14 +271,14 @@ export interface EphemeralShellState {
    * Latest renderer frame stats, emitted via `EngineEvent.stats`.
    * Read-only in the shell; never written back to the engine.
    */
-  rendererStats: unknown; // typed as RendererStats | null in App.tsx
+  rendererStats: unknown; // typed as RendererStats | null in App.svelte
 
   /**
    * Renderer health state (`ready | webgpu-unavailable | wasm-unavailable`).
    * Emitted by `RendererCanvasHost` / `ShapeCanvasHost` as an out-of-band
    * health change.  Read-only in the shell.
    */
-  rendererHealth: unknown; // typed as RendererHealth | null in App.tsx
+  rendererHealth: unknown; // typed as RendererHealth | null in App.svelte
 
   /**
    * Last raw renderer status string (superset of health state).  Shown in the

@@ -177,6 +177,7 @@ type SceneCoreModule = {
     coalesceMs: number,
     peerTtlMs: number
   ) => WasmSession;
+  WasmWindow: new (seedBboxJson: string, margin: number) => WasmWindow;
 };
 
 // The collaboration session (crates/client-runtime), exported as a wasm-bindgen
@@ -202,6 +203,19 @@ type WasmSession = {
   expire_peers: (nowMs: number) => string;
   peers: () => string;
   clear_peers: () => void;
+  free: () => void;
+};
+
+// The viewport-windowing DECISION layer (crates/client-runtime WindowState),
+// exported as a wasm-bindgen class. It owns the subscribed window + margin and
+// decides when a re-subscribe is warranted; the shell drives the debounce timer
+// and the transport. Bboxes cross as `{x,y,width,height}` JSON; `""`/`"null"` is
+// whole-canvas. Method names stay snake_case.
+type WasmWindow = {
+  on_viewport: (viewportJson: string) => string;
+  set_window: (bboxJson: string) => string;
+  subscribe_whole_canvas: () => boolean;
+  current_window: () => string;
   free: () => void;
 };
 
@@ -690,7 +704,7 @@ export function applyObjectOpSync(scene: ObjectScene, op: ObjectOp): ObjectApply
 
 /** The raw collaboration session FFI handle (snake_case, JSON over the boundary).
  *  The TS runtime adapters wrap it with their stable, JSON-marshalling API. */
-export type { WasmSession };
+export type { WasmSession, WasmWindow };
 
 /**
  * Construct a collaboration session over the wasm core (the SAME bundle as the
@@ -716,4 +730,20 @@ export function createWasmSession(args: {
     args.coalesceMs ?? -1,
     args.peerTtlMs ?? -1
   );
+}
+
+/**
+ * Construct the viewport-windowing decision state over the wasm core (the SAME
+ * bundle as the op-apply). Requires {@link ensureSceneCore} to have resolved. The
+ * `seed` bbox is the connect region's window (omit for whole-canvas); `margin <
+ * 0` uses the core default. Throws if the wasm is not yet initialized.
+ */
+export function createWasmWindow(args: {
+  seed?: { x: number; y: number; width: number; height: number };
+  margin?: number;
+}): WasmWindow {
+  if (!readyModule) {
+    throw new Error("scene-core wasm is not initialized; await ensureSceneCore() before createWasmWindow()");
+  }
+  return new readyModule.WasmWindow(args.seed ? JSON.stringify(args.seed) : "", args.margin ?? -1);
 }

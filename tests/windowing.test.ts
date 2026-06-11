@@ -16,8 +16,6 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   SceneClient,
-  windowFromViewport,
-  DEFAULT_VIEWPORT_MARGIN,
   type CanvasSummary
 } from "../platforms/web/runtime/sceneClient";
 import {
@@ -185,16 +183,10 @@ function opsFrames(socket: MockWebSocket) {
   return socket.sentMessages().filter((m): m is Extract<ClientMessage, { type: "ops" }> => m.type === "ops");
 }
 
-describe("windowFromViewport", () => {
-  it("grows the viewport by the margin fraction on each side", () => {
-    const win = windowFromViewport({ x: 0, y: 0, width: 100, height: 200 }, 0.5);
-    expect(win).toEqual({ x: -50, y: -100, width: 200, height: 400 });
-  });
-
-  it("has a sensible default margin", () => {
-    expect(DEFAULT_VIEWPORT_MARGIN).toBeGreaterThan(0);
-  });
-});
+// The windowing math (windowFromViewport) + the default margin now live in the
+// core (crates/client-runtime `WindowState` / `window_from_viewport`, covered by
+// tests/windowing.rs); the shell only drives it. These suites exercise the
+// wasm-backed SceneClient decisions end to end.
 
 describe("SceneClient windowed subscribe", () => {
   it("seeds the connection window from the connect region (hello carries the bbox)", async () => {
