@@ -37,7 +37,12 @@ Shortcuts and gestures have a single source: a click/shortcut command lives in
 scene-core `commands.rs` (`object_command_catalog`); a hold-key gesture lives in
 scene-core `gestures.rs` (`object_gesture_catalog`). Both export JSON over
 `wasm_api`, and the settings modal renders them read-only — register a feature in
-its catalog once and it self-documents, with no second place to update.
+its catalog once and it self-documents, with no second place to update. So any
+new key/modifier/button-hold or click behavior starts in the catalog, and the
+shell routes off its mirrored binding predicate; never branch behavior on a raw
+`event.shiftKey`/key-literal read in shell code, which skips the catalog and
+never reaches the modal. Verify by confirming the entry appears in the settings
+(Cmd+,) list with no modal edit.
 
 ## Operating Notes
 
