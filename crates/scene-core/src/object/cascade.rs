@@ -23,7 +23,7 @@
 //!
 //! Pure (no time/rng/IO/GPU), pointer-width-agnostic.
 
-use super::anchor_follow::anchor_follow_ops;
+use super::anchor_follow::geometry_follow_ops;
 use super::deform::{
     deform_open_path, is_open_class, is_pure_translate, open_endpoint_pins, route_open_endpoints,
     EndpointRoute,
@@ -31,6 +31,7 @@ use super::deform::{
 use super::model::{Geometry, Object, ObjectScene, Transform3x3};
 use super::move_together::{BindingGraph, BindingNode};
 use super::op::ObjectOp;
+use super::region::StubOutlineDeriver;
 
 /// 3x3 row-major pre-multiply `new = delta * base`. The delta is the cumulative
 /// world-space gesture matrix; `base` is the object's existing transform. Reuses
@@ -199,7 +200,13 @@ pub fn move_ops(scene: &ObjectScene, roots: &MoveRoots, delta: &Transform3x3) ->
         MoveRoots::Single(id) => cascade_transform_ops(scene, id, delta),
         MoveRoots::Multi(ids) => cascade_multi_transform_ops(scene, ids, delta),
     };
-    let follow = anchor_follow_ops(scene, &ops);
+    // The geometry-edit-aware follow chains followers off the cascade: a
+    // `set-transform` member reprojects its followers (§3), and an open-class
+    // member that committed as a chord-deform `edit-geometry` reshapes — so a
+    // follower anchored onto THAT member follows too, recursively (#3). The
+    // reference deriver reprojects an anchor's `at` onto a reshaped outline; the
+    // renderer substitutes its lyon backend for the LIVE preview.
+    let follow = geometry_follow_ops(&StubOutlineDeriver, scene, &ops);
     ops.extend(follow);
     ops
 }

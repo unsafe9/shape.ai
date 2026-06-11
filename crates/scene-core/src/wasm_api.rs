@@ -48,7 +48,7 @@ fn parse<T: serde::de::DeserializeOwned>(label: &str, json: &str) -> Result<T, S
 // ---------------------------------------------------------------------------
 
 use crate::object::anchor_follow::{
-    anchor_follow_ops as anchor_follow_ops_pure,
+    geometry_follow_ops as geometry_follow_ops_pure,
     synthesize_create_anchors as synthesize_create_anchors_pure,
 };
 use crate::object::deform::{
@@ -344,24 +344,27 @@ pub fn build_set_style_op(object_json: &str, color: &str) -> String {
     ok_json(&build_set_style_op_pure(&object, color))
 }
 
-/// `anchor_follow_ops(scene_json, transform_ops_json) -> ObjectOp[] | {error}`.
+/// `anchor_follow_ops(scene_json, ops_json) -> ObjectOp[] | {error}`.
 ///
-/// Tier-1/#14 commit-time anchor move-together. `transform_ops_json` is the move's
-/// `set-transform` ops; the result is the `edit-geometry` ops that reproject every
-/// object anchored to a moved target through that target's NEW transform (the SAME
-/// reproject the renderer-core LIVE preview applies). Returns `[]` when nothing
-/// follows. The shell batches the returned ops into the committed move.
+/// Tier-1/#14 + #2/#3 commit-time anchor follow. `ops_json` is the committed batch:
+/// `set-transform` ops MOVE a target (the transform reproject) and `edit-geometry`
+/// ops RESHAPE a target (the anchor `at` re-projects onto its NEW outline). The
+/// result is the chord-deform `edit-geometry` ops that make every anchored follower
+/// track its target — chained, so a follower of a follower follows too (#3). Use
+/// this when committing a geometry edit (e.g. a partial erase that reshapes a
+/// stroke) whose followers must reproject; `move_ops` already folds the same follow
+/// into a drag commit. Returns `[]` when nothing follows.
 #[wasm_bindgen]
-pub fn anchor_follow_ops(scene_json: &str, transform_ops_json: &str) -> String {
+pub fn anchor_follow_ops(scene_json: &str, ops_json: &str) -> String {
     let scene: ObjectScene = match parse("scene", scene_json) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let transform_ops: Vec<ObjectOp> = match parse("transformOps", transform_ops_json) {
+    let ops: Vec<ObjectOp> = match parse("ops", ops_json) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    ok_json(&anchor_follow_ops_pure(&scene, &transform_ops))
+    ok_json(&geometry_follow_ops_pure(&StubOutlineDeriver, &scene, &ops))
 }
 
 /// Wire shape for the [`move_ops`] roots: `{kind:"single",id}` for a single

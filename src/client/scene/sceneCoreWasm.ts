@@ -296,10 +296,14 @@ export type SceneCore = {
     y: number,
     radius: number
   ): SceneObject["geometry"] | null;
-  /** Tier-1/#14: the commit-time anchor move-together follow ops. `ops` are the
-   *  move's set-transform ops; the result is the edit-geometry ops that reproject
-   *  every object anchored to a moved target through that target's NEW transform.
-   *  Returns `[]` when nothing follows (the shell batches the result into the move). */
+  /** Tier-1/#14 + #2/#3: the commit-time anchor follow ops for any committed batch.
+   *  `ops` are the committed ops: `set-transform` MOVES a target (transform
+   *  reproject) and `edit-geometry` RESHAPES one (the anchor `at` re-projects onto
+   *  its new outline). The result is the chord-deform `edit-geometry` ops that make
+   *  every anchored follower track its target, chained so a follower of a follower
+   *  follows too. Call this when committing a geometry edit (e.g. a partial erase
+   *  reshaping a stroke) whose followers must reproject; `moveOps` already folds the
+   *  same follow into a drag. Returns `[]` when nothing follows. */
   anchorFollowOps(scene: ObjectScene, ops: ObjectOp[]): ObjectOp[];
   /** Tier-2: the combined commit-time move ops for a parent-drag / multi-select
    *  drag — the transform CASCADE ops (the dragged subtree, or every multi member

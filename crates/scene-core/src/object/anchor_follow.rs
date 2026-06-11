@@ -25,6 +25,7 @@ use super::model::{
     Anchor, Geometry, LocalPoint, Object, ObjectScene, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
 };
 use super::op::ObjectOp;
+use super::region::OutlineDeriver;
 
 /// Quantized units per logical pixel. Matches renderer-core
 /// `transform_bindings::UNITS_PER_PX` and the shell `GEOMETRY_QUANTUM_PER_PX`
@@ -332,77 +333,211 @@ pub fn anchor_follow_ops(scene: &ObjectScene, transform_ops: &[ObjectOp]) -> Vec
         {
             continue;
         }
-        let base = &follower.geometry.path_string;
-        let pairs = local_nodes(base);
-        let last_pair = i32::try_from(pairs.len().saturating_sub(1)).unwrap_or(i32::MAX);
-        let endpoint_deform = pairs.len() >= 2
-            && follower.anchors.iter().all(|a| a.node_index == 0 || a.node_index == last_pair)
-            && is_open_class_d(base);
-        if endpoint_deform {
-            // §3 chord follow: reprojected endpoints in, the whole silhouette out.
-            let mut new_start = pairs[0];
-            let mut new_end = pairs[pairs.len() - 1];
-            let mut any_moved = false;
-            for anchor in &follower.anchors {
-                let Some((_, target_new)) = moved.iter().find(|(id, _)| *id == anchor.target)
-                else {
-                    continue;
-                };
-                let (qx, qy) =
-                    reproject_node_local_quantized(&follower.transform, target_new, anchor.at);
-                let p = (qx as f64, qy as f64);
-                if anchor.node_index == 0 {
-                    new_start = p;
-                } else {
-                    new_end = p;
-                }
-                any_moved = true;
-            }
-            if !any_moved {
-                continue;
-            }
-            let Some(d) = deform_open_path(base, new_start, new_end).filter(|d| d != base) else {
+        // Each anchor's bound node reprojects through its moved target's NEW
+        // transform; an anchor whose target did not move contributes nothing.
+        let new_node = |anchor: &Anchor| -> Option<(i64, i64)> {
+            let (_, target_new) = moved.iter().find(|(id, _)| *id == anchor.target)?;
+            Some(reproject_node_local_quantized(&follower.transform, target_new, anchor.at))
+        };
+        if let Some(geometry) = follower_edit_geometry(follower, new_node) {
+            ops.push(ObjectOp::EditGeometry { id: follower.id.clone(), geometry });
+        }
+    }
+    ops
+}
+
+/// The single per-follower edit-authoring path shared by transform-follow
+/// ([`anchor_follow_ops`]) and geometry-edit-follow ([`geometry_follow_ops`]):
+/// fold `new_node` (the reprojected follower-local QUANTIZED position of each
+/// moved-target anchor's bound node) into ONE `Geometry`, or `None` when nothing
+/// changed (no anchor's target moved, or the result equals the base).
+///
+/// Anchor-semantics v3 §3: an open-class follower whose anchors all bind
+/// ENDPOINTS deforms as ONE chord ([`deform_open_path`]) — anchored endpoints at
+/// their reprojected positions, the un-anchored endpoint pinned at its original
+/// position. Everything else (closed-class, legacy multi-subpath ink, an
+/// interior-node anchor) keeps the node-splice fold (rule 5 — no regression).
+fn follower_edit_geometry(
+    follower: &Object,
+    new_node: impl Fn(&Anchor) -> Option<(i64, i64)>,
+) -> Option<Geometry> {
+    let base = &follower.geometry.path_string;
+    let pairs = local_nodes(base);
+    let last_pair = i32::try_from(pairs.len().saturating_sub(1)).unwrap_or(i32::MAX);
+    let endpoint_deform = pairs.len() >= 2
+        && follower.anchors.iter().all(|a| a.node_index == 0 || a.node_index == last_pair)
+        && is_open_class_d(base);
+    let d = if endpoint_deform {
+        // §3 chord follow: reprojected endpoints in, the whole silhouette out.
+        let mut new_start = pairs[0];
+        let mut new_end = pairs[pairs.len() - 1];
+        let mut any_moved = false;
+        for anchor in &follower.anchors {
+            let Some((qx, qy)) = new_node(anchor) else {
                 continue;
             };
-            ops.push(ObjectOp::EditGeometry {
-                id: follower.id.clone(),
-                geometry: Geometry {
-                    path_string: d,
-                    fill_rule: follower.geometry.fill_rule,
-                    subpaths: Vec::new(),
-                },
-            });
-            continue;
+            let p = (qx as f64, qy as f64);
+            if anchor.node_index == 0 {
+                new_start = p;
+            } else {
+                new_end = p;
+            }
+            any_moved = true;
         }
+        if !any_moved {
+            return None;
+        }
+        deform_open_path(base, new_start, new_end)?
+    } else {
         // Legacy node-splice fold (rule 5). `Some` once any anchor's rewrite
         // landed; later anchors fold into it.
         let mut rewritten: Option<String> = None;
         for anchor in &follower.anchors {
-            let Some((_, target_new)) = moved.iter().find(|(id, _)| *id == anchor.target) else {
+            let Some((qx, qy)) = new_node(anchor) else {
                 continue;
             };
-            let (qx, qy) =
-                reproject_node_local_quantized(&follower.transform, target_new, anchor.at);
             let current = rewritten.as_deref().unwrap_or(base);
             if let Some(d) = set_path_node(current, anchor.node_index, qx, qy) {
                 rewritten = Some(d);
             }
         }
-        // Author only when the cumulative result differs from the base — the
-        // no-op-authors-nothing contract.
-        let Some(d) = rewritten.filter(|d| d != base) else {
-            continue;
-        };
-        ops.push(ObjectOp::EditGeometry {
-            id: follower.id.clone(),
-            geometry: Geometry {
-                path_string: d,
-                fill_rule: follower.geometry.fill_rule,
-                subpaths: Vec::new(),
-            },
-        });
+        rewritten?
+    };
+    // Author only when the cumulative result differs from the base — the
+    // no-op-authors-nothing contract.
+    if d == *base {
+        return None;
     }
-    ops
+    Some(Geometry {
+        path_string: d,
+        fill_rule: follower.geometry.fill_rule,
+        subpaths: Vec::new(),
+    })
+}
+
+/// Curve-flattening tolerance for the geometry-edit reprojection of an anchor's
+/// `at` onto a target's NEW outline. The finest bucket (matching [`super::anchors`])
+/// so endpoints land on the true outline regardless of zoom LOD.
+const FOLLOW_FLATNESS: i32 = 1;
+
+/// How a target moved within a committed batch: a `set-transform` (the outline is
+/// unchanged in target-local space — the existing transform reproject) or an
+/// `edit-geometry` (the outline RESHAPED — the anchor `at` must re-project onto
+/// the new outline before the transform reproject).
+enum MovedTarget {
+    /// `set-transform`: the target's NEW transform (geometry unchanged).
+    Transform(Transform3x3),
+    /// `edit-geometry`: the target's NEW geometry (transform unchanged).
+    Reshape(Geometry),
+}
+
+/// The reprojected follower-local QUANTIZED bound-node position for `anchor`
+/// onto `target` (read from the scene for its transform), given how the target
+/// moved in this batch. For a reshape, `anchor.at` is first re-projected onto the
+/// NEW outline (target-local) via `deriver` so the endpoint stays glued to the
+/// edited outline; for a transform move the local `at` is carried straight
+/// through. Returns `None` when a reshaped target's region cannot be derived.
+fn reproject_through_moved(
+    deriver: &impl OutlineDeriver,
+    follower_transform: &Transform3x3,
+    target: &Object,
+    moved: &MovedTarget,
+    anchor: &Anchor,
+) -> Option<(i64, i64)> {
+    match moved {
+        MovedTarget::Transform(target_new) => {
+            Some(reproject_node_local_quantized(follower_transform, target_new, anchor.at))
+        }
+        MovedTarget::Reshape(geometry) => {
+            // The deriver reads `subpaths`; a reshape geometry straight off the
+            // commit may carry only its path-string, so hydrate before deriving.
+            let mut hydrated = geometry.clone();
+            hydrated.ensure_parsed().ok()?;
+            let region = deriver.derive_region(&hydrated, FOLLOW_FLATNESS).ok()?;
+            let at = deriver.reproject(&region, anchor.at);
+            Some(reproject_node_local_quantized(follower_transform, &target.transform, at))
+        }
+    }
+}
+
+/// The follow `edit-geometry` ops a committed batch produces so anchored objects
+/// track their targets — the geometry-edit-aware, CHAINING superset of
+/// [`anchor_follow_ops`]. `ops` is the committed batch: `set-transform` ops move a
+/// target (transform reproject, §3) and `edit-geometry` ops RESHAPE a target (the
+/// anchor `at` re-projects onto the new outline before the same chord-deform, #2).
+///
+/// #3 chain propagation: a follower whose geometry this pass rewrites is itself a
+/// reshaped target on the next wave, so a follower chained to THAT follower
+/// (line A → line B → shape T) updates too. A `visited` set keyed by follower id
+/// bounds the recursion — each follower is reprojected at most once, so a cycle in
+/// the binding graph terminates instead of looping.
+///
+/// A follower already carrying its OWN edit in the incoming batch is skipped (its
+/// geometry was placed by the same commit; reprojecting from its base would stomp
+/// that edit). Followers come out in scene-object order, first wave before the
+/// chained waves. Pure (no time/rng/IO/GPU), pointer-width-agnostic.
+pub fn geometry_follow_ops(
+    deriver: &impl OutlineDeriver,
+    scene: &ObjectScene,
+    ops: &[ObjectOp],
+) -> Vec<ObjectOp> {
+    // Seed the moved set from the committed batch (last write wins, a Batch
+    // applies sequentially); a moved id absent from the scene anchors nothing.
+    let mut moved: Vec<(String, MovedTarget)> = Vec::new();
+    for op in ops {
+        let (id, target) = match op {
+            ObjectOp::SetTransform { id, transform } if scene.get(id).is_some() => {
+                (id, MovedTarget::Transform(*transform))
+            }
+            ObjectOp::EditGeometry { id, geometry } if scene.get(id).is_some() => {
+                (id, MovedTarget::Reshape(geometry.clone()))
+            }
+            _ => continue,
+        };
+        if let Some(entry) = moved.iter_mut().find(|(mid, _)| mid == id) {
+            entry.1 = target;
+        } else {
+            moved.push((id.clone(), target));
+        }
+    }
+
+    // `visited` = ids whose geometry is already pinned for this commit: every id
+    // moved/reshaped by the incoming batch (an open-class moved member that
+    // committed as a chord-deform is in here as a `Reshape`), plus every follower
+    // this pass has already authored. Bounds the chain recursion (cycle-safe).
+    let mut visited: Vec<String> = moved.iter().map(|(id, _)| id.clone()).collect();
+    let mut out = Vec::new();
+    // The frontier is the ids whose move/reshape we still have to propagate from.
+    let mut frontier: Vec<String> = moved.iter().map(|(id, _)| id.clone()).collect();
+    while !frontier.is_empty() {
+        let mut next_frontier: Vec<String> = Vec::new();
+        for follower in &scene.objects {
+            if visited.contains(&follower.id) || follower.anchors.is_empty() {
+                continue;
+            }
+            // Only reproject when at least one anchor targets a FRONTIER id (a
+            // newly moved/reshaped target this wave), so a follower waits until
+            // its target's own edit is settled before chaining off it.
+            if !follower.anchors.iter().any(|a| frontier.contains(&a.target)) {
+                continue;
+            }
+            let new_node = |anchor: &Anchor| -> Option<(i64, i64)> {
+                let (_, mt) = moved.iter().find(|(id, _)| id == &anchor.target)?;
+                let target = scene.get(&anchor.target)?;
+                reproject_through_moved(deriver, &follower.transform, target, mt, anchor)
+            };
+            let Some(geometry) = follower_edit_geometry(follower, new_node) else {
+                continue;
+            };
+            // This follower is now a reshaped target for the next wave (#3).
+            visited.push(follower.id.clone());
+            next_frontier.push(follower.id.clone());
+            moved.push((follower.id.clone(), MovedTarget::Reshape(geometry.clone())));
+            out.push(ObjectOp::EditGeometry { id: follower.id.clone(), geometry });
+        }
+        frontier = next_frontier;
+    }
+    out
 }
 
 /// Synthesize the persistent anchor(s) for a snapped drag-create, or `None` when
@@ -851,5 +986,197 @@ mod tests {
         let g = polyline("M 0 0 L 80 0");
         assert_eq!(g.subpaths.len(), 1);
         assert_eq!(g.subpaths[0], SubPath { closed: false, nodes: g.subpaths[0].nodes.clone() });
+    }
+
+    // --- #2 geometry-edit follow + #3 chain propagation -------------------
+
+    use crate::object::model::PathNode;
+    use crate::object::region::StubOutlineDeriver;
+
+    /// A hydrated closed rect with the given quantized corners (the stub deriver
+    /// reprojects an anchor onto the nearest of these four outline vertices).
+    fn rect(id: &str, x0: i32, y0: i32, x1: i32, y1: i32) -> Object {
+        Object::new(
+            id,
+            "a0",
+            Geometry::from_subpaths(
+                vec![SubPath {
+                    closed: true,
+                    nodes: vec![
+                        PathNode::corner(x0, y0),
+                        PathNode::corner(x1, y0),
+                        PathNode::corner(x1, y1),
+                        PathNode::corner(x0, y1),
+                    ],
+                }],
+                FillRule::EvenOdd,
+            ),
+        )
+    }
+
+    /// The committed `edit-geometry` op reshaping `id` to the given closed rect.
+    fn reshape_rect_op(id: &str, x0: i32, y0: i32, x1: i32, y1: i32) -> ObjectOp {
+        let geometry = rect("ignored", x0, y0, x1, y1).geometry;
+        ObjectOp::EditGeometry { id: id.to_string(), geometry }
+    }
+
+    // #2 GOLDEN: a committed `edit-geometry` that RESHAPES a target reprojects the
+    // anchor's `at` onto the target's NEW outline and chord-deforms the follower —
+    // the SAME endpoint-deform path the transform-follow uses. FALSIFY: neutralize
+    // the reprojection wiring (drop EditGeometry targets, or reproject through the
+    // OLD outline) and the op vanishes / the endpoint stays at (800,0) — RED.
+    #[test]
+    fn target_geometry_edit_reprojects_open_follower() {
+        // shape-t: identity-transform rect, corners (0,0)-(800,400). edge: an open
+        // line whose node 1 anchors to shape-t's top-right corner at local (800,0).
+        let target = rect("shape-t", 0, 0, 800, 400);
+        let mut follower = Object::new("edge", "a1", polyline("M 320 160 L 800 0"));
+        follower.transform = Transform3x3::IDENTITY;
+        follower.anchors =
+            vec![Anchor { node_index: 1, target: "shape-t".into(), at: LocalPoint { x: 800, y: 0 } }];
+        let scene = scene_of(vec![target, follower]);
+
+        // Reshape: drag the top-right corner (800,0) down to (800,240). The stub
+        // reprojects the anchor's old `at`=(800,0) onto the nearest NEW vertex,
+        // which is the moved corner (800,240) (dist 240² < every other corner).
+        let reshape = reshape_rect_op("shape-t", 0, 240, 800, 400);
+        let ops = geometry_follow_ops(&StubOutlineDeriver, &scene, &[reshape.clone()]);
+        assert_eq!(ops.len(), 1, "one follow op for the reshaped target: {ops:?}");
+        let ObjectOp::EditGeometry { id, geometry } = &ops[0] else {
+            panic!("expected edit-geometry, got {ops:?}");
+        };
+        assert_eq!(id, "edge");
+        // node 1 reprojects to local (800,240); the free node 0 pins at (320,160).
+        assert_eq!(geometry.path_string, "M 320 160 L 800 240");
+
+        // Through REAL op-apply (the oracle): commit the reshape + the follow op as
+        // one batch and assert the follower's bound endpoint world position lands on
+        // the target's NEW outline vertex (100,30)px — the reprojected attachment.
+        let mut applied = scene.clone();
+        let mut batch = vec![reshape];
+        batch.extend(ops);
+        crate::object::apply::apply_object_op(&mut applied, ObjectOp::Batch { ops: batch })
+            .expect("the follow batch applies through op-apply");
+        let edge = applied.get("edge").unwrap();
+        let (wx, wy) = world_node(edge, 1);
+        assert!(
+            (wx - 100.0).abs() < 1e-9 && (wy - 30.0).abs() < 1e-9,
+            "the committed endpoint sits on the reshaped outline ({wx},{wy})"
+        );
+    }
+
+    // #2: a follower already carrying its OWN edit in the batch is NOT reprojected
+    // again (its geometry was placed by the same commit).
+    #[test]
+    fn follower_with_its_own_edit_in_the_batch_is_skipped_on_reshape() {
+        let target = rect("shape-t", 0, 0, 800, 400);
+        let mut follower = Object::new("edge", "a1", polyline("M 320 160 L 800 0"));
+        follower.anchors =
+            vec![Anchor { node_index: 1, target: "shape-t".into(), at: LocalPoint { x: 800, y: 0 } }];
+        let own_edit = follower.geometry.clone();
+        let scene = scene_of(vec![target, follower]);
+        let ops = geometry_follow_ops(
+            &StubOutlineDeriver,
+            &scene,
+            &[
+                reshape_rect_op("shape-t", 0, 240, 800, 400),
+                ObjectOp::EditGeometry { id: "edge".to_string(), geometry: own_edit },
+            ],
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(op, ObjectOp::EditGeometry { id, .. } if id == "edge")),
+            "a follower with its own batch edit is not reprojected again: {ops:?}"
+        );
+    }
+
+    // #3 GOLDEN: line A anchored to line B anchored to shape T. Moving T must
+    // propagate TWO hops — B follows T, then A follows B's new geometry. FALSIFY:
+    // remove the chain recursion and only B updates (A is dropped) — RED.
+    #[test]
+    fn line_to_line_chain_propagates_two_hops() {
+        // shape-t: identity rect (0,0)-(800,400). line-b: node 1 anchored to shape-t
+        // at the top-right corner (800,0). line-a: node 1 anchored to line-b's END
+        // node (its node 1) — so A follows B follows T.
+        let target = rect("shape-t", 0, 0, 800, 400);
+        let mut b = Object::new("line-b", "a1", polyline("M 0 0 L 800 0"));
+        b.transform = Transform3x3::IDENTITY;
+        b.anchors =
+            vec![Anchor { node_index: 1, target: "shape-t".into(), at: LocalPoint { x: 800, y: 0 } }];
+        let mut a = Object::new("line-a", "a2", polyline("M 0 400 L 800 0"));
+        a.transform = Transform3x3::IDENTITY;
+        // A's node 1 anchors onto line-b's node-1 endpoint at B-local (800,0).
+        a.anchors =
+            vec![Anchor { node_index: 1, target: "line-b".into(), at: LocalPoint { x: 800, y: 0 } }];
+        let scene = scene_of(vec![target, b, a]);
+
+        // Move shape-t by (+50,+20)px: its top-right corner world (100,0) -> (150,20).
+        let ops = geometry_follow_ops(
+            &StubOutlineDeriver,
+            &scene,
+            &[move_op("shape-t", translate(50.0, 20.0))],
+        );
+
+        let edited: std::collections::HashMap<&str, &str> = ops
+            .iter()
+            .filter_map(|op| match op {
+                ObjectOp::EditGeometry { id, geometry } => {
+                    Some((id.as_str(), geometry.path_string.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        // B follows T's moved corner: node 1 -> world (150,20) -> B-local (1200,160).
+        assert_eq!(edited.get("line-b"), Some(&"M 0 0 L 1200 160"), "B follows T: {ops:?}");
+        // A follows B's new endpoint: the chain reaches the second hop.
+        assert_eq!(edited.get("line-a"), Some(&"M 0 400 L 1200 160"), "A follows B: {ops:?}");
+    }
+
+    // #3: a binding CYCLE (A anchored to B, B anchored to A) must terminate via the
+    // visited set — no infinite recursion when a reshaped follower feeds back.
+    #[test]
+    fn anchor_cycle_terminates() {
+        let target = rect("shape-t", 0, 0, 800, 400);
+        let mut b = Object::new("line-b", "a1", polyline("M 0 0 L 800 0"));
+        b.anchors = vec![
+            Anchor { node_index: 1, target: "shape-t".into(), at: LocalPoint { x: 800, y: 0 } },
+            Anchor { node_index: 0, target: "line-a".into(), at: LocalPoint { x: 0, y: 0 } },
+        ];
+        let mut a = Object::new("line-a", "a2", polyline("M 0 400 L 800 0"));
+        a.anchors =
+            vec![Anchor { node_index: 1, target: "line-b".into(), at: LocalPoint { x: 800, y: 0 } }];
+        let scene = scene_of(vec![target, b, a]);
+        // Must return (not hang); each follower is reprojected at most once.
+        let ops = geometry_follow_ops(
+            &StubOutlineDeriver,
+            &scene,
+            &[move_op("shape-t", translate(50.0, 20.0))],
+        );
+        let b_edits = ops
+            .iter()
+            .filter(|op| matches!(op, ObjectOp::EditGeometry { id, .. } if id == "line-b"))
+            .count();
+        let a_edits = ops
+            .iter()
+            .filter(|op| matches!(op, ObjectOp::EditGeometry { id, .. } if id == "line-a"))
+            .count();
+        assert_eq!(b_edits, 1, "B reprojected exactly once despite the cycle: {ops:?}");
+        assert_eq!(a_edits, 1, "A reprojected exactly once despite the cycle: {ops:?}");
+    }
+
+    // #3: a transform move with a single anchored follower and NO chain stays a
+    // one-op follow — the recursion adds nothing when there is no second hop (the
+    // geometry-edit-aware path is a superset of the transform-only follow).
+    #[test]
+    fn geometry_follow_matches_transform_follow_without_a_chain() {
+        let target = line("rect-a", 0, 0, 200.0, 0.0);
+        let follower = anchored_line(&target, 200.0, 30.0);
+        let scene = scene_of(vec![target, follower]);
+        let transform_only = anchor_follow_ops(&scene, &[move_op("rect-a", translate(250.0, 20.0))]);
+        let geometry_aware = geometry_follow_ops(
+            &StubOutlineDeriver,
+            &scene,
+            &[move_op("rect-a", translate(250.0, 20.0))],
+        );
+        assert_eq!(transform_only, geometry_aware, "no chain => identical to the transform follow");
     }
 }
