@@ -989,18 +989,16 @@
       authorOp({ kind: "delete", id });
       return;
     }
-    const cut = sceneCore.splitSubpathAt(target.geometry, local.x, local.y, ERASE_RADIUS_QUANTIZED);
-    // No node within the erase radius: the touch missed; leave the stroke whole.
-    if (!cut) return;
-    // The cut removed every renderable piece — delete the now-empty object. The
-    // core omits `d` entirely when the geometry is empty (skip_serializing_if), so
-    // guard the undefined case before trimming.
-    if ((cut.d ?? "").trim().length === 0) {
-      authorOp({ kind: "delete", id });
-      if (selection.kind === "object" && selection.id === id) selectObject({ kind: "canvas" });
-      return;
+    // The core cuts the stroke and returns the WHOLE op batch: [] on a miss,
+    // [delete] when the cut empties the object, else [edit-geometry, ...followers]
+    // (a reshape reprojects anchored followers, commit-path). The shell just
+    // authors the result and owns the UI follow-up (clearing a stale selection).
+    const ops = sceneCore.partialEraseOps(scene, id, local.x, local.y, ERASE_RADIUS_QUANTIZED);
+    if (ops.length === 0) return; // touch missed: stroke left whole
+    authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops });
+    if (ops.some((op) => op.kind === "delete") && selection.kind === "object" && selection.id === id) {
+      selectObject({ kind: "canvas" });
     }
-    authorOp({ kind: "edit-geometry", id, geometry: cut });
   }
 
   function deleteSelection(): void {

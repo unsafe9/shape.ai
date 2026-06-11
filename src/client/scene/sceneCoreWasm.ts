@@ -147,6 +147,7 @@ type SceneCoreModule = {
     tolerancePx: number
   ) => string;
   split_subpath_at: (geometryJson: string, x: number, y: number, radius: number) => string;
+  partial_erase_ops: (sceneJson: string, id: string, x: number, y: number, radius: number) => string;
   anchor_follow_ops: (sceneJson: string, transformOpsJson: string) => string;
   move_ops: (sceneJson: string, rootsJson: string, deltaJson: string) => string;
   synthesize_create_anchors: (
@@ -296,14 +297,20 @@ export type SceneCore = {
     y: number,
     radius: number
   ): SceneObject["geometry"] | null;
-  /** Tier-1/#14 + #2/#3: the commit-time anchor follow ops for any committed batch.
-   *  `ops` are the committed ops: `set-transform` MOVES a target (transform
-   *  reproject) and `edit-geometry` RESHAPES one (the anchor `at` re-projects onto
-   *  its new outline). The result is the chord-deform `edit-geometry` ops that make
-   *  every anchored follower track its target, chained so a follower of a follower
-   *  follows too. Call this when committing a geometry edit (e.g. a partial erase
-   *  reshaping a stroke) whose followers must reproject; `moveOps` already folds the
-   *  same follow into a drag. Returns `[]` when nothing follows. */
+  /** #2/#3: cut the stroke at an object-local quantized touch and return the WHOLE
+   *  op batch — `[]` on a miss, `[delete]` when the cut empties the object, else
+   *  `[edit-geometry, ...follower-reprojection]` (a reshape re-projects anchored
+   *  followers onto the new outline, chained so a follower of a follower follows
+   *  too). The shell authors the result and owns only the UI follow-up; op
+   *  orchestration stays in the core. (`moveOps` / `endpointReleaseOps` fold the
+   *  same follow into their own batches.) */
+  partialEraseOps(scene: ObjectScene, id: string, x: number, y: number, radius: number): ObjectOp[];
+  /** #2/#3: the commit-time anchor follow ops for an arbitrary committed batch —
+   *  `set-transform` MOVES a target, `edit-geometry` RESHAPES one, and the result is
+   *  the chord-deform ops that make every anchored follower track its target
+   *  (chained). The op-authoring bridges (`partialEraseOps`, `endpointReleaseOps`,
+   *  `moveOps`) already fold this into their own batches; this is the standalone
+   *  entry. Returns `[]` when nothing follows. */
   anchorFollowOps(scene: ObjectScene, ops: ObjectOp[]): ObjectOp[];
   /** Tier-2: the combined commit-time move ops for a parent-drag / multi-select
    *  drag — the transform CASCADE ops (the dragged subtree, or every multi member
@@ -514,6 +521,12 @@ export async function loadSceneCore(): Promise<SceneCore> {
         return null;
       }
       return value as SceneObject["geometry"];
+    },
+    partialEraseOps(scene, id, x, y, radius) {
+      return parseBridge<ObjectOp[]>(
+        "partial_erase_ops",
+        mod.partial_erase_ops(JSON.stringify(scene), id, x, y, radius)
+      );
     },
     anchorFollowOps(scene, ops) {
       return parseBridge<ObjectOp[]>(

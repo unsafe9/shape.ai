@@ -285,6 +285,38 @@ pub fn split_subpath_at(geometry_json: &str, x: i32, y: i32, radius: i32) -> Str
     }
 }
 
+/// `partial_erase_ops(scene_json, id, x, y, radius) -> ObjectOp[] | {error}`.
+///
+/// The object-local quantized touch cuts the stroke and the core returns the WHOLE
+/// op batch: `[]` on a miss, `[delete]` when the cut empties the object, else
+/// `[edit-geometry, ...follower-reprojection]`. Op orchestration lives in the core,
+/// not the shell — the shell authors the result and only owns the UI follow-up
+/// (clearing a stale selection).
+#[wasm_bindgen]
+pub fn partial_erase_ops(scene_json: &str, id: &str, x: i32, y: i32, radius: i32) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let Some(object) = scene.objects.iter().find(|o| o.id == id) else {
+        return ok_json(&Vec::<ObjectOp>::new());
+    };
+    let mut geometry = object.geometry.clone();
+    if let Err(e) = geometry.ensure_parsed() {
+        return error_json(&format!("geometry parse failed: {e}"));
+    }
+    let Some(cut) = split_subpath_at_pure(&geometry, x, y, radius) else {
+        return ok_json(&Vec::<ObjectOp>::new()); // touch missed: leave the stroke whole
+    };
+    if cut.path_string.trim().is_empty() {
+        return ok_json(&vec![ObjectOp::Delete { id: id.into() }]);
+    }
+    let edit = ObjectOp::EditGeometry { id: id.into(), geometry: cut };
+    let mut ops = vec![edit.clone()];
+    ops.extend(geometry_follow_ops_pure(&StubOutlineDeriver, &scene, std::slice::from_ref(&edit)));
+    ok_json(&ops)
+}
+
 /// `build_primitive(kind, anchor_x, anchor_y, color, id, order) -> Object | {error}`.
 ///
 /// Tier-3: build a basic primitive (rectangle/ellipse/line/text/frame) centered on
@@ -350,10 +382,11 @@ pub fn build_set_style_op(object_json: &str, color: &str) -> String {
 /// `set-transform` ops MOVE a target (the transform reproject) and `edit-geometry`
 /// ops RESHAPE a target (the anchor `at` re-projects onto its NEW outline). The
 /// result is the chord-deform `edit-geometry` ops that make every anchored follower
-/// track its target — chained, so a follower of a follower follows too (#3). Use
-/// this when committing a geometry edit (e.g. a partial erase that reshapes a
-/// stroke) whose followers must reproject; `move_ops` already folds the same follow
-/// into a drag commit. Returns `[]` when nothing follows.
+/// track its target — chained, so a follower of a follower follows too (#3). The
+/// bridges that author a geometry edit (`endpoint_release_ops`, `partial_erase_ops`)
+/// and `move_ops` fold the same follow into their own batches; this export is the
+/// standalone entry the shell/tests use to compute it for an arbitrary committed
+/// batch. Returns `[]` when nothing follows.
 #[wasm_bindgen]
 pub fn anchor_follow_ops(scene_json: &str, ops_json: &str) -> String {
     let scene: ObjectScene = match parse("scene", scene_json) {
@@ -494,7 +527,23 @@ pub fn endpoint_release_ops(
     } else {
         Some((snap_target_id, snap_at.unwrap_or((new_x_px, new_y_px))))
     };
-    ok_json(&endpoint_release_ops_pure(&scene, id, node_index, (new_x_px, new_y_px), snap))
+    let ops = endpoint_release_ops_pure(&scene, id, node_index, (new_x_px, new_y_px), snap);
+    ok_json(&fold_follower_reprojection(&scene, ops))
+}
+
+/// Append the follower-reprojection ops for any `EditGeometry` an op batch carries,
+/// so a single shell `author()` applies the reshape AND moves its anchored followers
+/// (commit-path geometry-edit follow). Op orchestration stays in the core — the shell
+/// only authors what these bridges return.
+fn fold_follower_reprojection(scene: &ObjectScene, ops: Vec<ObjectOp>) -> Vec<ObjectOp> {
+    let edits: Vec<ObjectOp> =
+        ops.iter().filter(|op| matches!(op, ObjectOp::EditGeometry { .. })).cloned().collect();
+    if edits.is_empty() {
+        return ops;
+    }
+    let mut all = ops;
+    all.extend(geometry_follow_ops_pure(&StubOutlineDeriver, scene, &edits));
+    all
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +810,25 @@ mod tests {
         assert_eq!(far, "null", "no endpoint hit = no merge");
         let bad = merge_open_stroke_ops(scene, "[[0,0],[1,1]]", "diagonal", 12.0);
         assert!(bad.contains("\"error\""), "unknown mode is an error");
+    }
+
+    #[test]
+    fn partial_erase_ops_returns_the_whole_op_batch() {
+        // A 5-node open polyline; a touch near the middle node cuts the stroke
+        // (edit-geometry); a far touch misses (no ops); an unknown id is a no-op.
+        // The shell authors whatever this returns — it assembles no ops itself (op
+        // orchestration stays in the core).
+        let scene = r#"{"sceneVersion":1,"objects":[{"id":"seg","order":"a0","geometry":{"d":"M 0 0 L 80 0 L 160 0 L 240 0 L 320 0"}}],"tags":[],"selection":{"kind":"canvas"},"updatedAt":""}"#;
+        let cut = partial_erase_ops(scene, "seg", 161, 1, 16);
+        let ops: Vec<ObjectOp> = serde_json::from_str(&cut).expect("erase returns ops");
+        assert!(
+            ops.iter().any(|op| matches!(op, ObjectOp::EditGeometry { id, .. } if id == "seg")),
+            "a cut authors an edit-geometry: {cut}"
+        );
+        let miss = partial_erase_ops(scene, "seg", 5000, 5000, 16);
+        assert_eq!(serde_json::from_str::<Vec<ObjectOp>>(&miss).unwrap().len(), 0, "miss = no ops: {miss}");
+        let gone = partial_erase_ops(scene, "nope", 0, 0, 16);
+        assert_eq!(serde_json::from_str::<Vec<ObjectOp>>(&gone).unwrap().len(), 0, "missing object = no ops");
     }
 
     #[test]
