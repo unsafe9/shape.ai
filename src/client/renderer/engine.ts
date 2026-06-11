@@ -1188,13 +1188,13 @@ export class ShapeCanvasEngine {
       // (translate/resize/rotate). Remember it and emit a non-destructive preview;
       // the shell composes the matrix onto the object and commits on pointer-up.
       const { id, kind } = result.objectTransformDelta;
-      // EN1 (#2): the C2 coarse-rotate gesture (`coarse-rotate-shift`) — Shift held
-      // during a rotate quantizes the sweep to the catalog step (15°). Applied
-      // shell-side to the returned rotate matrix (RA2c semantics): extract the swept
-      // angle + center, re-snap, rebuild. Non-rotate deltas and a released Shift pass
-      // through unchanged.
+      // EN1 (#2, inverted): the C2 coarse-rotate gesture (`coarse-rotate-shift`) now
+      // snaps BY DEFAULT — a rotate with no Shift quantizes the sweep to the catalog
+      // step (15°); holding Shift inverts to free (fine) rotation. Applied shell-side
+      // to the returned rotate matrix (RA2c semantics): extract the swept angle +
+      // center, re-snap, rebuild. Non-rotate deltas and a held Shift pass through.
       const matrix =
-        kind === "rotate" && isCoarseRotate({ shiftKey: this.shiftHeld })
+        kind === "rotate" && !isCoarseRotate({ shiftKey: this.shiftHeld })
           ? snapRotateDeltaMatrix(result.objectTransformDelta.matrix, COARSE_ROTATE_SNAP_DEG)
           : result.objectTransformDelta.matrix;
       this.objectDrag = { id, matrix, kind };

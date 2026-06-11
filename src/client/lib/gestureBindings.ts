@@ -94,8 +94,10 @@ export function isPartialErase(event: { altKey: boolean }): boolean {
 }
 
 /**
- * The coarse-rotate gesture (C2 `coarse-rotate-shift`): Shift held during a
- * rotate quantizes the sweep to the catalog step (15°).
+ * The coarse-rotate gesture (C2 `coarse-rotate-shift`), inverted: rotation snaps
+ * to the catalog step (15°) BY DEFAULT, and holding Shift rotates freely (fine).
+ * This predicate still reports "Shift held"; the shell negates it at the call
+ * site, so no Shift = snap and Shift = the fine override.
  */
 export function isCoarseRotate(event: { shiftKey: boolean }): boolean {
   return event.shiftKey;

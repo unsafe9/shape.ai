@@ -167,13 +167,14 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
             HoldTrigger::modifier("Alt"),
             "Hold Alt with the erase tool to erase partial geometry instead of whole objects.",
         ),
-        // Transform — hold to coarsen the rotation step (D5: 15 degrees per tick).
+        // Transform — rotation snaps to 15° by default; hold Shift to rotate
+        // freely (inverted from the old coarse-on-Shift default).
         ObjectGesture::new(
             "coarse-rotate-shift",
-            "Coarse Rotate (Shift)",
+            "Fine Rotate (Shift)",
             Transform,
             HoldTrigger::modifier("Shift").with_degrees(15.0),
-            "Hold Shift while rotating to snap to 15-degree steps (90 degrees = 6 ticks).",
+            "Rotation snaps to 15-degree steps by default; hold Shift to rotate freely (fine).",
         ),
         // Anchor — hold to detach an anchored object and move it wholesale (DU4).
         ObjectGesture::new(
@@ -342,10 +343,10 @@ mod tests {
             },
             {
                 "id": "coarse-rotate-shift",
-                "label": "Coarse Rotate (Shift)",
+                "label": "Fine Rotate (Shift)",
                 "category": "transform",
                 "trigger": { "input": "modifier", "modifier": "Shift", "degrees": 15.0 },
-                "description": "Hold Shift while rotating to snap to 15-degree steps (90 degrees = 6 ticks)."
+                "description": "Rotation snaps to 15-degree steps by default; hold Shift to rotate freely (fine)."
             },
             {
                 "id": "detach-alt",
