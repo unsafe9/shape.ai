@@ -31,9 +31,12 @@
 //! RELEASES anchors on endpoints the junction turned into interior/ring nodes
 //! (the far endpoint's anchor survives, remapped to its new pair index; a
 //! closed result clears all of them, DU7=(b)), and a `delete` of the absorbed
-//! case-(ii) object (its own anchors die with it). The new stroke is NEVER
-//! inserted. `None` = no merge: the caller keeps the existing insert + release
-//! anchoring path. Endpoint merge takes PRIORITY over release-anchor authoring.
+//! case-(ii) object. The absorbed object's geometry moves into the survivor, so
+//! its OWN far-endpoint anchor (an outward anchor to a third object) TRANSFERS
+//! onto the survivor's new far node before the `delete` (its junction-end anchor
+//! is consumed by the merge and dropped). The new stroke is NEVER inserted.
+//! `None` = no merge: the caller keeps the existing insert + release anchoring
+//! path. Endpoint merge takes PRIORITY over release-anchor authoring.
 //!
 //! Pure (no time/rng/IO), pointer-width-agnostic; recognition + merge run once
 //! at pen-up (no per-frame cost). The tolerance is WORLD px — the shell
@@ -188,17 +191,14 @@ pub fn merge_open_stroke_ops(
     let new_anchors: Vec<Anchor> = if rec.closed {
         Vec::new()
     } else {
+        let survivor_last = i32::try_from(local_nodes(&local_d).len().checked_sub(1)?).ok()?;
         let old_last = i32::try_from(
             local_nodes(&survivor.geometry.path_string).len().checked_sub(1)?,
         )
         .ok()?;
         let far_old = if survivor_hit.node_last { 0 } else { old_last };
-        let far_new = if survivor_chain_first {
-            0
-        } else {
-            i32::try_from(local_nodes(&local_d).len().checked_sub(1)?).ok()?
-        };
-        survivor
+        let far_new = if survivor_chain_first { 0 } else { survivor_last };
+        let mut kept: Vec<Anchor> = survivor
             .anchors
             .iter()
             .filter(|a| a.node_index == far_old)
@@ -207,7 +207,31 @@ pub fn merge_open_stroke_ops(
                 a.node_index = far_new;
                 a
             })
-            .collect()
+            .collect();
+        // Case (ii): the absorbed object's geometry was appended after the
+        // survivor's start-side far end, so its OWN far-endpoint anchors (an
+        // anchor ON that endpoint pointing at a third object) must move with the
+        // geometry onto the survivor's NEW far node (the chain's last index).
+        // `target`/`at` live in the third object's frame, so only `node_index`
+        // remaps — the junction-end anchor of the absorbed object is consumed
+        // and dropped. The start-side survivor's anchors are handled above.
+        if let Some(index) = absorbed_index {
+            let absorbed = &scene.objects[index];
+            let b_last = i32::try_from(
+                local_nodes(&absorbed.geometry.path_string).len().checked_sub(1)?,
+            )
+            .ok()?;
+            // The absorbed object chains junction-first, so its far endpoint
+            // becomes the survivor's last node.
+            let b_far_old = if end_hit.as_ref().is_some_and(|b| b.node_last) { 0 } else { b_last };
+            kept.extend(absorbed.anchors.iter().filter(|a| a.node_index == b_far_old).cloned().map(
+                |mut a| {
+                    a.node_index = survivor_last;
+                    a
+                },
+            ));
+        }
+        kept
     };
     if new_anchors != survivor.anchors {
         ops.push(ObjectOp::SetAnchor { id: survivor.id.clone(), anchors: new_anchors });
@@ -557,5 +581,46 @@ mod tests {
         assert_eq!(id, "a", "the start-side match survives");
         assert_eq!(geometry.path_string, "M 0 0 L 1600 0 L 1600 800");
         assert_eq!(ops[1], ObjectOp::Delete { id: "b".into() });
+    }
+
+    /// Case (ii) anchor transfer: the absorbed object B carries an OUTWARD anchor
+    /// on its FAR endpoint (the non-junction end) pointing at a third object Y.
+    /// B's geometry moves into the survivor, so that anchor must follow onto the
+    /// survivor's new far node — `target`/`at` preserved (they live in Y's frame),
+    /// only `node_index` remapped. Driven through real op-apply.
+    #[test]
+    fn bridging_transfers_the_absorbed_objects_far_anchor_to_the_survivor() {
+        // B = "M 0 0 L 0 800" at (200,0): node 0 = world (200,0) is the JUNCTION
+        // (the stroke lands there); node 1 = world (200,100) is the FAR endpoint,
+        // and it anchors out to Y.
+        let far = Anchor { node_index: 1, target: "y".into(), at: LocalPoint { x: 48, y: 16 } };
+        let mut b = open_object("b", "M 0 0 L 0 800", 200.0, 0.0);
+        b.anchors = vec![far.clone()];
+        let mut scene = scene_of(vec![
+            open_object("a", "M 0 0 L 800 0", 0.0, 0.0),
+            b,
+            closed_box("y", 500.0, 500.0),
+        ]);
+        let mut pts = Vec::new();
+        edge((101.0, 1.0), (199.0, 1.0), 10, &mut pts);
+        pts.push((199.0, 1.0));
+        let ops =
+            merge_open_stroke_ops(&scene, &pts, RecognizeMode::Basic, TOL).expect("merges");
+        // edit + anchor transfer + delete (the start-side survivor "a" had no
+        // anchors, so the only set-anchor authored is the transfer from "b").
+        assert_eq!(ops.len(), 3, "edit + anchor transfer + delete: {ops:?}");
+        for op in ops {
+            apply_object_op(&mut scene, op).expect("merge ops apply");
+        }
+        // B is gone; the survivor "a" carries B's far anchor at its NEW far node.
+        assert!(scene.objects.iter().all(|o| o.id != "b"), "absorbed B is deleted");
+        let survivor = scene.objects.iter().find(|o| o.id == "a").expect("survivor present");
+        // Survivor geometry "M 0 0 L 1600 0 L 1600 800" has 3 nodes; B's far end
+        // is the LAST node (index 2). target/at unchanged from B's original.
+        assert_eq!(
+            survivor.anchors,
+            vec![Anchor { node_index: 2, target: "y".into(), at: LocalPoint { x: 48, y: 16 } }],
+            "B's far anchor transferred to the survivor's last node, target/at preserved",
+        );
     }
 }
