@@ -57,6 +57,17 @@ pub trait OutboxStore {
     fn clear(&mut self) -> Result<(), OutboxError>;
     /// Next monotonic `local_seq` for this client; advances and persists.
     fn next_local_seq(&mut self) -> Result<i64, OutboxError>;
+    /// Replace the contents with `entries` (durable rows read back from the shell's
+    /// persistence on a fresh-session reconnect) so the engine can replay them. A
+    /// durable backend persists its own `local_seq` high-water, so the default only
+    /// clears + re-appends; the in-memory store overrides to also reset the counter.
+    fn reseed(&mut self, entries: Vec<OutboxEntry>) -> Result<(), OutboxError> {
+        self.clear()?;
+        for entry in entries {
+            self.append(entry)?;
+        }
+        Ok(())
+    }
 }
 
 /// Non-durable [`OutboxStore`] backed by a plain `Vec`. Entries are lost on reload;
@@ -103,5 +114,11 @@ impl OutboxStore for InMemoryOutboxStore {
     fn next_local_seq(&mut self) -> Result<i64, OutboxError> {
         self.seq += 1;
         Ok(self.seq)
+    }
+
+    fn reseed(&mut self, entries: Vec<OutboxEntry>) -> Result<(), OutboxError> {
+        self.seq = entries.iter().map(|e| e.op_id.local_seq).max().unwrap_or(0);
+        self.entries = entries;
+        Ok(())
     }
 }

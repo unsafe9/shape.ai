@@ -84,7 +84,10 @@ const welcomeFrame = (scene: ObjectScene, seq: number): WelcomeMessage => ({
 
 const insertA: ObjectOp = {
   kind: "insert-object",
-  object: { id: "a", order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z" } }
+  // fillRule is the canonical scene-core default; spell it out so the WireOp
+  // propDelta round-tripped through the Rust session (which materializes serde
+  // defaults) deep-equals this fixture.
+  object: { id: "a", order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z", fillRule: "evenOdd" } }
 };
 
 let nowCounter = 0;

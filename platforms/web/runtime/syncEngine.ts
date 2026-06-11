@@ -1,45 +1,26 @@
-// Client object sync engine (OB4.3): durable outbox + optimistic apply +
-// transient ownership/unacked discard + coalescing + reconnect reconcile.
+// Client object sync engine — a THIN adapter over the Rust collaboration session
+// (crates/client-runtime, compiled to wasm). The engine semantics — optimistic
+// apply, transient ownership / unacked discard, the coalescing flush DECISION, and
+// reconnect reconcile — all run in Rust now; this class keeps only the TS-side IO
+// seams the OS forces up here:
 //
-// The engine sits between the shell and the wire transport. It owns:
+//   1. PERSISTENCE — the session does the outbox BOOKKEEPING (monotonic localSeq,
+//      append/remove, replay order); durability is the `OutboxStore` port (the web
+//      shell keeps IndexedDB). `author` persists the entry the session minted;
+//      `onAck`/`onRejected` drop the acked rows.
+//   2. TRANSPORT — the session buffers coalesced envelopes; this drains them with
+//      `takePending()` and hands them to the `EngineTransport` sink.
+//   3. TIMERS — the session reports `flushArmed`; this arms the injected coalescing
+//      timer and fires `onFlushDue` when it elapses, then drains + sends.
+//   4. CLOCK — `now()` stamps each envelope `ts` (injected for deterministic tests).
 //
-//   1. the durable outbox — every authored op is persisted (as the `WireOp`
-//      envelope) before it is sent, removed on ack, and replayed in localSeq
-//      order on (re)connect;
-//   2. the optimistic local `ObjectScene` — ops apply locally the instant they
-//      are authored, so the shell never waits for a round-trip;
-//   3. transient ownership / unacked discard — while a local write on an
-//      (object, field) is still unacked, an incoming REMOTE op for that same
-//      (object, field) is ignored, so a peer/echo can't clobber the value the
-//      user is still dragging;
-//   4. coalescing — rapid ops (continuous move/transform) are batched into one
-//      `ops` frame on a ~33ms timer instead of one frame per pointer event;
-//   5. reconnect reconcile — on a fresh `welcome` snapshot the local base is
-//      reset to the snapshot and the outbox is replayed on top.
-//
-// The op-apply is THE scene-core object op-apply (Rust compiled to wasm, the same
-// logic the server runs) via `applyObjectOpSync`; the wasm instance must be
-// initialized via `ensureSceneCore` before the engine authors. It is transport-
-// shaped via the `EngineTransport` seam so tests drive it with a mock socket.
+// The wasm instance must be initialized via `ensureSceneCore()` before an engine is
+// constructed (the session is created synchronously). The session runs THE
+// scene-core object op-apply (the same Rust the server runs).
 
 import type { ObjectScene, ObjectOp, WireOp } from "../shared/object";
-import { opPrimaryTargetId } from "../shared/object";
-import { applyObjectOpSync, type ObjectApplyResult } from "../bridge/sceneCoreWasm";
-import {
-  opIdKey,
-  type OpId,
-  type OutboxEntry,
-  type OutboxStore
-} from "./outbox";
-
-/**
- * The synchronous object op-apply the engine drives. It is THE scene-core
- * op-apply (Rust compiled to wasm, the same logic the server runs); the wasm
- * instance must be initialized — via {@link ensureSceneCore} — before the engine
- * authors. The seam is injectable so tests can substitute a double, but
- * production uses the wasm apply in both the browser and Node/vitest.
- */
-export type ApplyObjectOp = (scene: ObjectScene, op: ObjectOp) => ObjectApplyResult;
+import { createWasmSession, type WasmSession } from "../bridge/sceneCoreWasm";
+import { type OpId, type OutboxEntry, type OutboxStore } from "./outbox";
 
 /** Default coalescing window: rapid ops within this many ms ride one frame. */
 export const COALESCE_MS = 33;
@@ -56,16 +37,10 @@ export interface EngineTransport {
 export type SyncEngineOptions = {
   /** Authoring identity; stamped into every opId.clientId + WireOp.actor. */
   clientId: string;
-  /** Durable outbox; defaults to an in-memory store if omitted by the caller. */
+  /** Durable outbox; the persistence port the session bookkeeping is mirrored to. */
   outbox: OutboxStore;
   /** Where coalesced frames are flushed. */
   transport: EngineTransport;
-  /**
-   * The synchronous op-apply; defaults to the scene-core wasm apply
-   * ({@link applyObjectOpSync}). Injectable for tests. When the default is used,
-   * the wasm must already be initialized via `ensureSceneCore()`.
-   */
-  applyOp?: ApplyObjectOp;
   /** Coalescing window in ms; defaults to {@link COALESCE_MS}. */
   coalesceMs?: number;
   /** Clock source for envelope `ts`; injected for deterministic tests. */
@@ -83,92 +58,49 @@ export type AuthorResult = {
   inverse?: ObjectOp | null;
 };
 
-/**
- * Granularity of transient ownership: per (objectId, field).
- *
- * Ownership protects an in-flight CONTINUOUS field edit (transform/geometry/
- * text) so a peer or self-echo can't clobber the value the user is still
- * authoring before our op is acked. A `set-transform` owns `(id, "transform")`;
- * a `set-text` owns `(id, "text")`; `edit-geometry` owns `(id, "geometry")`.
- *
- * Structural ops (insert/delete/reparent/reorder/tags/...) take NO ownership:
- * they are not single-field property writes, so a later remote field edit on the
- * same object is a legitimate concurrent change, and create/delete conflicts are
- * settled by the server's authoritative seq ordering. A batch contributes the
- * union of its members' field keys.
- */
-function ownedKeys(op: ObjectOp): string[] {
-  switch (op.kind) {
-    case "set-transform":
-      return [`${op.id}:transform`];
-    case "edit-geometry":
-      return [`${op.id}:geometry`];
-    case "set-text":
-      return [`${op.id}:text`];
-    case "set-style":
-      return [`${op.id}:style`];
-    case "batch":
-      return op.ops.flatMap(ownedKeys);
-    default:
-      return [];
-  }
-}
-
-/** Does a remote op write any (object, field) key the client currently owns? */
-function remoteTouchesOwnedKey(op: ObjectOp, owned: Set<string>): boolean {
-  if (owned.size === 0) return false;
-  return ownedKeys(op).some((key) => owned.has(key));
-}
+/** The session `author` wire shape: errors + opId + inverse + the durable entry. */
+type AuthorWire = {
+  errors: string[];
+  opId?: OpId | null;
+  inverse?: ObjectOp | null;
+  entry?: WireOp | null;
+};
 
 export class SyncEngine {
-  private readonly clientId: string;
+  private readonly session: WasmSession;
   private readonly outbox: OutboxStore;
   private readonly transport: EngineTransport;
-  private readonly applyOp: ApplyObjectOp;
   private readonly coalesceMs: number;
   private readonly now: () => string;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
 
-  /** Local optimistic scene the shell renders. */
-  private scene: ObjectScene;
-  /** Revision the next authored op is based on (server revision + local lead). */
-  private baseRevision = 0;
-
-  /** Buffer of envelopes waiting on the coalescing flush. */
-  private pending: OutboxEntry[] = [];
   private timer: unknown = null;
-
-  /** (object,field) keys with an unacked local write, -> count of owning ops. */
-  private readonly ownership = new Map<string, number>();
-  /** opId key -> the keys that op owns, so we release them on ack/reject. */
-  private readonly opOwnedKeys = new Map<string, string[]>();
-
   private sceneListeners = new Set<(scene: ObjectScene) => void>();
 
   constructor(initialScene: ObjectScene, opts: SyncEngineOptions) {
-    this.scene = initialScene;
-    this.baseRevision = initialScene.sceneVersion;
-    this.clientId = opts.clientId;
     this.outbox = opts.outbox;
     this.transport = opts.transport;
-    this.applyOp = opts.applyOp ?? applyObjectOpSync;
     this.coalesceMs = opts.coalesceMs ?? COALESCE_MS;
     this.now = opts.now ?? (() => new Date().toISOString());
-    this.setTimer =
-      opts.setTimer ?? ((fn, ms) => setTimeout(fn, ms) as unknown);
+    this.setTimer = opts.setTimer ?? ((fn, ms) => setTimeout(fn, ms) as unknown);
     this.clearTimer =
       opts.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+    this.session = createWasmSession({
+      welcomeScene: initialScene,
+      clientId: opts.clientId,
+      coalesceMs: this.coalesceMs
+    });
   }
 
   /** The current optimistic scene. */
   getScene(): ObjectScene {
-    return this.scene;
+    return JSON.parse(this.session.scene()) as ObjectScene;
   }
 
   /** The (object,field) keys currently held under transient ownership. */
   ownedKeySet(): Set<string> {
-    return new Set(this.ownership.keys());
+    return new Set(JSON.parse(this.session.owned_key_set()) as string[]);
   }
 
   /** Subscribe to optimistic scene updates; returns an unsubscribe. */
@@ -178,42 +110,19 @@ export class SyncEngine {
   }
 
   /**
-   * Build the `WireOp` envelope for an `ObjectOp` authored at `localSeq`. The
-   * `propDelta` carries the full op; `objectId`/`kind` are descriptive (mirroring
-   * the server's `op_to_wire`).
-   */
-  private wireOp(op: ObjectOp, localSeq: number): WireOp {
-    return {
-      opId: { clientId: this.clientId, localSeq },
-      objectId: opPrimaryTargetId(op),
-      kind: op.kind,
-      propDelta: op,
-      baseRevision: this.baseRevision,
-      actor: this.clientId,
-      ts: this.now()
-    };
-  }
-
-  /**
-   * Author a local op: apply optimistically, take transient ownership of its
-   * keys, persist its `WireOp` envelope to the outbox, then schedule a coalesced
+   * Author a local op: optimistic apply (in the session), take transient
+   * ownership, persist the minted `WireOp` envelope, then schedule a coalesced
    * send. Rejected-by-core ops never enter the outbox or the wire. Returns the
    * captured inverse op (the undo entry, D21) on success.
    */
   async author(op: ObjectOp): Promise<AuthorResult> {
-    const applied = this.applyOp(this.scene, op);
-    if (applied.errors.length > 0) return { errors: applied.errors };
+    const result = JSON.parse(this.session.author(JSON.stringify(op), this.now())) as AuthorWire;
+    if (result.errors.length > 0) return { errors: result.errors };
 
-    const localSeq = await this.outbox.nextLocalSeq();
-    const entry = this.wireOp(op, localSeq);
-    const opId = entry.opId;
-
-    this.scene = applied.scene;
-    this.takeOwnership(opId, ownedKeys(op));
-    await this.outbox.append(entry);
-    this.enqueue(entry);
+    if (result.entry) await this.outbox.append(result.entry);
     this.emitScene();
-    return { errors: [], opId, inverse: applied.inverse };
+    this.armTimer();
+    return { errors: [], opId: result.opId ?? undefined, inverse: result.inverse ?? null };
   }
 
   /**
@@ -222,24 +131,21 @@ export class SyncEngine {
    * dropped until our local op is acked. Returns true if applied.
    */
   applyRemote(op: ObjectOp): boolean {
-    if (remoteTouchesOwnedKey(op, this.ownedKeySet())) return false;
-    const applied = this.applyOp(this.scene, op);
-    if (applied.errors.length > 0) return false;
-    this.scene = applied.scene;
-    this.emitScene();
-    return true;
+    const applied = JSON.parse(this.session.apply_remote(JSON.stringify(op))) as boolean;
+    if (applied) this.emitScene();
+    return applied;
   }
 
   /**
    * Reconcile an ack: drop the acked entries from the outbox, release their
-   * ownership, and advance the base revision. A duplicate ack is harmless.
+   * ownership (session-side), and advance the base revision. A duplicate ack is
+   * harmless.
    */
   async onAck(result: { opIds: OpId[]; revision?: number }): Promise<void> {
-    await this.outbox.remove(result.opIds);
-    for (const id of result.opIds) this.releaseOwnership(id);
-    if (typeof result.revision === "number") {
-      this.baseRevision = Math.max(this.baseRevision, result.revision);
-    }
+    const removed = JSON.parse(
+      this.session.on_ack(JSON.stringify(result.opIds), result.revision ?? -1)
+    ) as OpId[];
+    await this.outbox.remove(removed);
   }
 
   /**
@@ -248,30 +154,22 @@ export class SyncEngine {
    * the local scene until the next snapshot/patch corrects it.
    */
   async onRejected(opIds: OpId[]): Promise<void> {
-    await this.outbox.remove(opIds);
-    for (const id of opIds) this.releaseOwnership(id);
+    const removed = JSON.parse(this.session.on_rejected(JSON.stringify(opIds))) as OpId[];
+    await this.outbox.remove(removed);
   }
 
   /**
    * Reconnect reconcile: reset the local base to a fresh `welcome` snapshot, then
-   * REPLAY every outbox entry (re-send unacked ops). Ownership is rebuilt from the
-   * replayed entries so transient ownership survives a reconnect. The snapshot is
-   * authoritative for everything NOT under a surviving unacked write.
+   * REPLAY every persisted outbox entry (re-send unacked ops). Ownership is rebuilt
+   * from the replayed entries so transient ownership survives a reconnect. The
+   * snapshot is authoritative for everything NOT under a surviving unacked write.
    */
   async reconcileSnapshot(snapshot: ObjectScene): Promise<void> {
-    this.scene = snapshot;
-    this.baseRevision = snapshot.sceneVersion;
-    this.ownership.clear();
-    this.opOwnedKeys.clear();
-
     const entries = await this.outbox.all();
-    for (const entry of entries) {
-      const applied = this.applyOp(this.scene, entry.propDelta);
-      if (applied.errors.length === 0) this.scene = applied.scene;
-      this.takeOwnership(entry.opId, ownedKeys(entry.propDelta));
-    }
+    this.session.reconcile_snapshot(JSON.stringify(snapshot), JSON.stringify(entries));
     this.emitScene();
-    if (entries.length > 0) this.transport.sendEnvelopes(entries);
+    const pending = JSON.parse(this.session.take_pending()) as OutboxEntry[];
+    if (pending.length > 0) this.transport.sendEnvelopes(pending);
   }
 
   /** Flush any buffered coalesced frame immediately (e.g. on shutdown). */
@@ -280,51 +178,31 @@ export class SyncEngine {
       this.clearTimer(this.timer);
       this.timer = null;
     }
-    if (this.pending.length === 0) return;
-    const batch = this.pending;
-    this.pending = [];
-    this.transport.sendEnvelopes(batch);
+    this.session.flush();
+    this.drainPending();
   }
 
   // --- internals -----------------------------------------------------------
 
-  /** Buffer an envelope and arm the coalescing timer if not already armed. */
-  private enqueue(entry: OutboxEntry): void {
-    this.pending.push(entry);
-    if (this.timer != null) return;
+  /** Arm the coalescing timer if the session has a flush due and it is not armed. */
+  private armTimer(): void {
+    if (this.timer != null || !this.session.flush_armed()) return;
     this.timer = this.setTimer(() => {
       this.timer = null;
-      this.flushPending();
+      this.session.on_flush_due();
+      this.drainPending();
     }, this.coalesceMs);
   }
 
-  private flushPending(): void {
-    if (this.pending.length === 0) return;
-    const batch = this.pending;
-    this.pending = [];
-    this.transport.sendEnvelopes(batch);
-  }
-
-  private takeOwnership(opId: OpId, keys: string[]): void {
-    this.opOwnedKeys.set(opIdKey(opId), keys);
-    for (const key of keys) {
-      this.ownership.set(key, (this.ownership.get(key) ?? 0) + 1);
-    }
-  }
-
-  private releaseOwnership(opId: OpId): void {
-    const key = opIdKey(opId);
-    const keys = this.opOwnedKeys.get(key);
-    if (!keys) return;
-    this.opOwnedKeys.delete(key);
-    for (const k of keys) {
-      const count = (this.ownership.get(k) ?? 0) - 1;
-      if (count <= 0) this.ownership.delete(k);
-      else this.ownership.set(k, count);
-    }
+  /** Drain the session's buffered envelopes onto the transport sink. */
+  private drainPending(): void {
+    const batch = JSON.parse(this.session.take_pending()) as OutboxEntry[];
+    if (batch.length > 0) this.transport.sendEnvelopes(batch);
   }
 
   private emitScene(): void {
-    for (const cb of this.sceneListeners) cb(this.scene);
+    if (this.sceneListeners.size === 0) return;
+    const scene = this.getScene();
+    for (const cb of this.sceneListeners) cb(scene);
   }
 }

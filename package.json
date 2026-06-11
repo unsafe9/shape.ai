@@ -16,7 +16,7 @@
     "renderer:test": "vitest run tests/infinite-canvas-renderer.test.ts",
     "renderer:rust:test": "scripts/renderer-toolchain.sh cargo test --manifest-path crates/renderer-wgpu/Cargo.toml --features wgpu-probe",
     "renderer:wasm:build": "scripts/renderer-toolchain.sh wasm-pack build crates/renderer-wgpu --target web --out-dir ../../platforms/web/bridge/wasm --out-name shape_canvas_core",
-    "scene:wasm:build": "scripts/renderer-toolchain.sh wasm-pack build crates/scene-core --target web --out-dir ../../platforms/web/bridge/wasm --out-name shape_scene_core --features wasm"
+    "scene:wasm:build": "scripts/renderer-toolchain.sh wasm-pack build crates/client-runtime --target web --out-dir ../../platforms/web/bridge/wasm --out-name shape_scene_core --features wasm"
   },
   "dependencies": {
     "zod": "^4.1.13"

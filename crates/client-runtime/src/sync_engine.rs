@@ -203,6 +203,25 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         self.outbox.all().map(|e| e.len()).unwrap_or(0)
     }
 
+    /// The persisted outbox entry for `op_id`, or `None`. Used by the wasm session
+    /// to return the just-appended durable `WireOp` to the shell for persistence.
+    pub fn outbox_entry(&self, op_id: &OpId) -> Option<OutboxEntry> {
+        let key = op_id_key(op_id);
+        self.outbox
+            .all()
+            .ok()?
+            .into_iter()
+            .find(|e| op_id_key(&e.op_id) == key)
+    }
+
+    /// Reseed the bookkeeping outbox from durable rows (a fresh-session reconnect
+    /// where the shell read its persisted `WireOp`s back). A no-op store error is
+    /// swallowed (the in-memory bookkeeping store never fails). The caller then
+    /// runs [`reconcile_snapshot`](Self::reconcile_snapshot) to replay them.
+    pub fn reseed_outbox(&mut self, entries: Vec<OutboxEntry>) {
+        let _ = self.outbox.reseed(entries);
+    }
+
     /// Consume the engine and return its outbox store, so a fresh engine can be
     /// built on the SAME durable outbox to model a reconnect (the durable case).
     pub fn into_outbox(self) -> S {

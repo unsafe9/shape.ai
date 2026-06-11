@@ -170,6 +170,39 @@ type SceneCoreModule = {
   ungroup_enabled: (sceneJson: string, selectedId: string) => string;
   double_click_action: (sceneJson: string, id: string) => string;
   WasmUndoStack: new (actorId: string) => WasmUndoStack;
+  WasmSession: new (
+    welcomeSceneJson: string,
+    clientId: string,
+    selfUserId: string,
+    coalesceMs: number,
+    peerTtlMs: number
+  ) => WasmSession;
+};
+
+// The collaboration session (crates/client-runtime), exported as a wasm-bindgen
+// class. It owns the optimistic sync engine + the peer registry; all payloads
+// cross the boundary as JSON strings. Method names stay snake_case. The TS runtime
+// adapters (syncEngine.ts / peers.ts / outbox.ts bookkeeping) drive this; the IO
+// seams (WS socket, IndexedDB durability, timers) stay TS-side.
+type WasmSession = {
+  author: (opJson: string, ts: string) => string;
+  apply_remote: (opJson: string) => string;
+  on_ack: (opIdsJson: string, revision: number) => string;
+  on_rejected: (opIdsJson: string) => string;
+  reconcile_snapshot: (snapshotJson: string, persistedEntriesJson: string) => string;
+  flush: () => void;
+  on_flush_due: () => void;
+  take_pending: () => string;
+  scene: () => string;
+  base_revision: () => number;
+  flush_armed: () => boolean;
+  outbox_len: () => number;
+  owned_key_set: () => string;
+  ingest_presence: (payloadJson: string, nowMs: number) => string;
+  expire_peers: (nowMs: number) => string;
+  peers: () => string;
+  clear_peers: () => void;
+  free: () => void;
 };
 
 // The core's per-actor undo stack (FC-15), exported as a wasm-bindgen class. Ops
@@ -652,5 +685,35 @@ export function applyObjectOpSync(scene: ObjectScene, op: ObjectOp): ObjectApply
   return parseBridge<ObjectApplyResult>(
     "apply_object_op",
     readyModule.apply_object_op(JSON.stringify(scene), JSON.stringify(op))
+  );
+}
+
+/** The raw collaboration session FFI handle (snake_case, JSON over the boundary).
+ *  The TS runtime adapters wrap it with their stable, JSON-marshalling API. */
+export type { WasmSession };
+
+/**
+ * Construct a collaboration session over the wasm core (the SAME bundle as the
+ * op-apply). Requires {@link ensureSceneCore} to have resolved (the wasm instance
+ * must be initialized), since the session methods are synchronous. `coalesceMs <
+ * 0` / `peerTtlMs < 0` use the core defaults; an empty `selfUserId` disables peer
+ * self-skip. Throws if the wasm is not yet initialized.
+ */
+export function createWasmSession(args: {
+  welcomeScene: ObjectScene;
+  clientId: string;
+  selfUserId?: string;
+  coalesceMs?: number;
+  peerTtlMs?: number;
+}): WasmSession {
+  if (!readyModule) {
+    throw new Error("scene-core wasm is not initialized; await ensureSceneCore() before createWasmSession()");
+  }
+  return new readyModule.WasmSession(
+    JSON.stringify(args.welcomeScene),
+    args.clientId,
+    args.selfUserId ?? "",
+    args.coalesceMs ?? -1,
+    args.peerTtlMs ?? -1
   );
 }

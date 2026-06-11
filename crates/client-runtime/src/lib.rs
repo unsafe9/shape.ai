@@ -27,6 +27,19 @@ pub mod peers;
 pub mod scene_client;
 pub mod sync_engine;
 
+/// wasm-bindgen session bridge (the web shell FFI); gated off the `wasm` feature
+/// so native builds never touch wasm-bindgen.
+#[cfg(feature = "wasm")]
+pub mod wasm_session;
+
+/// Re-export scene-core's wasm bridge so its `#[wasm_bindgen]` exports
+/// (apply_object_op, the catalogs, the builders, WasmUndoStack, …) land in THIS
+/// crate's wasm-pack bundle alongside [`wasm_session`]. The single bundle carries
+/// both crates' exports, so `platforms/web/bridge/sceneCoreWasm.ts` keeps working
+/// against the same artifact that now also exposes the session.
+#[cfg(feature = "wasm")]
+pub use shape_scene_core::wasm_api;
+
 pub use outbox::{op_id_key, InMemoryOutboxStore, OpId, OutboxEntry, OutboxError, OutboxStore};
 pub use peers::{PeerPresence, PeerRegistry, PresencePayload, DEFAULT_PEER_TTL_MS};
 pub use scene_client::{

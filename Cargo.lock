@@ -1326,6 +1326,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shape_scene_core",
+ "wasm-bindgen",
 ]
 
 [[package]]
