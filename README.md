@@ -35,7 +35,7 @@ The stack is one Rust workspace plus a thin Svelte shell:
   and the command catalog. Compiles for native and `wasm32`; no time/rng/thread/IO.
   The web client builds it to WASM (`--features wasm`) and uses it as the
   client-side op-apply.
-- `src/storage/core` (`shape_storage_core`) — store-neutral persistence: a
+- `crates/storage-core` (`shape_storage_core`) — store-neutral persistence: a
   `StorageAdapter` trait, a spatial region index, a portable sharded bundle
   format, and Memory/File/SQLite adapters. SQLite is native-only; `wasm32` keeps
   the model, the trait, and the in-memory adapter.

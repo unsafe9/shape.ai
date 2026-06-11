@@ -40,7 +40,7 @@ rmcp = { version = "1.7", features = [
 schemars = "1"
 
 shape_scene_core = { path = "../scene-core" }
-shape_storage_core = { path = "../../src/storage/core", features = ["redb"] }
+shape_storage_core = { path = "../storage-core", features = ["redb"] }
 # MG-8 scale-out: single-writer canvas leases + routing + presence/pubsub seam.
 shape_coordination = { path = "../coordination" }
 

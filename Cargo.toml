@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "src/storage/core",
+    "crates/storage-core",
     "crates/scene-core",
     "crates/server",
     "crates/coordination",
