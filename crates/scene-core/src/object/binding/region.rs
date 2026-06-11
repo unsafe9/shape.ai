@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{Geometry, LocalPoint};
+use crate::object::model::{Geometry, LocalPoint};
 
 /// An axis-aligned bound in object-local quantized units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

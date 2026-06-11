@@ -2,7 +2,7 @@
 //!
 //! Pure: no time, randomness, threads, or I/O — a static light/dark RGBA lookup
 //! over a fixed set of kebab-case semantic token names. The wire convention is
-//! `Paint::Token { name }` ([`super::model::Paint`]); the renderer resolves a
+//! `Paint::Token { name }` ([`crate::object::model::Paint`]); the renderer resolves a
 //! token to its RGBA at draw time (a later wave), light/dark aware. This module
 //! is the single source of truth for which tokens exist and what they resolve to.
 //!

@@ -1,7 +1,7 @@
 //! The hold-key gesture catalog: the canonical list of press-and-hold input
 //! gestures over the canvas (sibling to the click/shortcut [`commands`]).
 //!
-//! [`commands`](super::commands) covers discrete click/shortcut actions, but a
+//! [`commands`](crate::object::commands) covers discrete click/shortcut actions, but a
 //! second family of inputs are *held*: Space to pan, the middle mouse button to
 //! pan, Shift/Mod to add to the selection, Alt to suppress snapping or erase
 //! partially, and Shift to coarsen rotation. These were undocumented shell

@@ -46,7 +46,7 @@ pub struct ObjectCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_shortcut: Option<String>,
     pub description: String,
-    /// The [`ObjectOp`](super::op::ObjectOp) kind this command lowers to, when it
+    /// The [`ObjectOp`](crate::object::op::ObjectOp) kind this command lowers to, when it
     /// maps 1:1. `None` for composite or shell-only actions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub op_kind: Option<String>,

@@ -11,13 +11,13 @@
 //! `ungroupEnabled` / `doubleClickAction`) so the containment logic lives in the
 //! Rust core; the shell now only dispatches the returned op/decision (the inline
 //! IME edit vs active-container set stays a shell concern). The authored
-//! `Reparent` rides the existing [`super::apply`] arm (with its cycle check)
+//! `Reparent` rides the existing [`crate::object::apply`] arm (with its cycle check)
 //! unchanged.
 //!
 //! Pure (no time/rng/IO/GPU), pointer-width-agnostic.
 
-use super::model::{ObjectId, ObjectScene};
-use super::op::ObjectOp;
+use crate::object::model::{ObjectId, ObjectScene};
+use crate::object::op::ObjectOp;
 
 /// The shell's container-vs-leaf decision for a double-click on an object. An
 /// object WITH children is a container (the shell drills in, setting

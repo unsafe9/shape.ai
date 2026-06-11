@@ -5,7 +5,7 @@
 //! are reparented under a frame with world-absolute transforms (D3), so moving a
 //! parent must apply the SAME world delta to every descendant — otherwise the
 //! frame slides out from under its contents. The SameDelta id set + ORDER is
-//! derived from the SINGLE source `super::move_together::BindingGraph::propagation_closure`
+//! derived from the SINGLE source `crate::object::move_together::BindingGraph::propagation_closure`
 //! — the SAME traversal the renderer-core LIVE preview consumes (via the scene-core
 //! path-dep) — so the objects the preview shows and the ops the commit authors are
 //! the same set, in the same order, by construction (they cannot drift).
@@ -23,15 +23,15 @@
 //!
 //! Pure (no time/rng/IO/GPU), pointer-width-agnostic.
 
-use super::anchor_follow::geometry_follow_ops;
-use super::deform::{
+use crate::object::anchor_follow::geometry_follow_ops;
+use crate::object::deform::{
     deform_open_path, is_open_class, is_pure_translate, open_endpoint_pins, route_open_endpoints,
     EndpointRoute,
 };
-use super::model::{Geometry, Object, ObjectScene, Transform3x3};
-use super::move_together::{BindingGraph, BindingNode};
-use super::op::ObjectOp;
-use super::region::StubOutlineDeriver;
+use crate::object::model::{Geometry, Object, ObjectScene, Transform3x3};
+use crate::object::move_together::{BindingGraph, BindingNode};
+use crate::object::op::ObjectOp;
+use crate::object::region::StubOutlineDeriver;
 
 /// 3x3 row-major pre-multiply `new = delta * base`. The delta is the cumulative
 /// world-space gesture matrix; `base` is the object's existing transform. Reuses
@@ -563,7 +563,7 @@ mod tests {
 
     // PIN the cascade ordering equals the shared SameDelta closure ordering: a
     // documented expected sequence for two frames a{b}, d{e} multi-selected [a,d].
-    // This is the SAME fixture as `super::move_together::tests` (expected
+    // This is the SAME fixture as `crate::object::move_together::tests` (expected
     // `["a","b","d","e"]`); cascade now DERIVES its order from that closure, so this
     // pins the canonical order both the commit and the renderer live-preview share.
     #[test]

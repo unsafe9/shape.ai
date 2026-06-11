@@ -43,14 +43,14 @@
 //! converts its screen-px constant through the zoom (the existing snap
 //! convention).
 
-use super::anchor_follow::{affine_of, apply_affine, invert_affine, local_nodes};
-use super::deform::round_unit;
-use super::model::{
+use crate::object::anchor_follow::{affine_of, apply_affine, invert_affine, local_nodes};
+use crate::object::deform::round_unit;
+use crate::object::model::{
     path_string, Anchor, Geometry, HandlePoint, ObjectScene, PathNode, SubPath, Transform3x3,
     GEOMETRY_QUANTUM_PER_PX,
 };
-use super::op::ObjectOp;
-use super::recognize::{recognize_stroke, RecognizeMode};
+use crate::object::op::ObjectOp;
+use crate::object::recognize::{recognize_stroke, RecognizeMode};
 
 /// Quantized units per logical pixel (Q=8).
 const UNITS_PER_PX: f64 = GEOMETRY_QUANTUM_PER_PX as f64;

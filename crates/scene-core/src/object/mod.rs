@@ -19,27 +19,23 @@
 //! - [`layout_solve`] — thin auto-layout solve (OB3.A1/D3).
 //! - [`validate`] — pure structural validators (OB3.S2).
 
-pub mod anchor_follow;
-pub mod anchors;
-pub mod apply;
-pub mod cascade;
-pub mod commands;
-pub mod deform;
-pub mod drawing;
-pub mod gestures;
-pub mod grouping;
-pub mod layout_solve;
-pub mod merge;
-pub mod model;
-pub mod move_together;
-pub mod op;
-pub mod primitives;
-pub mod recognize;
-pub mod region;
-pub mod templates;
-pub mod theme;
-pub mod undo;
-pub mod validate;
+// Internal tiers (kernel <- {authoring, binding, catalog}). The facade below
+// re-surfaces every file-module at the `object::` level, so every existing
+// `object::model`/`object::op`/`object::region`/... path keeps resolving.
+pub mod authoring;
+pub mod binding;
+pub mod catalog;
+pub mod kernel;
+
+pub use kernel::{apply, model, op, undo, validate};
+
+pub use authoring::{deform, drawing, merge, primitives, recognize, templates};
+
+pub use binding::{
+    anchor_follow, anchors, cascade, grouping, layout_solve, move_together, region,
+};
+
+pub use catalog::{commands, gestures, theme};
 
 pub use anchor_follow::{
     anchor_follow_ops, geometry_follow_ops, local_nodes, reproject_geometry_node,

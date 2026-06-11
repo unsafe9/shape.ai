@@ -21,12 +21,12 @@
 //! Pure (no time/rng/IO), pointer-width-agnostic. Coordinates are object-local
 //! quantized units (Q=8), the same space `reproject_node_local_quantized` emits.
 
-use super::anchor_follow::{affine_of, apply_affine, invert_affine, local_nodes};
-use super::model::{
+use crate::object::anchor_follow::{affine_of, apply_affine, invert_affine, local_nodes};
+use crate::object::model::{
     path_string, Anchor, Geometry, HandlePoint, LocalPoint, ObjectScene, PathNode, SubPath,
     Transform3x3, GEOMETRY_QUANTUM_PER_PX,
 };
-use super::op::ObjectOp;
+use crate::object::op::ObjectOp;
 
 /// Quantized units per logical pixel (Q=8).
 const UNITS_PER_PX: f64 = GEOMETRY_QUANTUM_PER_PX as f64;

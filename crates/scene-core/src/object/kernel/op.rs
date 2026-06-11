@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{
+use crate::object::model::{
     Anchor, Comment, Fill, Geometry, Layout, Object, ObjectId, Stroke, Text, Transform3x3,
 };
 

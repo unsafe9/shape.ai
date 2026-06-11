@@ -17,15 +17,15 @@
 //! concrete numeric vector in BOTH cores so either copy drifting fails its own test.
 //!
 //! Pure (no time/rng/IO/GPU), pointer-width-agnostic. Region-based anchor
-//! resolution ([`super::anchors`]) is a SEPARATE axis (geometry-edit follow); this
+//! resolution ([`crate::object::anchors`]) is a SEPARATE axis (geometry-edit follow); this
 //! module is the transform-based move-together only and must not be folded into it.
 
-use super::deform::{deform_open_path, is_open_class_d};
-use super::model::{
+use crate::object::deform::{deform_open_path, is_open_class_d};
+use crate::object::model::{
     Anchor, Geometry, LocalPoint, Object, ObjectScene, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
 };
-use super::op::ObjectOp;
-use super::region::OutlineDeriver;
+use crate::object::op::ObjectOp;
+use crate::object::region::OutlineDeriver;
 
 /// Quantized units per logical pixel. Matches renderer-core
 /// `transform_bindings::UNITS_PER_PX` and the shell `GEOMETRY_QUANTUM_PER_PX`
@@ -35,12 +35,12 @@ const UNITS_PER_PX: f64 = GEOMETRY_QUANTUM_PER_PX as f64;
 /// A 2x3 affine (the top two rows of a row-major 3x3 with `g=h=0,i=1`), used for
 /// the tiny invert/apply the reproject needs. A scene-core-local copy (no shared
 /// crate); equivalent to the shell `applyTransform` / `invertAffine`. Shared
-/// (`pub(super)`) with the open-class endpoint routing in [`super::deform`].
-pub(super) type Affine = [[f64; 3]; 2];
+/// (`pub(crate)`) with the open-class endpoint routing in [`crate::object::deform`].
+pub(crate) type Affine = [[f64; 3]; 2];
 
 /// The affine rows of a transform (absent => identity), dropping the projective
 /// bottom row (anchors are affine-only, matching the shell `Transform3x3` shape).
-pub(super) fn affine_of(t: &Transform3x3) -> Affine {
+pub(crate) fn affine_of(t: &Transform3x3) -> Affine {
     [
         [t.m[0][0], t.m[0][1], t.m[0][2]],
         [t.m[1][0], t.m[1][1], t.m[1][2]],
@@ -48,7 +48,7 @@ pub(super) fn affine_of(t: &Transform3x3) -> Affine {
 }
 
 /// Apply a row-major affine to a point. Mirrors the shell `applyTransform`.
-pub(super) fn apply_affine(a: &Affine, x: f64, y: f64) -> (f64, f64) {
+pub(crate) fn apply_affine(a: &Affine, x: f64, y: f64) -> (f64, f64) {
     (
         a[0][0] * x + a[0][1] * y + a[0][2],
         a[1][0] * x + a[1][1] * y + a[1][2],
@@ -57,7 +57,7 @@ pub(super) fn apply_affine(a: &Affine, x: f64, y: f64) -> (f64, f64) {
 
 /// Invert a row-major affine (`g=h=0,i=1`). Returns identity when singular,
 /// matching the shell `invertAffine` (a singular follower then no-ops the node).
-pub(super) fn invert_affine(a: &Affine) -> Affine {
+pub(crate) fn invert_affine(a: &Affine) -> Affine {
     let (a00, a01, a02) = (a[0][0], a[0][1], a[0][2]);
     let (a10, a11, a12) = (a[1][0], a[1][1], a[1][2]);
     let det = a00 * a11 - a01 * a10;
@@ -416,7 +416,7 @@ fn follower_edit_geometry(
 }
 
 /// Curve-flattening tolerance for the geometry-edit reprojection of an anchor's
-/// `at` onto a target's NEW outline. The finest bucket (matching [`super::anchors`])
+/// `at` onto a target's NEW outline. The finest bucket (matching [`crate::object::anchors`])
 /// so endpoints land on the true outline regardless of zoom LOD.
 const FOLLOW_FLATNESS: i32 = 1;
 

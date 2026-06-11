@@ -2,15 +2,15 @@
 //!
 //! Pen-and-ink capture math in the Rust core: RDP simplification, tangent-
 //! estimated bezier fitting, the pen [`Brush`], and the partial-erase subpath
-//! split. The pen-up COMMIT lives in [`super::recognize`] (anchor-semantics v3
+//! split. The pen-up COMMIT lives in [`crate::object::recognize`] (anchor-semantics v3
 //! §4): one stroke = one recognized object, which replaced the D12/D13 drawing
 //! session (a multi-stroke span committing to a single multi-subpath object).
 //!
 //! Pipeline per stroke:
 //!   raw points (transient, world px) --pen-up--> recognition
-//!   ([`super::recognize::recognize_stroke`], which reuses [`rdp_simplify`] +
+//!   ([`crate::object::recognize::recognize_stroke`], which reuses [`rdp_simplify`] +
 //!   [`fit_beziers`] for its silhouette-preserving fallback) --> one committed
-//!   [`super::model::Object`].
+//!   [`crate::object::model::Object`].
 //!
 //! Conventions (CLAUDE.md): pure (no time/rng/IO — all inputs passed in, the
 //! commit id/order are caller-supplied); pointer-width-agnostic (coords are i32
@@ -18,7 +18,7 @@
 //! width casts (the one f64 -> i32 quantize step clamps into i32 range first,
 //! making the narrowing provably safe under a scoped `#[allow]`).
 
-use super::model::{
+use crate::object::model::{
     Geometry, HandlePoint, LineCap, LineJoin, Paint, PathNode, Stroke, SubPath,
     GEOMETRY_QUANTUM_PER_PX,
 };

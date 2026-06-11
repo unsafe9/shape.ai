@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use super::model::{CommentAnchor, Geometry, Object, ObjectScene};
+use crate::object::model::{CommentAnchor, Geometry, Object, ObjectScene};
 
 /// A single structural defect found in the object model.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -38,10 +38,10 @@
 //! ([`recognize_stroke_object`]) subtracts the origin so geometry stays
 //! object-local with the position riding the transform translate (P4).
 
-use super::drawing::{
+use crate::object::drawing::{
     fit_beziers, perpendicular_distance, quantize_px, rdp_simplify, Brush,
 };
-use super::model::{
+use crate::object::model::{
     path_string, FillRule, Geometry, HandlePoint, Object, PathNode, SubPath, Transform3x3,
 };
 

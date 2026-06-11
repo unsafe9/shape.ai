@@ -22,10 +22,10 @@
 //! [`LayoutAlign::Stretch`] would resize a child's cross extent, which this
 //! transform-only slice cannot express, so it falls back to `Start` alignment.
 
-use super::model::{
+use crate::object::model::{
     LayoutAlign, LayoutDirection, ObjectId, ObjectScene, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
 };
-use super::region::{LocalBounds, OutlineDeriver};
+use crate::object::region::{LocalBounds, OutlineDeriver};
 
 /// Quantized-units -> logical px. Exact for the values used here (small integer
 /// extents over a power-of-two quantum), and never lossy in a width sense.

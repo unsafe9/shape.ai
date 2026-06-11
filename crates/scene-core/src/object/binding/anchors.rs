@@ -12,8 +12,8 @@
 //! anchor index returned by [`reproject_object_anchors`] is a runtime `usize`
 //! position, not an addressing field that ever crosses the wire).
 
-use super::model::{Anchor, LocalPoint, Object, ObjectId, ObjectScene};
-use super::region::OutlineDeriver;
+use crate::object::model::{Anchor, LocalPoint, Object, ObjectId, ObjectScene};
+use crate::object::region::OutlineDeriver;
 
 /// Resolve the **derived** endpoint position for one anchor of `anchored`.
 ///

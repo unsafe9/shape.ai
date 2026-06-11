@@ -35,7 +35,7 @@
 //! window; every `record` during it folds into the single live entry;
 //! `end_coalesce()` closes it. `undo`/`redo` implicitly close any open window.
 
-use super::op::ObjectOp;
+use crate::object::op::ObjectOp;
 
 /// One reversible step on a stack: the op that was applied (`forward`) and the
 /// op that reverses it (`inverse`, as returned by `apply_object_op`).

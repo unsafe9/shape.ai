@@ -12,11 +12,11 @@
 
 use crate::fractional::generate_key_between;
 
-use super::model::{
+use crate::object::model::{
     Anchor, Comment, Geometry, Layout, Object, ObjectId, ObjectScene, SubPath,
 };
-use super::op::{FieldEdit, ObjectOp};
-use super::validate::{validate_geometry, ValidationError};
+use crate::object::op::{FieldEdit, ObjectOp};
+use crate::object::validate::{validate_geometry, ValidationError};
 
 /// Map a [`ValidationError`] from `validate.rs` onto the apply path's
 /// [`ApplyError`]. Geometry defects collapse to `BadGeometry`; structural ones

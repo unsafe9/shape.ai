@@ -340,7 +340,7 @@ pub enum Paint {
     /// content-addressed handle resolved out-of-band; type-per-kind deferred.
     Image { content_ref: String },
     /// Semantic theme token (D-token contract). `name` is a kebab-case token id
-    /// from [`super::theme`]; resolution to RGBA is deferred to the renderer
+    /// from [`crate::object::theme`]; resolution to RGBA is deferred to the renderer
     /// (light/dark aware) — treated as an opaque color source until then.
     Token { name: String },
 }

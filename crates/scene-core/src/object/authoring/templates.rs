@@ -28,11 +28,11 @@
 //! integer pixel constants quantized exactly, and the only `f64` values live in
 //! the (`f64`) `Transform3x3`.
 
-use super::model::{
+use crate::object::model::{
     Anchor, Fill, FillRule, Geometry, LineCap, LineJoin, LocalPoint, Object, Paint, PathNode,
     Stroke, SubPath, Text, TextAlign, TextRun, TextVAlign, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
 };
-use super::op::ObjectOp;
+use crate::object::op::ObjectOp;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

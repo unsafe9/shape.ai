@@ -7,7 +7,7 @@
 //! object at a world anchor) — the SAME logic that used to live in the shell's
 //! `objectPrimitives.ts`, moved into the core so the web client builds primitives
 //! with the same Rust the server links (P1). It mirrors the structure of
-//! [`super::templates`]: a per-kind default spec, a builder that places the spec
+//! [`crate::object::templates`]: a per-kind default spec, a builder that places the spec
 //! at an anchor (or sizes it to a drag span), and caller-supplied id/order.
 //!
 //! Geometry convention (D2): each object's geometry is object-local quantized i32
@@ -21,11 +21,11 @@
 
 use core::fmt::Write as _;
 
-use super::deform::is_open_class;
-use super::model::{
+use crate::object::deform::is_open_class;
+use crate::object::model::{
     Fill, FillRule, Geometry, Object, Paint, Stroke, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
 };
-use super::op::{FieldEdit, ObjectOp};
+use crate::object::op::{FieldEdit, ObjectOp};
 
 /// The primitive kinds the toolbar can author (mirrors the shell `PrimitiveKindId`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,7 +63,7 @@ pub const THEME_DEFAULT_COLOR: &str = "token:text";
 /// theme token, every other value to a solid hex.
 pub fn paint_for_color(color: &str) -> Paint {
     if color == THEME_DEFAULT_COLOR {
-        Paint::Token { name: super::theme::Token::Text.name().to_string() }
+        Paint::Token { name: crate::object::theme::Token::Text.name().to_string() }
     } else {
         Paint::Solid { color: color.to_string() }
     }
@@ -166,8 +166,8 @@ fn solid_stroke(hex: &str, width_px: f64) -> Stroke {
         width: q(width_px),
         opacity: 1.0,
         dash: Vec::new(),
-        cap: super::model::LineCap::Butt,
-        join: super::model::LineJoin::Miter,
+        cap: crate::object::model::LineCap::Butt,
+        join: crate::object::model::LineJoin::Miter,
     }
 }
 
