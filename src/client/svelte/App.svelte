@@ -37,6 +37,7 @@
     type UndoStack
   } from "../scene/sceneCoreWasm";
   import { createShortcutDispatcher } from "../lib/shortcuts";
+  import { isFreeRecognizeHold } from "../lib/gestureBindings";
   import { ToastChannel } from "../lib/statusChannel";
   import {
     MIN_DRAG_EXTENT_PX,
@@ -454,7 +455,7 @@
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
       const typing = target ? ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName) || target.isContentEditable : false;
-      freeRecognitionHeld = event.shiftKey;
+      freeRecognitionHeld = isFreeRecognizeHold(event);
       if (event.key === "Escape") {
         event.preventDefault();
         handleEscape();
@@ -474,7 +475,7 @@
       dispatch(event);
     }
     function handleKeyUp(event: KeyboardEvent) {
-      freeRecognitionHeld = event.shiftKey;
+      freeRecognitionHeld = isFreeRecognizeHold(event);
       if (event.code === "Space" && spaceHeld) {
         event.preventDefault();
         spaceHeld = false;

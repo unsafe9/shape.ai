@@ -278,7 +278,9 @@ describe("pen recognition mode (Basic default, Shift-hold Free)", () => {
     expect(app).not.toMatch(/let freeRecognition\b/);
     expect(app).not.toContain("onToggleFreeRecognition");
     expect(app).toMatch(/let freeRecognitionHeld = \$state\(false\)/);
-    expect(app).toMatch(/freeRecognitionHeld = event\.shiftKey/);
+    // Routed through the catalog-backed predicate (C2 single source), not a magic
+    // event.shiftKey, so the gesture self-documents in the settings modal.
+    expect(app).toMatch(/freeRecognitionHeld = isFreeRecognizeHold\(event\)/);
     expect(app).toMatch(/freeRecognitionHeld \? "free" : "basic"/);
   });
 });

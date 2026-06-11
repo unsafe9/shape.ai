@@ -23,6 +23,7 @@ export const GESTURE_NO_SNAP_ALT = "no-snap-alt";
 export const GESTURE_PARTIAL_ERASE_ALT = "partial-erase-alt";
 export const GESTURE_COARSE_ROTATE_SHIFT = "coarse-rotate-shift";
 export const GESTURE_DETACH_ALT = "detach-alt";
+export const GESTURE_FREE_RECOGNIZE_SHIFT = "free-recognize-shift";
 
 /**
  * The frozen binding token for each routed gesture, mirrored from C2. `key`/
@@ -39,7 +40,8 @@ export const GESTURE_BINDINGS = {
   [GESTURE_NO_SNAP_ALT]: { modifier: "Alt" },
   [GESTURE_PARTIAL_ERASE_ALT]: { modifier: "Alt" },
   [GESTURE_COARSE_ROTATE_SHIFT]: { modifier: "Shift", degrees: 15 },
-  [GESTURE_DETACH_ALT]: { modifier: "Alt" }
+  [GESTURE_DETACH_ALT]: { modifier: "Alt" },
+  [GESTURE_FREE_RECOGNIZE_SHIFT]: { modifier: "Shift" }
 } as const;
 
 /** DOM MouseEvent button value for the middle mouse button (C2 `pan-middle`). */
@@ -109,6 +111,15 @@ export function isCoarseRotate(event: { shiftKey: boolean }): boolean {
  */
 export function isDetachDrag(event: { altKey: boolean }): boolean {
   return event.altKey;
+}
+
+/**
+ * The free-form-recognition gesture (C2 `free-recognize-shift`): Shift held while
+ * drawing with the pen recognizes the stroke as a free-form shape instead of
+ * snapping it to a basic primitive (released = back to Basic).
+ */
+export function isFreeRecognizeHold(event: { shiftKey: boolean }): boolean {
+  return event.shiftKey;
 }
 
 /**

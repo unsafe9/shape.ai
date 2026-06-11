@@ -31,6 +31,8 @@ pub enum ObjectGestureCategory {
     Transform,
     /// Detaching anchors (move whole, ignoring attachments) while a modifier is held.
     Anchor,
+    /// Forcing free-form pen recognition while a modifier is held.
+    Draw,
 }
 
 /// Which physical input must be HELD to engage a gesture. Serialized kebab-case;
@@ -184,6 +186,14 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
             HoldTrigger::modifier("Alt"),
             "Hold Alt while dragging an anchored object to move it whole, ignoring its anchors and detaching them.",
         ),
+        // Draw — hold to force free-form pen recognition (release snaps to Basic).
+        ObjectGesture::new(
+            "free-recognize-shift",
+            "Free-form Recognition (Shift)",
+            Draw,
+            HoldTrigger::modifier("Shift"),
+            "Hold Shift while drawing with the pen to recognize the stroke as a free-form shape instead of snapping to a basic shape (release returns to Basic).",
+        ),
     ]
 }
 
@@ -224,10 +234,11 @@ mod tests {
             "partial-erase-alt",
             "coarse-rotate-shift",
             "detach-alt",
+            "free-recognize-shift",
         ];
-        // Exactly the 8 ids, each once.
+        // Exactly the 9 ids, each once.
         let ids: Vec<&str> = catalog.iter().map(|g| g.id.as_str()).collect();
-        assert_eq!(ids.len(), expected.len(), "catalog must hold exactly 8 gestures");
+        assert_eq!(ids.len(), expected.len(), "catalog must hold exactly 9 gestures");
         let mut seen = HashSet::new();
         for id in &ids {
             assert!(seen.insert(*id), "duplicate id: {id}");
@@ -277,6 +288,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&ObjectGestureCategory::Transform).unwrap(), "\"transform\"");
         assert_eq!(serde_json::to_string(&ObjectGestureCategory::Pan).unwrap(), "\"pan\"");
         assert_eq!(serde_json::to_string(&ObjectGestureCategory::Anchor).unwrap(), "\"anchor\"");
+        assert_eq!(serde_json::to_string(&ObjectGestureCategory::Draw).unwrap(), "\"draw\"");
     }
 
     #[test]
@@ -354,6 +366,13 @@ mod tests {
                 "category": "anchor",
                 "trigger": { "input": "modifier", "modifier": "Alt" },
                 "description": "Hold Alt while dragging an anchored object to move it whole, ignoring its anchors and detaching them."
+            },
+            {
+                "id": "free-recognize-shift",
+                "label": "Free-form Recognition (Shift)",
+                "category": "draw",
+                "trigger": { "input": "modifier", "modifier": "Shift" },
+                "description": "Hold Shift while drawing with the pen to recognize the stroke as a free-form shape instead of snapping to a basic shape (release returns to Basic)."
             }
         ]);
         let actual: serde_json::Value =
