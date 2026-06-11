@@ -572,32 +572,63 @@ fn basic_rect_corners(points: &[(f64, f64)]) -> [(f64, f64); 4] {
     oriented_rect_corners(points, 0.0)
 }
 
-/// Basic-mode triangle candidate: the max-area triple over the coarse-RDP
-/// ring (pen-up endpoint dropped, as in [`fit_polygon`]), kept in ring order
-/// so the triangle never self-intersects. The coarse ring is small, so the
-/// brute-force sweep is a one-shot pen-up cost.
+/// Basic-mode triangle candidate: an axis-aligned ISOSCELES triangle filling the
+/// bbox, its apex pointing the same cardinal direction (up/down/left/right) as the
+/// drawn triangle's apex. Basic shapes resolve flat like the rect — the apex of
+/// the max-area triple over the coarse ring only picks the cardinal; the
+/// silhouette is otherwise normalized to a clean isosceles (the user rotates it
+/// by hand if they want it angled).
 fn basic_triangle_corners(points: &[(f64, f64)], diag: f64) -> [(f64, f64); 3] {
+    let (min_x, min_y, max_x, max_y) = bbox(points);
+    let cx = (min_x + max_x) / 2.0;
+    let cy = (min_y + max_y) / 2.0;
+    // Apex direction: the vertex opposite the longest edge of the max-area triple,
+    // measured from that edge's midpoint, then snapped to a cardinal.
     let kept = rdp_simplify(points, normalize_epsilon(diag));
     let ring: &[(f64, f64)] = if kept.len() > 3 { &kept[..kept.len() - 1] } else { &kept };
-    if ring.len() < 3 {
-        // Degenerate closed scribble: spread three picks along the samples.
-        return [points[0], points[points.len() / 3], points[2 * points.len() / 3]];
-    }
-    let area2 = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
-        ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs()
-    };
-    let mut best = (f64::NEG_INFINITY, [ring[0], ring[1], ring[2]]);
-    for i in 0..ring.len() {
-        for j in i + 1..ring.len() {
-            for k in j + 1..ring.len() {
-                let a2 = area2(ring[i], ring[j], ring[k]);
-                if a2 > best.0 {
-                    best = (a2, [ring[i], ring[j], ring[k]]);
+    let (adx, ady) = if ring.len() >= 3 {
+        let area2 = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+            ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs()
+        };
+        let mut best = (f64::NEG_INFINITY, [ring[0], ring[1], ring[2]]);
+        for i in 0..ring.len() {
+            for j in i + 1..ring.len() {
+                for k in j + 1..ring.len() {
+                    let a2 = area2(ring[i], ring[j], ring[k]);
+                    if a2 > best.0 {
+                        best = (a2, [ring[i], ring[j], ring[k]]);
+                    }
                 }
             }
         }
+        let [a, b, c] = best.1;
+        let ab = (a.0 - b.0).hypot(a.1 - b.1);
+        let bc = (b.0 - c.0).hypot(b.1 - c.1);
+        let ca = (c.0 - a.0).hypot(c.1 - a.1);
+        let (mid, apex) = if ab >= bc && ab >= ca {
+            (((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0), c)
+        } else if bc >= ca {
+            (((b.0 + c.0) / 2.0, (b.1 + c.1) / 2.0), a)
+        } else {
+            (((c.0 + a.0) / 2.0, (c.1 + a.1) / 2.0), b)
+        };
+        (apex.0 - mid.0, apex.1 - mid.1)
+    } else {
+        (0.0, -1.0) // degenerate scribble: default apex up
+    };
+    // Cardinal-snap the apex (y grows downward, so apex-up = ady < 0) and build the
+    // bbox-filling isosceles triangle pointing that way.
+    if adx.abs() >= ady.abs() {
+        if adx < 0.0 {
+            [(max_x, min_y), (max_x, max_y), (min_x, cy)] // apex left
+        } else {
+            [(min_x, min_y), (min_x, max_y), (max_x, cy)] // apex right
+        }
+    } else if ady < 0.0 {
+        [(min_x, max_y), (max_x, max_y), (cx, min_y)] // apex up
+    } else {
+        [(min_x, min_y), (max_x, min_y), (cx, max_y)] // apex down
     }
-    best.1
 }
 
 /// RMS distance (px) from every sample to a closed outline ring — the shared
@@ -1251,6 +1282,33 @@ mod tests {
         assert!(
             (x0 - bx0).abs() < 1e-6 && (y0 - by0).abs() < 1e-6 && (x1 - bx1).abs() < 1e-6 && (y1 - by1).abs() < 1e-6,
             "axis rect must equal the sample bbox"
+        );
+    }
+
+    #[test]
+    fn basic_triangle_candidate_is_axis_aligned_isosceles() {
+        // A wide, low, slightly tilted triangle pointing UP (base clearly the
+        // longest edge). The Basic candidate resolves it to a FLAT isosceles: a
+        // horizontal base on the bbox bottom, the apex centered on top — keeping
+        // only the cardinal (up), not the tilt.
+        let mut pts = Vec::new();
+        edge((0.0, 102.0), (120.0, 98.0), 14, &mut pts); // wide base, tilted
+        edge((120.0, 98.0), (62.0, 20.0), 12, &mut pts); // up to the apex
+        edge((62.0, 20.0), (0.0, 102.0), 11, &mut pts); // back, short of start
+        let (min_x, min_y, max_x, max_y) = bbox(&pts);
+        let diag = (max_x - min_x).hypot(max_y - min_y);
+        let t = basic_triangle_corners(&pts, diag);
+        // Apex up: exactly two corners on the bbox bottom (horizontal base), the
+        // third (apex) on the bbox top, centered.
+        let base: Vec<&(f64, f64)> = t.iter().filter(|p| (p.1 - max_y).abs() < 1e-6).collect();
+        assert_eq!(base.len(), 2, "horizontal base on the bbox bottom: {t:?}");
+        let apex = t.iter().find(|p| (p.1 - min_y).abs() < 1e-6).expect("apex on the bbox top");
+        assert!((apex.0 - (min_x + max_x) / 2.0).abs() < 1e-6, "apex centered (isosceles): {t:?}");
+        let mut bx: Vec<f64> = base.iter().map(|p| p.0).collect();
+        bx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(
+            (bx[0] - min_x).abs() < 1e-6 && (bx[1] - max_x).abs() < 1e-6,
+            "base spans the full bbox width: {t:?}"
         );
     }
 }
