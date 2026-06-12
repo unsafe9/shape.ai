@@ -7,10 +7,10 @@
 // Falsifiable: if the engine swallows the snap (stale camera, wrong feature-detect,
 // or never querying), the near-outline case fails snapped/targetId.
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ShapeCanvasEngine, type EngineEvent } from "../platforms/web/renderer/engine";
+import { canonicalizeCreateSnap } from "../platforms/web/controller/interactions";
+import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../platforms/web/shared/object";
 import type {
   RustDebugSnapshot,
   RustInputBatchResult,
@@ -219,41 +219,30 @@ describe("create-drag outline snap (W3-G5 #6)", () => {
   });
 });
 
-// The pure mirror of App.svelte's handleCreate snap-target canonicalization (#6):
-// a snap is honored ONLY when its target is a real object in the canonical scene
-// (the transient drag-create preview / snap-indicator never are), so a self-snap
-// onto the preview is dropped while a real-edge snap is kept.
-function canonicalizeSnap(
-  sceneIds: string[],
-  snapped: boolean,
-  targetId: string | null
-): { snapped: boolean; target: string | null } {
-  const target = targetId !== null && sceneIds.includes(targetId) ? targetId : null;
-  return { snapped: snapped && target !== null, target };
-}
-
-describe("handleCreate snap-target canonicalization (W3-G5 #6)", () => {
-  const sceneIds = ["rect-1", "ell-1"];
+// handleCreate's snap-target canonicalization (#6), exercised through the extracted
+// controller function the shell now composes (no .svelte source pin): a snap is
+// honored ONLY when its target is a real object in the canonical scene (the
+// transient drag-create preview / snap-indicator never are), so a self-snap onto
+// the preview is dropped while a real-edge snap is kept.
+describe("canonicalizeCreateSnap (handleCreate snap-target, W3-G5 #6)", () => {
+  function sceneOf(ids: string[]): ObjectScene {
+    return { ...emptyObjectScene(), objects: ids.map((id) => ({ id, order: "a0", geometry: { d: "M 0 0 L 8 0" } }) as SceneObject) };
+  }
+  const scene = sceneOf(["rect-1", "ell-1"]);
 
   it("keeps a snap whose target is a real canonical object (ring + AP5 fire)", () => {
-    expect(canonicalizeSnap(sceneIds, true, "rect-1")).toEqual({ snapped: true, target: "rect-1" });
+    expect(canonicalizeCreateSnap(scene, true, "rect-1")).toEqual({ snapped: true, target: "rect-1" });
   });
 
   it("drops a phantom self-snap onto the transient create-preview", () => {
     // The renderer can return the preview's own id when nothing real is near; that
     // must NOT count as a snap (no phantom ring, no anchor to a discarded object).
-    expect(canonicalizeSnap(sceneIds, true, "create-preview")).toEqual({ snapped: false, target: null });
-    expect(canonicalizeSnap(sceneIds, true, "create-snap-indicator")).toEqual({ snapped: false, target: null });
+    expect(canonicalizeCreateSnap(scene, true, "create-preview")).toEqual({ snapped: false, target: null });
+    expect(canonicalizeCreateSnap(scene, true, "create-snap-indicator")).toEqual({ snapped: false, target: null });
   });
 
   it("a non-snapped move stays non-snapped", () => {
-    expect(canonicalizeSnap(sceneIds, false, null)).toEqual({ snapped: false, target: null });
-  });
-
-  it("App.svelte handleCreate filters the snap target to canonical objects", () => {
-    const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
-    expect(source).toMatch(/scene\.objects\.some\(\(o\)\s*=>\s*o\.id\s*===\s*targetIdIn\)\s*\?\s*targetIdIn\s*:\s*null/);
-    expect(source).toMatch(/snappedIn\s*&&\s*targetId\s*!==\s*null/);
+    expect(canonicalizeCreateSnap(scene, false, null)).toEqual({ snapped: false, target: null });
   });
 });
 

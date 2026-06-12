@@ -10,10 +10,11 @@
 // Falsifiable: if the engine re-gates the create move behind a drag, (1) sees no
 // create-hover; if the ring stays drag-only, (3)'s source pin fails.
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ShapeCanvasEngine, createMoveEmission, type EngineEvent } from "../platforms/web/renderer/engine";
+import { buildFeedScene, canonicalizeHoverSnap } from "../platforms/web/controller/interactions";
+import { THEME_DEFAULT_COLOR } from "../platforms/web/controller/objectPrimitives";
+import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../platforms/web/shared/object";
 import type {
   RustDebugSnapshot,
   RustInputBatchResult,
@@ -204,51 +205,66 @@ describe("create-hover engine probe (W3-G9 #3)", () => {
   });
 });
 
-// The pure mirror of App.svelte's handleCreateHover canonicalization (#3/#6): a
-// hover snap is honored as a ring ONLY when its target is a REAL object in the
-// canonical scene (the transient preview / snap-indicator never are), else the
-// ring clears.
-function canonicalizeHover(
-  sceneIds: string[],
-  snapped: boolean,
-  targetId: string | null
-): { at: { x: number; y: number }; target: string | null } | null {
-  const target = targetId !== null && sceneIds.includes(targetId) ? targetId : null;
-  return snapped && target !== null ? { at: { x: 0, y: 0 }, target } : null;
+// handleCreateHover's canonicalization (#3/#6), exercised through the extracted
+// controller function the shell now composes (no .svelte source pin): a hover snap
+// is honored as a ring ONLY when its target is a REAL object in the canonical scene
+// (the transient preview / snap-indicator never are), else the ring clears.
+function sceneOf(ids: string[]): ObjectScene {
+  return { ...emptyObjectScene(), objects: ids.map((id) => ({ id, order: "a0", geometry: { d: "M 0 0 L 8 0" } }) as SceneObject) };
 }
 
-describe("handleCreateHover canonicalization (W3-G9 #3)", () => {
-  const sceneIds = ["rect-1", "ell-1"];
+describe("canonicalizeHoverSnap (handleCreateHover, W3-G9 #3)", () => {
+  const scene = sceneOf(["rect-1", "ell-1"]);
 
   it("sets the ring when snapped onto a real canonical object", () => {
-    expect(canonicalizeHover(sceneIds, true, "rect-1")).toEqual({ at: { x: 0, y: 0 }, target: "rect-1" });
+    expect(canonicalizeHoverSnap(scene, true, "rect-1", { x: 7, y: 9 })).toEqual({ at: { x: 7, y: 9 }, target: "rect-1" });
   });
 
   it("clears the ring when not snapped", () => {
-    expect(canonicalizeHover(sceneIds, false, null)).toBeNull();
+    expect(canonicalizeHoverSnap(scene, false, null, { x: 0, y: 0 })).toBeNull();
   });
 
   it("clears the ring for a phantom self-snap onto the transient preview", () => {
-    expect(canonicalizeHover(sceneIds, true, "create-preview")).toBeNull();
-    expect(canonicalizeHover(sceneIds, true, "create-snap-indicator")).toBeNull();
-  });
-
-  it("App.svelte handleCreateHover filters the snap target to canonical objects and clears on no-snap", () => {
-    const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
-    expect(source).toMatch(/function handleCreateHover\(/);
-    expect(source).toMatch(/scene\.objects\.some\(\(o\)\s*=>\s*o\.id\s*===\s*targetIdIn\)\s*\?\s*targetIdIn\s*:\s*null/);
-    expect(source).toMatch(/createHoverSnap\s*=\s*snappedIn\s*&&\s*target\s*!==\s*null\s*\?\s*\{\s*at:\s*world,\s*target\s*\}\s*:\s*null/);
+    expect(canonicalizeHoverSnap(scene, true, "create-preview", { x: 0, y: 0 })).toBeNull();
+    expect(canonicalizeHoverSnap(scene, true, "create-snap-indicator", { x: 0, y: 0 })).toBeNull();
   });
 });
 
+// buildFeedScene's hover-ring branch (#3), exercised through the extracted function
+// the shell now composes (no .svelte source pin): a hover snap with NO drag in
+// progress appends a single snap-indicator ring; a drag's own preview takes over so
+// the ring is never doubled.
 describe("buildFeedScene renders the persistent hover ring (W3-G9 #3)", () => {
-  it("App.svelte buildFeedScene appends a snap-indicator from the hover snap when no drag is in progress", () => {
-    const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
-    // The ring renders from createHoverSnap ONLY in the no-drag branch (else-if after
-    // the drag-preview branch), so a drag's own ring is never doubled.
-    expect(source).toMatch(/}\s*else if \(hoverSnap\) \{\s*[\s\S]*?snapIndicatorObject\(hoverSnap\.at\)/);
-    // feedScene must depend on createHoverSnap so the ring updates continuously.
-    expect(source).toMatch(/buildFeedScene\(scene, drawPoints, createKind, createDrag, createHoverSnap\)/);
+  const base = sceneOf(["rect-1"]);
+  const order = () => "z0";
+
+  it("appends a snap-indicator ring from the hover snap when no drag is in progress", () => {
+    const feed = buildFeedScene(base, null, null, null, { at: { x: 200, y: 200 }, target: "rect-1" }, order, THEME_DEFAULT_COLOR, 2);
+    const added = feed.objects.filter((o) => !base.objects.some((b) => b.id === o.id));
+    expect(added.map((o) => o.id)).toEqual(["create-snap-indicator"]);
+  });
+
+  it("does NOT append the hover ring while a drag-create is in progress (no doubled ring)", () => {
+    // A drag's own preview/snap-indicator takes over: the standalone hover ring is
+    // suppressed (the else-if branch), so only the drag preview objects are added.
+    const feed = buildFeedScene(
+      base,
+      null,
+      "rectangle",
+      { span: { start: { x: 0, y: 0 }, end: { x: 50, y: 50 } }, snapped: true },
+      { at: { x: 200, y: 200 }, target: "rect-1" },
+      order,
+      THEME_DEFAULT_COLOR,
+      2
+    );
+    const addedIds = feed.objects.filter((o) => !base.objects.some((b) => b.id === o.id)).map((o) => o.id);
+    // The drag preview + its own snap-indicator; the standalone hover ring is NOT doubled.
+    expect(addedIds).toEqual(["create-preview", "create-snap-indicator"]);
+  });
+
+  it("leaves the feed untouched when there is no pen / drag / hover", () => {
+    const feed = buildFeedScene(base, null, null, null, null, order, THEME_DEFAULT_COLOR, 2);
+    expect(feed).toBe(base);
   });
 });
 

@@ -8,8 +8,6 @@
 //      the scene-core `moveOps` core call — the delta reaches children (and
 //      grandchildren), with the multi-union deduped.
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   emptyObjectScene,
@@ -20,16 +18,7 @@ import {
   type ObjectSelection
 } from "../platforms/web/shared/object";
 import { loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
-
-// The pure mirror of App.svelte's onSelectObject routing (W3-G5 #10). A plain pick
-// on a member of the current Multi keeps the Multi (so a group-drag does not
-// collapse); additive toggles; everything else replaces. Pinned both here (real
-// logic) and against the source below, so the two cannot drift silently.
-function routeSelectObject(current: ObjectSelection, id: string, additive: boolean): ObjectSelection {
-  if (additive) return toggleObjectSelection(current, id);
-  if (current.kind === "multi" && current.ids.includes(id)) return current;
-  return { kind: "object", id };
-}
+import { commitBodyDrag, routeMarquee, routeSelectObject } from "../platforms/web/controller/interactions";
 
 describe("toggleObjectSelection (additive modifier-click, #10)", () => {
   it("accumulates a multi-select as ids are modifier-clicked in", () => {
@@ -200,31 +189,53 @@ describe("sceneCore.moveOps cascade (parent-drag #15 / multi #10)", () => {
   });
 });
 
-describe("App.svelte selection-UX wiring (AP2)", () => {
-  // No DOM in the node test env: assert the wiring against the .svelte source.
-  // Falsifiable — dropping the additive toggle, the marquee apply, or the cascade
-  // route all fail these.
-  const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
-
-  it("routes the engine's C2 additive flag through toggleObjectSelection on pick", () => {
-    expect(source).toMatch(/onSelectObject:\s*\(id,\s*additive\)\s*=>/);
-    expect(source).toMatch(/additive\s*\n?\s*\?\s*toggleObjectSelection\(selection,\s*id\)/);
-  });
-
-  it("keeps the Multi when a plain pick lands on a member (no collapse-on-drag, #10)", () => {
-    expect(source).toMatch(/selection\.kind\s*===\s*"multi"\s*&&\s*selection\.ids\.includes\(id\)\s*\n?\s*\?\s*selection/);
+// The onSelectObject / onMarquee / onTransformCommit wiring, exercised through the
+// extracted controller functions the shell now composes (no .svelte source pin).
+// Falsifiable — dropping the additive toggle, the marquee apply, or the cascade
+// route all change these results.
+describe("controller selection-UX wiring (AP2)", () => {
+  it("routes the additive flag through toggleObjectSelection on pick", () => {
+    // routeSelectObject(additive=true) must equal the pure toggle the shell uses.
+    const before: ObjectSelection = { kind: "object", id: "o1" };
+    expect(routeSelectObject(before, "o2", true)).toEqual(toggleObjectSelection(before, "o2"));
   });
 
   it("applies the marquee ids (RA2a) to the selection", () => {
-    expect(source).toMatch(/onMarquee:\s*\(ids\)\s*=>/);
-    expect(source).toMatch(/ids\.length\s*>=\s*2\s*\?\s*\{\s*kind:\s*"multi",\s*ids\s*\}/);
+    expect(routeMarquee(["o1", "o2"])).toEqual({ kind: "multi", ids: ["o1", "o2"] });
+    expect(routeMarquee(["o1"])).toEqual({ kind: "object", id: "o1" });
+    expect(routeMarquee([])).toEqual({ kind: "canvas" });
   });
 
-  it("commits a parent/Multi drag through the single scene-core moveOps call (#10/#15)", () => {
-    // Tier-2: the cascade + multi-union + anchor-follow collapsed to one core call.
-    expect(source).toMatch(/\{\s*kind:\s*"multi",\s*ids:\s*selection\.ids\s*\}/);
-    expect(source).toMatch(/\{\s*kind:\s*"single",\s*id\s*\}/);
-    expect(source).toMatch(/sceneCore\.moveOps\(scene,\s*roots,\s*matrix\)/);
-    expect(source).toMatch(/allOps\.length\s*===\s*1\s*\?\s*allOps\[0\]\s*:\s*\{\s*kind:\s*"batch",\s*ops:\s*allOps\s*\}/);
+  describe("commitBodyDrag (parent/Multi drag through the single moveOps call, #10/#15)", () => {
+    let core: SceneCore;
+    beforeAll(async () => {
+      core = await loadSceneCore();
+    });
+
+    it("routes a single-object drag through { kind: 'single', id } and bare-ops the result", () => {
+      const scene = sceneOf([obj("a", undefined, 100, 100)]);
+      const { op, allOps } = commitBodyDrag(core, scene, { kind: "object", id: "a" }, "a", translateDelta(40, 25), "translate", false);
+      // One member dragged -> one set-transform op, returned bare (not wrapped in a batch).
+      expect(setTransformIds(allOps)).toEqual(["a"]);
+      expect(originOf(allOps, "a")).toEqual([140, 125]);
+      expect(op).toEqual(allOps[0]);
+    });
+
+    it("routes a Multi drag through { kind: 'multi', ids } so every member moves, wrapped in a batch", () => {
+      const scene = sceneOf([obj("a", undefined, 100, 100), obj("b", undefined, 300, 50), obj("c", undefined, 500, 500)]);
+      const selection: ObjectSelection = { kind: "multi", ids: ["a", "b"] };
+      const { op, allOps } = commitBodyDrag(core, scene, selection, "a", translateDelta(40, 25), "translate", false);
+      expect(setTransformIds(allOps)).toEqual(["a", "b"]);
+      expect(originOf(allOps, "b")).toEqual([340, 75]);
+      // Many ops -> wrapped in a single batch op.
+      expect(op).toEqual({ kind: "batch", ops: allOps });
+    });
+
+    it("anchors a plain drag on the picked id even when a different Multi is selected", () => {
+      // The picked id is NOT in the multi -> the drag falls back to the single root.
+      const scene = sceneOf([obj("frame", undefined, 0, 0), obj("c1", "frame", 10, 10), obj("loner", undefined, 200, 200)]);
+      const { allOps } = commitBodyDrag(core, scene, { kind: "multi", ids: ["loner"] }, "frame", translateDelta(5, 5), "translate", false);
+      expect(setTransformIds(allOps).sort()).toEqual(["c1", "frame"]);
+    });
   });
 });

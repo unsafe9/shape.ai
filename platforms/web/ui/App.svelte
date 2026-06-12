@@ -5,14 +5,11 @@
   import type { CameraState } from "../shared/geometry";
   import {
     emptyObjectScene,
-    translateTransform,
-    toggleObjectSelection,
     GEOMETRY_QUANTUM_PER_PX,
     type Object as SceneObject,
     type ObjectOp,
     type ObjectScene,
     type ObjectSelection,
-    type Paint,
     type FeatureResponse
   } from "../shared/object";
   import {
@@ -29,7 +26,6 @@
   import type { HoverAffordance } from "../bridge/wasmLoader";
   import {
     loadSceneCore,
-    type MoveRoots,
     type ObjectCommand,
     type ObjectGesture,
     type SceneCore,
@@ -44,12 +40,31 @@
     THEME_DEFAULT_COLOR,
     type DragSpan,
     type CreateSnap,
-    altDetachOps,
     resolveCreateRelease,
     synthesizeReleaseAnchors,
     CREATE_ANCHOR_REUSE_TOLERANCE_PX,
     MERGE_ENDPOINT_TOLERANCE_PX
   } from "../controller/objectPrimitives";
+  import {
+    routeSelectObject,
+    routeMarquee,
+    commitBodyDrag,
+    draggedRootTransform,
+    endpointSnapTarget,
+    endpointReleaseOp,
+    canonicalizeCreateSnap,
+    canonicalizeHoverSnap,
+    buildInsertPrimitive,
+    buildColorApplyOp,
+    buildGroupOps,
+    resolveDoubleClick,
+    ungroupPickEnabled as ungroupPickEnabledOf,
+    popOutPickEnabled as popOutPickEnabledOf,
+    resolveContextMenuItems,
+    previewPaint,
+    buildFeedScene as buildFeedSceneOf,
+    type ContextMenuEntry
+  } from "../controller/interactions";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../controller/toolbar";
   import {
     transformOrigin,
@@ -267,7 +282,9 @@
   // FC-11/W2-07: while a freehand stroke or shape drag-create is in progress, append
   // a transient preview object (a NEW object has no instance to update, so it bakes
   // once per geometry change — correct, not a P4 violation).
-  const feedScene = $derived(buildFeedScene(scene, drawPoints, createKind, createDrag, createHoverSnap));
+  const feedScene = $derived(
+    buildFeedSceneOf(scene, drawPoints, createKind, createDrag, createHoverSnap, nextOrderKey, selectedColor, penWidthPx)
+  );
 
   const hostCallbacks: ShapeCanvasHostCallbacks = {
     onCameraChange: (next) => (camera = next),
@@ -282,14 +299,7 @@
     // (so the pointer-down that begins a group-drag never collapses it to a single
     // object — the drag then moves every member together, see onTransformCommit).
     // A plain click on anything else replaces the selection with that object.
-    onSelectObject: (id, additive) =>
-      selectObject(
-        additive
-          ? toggleObjectSelection(selection, id)
-          : selection.kind === "multi" && selection.ids.includes(id)
-            ? selection
-            : { kind: "object", id }
-      ),
+    onSelectObject: (id, additive) => selectObject(routeSelectObject(selection, id, additive)),
     onTransformPreview: (id, _matrix, _kind) => {
       // W2-11: the matrix is already on the GPU instance buffer (pushed by the engine
       // per move). This handler only invalidates a stale pendingCommit so a new drag
@@ -302,34 +312,13 @@
       const src = scene.objects.find((o) => o.id === id);
       // W2-11: with no src the GPU preview must not linger — revert it to canonical.
       if (!src) return void host?.clearObjectPreview(id);
-      // Tier-2: the parent-drag cascade + multi-select union + anchor-follow now
-      // live in scene-core as ONE call. AP2 (#15): a parent drag cascades the
-      // world-space delta to its descendants (children transforms are world-absolute,
-      // D3), so a frame moves with its contents. AP2 (#10): a Multi drag anchors the
-      // gesture on the one picked `id` but the delta applies to EVERY member (and
-      // each member's subtree). AP5 (#14): every object anchored to a moved object
-      // reprojects its bound node through that object's NEW transform — cascade ops
-      // first, then the anchor-follow edit-geometry ops, as one batch.
-      const roots: MoveRoots =
-        selection.kind === "multi" && selection.ids.includes(id)
-          ? { kind: "multi", ids: selection.ids }
-          : { kind: "single", id };
       // Null-guard (mirrors Tier-1's degrade): with no scene-core the cascade cannot
       // be authored — drop the GPU preview rather than commit shell-side matrix math.
       if (!sceneCore) return void host?.clearObjectPreview(id);
-      // v3 §3 (DU4) Alt-detach: an Alt-held BODY translate of an anchored
-      // open-class object moves it whole and detaches its anchors — one set-anchor
-      // clear plus the move computed against the detached scene (so the endpoint
-      // routing sees no pins and keeps the SetTransform translate). The class
-      // judgment is the core's (isOpenClassD); single-root body drags only.
-      const detachable =
-        detach &&
-        kind === "translate" &&
-        roots.kind === "single" &&
-        (src.anchors?.length ?? 0) > 0 &&
-        sceneCore.isOpenClassD(src.geometry.d);
-      const allOps = detachable ? altDetachOps(sceneCore, scene, id, matrix) : sceneCore.moveOps(scene, roots, matrix);
-      const op: ObjectOp = allOps.length === 1 ? allOps[0] : { kind: "batch", ops: allOps };
+      // Tier-2: the parent-drag cascade + multi-select union + anchor-follow + the
+      // v3 §3 Alt-detach branch collapse into commitBodyDrag, which yields the single
+      // commit op plus the full op list (for the snap-back guard below).
+      const { op, allOps } = commitBodyDrag(sceneCore, scene, selection, id, matrix, kind, detach);
       // FC-16: pre-connect authorOp applies synchronously (the committed scene is on
       // return, so the rebake $effect drops the preview matrix immediately). In the
       // connected path the scene update is async — the GPU instance matrix holds the
@@ -339,8 +328,7 @@
       // The GPU previewed only the dragged `id`; pendingCommit (snap-back guard) is
       // keyed on it, so read ITS composed transform from the cascade — not allOps[0],
       // which under a multi cascade may be another member (and may be a follow op).
-      const draggedOp = allOps.find((o) => o.kind === "set-transform" && o.id === id);
-      const rootTransform = draggedOp?.kind === "set-transform" ? draggedOp.transform : src.transform;
+      const rootTransform = draggedRootTransform(allOps, id, src.transform);
       if (wasConnected && rootTransform) pendingCommit = { id, transform: rootTransform };
       authorOp(op, true, (ok) => {
         if (!ok) {
@@ -355,8 +343,7 @@
     // drag-create (createHoverSnap -> feedScene), honoring a snap only onto a
     // real, OTHER canonical object (mirrors handleCreate #6).
     onEndpointPreview: (id, _nodeIndex, world, snapped, targetId) => {
-      const target =
-        snapped && targetId !== null && targetId !== id && scene.objects.some((o) => o.id === targetId) ? targetId : null;
+      const target = endpointSnapTarget(scene, id, snapped, targetId);
       const next = target !== null ? { at: world, target } : null;
       // Skip the null -> null write so an unsnapped drag never re-feeds the scene.
       if (next !== null || createHoverSnap !== null) createHoverSnap = next;
@@ -369,20 +356,17 @@
     onEndpointCommit: (id, nodeIndex, world, snapped, targetId) => {
       createHoverSnap = null;
       if (!sceneCore) return void host?.clearObjectEndpointPreview(id);
-      const target =
-        snapped && targetId !== null && targetId !== id && scene.objects.some((o) => o.id === targetId) ? targetId : null;
-      const ops = sceneCore.endpointReleaseOps(scene, id, nodeIndex, world, target ? { targetId: target, at: world } : null);
-      if (ops.length === 0) return void host?.clearObjectEndpointPreview(id);
-      authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops }, true, (ok) => {
+      const target = endpointSnapTarget(scene, id, snapped, targetId);
+      const op = endpointReleaseOp(sceneCore, scene, id, nodeIndex, world, target);
+      if (!op) return void host?.clearObjectEndpointPreview(id);
+      authorOp(op, true, (ok) => {
         if (!ok) host?.clearObjectEndpointPreview(id);
       });
     },
     onMarquee: (ids) => {
       // FC-16: route the marquee result through the same validation as
       // onSelectObject (validSelection drops stale ids and collapses the kind).
-      const next: ObjectSelection =
-        ids.length >= 2 ? { kind: "multi", ids } : ids.length === 1 ? { kind: "object", id: ids[0] } : { kind: "canvas" };
-      selectObject(next);
+      selectObject(routeMarquee(ids));
     },
     // RA2b/AP3: a double-click on a container drills in (sets activeContainer); a
     // leaf enters inline text edit through the existing path.
@@ -744,7 +728,7 @@
     }
     if (!sceneCore) return;
     const center = anchor ?? viewportCenterWorld();
-    const object = sceneCore.buildPrimitive(kind, center, freshId(kind), nextOrderKey(), selectedColor);
+    const object = buildInsertPrimitive(sceneCore, kind, center, freshId(kind), nextOrderKey(), selectedColor);
     authorOp({ kind: "insert-object", object });
     selection = { kind: "object", id: object.id };
     persistSelection(selection);
@@ -787,8 +771,7 @@
     // Honor a snap ONLY when its target is a real canonical object (the preview /
     // snap-indicator ids never are), so the ring + AP5 anchor fire on a real edge
     // and never on the preview itself.
-    const targetId = targetIdIn !== null && scene.objects.some((o) => o.id === targetIdIn) ? targetIdIn : null;
-    const snapped = snappedIn && targetId !== null;
+    const { snapped, target: targetId } = canonicalizeCreateSnap(scene, snappedIn, targetIdIn);
     if (phase === "start") {
       // W3-G9 (#3): a drag takes over the ring (its own snap-indicator rides the
       // preview), so drop the pre-drag hover snap to avoid a doubled ring — but FIRST
@@ -877,8 +860,7 @@
   // anchors its start, so the pen shows the ring before pen-down too.
   function handleCreateHover(world: { x: number; y: number }, snappedIn: boolean, targetIdIn: string | null): void {
     if (!createKind && activeTool !== "draw") return void (createHoverSnap = null);
-    const target = targetIdIn !== null && scene.objects.some((o) => o.id === targetIdIn) ? targetIdIn : null;
-    createHoverSnap = snappedIn && target !== null ? { at: world, target } : null;
+    createHoverSnap = canonicalizeHoverSnap(scene, snappedIn, targetIdIn, world);
   }
 
   // FC-11/v3 §4: drive the freehand pen. Accumulate world points across start/move;
@@ -1056,24 +1038,9 @@
     if (ids.length < 1) return;
     const objects = ids.map((id) => scene.objects.find((o) => o.id === id)).filter((o): o is SceneObject => Boolean(o));
     const bounds = unionWorldAabb(objects);
-    const frame: SceneObject = {
-      id: freshId("frame"),
-      order: nextOrderKey(),
-      transform: bounds ? translateTransform(bounds.minX, bounds.minY) : translateTransform(0, 0),
-      geometry: {
-        d: rectPathQuantized(bounds ? bounds.maxX - bounds.minX : 1, bounds ? bounds.maxY - bounds.minY : 1),
-        fillRule: "nonZero"
-      },
-      clip: false
-    };
-    const ops: ObjectOp[] = [{ kind: "insert-object", object: frame }];
-    let order = "a0";
-    for (const id of ids) {
-      ops.push({ kind: "reparent", id, parent: frame.id, order });
-      order = `${order}~`;
-    }
+    const { ops, frameId } = buildGroupOps(ids, objects, bounds, freshId("frame"), nextOrderKey(), rectPathQuantized);
     authorOp({ kind: "batch", ops });
-    selection = { kind: "object", id: frame.id };
+    selection = { kind: "object", id: frameId };
     persistSelection(selection);
     showToast("Grouped selection");
   }
@@ -1178,10 +1145,9 @@
   // pick recolors it live through the existing op-apply path (D21 undo).
   function applySelectedColor(color: string): void {
     selectedColor = color;
-    if (selection.kind !== "object" || !sceneCore) return;
-    const object = scene.objects.find((o) => o.id === selection.id);
-    if (!object) return;
-    authorOp(sceneCore.buildSetStyleOp(object, color));
+    if (!sceneCore) return;
+    const op = buildColorApplyOp(sceneCore, scene, selection, color);
+    if (op) authorOp(op);
   }
 
   // ----- AP3 (#9): double-click drill-in -----
@@ -1193,14 +1159,14 @@
   // object) is a no-op; the container-vs-leaf decision lives in the core.
   function handleObjectDoubleClick(signal: { id: string; hasChildren: boolean } | null): void {
     if (!signal || !sceneCore) return;
-    const action = sceneCore.doubleClickAction(scene, signal.id);
-    if (action.kind === "drill-in-container") {
-      activeContainer = signal.id;
-      selectObject({ kind: "object", id: signal.id });
+    const action = resolveDoubleClick(sceneCore, scene, signal);
+    if (action.kind === "drill-in") {
+      activeContainer = action.id;
+      selectObject({ kind: "object", id: action.id });
       showToast("Entered group");
       return;
     }
-    enterTextEdit(signal.id);
+    if (action.kind === "edit-leaf") enterTextEdit(action.id);
   }
 
   // ----- W2-10: inline text editing -----
@@ -1465,81 +1431,47 @@
     return () => window.removeEventListener("pointerdown", dismiss);
   });
 
-  // FC-13: the right-click menu is derived from the object command catalog. The
-  // catalog (the wasm core's `objectCommandCatalog()`) supplies the label/order;
-  // each id routes to the SAME shell handler the shortcut layer uses. The
-  // object/canvas split picks which command ids appear, and a `null` entry renders
-  // a separator. Icons + the delete danger flag are decorated here.
-  // AP3: `enabled` is an optional predicate gating an entry on the picked target's
-  // shape in the forest (children/parent), beyond the coarse `disabledFor` kind
-  // check — e.g. ungroup needs a container, pop-out needs a child.
-  type ContextMenuEntry =
-    | "separator"
-    | {
-        id: string;
-        label?: string;
-        icon?: typeof Copy;
-        danger?: boolean;
-        disabledFor?: ObjectSelection["kind"];
-        enabled?: (picked: ObjectSelection) => boolean;
-      };
+  // FC-13: the right-click menu layout (OBJECT_MENU / CANVAS_MENU) + the resolver
+  // live in controller/interactions; here we only decorate the icon tag with the
+  // shell's lucide component and gate `enabled` on the core children/parent queries.
+  const MENU_ICONS: Record<string, typeof Copy> = {
+    copy: Copy,
+    group: GroupIcon,
+    ungroup: Ungroup,
+    comment: MessageSquarePlus,
+    template: LayoutTemplate,
+    trash: Trash2
+  };
 
-  // AP3 (#13): ungroup is enabled only for a single container object (has children).
-  function ungroupPickEnabled(picked: ObjectSelection): boolean {
-    return picked.kind === "object" && !!sceneCore && sceneCore.ungroupEnabled(scene, picked.id);
+  // AP3: an entry's `enabled` predicate, bound to the live scene + core. ungroup
+  // needs a container (has children), pop-out needs a parent; both stay disabled
+  // until the core loads (the queries are core-only). Every other entry is enabled
+  // by default. Returns true = the entry is interactive.
+  function contextEntryEnabled(entry: Extract<ContextMenuEntry<string>, { id: string }>, picked: ObjectSelection): boolean {
+    if (entry.id === "ungroup") return !!sceneCore && ungroupPickEnabledOf(sceneCore, scene, picked);
+    if (entry.id === "pop-out") return !!sceneCore && popOutPickEnabledOf(sceneCore, scene, picked);
+    return true;
   }
-
-  // AP3 (#18): pop-out is enabled only when the single picked object has a parent.
-  function popOutPickEnabled(picked: ObjectSelection): boolean {
-    return picked.kind === "object" && !!sceneCore && sceneCore.popOutOp(scene, picked.id) !== null;
-  }
-
-  const OBJECT_MENU: ContextMenuEntry[] = [
-    { id: "duplicate", icon: Copy },
-    { id: "group", icon: GroupIcon, disabledFor: "object" },
-    // AP3 (#13): ungroup is meaningful only for a single container object (one with
-    // children) — disabled for a multi-select and for a childless leaf.
-    { id: "ungroup", icon: Ungroup, enabled: ungroupPickEnabled },
-    // AP3 (#18): pop a child out one level — only when the picked object has a parent.
-    // Shell-only command (no catalog entry), so it carries its own label.
-    { id: "pop-out", label: "Pop out one level", enabled: popOutPickEnabled },
-    { id: "bring-to-front" },
-    { id: "send-to-back" },
-    { id: "add-comment", icon: MessageSquarePlus },
-    "separator",
-    { id: "delete", icon: Trash2, danger: true }
-  ];
-
-  // AP3 (#18, D7): the empty-canvas menu — quick inserts, the template library, and
-  // select-all. The insert-text entry is gone (D7); text arrives via the toolbar.
-  const CANVAS_MENU: ContextMenuEntry[] = [
-    { id: "insert-rectangle" },
-    { id: "insert-ellipse" },
-    { id: "open-template-library", icon: LayoutTemplate },
-    "separator",
-    { id: "select-all" }
-  ];
 
   function contextMenuItems(menu: ContextMenuState): (ContextMenuItem | null)[] {
-    const picked = menu.selection;
-    const layout = picked.kind === "object" || picked.kind === "multi" ? OBJECT_MENU : CANVAS_MENU;
     const handlers = contextHandlers(menu);
-    return layout.map((entry) => {
-      if (entry === "separator") return null;
-      const command = commandCatalog.find((c) => c.id === entry.id);
-      const run = handlers[entry.id];
-      if (!run) return null;
-      // AP3: an entry is disabled when its target kind matches `disabledFor`, OR when
-      // its `enabled` predicate (children/parent shape) rejects the picked target.
-      const disabled = entry.disabledFor === picked.kind || (entry.enabled !== undefined && !entry.enabled(picked));
-      return {
-        label: entry.label ?? command?.label ?? entry.id,
-        icon: entry.icon,
-        danger: entry.danger,
-        disabled,
-        onSelect: () => closeContextThen(run)
-      };
-    });
+    const resolved = resolveContextMenuItems<string>(
+      menu.selection,
+      commandCatalog,
+      (id) => handlers[id] !== undefined,
+      contextEntryEnabled
+    );
+    return resolved.map((item) =>
+      item === null
+        ? null
+        : {
+            label: item.label,
+            icon: item.icon ? MENU_ICONS[item.icon] : undefined,
+            danger: item.danger,
+            disabled: item.disabled,
+            onSelect: () => closeContextThen(handlers[item.id])
+          }
+    );
   }
 
   // Map a context-menu command id to the existing shell handler. Canvas inserts
@@ -1608,147 +1540,6 @@
     const topLeft = screenToWorld({ x: 0, y: 0 }, camera);
     const bottomRight = screenToWorld({ x: rect.width, y: rect.height }, camera);
     sceneClient.sendCursor(cursor, { x: topLeft.x, y: topLeft.y, width: bottomRight.x - topLeft.x, height: bottomRight.y - topLeft.y });
-  }
-
-  // FC-11/W2-07: the renderer feed. Start from the canonical scene and append a
-  // transient pen-stroke / shape-drag-create preview — neither mutates the canonical
-  // `scene` nor runs op-apply (geometry-vocabulary construction only). W2-11: an
-  // existing object's live transform is NOT previewed here anymore (it rides the GPU
-  // instance matrix); only NEW-object previews, which inherently need one bake.
-  function buildFeedScene(
-    source: ObjectScene,
-    pen: { x: number; y: number }[] | null,
-    create: DragCreateShape | null,
-    createState: { span: DragSpan; snapped: boolean } | null,
-    hoverSnap: { at: { x: number; y: number }; target: string | null } | null
-  ): ObjectScene {
-    let feed = source;
-    const preview = pen && pen.length >= 1 ? drawPreviewObject(pen) : null;
-    if (preview) feed = { ...feed, objects: [...feed.objects, preview] };
-    // W2-07: a transient rubber-band preview of the shape being drag-created, plus
-    // a snap indicator marker when the dragged corner is snapped to an outline.
-    if (create && createState) {
-      const extra = createPreviewObjects(create, createState.span, createState.snapped);
-      if (extra.length > 0) feed = { ...feed, objects: [...feed.objects, ...extra] };
-    } else if (hoverSnap) {
-      // W3-G9 (#3): no drag in progress — render the PERSISTENT pre-drag anchor ring
-      // at the hovered edge so the user sees where the next create would anchor.
-      feed = { ...feed, objects: [...feed.objects, snapIndicatorObject(hoverSnap.at)] };
-    }
-    return feed;
-  }
-
-  // W2-07: transient preview objects for the in-progress shape drag-create — the
-  // rubber-band primitive and, when the dragged corner is snapped to an outline
-  // anchor, a small circle marker at that corner. The committed object replaces
-  // them on pointer-up.
-  //
-  // PERF (Tier-3 #4): this runs EVERY pointer-move frame (via buildFeedScene), so
-  // the rubber-band is a CHEAP shell-side path — a throwaway visual affordance, a
-  // legitimate platform preview — NOT a per-frame wasm core call. The COMMITTED
-  // object always comes from the core (sceneCore.buildPrimitiveFromDrag on
-  // pointer-up); this preview only mirrors its geometry so the two look identical.
-  function createPreviewObjects(kind: DragCreateShape, span: DragSpan, snapped: boolean): SceneObject[] {
-    const objects: SceneObject[] = [createPreviewObject(kind, span)];
-    if (snapped) objects.push(snapIndicatorObject(span.end));
-    return objects;
-  }
-
-  // W2-07/Tier-3: the transient rubber-band for one drag-create frame. Mirrors the
-  // core `build_primitive_from_drag` geometry (line corner-to-corner; closed kinds
-  // to the normalized bbox) on a pure-translation transform, cheaply in TS so the
-  // per-frame preview never crosses the FFI boundary. Color/snap-anchor are core
-  // concerns of the committed object, not this throwaway visual.
-  function createPreviewObject(kind: DragCreateShape, span: DragSpan): SceneObject {
-    const q = (px: number) => Math.round(px * GEOMETRY_QUANTUM_PER_PX);
-    let d: string;
-    let tx: number;
-    let ty: number;
-    if (kind === "line") {
-      d = `M 0 0 L ${q(span.end.x - span.start.x)} ${q(span.end.y - span.start.y)}`;
-      tx = span.start.x;
-      ty = span.start.y;
-    } else {
-      const w = Math.abs(span.end.x - span.start.x);
-      const h = Math.abs(span.end.y - span.start.y);
-      d = kind === "ellipse" ? previewEllipsePath(w, h) : `M 0 0 L ${q(w)} 0 L ${q(w)} ${q(h)} L 0 ${q(h)} Z`;
-      tx = Math.min(span.start.x, span.end.x);
-      ty = Math.min(span.start.y, span.end.y);
-    }
-    return {
-      id: "create-preview",
-      order: nextOrderKey(),
-      transform: translateTransform(tx, ty),
-      geometry: { d, fillRule: "nonZero" },
-      stroke: { paint: previewPaint(selectedColor), width: 2 * GEOMETRY_QUANTUM_PER_PX }
-    };
-  }
-
-  // The four-cubic ellipse rubber-band path (kappa 0.5523), object-local quantized.
-  // A shell-side preview affordance; the committed ellipse is built by the core.
-  function previewEllipsePath(w: number, h: number): string {
-    const q = (px: number) => Math.round(px * GEOMETRY_QUANTUM_PER_PX);
-    const cx = q(w / 2);
-    const cy = q(h / 2);
-    const kx = Math.round(q(w / 2) * 0.5523);
-    const ky = Math.round(q(h / 2) * 0.5523);
-    return [
-      `M 0 ${cy}`,
-      `C 0 ${cy - ky} ${cx - kx} 0 ${cx} 0`,
-      `C ${cx + kx} 0 ${q(w)} ${cy - ky} ${q(w)} ${cy}`,
-      `C ${q(w)} ${cy + ky} ${cx + kx} ${q(h)} ${cx} ${q(h)}`,
-      `C ${cx - kx} ${q(h)} 0 ${cy + ky} 0 ${cy}`,
-      "Z"
-    ].join(" ");
-  }
-
-  // Tier-3: the renderer Paint for a transient shell preview's selected color — the
-  // theme-default sentinel renders as the "text" token, every other color as solid.
-  // The CANONICAL sentinel→Paint rule lives in the core (build_primitive /
-  // build_set_style_op); this is the per-frame-preview mirror, kept off the FFI
-  // hot path. Pure presentation, not primitive logic.
-  function previewPaint(color: string): Paint {
-    return color === THEME_DEFAULT_COLOR ? { kind: "token", name: "text" } : { kind: "solid", color };
-  }
-
-  // W2-07: a small ring drawn at the snapped corner so the user sees the snap.
-  // Geometry is a world-px ellipse (identity transform, so local==world); built in
-  // TS like the pen preview (NOT op-apply).
-  function snapIndicatorObject(at: { x: number; y: number }): SceneObject {
-    const q = (px: number) => Math.round(px * GEOMETRY_QUANTUM_PER_PX);
-    const r = 5;
-    const k = r * 0.5523;
-    const cx = at.x;
-    const cy = at.y;
-    const d = [
-      `M ${q(cx - r)} ${q(cy)}`,
-      `C ${q(cx - r)} ${q(cy - k)} ${q(cx - k)} ${q(cy - r)} ${q(cx)} ${q(cy - r)}`,
-      `C ${q(cx + k)} ${q(cy - r)} ${q(cx + r)} ${q(cy - k)} ${q(cx + r)} ${q(cy)}`,
-      `C ${q(cx + r)} ${q(cy + k)} ${q(cx + k)} ${q(cy + r)} ${q(cx)} ${q(cy + r)}`,
-      `C ${q(cx - k)} ${q(cy + r)} ${q(cx - r)} ${q(cy + k)} ${q(cx - r)} ${q(cy)}`,
-      "Z"
-    ].join(" ");
-    return {
-      id: "create-snap-indicator",
-      order: nextOrderKey(),
-      geometry: { d, fillRule: "nonZero" },
-      stroke: { paint: { kind: "solid", color: "#ff3b6b" }, width: 2 * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
-    };
-  }
-
-  // FC-11: a transient preview object for the in-progress pen stroke. Geometry is
-  // a world-px polyline (identity transform, so local==world) with the pen brush;
-  // built directly in TS like objectPrimitives.ts (NOT op-apply). The committed
-  // object replaces it on pointer-up.
-  function drawPreviewObject(points: { x: number; y: number }[]): SceneObject {
-    const q = (px: number) => Math.round(px * GEOMETRY_QUANTUM_PER_PX);
-    const d = points.map((p, i) => `${i === 0 ? "M" : "L"} ${q(p.x)} ${q(p.y)}`).join(" ");
-    return {
-      id: "draw-preview",
-      order: nextOrderKey(),
-      geometry: { d },
-      stroke: { paint: previewPaint(selectedColor), width: penWidthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
-    };
   }
 
   // ----- session / identity (composition-root binding) --------------------

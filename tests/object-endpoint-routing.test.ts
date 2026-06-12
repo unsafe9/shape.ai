@@ -16,12 +16,11 @@
 // Falsifiable: dropping the delta read, the exclude list, the Alt snap bypass,
 // or the commit emission each fails a dedicated assertion below.
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { ShapeCanvasEngine, type EngineEvent } from "../platforms/web/renderer/engine";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
+import { endpointReleaseOp, endpointSnapTarget } from "../platforms/web/controller/interactions";
 import {
   emptyObjectScene,
   translateTransform,
@@ -278,16 +277,35 @@ describe("endpointReleaseOps commit contract (the App onEndpointCommit call)", (
   });
 });
 
-describe("App.svelte endpoint wiring (source pins)", () => {
-  const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
-
-  it("authors the release through the core endpointReleaseOps in onEndpointCommit", () => {
-    expect(source).toMatch(/onEndpointCommit:/);
-    expect(source).toMatch(/sceneCore\.endpointReleaseOps\(scene, id, nodeIndex, world,/);
+// The onEndpointCommit / onEndpointPreview wiring, exercised through the extracted
+// controller functions the shell now composes (no .svelte source pin).
+describe("controller endpoint wiring", () => {
+  it("onEndpointCommit authors the release through the core endpointReleaseOps, snap canonicalized", () => {
+    // A snapped release onto rect-1 -> the chord-deform edit-geometry + the rebind,
+    // collapsed to ONE batch op (the shape App.svelte authors).
+    const target = endpointSnapTarget(releaseScene(), LINE_ID, true, TARGET_ID);
+    expect(target).toBe(TARGET_ID);
+    const op = endpointReleaseOp(core, releaseScene(), LINE_ID, 1, { x: 200, y: 200 }, target);
+    expect(op).not.toBeNull();
+    expect(op!.kind).toBe("batch");
+    if (op!.kind !== "batch") throw new Error("expected batch");
+    expect(op!.ops.map((o) => o.kind)).toEqual(["edit-geometry", "set-anchor"]);
   });
 
-  it("drives the snap ring from the endpoint preview via the createHoverSnap mechanism", () => {
-    expect(source).toMatch(/onEndpointPreview:/);
-    expect(source).toMatch(/onEndpointPreview:[\s\S]{0,800}?createHoverSnap = next/);
+  it("onEndpointCommit returns null (no op) on a no-op release so the shell reverts the deform", () => {
+    // A closed-class id has no endpoint surface -> endpointReleaseOps returns [].
+    expect(endpointReleaseOp(core, releaseScene(), TARGET_ID, 0, { x: 0, y: 0 }, null)).toBeNull();
+  });
+
+  it("the preview snap probe honors a real OTHER object and rejects a self-snap (drives the ring)", () => {
+    const scene = releaseScene();
+    // A snap onto a real, OTHER object surfaces as the hover-ring target.
+    expect(endpointSnapTarget(scene, LINE_ID, true, TARGET_ID)).toBe(TARGET_ID);
+    // A self-snap onto the dragged line is rejected (no phantom ring).
+    expect(endpointSnapTarget(scene, LINE_ID, true, LINE_ID)).toBeNull();
+    // An unsnapped move never targets.
+    expect(endpointSnapTarget(scene, LINE_ID, false, TARGET_ID)).toBeNull();
+    // A snap onto a non-existent id is rejected.
+    expect(endpointSnapTarget(scene, LINE_ID, true, "ghost")).toBeNull();
   });
 });

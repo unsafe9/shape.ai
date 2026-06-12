@@ -5,12 +5,11 @@
 // `buildPrimitiveFromDrag` / `buildSetStyleOp`), plus assert the App.svelte wiring
 // threads the color through the insert path and routes onSelectColor.
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import { THEME_DEFAULT_COLOR, type DragSpan } from "../platforms/web/controller/objectPrimitives";
+import { buildColorApplyOp, buildInsertPrimitive } from "../platforms/web/controller/interactions";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
-import type { Object as SceneObject } from "../platforms/web/shared/object";
+import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../platforms/web/shared/object";
 
 const COLOR = "#abcdef";
 
@@ -175,22 +174,34 @@ describe("theme-default token (S2 / #5 — resolves through the core)", () => {
   });
 });
 
-describe("App.svelte color wiring (AP1)", () => {
-  // No DOM in the node test env: assert the wiring against the .svelte source.
-  // Falsifiable — dropping the selectedColor arg from the insert path, the
-  // onSelectColor route, or the set-style authoring all fail these.
-  const source = readFileSync(fileURLToPath(new URL("../platforms/web/ui/App.svelte", import.meta.url)), "utf8");
+// The insertPrimitive / applySelectedColor wiring, exercised through the extracted
+// controller functions the shell now composes (no .svelte source pin).
+describe("controller color wiring (AP1)", () => {
+  function sceneWith(object: SceneObject): ObjectScene {
+    return { ...emptyObjectScene(), objects: [object] };
+  }
 
   it("threads selectedColor into the immediate-insert core builder", () => {
-    expect(source).toMatch(/sceneCore\.buildPrimitive\(kind, center, freshId\(kind\), nextOrderKey\(\), selectedColor\)/);
-  });
-
-  it("routes the toolbar onSelectColor to applySelectedColor", () => {
-    expect(source).toMatch(/onSelectColor=\{applySelectedColor\}/);
+    // buildInsertPrimitive paints the new object in the selected color (vs the
+    // kind default when no color is passed).
+    const object = buildInsertPrimitive(core, "rectangle", { x: 0, y: 0 }, "rect-1", "a0", COLOR);
+    expect(object.fill?.paint).toEqual({ kind: "solid", color: COLOR });
+    expect(object.stroke?.paint).toEqual({ kind: "solid", color: COLOR });
   });
 
   it("authors a set-style op (core.buildSetStyleOp) when a single object is selected", () => {
-    expect(source).toMatch(/authorOp\(sceneCore\.buildSetStyleOp\(object, color\)\)/);
-    expect(source).toMatch(/selection\.kind !== "object"/);
+    const object = { id: "o1", order: "a0", geometry: { d: "M 0 0 L 8 0" }, stroke: { paint: { kind: "solid", color: "#111111" }, width: 16 } } as SceneObject;
+    const op = buildColorApplyOp(core, sceneWith(object), { kind: "object", id: "o1" }, COLOR);
+    expect(op).not.toBeNull();
+    expect(op!.kind).toBe("set-style");
+    if (op!.kind !== "set-style") throw new Error("expected set-style");
+    expect(op!.id).toBe("o1");
+  });
+
+  it("authors NO recolor op when the selection is not a single object (color still adopted shell-side)", () => {
+    const object = { id: "o1", order: "a0", geometry: { d: "M 0 0 L 8 0" } } as SceneObject;
+    const scene = sceneWith(object);
+    expect(buildColorApplyOp(core, scene, { kind: "canvas" }, COLOR)).toBeNull();
+    expect(buildColorApplyOp(core, scene, { kind: "multi", ids: ["o1"] }, COLOR)).toBeNull();
   });
 });

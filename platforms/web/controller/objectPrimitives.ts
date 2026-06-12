@@ -9,7 +9,6 @@
 
 import type { CameraState } from "../shared/geometry";
 import {
-  GEOMETRY_QUANTUM_PER_PX,
   type Anchor,
   type Object as SceneObject,
   type ObjectOp,
@@ -17,8 +16,7 @@ import {
   type Transform3x3
 } from "../shared/object";
 import { worldToScreen, type WorldRect } from "../renderer/scene";
-
-const Q = GEOMETRY_QUANTUM_PER_PX;
+import { pathLocalBbox } from "./transforms";
 
 // S2 (#5): the sentinel a user color carries when "Theme default" is picked. It is
 // NOT a CSS hex — the core's `paint_for_color` maps it to a `Paint::Token { name:
@@ -163,25 +161,4 @@ export function textOverlayScreenRect(object: SceneObject, camera: CameraState):
   const topLeft = worldToScreen({ x: minX, y: minY }, camera);
   const bottomRight = worldToScreen({ x: maxX, y: maxY }, camera);
   return { x: topLeft.x, y: topLeft.y, width: bottomRight.x - topLeft.x, height: bottomRight.y - topLeft.y };
-}
-
-// The object-local bbox (logical px) of a path-string's coordinate pairs. Coords are
-// quantized integers (GEOMETRY_QUANTUM_PER_PX per px); reading every numeric pair
-// covers M/L/C control points — a conservative enclosing box for the overlay.
-function pathLocalBbox(d: string): { minX: number; minY: number; maxX: number; maxY: number } | null {
-  const nums = d?.match(/-?\d+(?:\.\d+)?/g);
-  if (!nums || nums.length < 2) return null;
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (let i = 0; i + 1 < nums.length; i += 2) {
-    const x = Number(nums[i]) / Q;
-    const y = Number(nums[i + 1]) / Q;
-    minX = Math.min(minX, x);
-    minY = Math.min(minY, y);
-    maxX = Math.max(maxX, x);
-    maxY = Math.max(maxY, y);
-  }
-  return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
 }
