@@ -203,7 +203,7 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     const note = core.buildPrimitive("text", { x: 700, y: 100 }, "note-1", "a3");
     expect(note.text).toBeUndefined(); // borderless, style-less, no default text
     shell.author({ kind: "insert-object", object: note });
-    shell.author({ kind: "set-text", id: "note-1", text: { runs: [{ text: "Live" }] } });
+    shell.author({ kind: "set-text", id: "note-1", text: { runs: [{ text: "Live", bold: false, italic: false }], align: "start", valign: "top" } });
     expect(shell.byId("note-1")?.text?.runs[0]?.text).toBe("Live");
     const feed = objectSceneToRenderObjectScene(shell.scene, { x: 0, y: 0, zoom: 1 }, shell.selection, "ig1");
     const feedNote = (feed.objects as Array<Record<string, unknown>>).find((o) => o.id === "note-1")!;
@@ -254,7 +254,7 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     // node so it tracks the target's +200/+60 delta. The world position of the
     // edge's node 1 (the anchored endpoint) before vs after the follow.
     const worldNode1 = (obj: SceneObject): { x: number; y: number } => {
-      const nums = obj.geometry.d.match(/-?\d+(?:\.\d+)?/g)!;
+      const nums = (obj.geometry.d ?? "").match(/-?\d+(?:\.\d+)?/g)!;
       const lx = Number(nums[2]) / GEOMETRY_QUANTUM_PER_PX;
       const ly = Number(nums[3]) / GEOMETRY_QUANTUM_PER_PX;
       const t = obj.transform;
@@ -284,7 +284,7 @@ describe("W3-IG1 wave-3 live paths compose through one shared scene", () => {
     // First touch of the sweep: cut at the interior peak (80,0 local) → two subpaths.
     const cut1 = core.splitSubpathAt(shell.byId("draw-1")!.geometry, 80 * GEOMETRY_QUANTUM_PER_PX, 0, radius);
     expect(cut1).not.toBeNull();
-    expect((cut1!.d.match(/M/g) ?? []).length).toBe(2);
+    expect(((cut1!.d ?? "").match(/M/g) ?? []).length).toBe(2);
     let edit = core.applyObjectOp(shell.scene, { kind: "edit-geometry", id: "draw-1", geometry: cut1! });
     undo.record({ kind: "edit-geometry", id: "draw-1", geometry: cut1! }, edit.inverse!);
     shell.scene = edit.scene;

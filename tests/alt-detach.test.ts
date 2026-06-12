@@ -176,13 +176,13 @@ function anchoredScene(): ObjectScene {
     objects: [
       obj({
         id: TARGET_ID,
-        geometry: { d: "M 0 0 L 800 0 L 800 800 L 0 800 Z" },
+        geometry: { d: "M 0 0 L 800 0 L 800 800 L 0 800 Z", fillRule: "nonZero" },
         transform: translateTransform(100, 100)
       }),
       obj({
         id: LINE_ID,
         order: "a1",
-        geometry: { d: "M 0 0 L 1600 0" },
+        geometry: { d: "M 0 0 L 1600 0", fillRule: "nonZero" },
         transform: translateTransform(150, 150),
         anchors: [{ nodeIndex: 0, target: TARGET_ID, at: { x: 400, y: 400 } }]
       })

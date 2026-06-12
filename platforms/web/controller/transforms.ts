@@ -75,7 +75,7 @@ export function unionWorldAabb(
   let maxX = -Infinity;
   let maxY = -Infinity;
   for (const object of objects) {
-    const local = pathLocalBbox(object.geometry.d);
+    const local = pathLocalBbox(object.geometry.d ?? "");
     if (!local) continue;
     const t = object.transform;
     for (const [lx, ly] of [

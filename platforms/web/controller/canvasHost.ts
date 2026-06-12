@@ -153,9 +153,9 @@ export function objectSceneToRenderObjectScene(
       parent: object.parent ?? null,
       order: object.order,
       transform: object.transform ?? IDENTITY_3X3,
-      geometryD: object.geometry.d,
+      geometryD: object.geometry.d ?? "",
       fill: object.fill ?? null,
-      stroke: projectStroke(object.stroke),
+      stroke: projectStroke(object.stroke ?? undefined),
       text: object.text ?? null,
       // W3-G9/#5: the D5 anchors must reach the core so `Bindings::build` inverts
       // them into Reproject edges and a moved target reprojects its followers LIVE

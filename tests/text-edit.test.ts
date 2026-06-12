@@ -7,7 +7,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { textOverlayScreenRect, type DragSpan } from "../platforms/web/controller/objectPrimitives";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
-import { GEOMETRY_QUANTUM_PER_PX } from "../platforms/web/shared/object";
+import { GEOMETRY_QUANTUM_PER_PX, IDENTITY_TRANSFORM } from "../platforms/web/shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 
@@ -59,6 +59,6 @@ describe("textOverlayScreenRect (W2-10 overlay placement)", () => {
   });
 
   it("returns null for an empty path", () => {
-    expect(textOverlayScreenRect({ id: "x", order: "a0", geometry: { d: "" } }, { x: 0, y: 0, zoom: 1 })).toBeNull();
+    expect(textOverlayScreenRect({ id: "x", order: "a0", transform: IDENTITY_TRANSFORM, geometry: { d: "", fillRule: "nonZero" } }, { x: 0, y: 0, zoom: 1 })).toBeNull();
   });
 });

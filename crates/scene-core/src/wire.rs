@@ -40,9 +40,13 @@ pub struct Region {
 /// `(clientId, localSeq)` idempotency key assigned at the transport boundary.
 /// The server dedups by this pair so a replayed outbox entry is a no-op.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct OpId {
     pub client_id: String,
+    // i64 on the wire is a JSON number (JS `number`), not ts-rs's default `bigint`.
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub local_seq: i64,
 }
 
@@ -51,12 +55,21 @@ pub struct OpId {
 /// `prop_delta` stays an opaque JSON value so the wire schema does not couple to
 /// the full op union (the canvas actor decodes it server-side).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct WireOp {
     pub op_id: OpId,
     pub object_id: String,
     pub kind: String,
+    // On the wire `prop_delta` is an opaque JSON `Value`, but every delta the
+    // client authors/reads IS an `ObjectOp`; type it as such (matches the retired
+    // hand mirror) rather than ts-rs's raw `JsonValue`. `ObjectOp` is a sibling in
+    // the same generated file, so no import is needed.
+    #[cfg_attr(feature = "ts-gen", ts(type = "ObjectOp"))]
     pub prop_delta: serde_json::Value,
+    // i64 on the wire is a JSON number (JS `number`), not ts-rs's default `bigint`.
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub base_revision: i64,
     /// userId of the authoring actor.
     pub actor: String,

@@ -137,7 +137,7 @@ export function altDetachOps(
 // test can pin the placement without a renderer or a Svelte mount. Returns null when
 // the path carries no coordinate pairs.
 export function textOverlayScreenRect(object: SceneObject, camera: CameraState): WorldRect | null {
-  const local = pathLocalBbox(object.geometry.d);
+  const local = pathLocalBbox(object.geometry.d ?? "");
   if (!local) return null;
   const t = object.transform;
   const corners: Array<[number, number]> = [

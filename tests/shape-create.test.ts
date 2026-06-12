@@ -35,7 +35,7 @@ describe("sceneCore.buildPrimitiveFromDrag (W2-07 bbox sizing)", () => {
       [0, 0, 1]
     ]);
     // 160 x 100 logical px, object-local quantized integers.
-    expect(object.geometry.d).toBe(`M 0 0 L ${160 * Q} 0 L ${160 * Q} ${100 * Q} L 0 ${100 * Q} Z`);
+    expect((object.geometry.d ?? "")).toBe(`M 0 0 L ${160 * Q} 0 L ${160 * Q} ${100 * Q} L 0 ${100 * Q} Z`);
   });
 
   it("normalizes a drag dragged up-left so width/height stay positive", () => {
@@ -43,7 +43,7 @@ describe("sceneCore.buildPrimitiveFromDrag (W2-07 bbox sizing)", () => {
     const object = core.buildPrimitiveFromDrag("rectangle", span, "rect-2", "a0");
     expect(object.transform?.[0][2]).toBe(100);
     expect(object.transform?.[1][2]).toBe(250);
-    expect(object.geometry.d).toBe(`M 0 0 L ${200 * Q} 0 L ${200 * Q} ${150 * Q} L 0 ${150 * Q} Z`);
+    expect((object.geometry.d ?? "")).toBe(`M 0 0 L ${200 * Q} 0 L ${200 * Q} ${150 * Q} L 0 ${150 * Q} Z`);
   });
 
   it("draws a line corner-to-corner (diagonal), anchored at the drag start", () => {
@@ -55,16 +55,16 @@ describe("sceneCore.buildPrimitiveFromDrag (W2-07 bbox sizing)", () => {
       [0, 0, 1]
     ]);
     // Object-local from (0,0) to the end delta (100, 50).
-    expect(object.geometry.d).toBe(`M 0 0 L ${100 * Q} ${50 * Q}`);
+    expect((object.geometry.d ?? "")).toBe(`M 0 0 L ${100 * Q} ${50 * Q}`);
   });
 
   it("sizes an ellipse to the drag bbox (four cubic arcs)", () => {
     const span: DragSpan = { start: { x: 0, y: 0 }, end: { x: 140, y: 140 } };
     const object = core.buildPrimitiveFromDrag("ellipse", span, "ell-1", "a0");
     expect(object.transform?.[0][2]).toBe(0);
-    expect(object.geometry.d.startsWith("M 0")).toBe(true);
-    expect(object.geometry.d).toContain("C ");
-    expect(object.geometry.d.endsWith("Z")).toBe(true);
+    expect((object.geometry.d ?? "").startsWith("M 0")).toBe(true);
+    expect((object.geometry.d ?? "")).toContain("C ");
+    expect((object.geometry.d ?? "").endsWith("Z")).toBe(true);
   });
 });
 

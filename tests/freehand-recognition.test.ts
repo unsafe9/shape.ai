@@ -32,7 +32,7 @@ function targetRect(id: string, tx: number, ty: number): SceneObject {
 
 /** The world position of an object's geometry node `i` under its transform. */
 function worldNode(obj: SceneObject, i: number): { x: number; y: number } {
-  const nums = obj.geometry.d.match(/-?\d+(?:\.\d+)?/g)!;
+  const nums = (obj.geometry.d ?? "").match(/-?\d+(?:\.\d+)?/g)!;
   const lx = Number(nums[i * 2]) / Q;
   const ly = Number(nums[i * 2 + 1]) / Q;
   const t = obj.transform;
@@ -58,8 +58,8 @@ function circleStroke(cx: number, cy: number, r: number): { x: number; y: number
 describe("(1) freehandToObject recognizes the pen-up stroke (v3 §4)", () => {
   it("commits a straight stroke as a canonical 2-node OPEN line with preserved endpoints", () => {
     const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2", "free");
-    expect(stroke.geometry.d).toBe(`M 0 0 L ${200 * Q} 0`);
-    expect(core.isOpenClassD(stroke.geometry.d)).toBe(true);
+    expect((stroke.geometry.d ?? "")).toBe(`M 0 0 L ${200 * Q} 0`);
+    expect(core.isOpenClassD((stroke.geometry.d ?? ""))).toBe(true);
     // Endpoint preservation — the anchoring premise: the recognized endpoints
     // sit exactly at the input start/end in world space.
     expect(worldNode(stroke, 0)).toEqual({ x: 300, y: 30 });
@@ -69,8 +69,8 @@ describe("(1) freehandToObject recognizes the pen-up stroke (v3 §4)", () => {
 
   it("commits a circular stroke as a CLOSED ring (not open-class)", () => {
     const stroke = core.freehandToObject(circleStroke(100, 100, 40), PEN.color, PEN.widthPx, "draw-2", "a2", "free");
-    expect(stroke.geometry.d.trim().endsWith("Z")).toBe(true);
-    expect(core.isOpenClassD(stroke.geometry.d)).toBe(false);
+    expect((stroke.geometry.d ?? "").trim().endsWith("Z")).toBe(true);
+    expect(core.isOpenClassD((stroke.geometry.d ?? ""))).toBe(false);
   });
 
   it("commits a rough rectangular stroke as an axis-snapped closed rect", () => {
@@ -83,7 +83,7 @@ describe("(1) freehandToObject recognizes the pen-up stroke (v3 §4)", () => {
       { x: 0, y: 80 }, { x: 1, y: 55 }, { x: 0.8, y: 30 }, { x: 0, y: 10 }
     ];
     const stroke = core.freehandToObject(rectStroke, PEN.color, PEN.widthPx, "draw-3", "a2", "free");
-    expect(stroke.geometry.d).toBe(`M 0 0 L ${120 * Q} 0 L ${120 * Q} ${80 * Q} L 0 ${80 * Q} Z`);
+    expect((stroke.geometry.d ?? "")).toBe(`M 0 0 L ${120 * Q} 0 L ${120 * Q} ${80 * Q} L 0 ${80 * Q} Z`);
   });
 });
 
@@ -94,7 +94,7 @@ describe("(2) freehand release anchoring (v3 §4 — open results, both corners)
     const rectA = targetRect("rect-a", 200, 0);
     const rectB = targetRect("rect-b", 500, 0);
     const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2", "free");
-    expect(core.isOpenClassD(stroke.geometry.d)).toBe(true); // the shell's anchor gate
+    expect(core.isOpenClassD((stroke.geometry.d ?? ""))).toBe(true); // the shell's anchor gate
 
     const anchors = synthesizeReleaseAnchors(core, [rectA, rectB], stroke, [
       { target: "rect-a", at: { x: 300, y: 30 } },
@@ -139,7 +139,7 @@ describe("(2) freehand release anchoring (v3 §4 — open results, both corners)
     // A circle drawn ON a target's edge still recognizes closed — and the shell
     // only calls the anchor path for open-class results.
     const stroke = core.freehandToObject(circleStroke(300, 30, 25), PEN.color, PEN.widthPx, "draw-2", "a2", "free");
-    expect(core.isOpenClassD(stroke.geometry.d)).toBe(false);
+    expect(core.isOpenClassD((stroke.geometry.d ?? ""))).toBe(false);
   });
 });
 
@@ -153,11 +153,11 @@ describe("(3) recognition mode contract — the SAME stroke resolves differently
     const basic = core.freehandToObject(sCurve, PEN.color, PEN.widthPx, "draw-b", "a2", "basic");
     // Exactly 2 line nodes (object-local: the bbox-min origin rides the
     // transform, so the chord sits at the S-curve's dip height, not y=0).
-    expect(basic.geometry.d).toMatch(/^M \d+ \d+ L \d+ \d+$/);
-    expect(core.isOpenClassD(basic.geometry.d)).toBe(true);
+    expect((basic.geometry.d ?? "")).toMatch(/^M \d+ \d+ L \d+ \d+$/);
+    expect(core.isOpenClassD((basic.geometry.d ?? ""))).toBe(true);
     const free = core.freehandToObject(sCurve, PEN.color, PEN.widthPx, "draw-f", "a2", "free");
-    expect(free.geometry.d).not.toBe(basic.geometry.d);
-    expect(free.geometry.d).toContain("C"); // bezier-smoothed curve, not a line
+    expect((free.geometry.d ?? "")).not.toBe((basic.geometry.d ?? ""));
+    expect((free.geometry.d ?? "")).toContain("C"); // bezier-smoothed curve, not a line
   });
 
   it("a closed pentagon-ish stroke: Basic snaps to a basic primitive, Free keeps the 5-corner polygon", () => {
@@ -177,14 +177,14 @@ describe("(3) recognition mode contract — the SAME stroke resolves differently
     });
     const free = core.freehandToObject(pentagon, PEN.color, PEN.widthPx, "draw-f", "a2", "free");
     // Free: a 5-corner straight-edged closed polygon (M + 4 L + Z).
-    expect(free.geometry.d.match(/L/g)).toHaveLength(4);
-    expect(free.geometry.d.trim().endsWith("Z")).toBe(true);
-    expect(free.geometry.d).not.toContain("C");
+    expect((free.geometry.d ?? "").match(/L/g)).toHaveLength(4);
+    expect((free.geometry.d ?? "").trim().endsWith("Z")).toBe(true);
+    expect((free.geometry.d ?? "")).not.toContain("C");
     const basic = core.freehandToObject(pentagon, PEN.color, PEN.widthPx, "draw-b", "a2", "basic");
     // Basic forbids the polygon: the residual comparison resolves the bbox
     // ellipse (the curved four-arc ring), a different d than Free's.
-    expect(basic.geometry.d).toContain("C");
-    expect(basic.geometry.d.trim().endsWith("Z")).toBe(true);
-    expect(basic.geometry.d).not.toBe(free.geometry.d);
+    expect((basic.geometry.d ?? "")).toContain("C");
+    expect((basic.geometry.d ?? "").trim().endsWith("Z")).toBe(true);
+    expect((basic.geometry.d ?? "")).not.toBe((free.geometry.d ?? ""));
   });
 });

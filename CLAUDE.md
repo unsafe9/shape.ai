@@ -63,4 +63,7 @@ is otherwise not on `PATH`.
 - `npm run build` — build the client (wasm + vite)
 - `cargo run -p shape_server` — serve the app on :8787
 - `npm run dev` — iterative client against a running server
+- `npm run types:gen` — regenerate the TS wire types from the scene-core serde
+  surface (ts-rs, dev-only `ts-gen` feature); `npm run types:check` fails on drift
+  and runs in the `test:unit` pre-step
 - `cargo test --workspace` · `npm run test:unit` — test gates

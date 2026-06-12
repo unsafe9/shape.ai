@@ -62,8 +62,8 @@ describe("(2) partial erase cuts the touched subpath into two open pieces", () =
     const cut = core.splitSubpathAt(stroke.geometry, touchLocalX, touchLocalY, radius);
     expect(cut).not.toBeNull();
     // Two `M` subpaths (a split), and both open (no trailing Z).
-    expect((cut!.d.match(/M/g) ?? []).length).toBe(2);
-    expect(cut!.d.includes("Z")).toBe(false);
+    expect(((cut!.d ?? "").match(/M/g) ?? []).length).toBe(2);
+    expect((cut!.d ?? "").includes("Z")).toBe(false);
 
     // The cut geometry rides an edit-geometry op (the shell's partial-erase path).
     const scene = { ...emptyObjectScene(), objects: [stroke] };

@@ -65,7 +65,7 @@ export function isDetachableBodyDrag(
     kind === "translate" &&
     roots.kind === "single" &&
     (src.anchors?.length ?? 0) > 0 &&
-    core.isOpenClassD(src.geometry.d)
+    core.isOpenClassD(src.geometry.d ?? "")
   );
 }
 
@@ -361,8 +361,15 @@ export function drawPreviewObject(
   return {
     id: "draw-preview",
     order,
-    geometry: { d },
-    stroke: { paint: previewPaint(selectedColor), width: penWidthPx * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
+    transform: translateTransform(0, 0),
+    geometry: { d, fillRule: "nonZero" },
+    stroke: {
+      paint: previewPaint(selectedColor),
+      width: penWidthPx * GEOMETRY_QUANTUM_PER_PX,
+      opacity: 1,
+      cap: "round",
+      join: "round"
+    }
   };
 }
 
@@ -395,7 +402,7 @@ export function createPreviewObject(
     order,
     transform: translateTransform(tx, ty),
     geometry: { d, fillRule: "nonZero" },
-    stroke: { paint: previewPaint(selectedColor), width: 2 * GEOMETRY_QUANTUM_PER_PX }
+    stroke: { paint: previewPaint(selectedColor), width: 2 * GEOMETRY_QUANTUM_PER_PX, opacity: 1, cap: "butt", join: "miter" }
   };
 }
 
@@ -435,8 +442,9 @@ export function snapIndicatorObject(at: { x: number; y: number }, order: string)
   return {
     id: "create-snap-indicator",
     order,
+    transform: translateTransform(0, 0),
     geometry: { d, fillRule: "nonZero" },
-    stroke: { paint: { kind: "solid", color: "#ff3b6b" }, width: 2 * GEOMETRY_QUANTUM_PER_PX, cap: "round", join: "round" }
+    stroke: { paint: { kind: "solid", color: "#ff3b6b" }, width: 2 * GEOMETRY_QUANTUM_PER_PX, opacity: 1, cap: "round", join: "round" }
   };
 }
 

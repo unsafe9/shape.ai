@@ -74,7 +74,7 @@ beforeAll(async () => {
 });
 
 function rect(id: string): SceneObject {
-  return { id, order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z" } };
+  return { id, order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z", fillRule: "nonZero" } };
 }
 
 /** Wrap an ObjectOp as a peer WireOp for a `patch` fan-out frame. */
@@ -92,7 +92,7 @@ function peerWire(op: ObjectOp, seq: number): WireOp {
 
 const insertA: ObjectOp = { kind: "insert-object", object: rect("a") };
 const moveA = (x: number, y: number): ObjectOp => ({ kind: "set-transform", id: "a", transform: translateTransform(x, y) });
-const textA = (value: string): ObjectOp => ({ kind: "set-text", id: "a", text: { runs: [{ text: value }] } });
+const textA = (value: string): ObjectOp => ({ kind: "set-text", id: "a", text: { runs: [{ text: value, bold: false, italic: false }], align: "start", valign: "top" } });
 
 const welcomeFrame = (scene: ObjectScene, seq: number): WelcomeMessage => ({ type: "welcome", scene, seq, revision: seq });
 

@@ -125,8 +125,8 @@ describe("(a) freehandToObject lowers a stroke to an insert-able open-path objec
     expect(object.order).toBe("a0");
     // A freehand stroke is an OPEN path: the `d` starts with a move and is not
     // closed with a trailing `Z`.
-    expect(object.geometry.d.startsWith("M")).toBe(true);
-    expect(object.geometry.d.trim().endsWith("Z")).toBe(false);
+    expect((object.geometry.d ?? "").startsWith("M")).toBe(true);
+    expect((object.geometry.d ?? "").trim().endsWith("Z")).toBe(false);
     // The pen brush lowered to a stroke (no fill — a stroke-only object).
     expect(object.stroke).toBeDefined();
     expect(object.stroke?.paint).toEqual({ kind: "solid", color: PEN.color });
@@ -143,7 +143,7 @@ describe("(b) objectSceneToRenderObjectScene projects a heterogeneous scene", ()
     const rectangle = core.buildPrimitive("rectangle", { x: 0, y: 0 }, "rect-1", "a0");
     // W2-10: the text primitive is borderless + style-less (no default "Note"); set
     // text explicitly to verify the projection preserves an object's text runs.
-    const note: SceneObject = { ...core.buildPrimitive("text", { x: 400, y: 0 }, "note-1", "a1"), text: { runs: [{ text: "Note" }] } };
+    const note: SceneObject = { ...core.buildPrimitive("text", { x: 400, y: 0 }, "note-1", "a1"), text: { runs: [{ text: "Note", bold: false, italic: false }], align: "start", valign: "top" } };
     const freehand = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a2", "free");
 
     const scene: ObjectScene = { ...emptyObjectScene(), objects: [rectangle, note, freehand] };
@@ -267,7 +267,7 @@ describe("(f) drag-create + snap-bypass + select-after-create (W2-07)", () => {
     // Positioned at the normalized bbox top-left; 160x100 logical px object-local.
     expect(object.transform).toEqual(translateTransform(100, 200));
     const Q = GEOMETRY_QUANTUM_PER_PX;
-    expect(object.geometry.d).toBe(`M 0 0 L ${160 * Q} 0 L ${160 * Q} ${100 * Q} L 0 ${100 * Q} Z`);
+    expect((object.geometry.d ?? "")).toBe(`M 0 0 L ${160 * Q} 0 L ${160 * Q} ${100 * Q} L 0 ${100 * Q} Z`);
 
     const inserted = core.applyObjectOp(emptyObjectScene(), { kind: "insert-object", object });
     expect(inserted.errors).toEqual([]);
@@ -307,8 +307,8 @@ describe("(g) draw + eraser (whole/partial), all undoable (W2-08, FC-11)", () =>
     const cut = core.splitSubpathAt(stroke.geometry, touchX, touchY, 24 * GEOMETRY_QUANTUM_PER_PX);
     expect(cut).not.toBeNull();
     // Two M subpaths (a split), both open (no trailing Z).
-    expect((cut!.d.match(/M/g) ?? []).length).toBe(2);
-    expect(cut!.d.includes("Z")).toBe(false);
+    expect(((cut!.d ?? "").match(/M/g) ?? []).length).toBe(2);
+    expect((cut!.d ?? "").includes("Z")).toBe(false);
 
     const scene: ObjectScene = { ...emptyObjectScene(), objects: [stroke] };
     const edited = core.applyObjectOp(scene, { kind: "edit-geometry", id: "draw-1", geometry: cut! });
@@ -357,7 +357,7 @@ describe("(h) inline text: borderless primitive + set-text + overlay placement (
     const edited = core.applyObjectOp(inserted.scene, {
       kind: "set-text",
       id: "note-1",
-      text: { runs: [{ text: "Hello" }] }
+      text: { runs: [{ text: "Hello", bold: false, italic: false }], align: "start", valign: "top" }
     });
     expect(edited.errors).toEqual([]);
     expect(edited.scene.objects[0].text?.runs[0]?.text).toBe("Hello");
@@ -387,7 +387,7 @@ describe("(i) template popup lowers a recipe the core inserts as a batch (W2-09)
     expect(recipe.length).toBeGreaterThan(0);
     for (const object of recipe) {
       expect(typeof object.id).toBe("string");
-      expect(typeof object.geometry.d).toBe("string");
+      expect(typeof (object.geometry.d ?? "")).toBe("string");
     }
 
     // The shell applies the recipe via the op path (server lowers to insert-object

@@ -40,6 +40,8 @@ pub const GEOMETRY_QUANTUM_PER_PX: i32 = 8;
 
 /// Bezier handle offset, object-local quantized i32 relative to its owning node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct HandlePoint {
     pub dx: i32,
@@ -53,6 +55,8 @@ pub struct HandlePoint {
 /// per-node stroke/pressure slot (D4/D13, behavior deferred). Coords object-local
 /// quantized i32 (D2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct PathNode {
     pub x: i32,
@@ -75,6 +79,8 @@ impl PathNode {
 /// One contour. `closed` + presence-of-handles + multi-subpath define topology;
 /// there is no shape/type discriminant (P2/D2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct SubPath {
     pub closed: bool,
@@ -82,6 +88,8 @@ pub struct SubPath {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub enum FillRule {
     #[default]
@@ -95,6 +103,8 @@ pub enum FillRule {
 /// makes the path-string the single source of truth at rest + on the wire
 /// (no duality / divergence risk).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Geometry {
     /// At-rest / wire SVG-subset path-string (M/L/C/Z, multi-subpath). Absolute
@@ -315,6 +325,8 @@ impl Transform3x3 {
 /// FFD warp grid slot (D7 nonlinear bend/envelope/text-on-path). Schema-present,
 /// implementation deferred — control point grid in object-local quantized units.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Warp {
     pub cols: i32,
@@ -332,6 +344,8 @@ fn default_opacity() -> f64 {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Paint {
     Solid { color: String },
@@ -346,6 +360,8 @@ pub enum Paint {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct GradientStop {
     pub offset: f64,
@@ -354,6 +370,8 @@ pub struct GradientStop {
 
 /// Paint applied to the derived region (D6 render order: fill below stroke).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Fill {
     pub paint: Paint,
@@ -362,6 +380,8 @@ pub struct Fill {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub enum LineCap {
     #[default]
@@ -371,6 +391,8 @@ pub enum LineCap {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub enum LineJoin {
     #[default]
@@ -381,6 +403,8 @@ pub enum LineJoin {
 
 /// Stroke paints the path outline (open + closed) above fill.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Stroke {
     pub paint: Paint,
@@ -398,6 +422,8 @@ pub struct Stroke {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub enum TextAlign {
     #[default]
@@ -408,6 +434,8 @@ pub enum TextAlign {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub enum TextVAlign {
     #[default]
@@ -417,6 +445,8 @@ pub enum TextVAlign {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct TextRun {
     pub text: String,
@@ -436,6 +466,8 @@ pub struct TextRun {
 /// D4 — text is a runs array (styled segments), positioned relative to the
 /// derived region (D6). Markdown/silhouette-flow deferred; runs present.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Text {
     pub runs: Vec<TextRun>,
@@ -450,6 +482,8 @@ pub struct Text {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct LocalPoint {
     pub x: i32,
@@ -461,6 +495,8 @@ pub struct LocalPoint {
 /// target's derived outline (re-projected when the target's geometry edits).
 /// The pair of `target`s on two anchors defines the connection graph (D5/D6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Anchor {
     pub node_index: i32,
@@ -473,6 +509,8 @@ pub struct Anchor {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub enum LayoutDirection {
     Row,
@@ -480,6 +518,8 @@ pub enum LayoutDirection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub enum LayoutAlign {
     Start,
@@ -489,6 +529,8 @@ pub enum LayoutAlign {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub enum LayoutSizing {
     Hug,
@@ -499,6 +541,8 @@ pub enum LayoutSizing {
 /// Auto-layout inputs on a children group (D3 tier-3, OB3.A1). Output positions
 /// are derived (not stored/synced); these are the inputs. Schema-present.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Layout {
     pub direction: LayoutDirection,
@@ -509,6 +553,8 @@ pub struct Layout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum CommentAnchor {
     Node { node_index: i32 },
@@ -517,6 +563,8 @@ pub enum CommentAnchor {
 
 /// D20 — comment on an object, optionally anchored to a node or local point.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Comment {
     pub id: String,
@@ -532,6 +580,8 @@ pub struct Comment {
 /// string and `contentRef` a content-addressed handle so adding behavior later
 /// is non-breaking.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct ContentEmbed {
     pub kind: String,
@@ -545,6 +595,8 @@ pub struct ContentEmbed {
 /// The one canvas primitive (D1/P2). Optional fields use `skip_serializing_if`
 /// so an empty object is minimal on the wire and at rest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Object {
     pub id: ObjectId,
@@ -553,7 +605,12 @@ pub struct Object {
     pub parent: Option<ObjectId>,
     /// Fractional z-order key (base-62, `fractional.rs`); sorts by plain str Ord.
     pub order: String,
+    // `Transform3x3` is `#[serde(transparent)]` (a bare `[[..],[..],[..]]` array on
+    // the wire); ts-rs ignores `transparent` and can't impl `TS` for it, so emit the
+    // matrix AS its inner `[[f64; 3]; 3]` — a faithful bare-array shape that ts-rs
+    // can resolve — instead of referencing the (hand-written, facade-only) type.
     #[serde(default)]
+    #[cfg_attr(feature = "ts-gen", ts(as = "[[f64; 3]; 3]"))]
     pub transform: Transform3x3,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warp: Option<Warp>,
@@ -583,7 +640,10 @@ pub struct Object {
     /// Hedge: object-level content/embed channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<ContentEmbed>,
+    // `ObjectMeta` is a `serde_json::Map` (free-form bag); type it as the matching
+    // index signature rather than dragging ts-rs's `JsonValue` into the surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-gen", ts(type = "Record<string, unknown>"))]
     pub meta: Option<ObjectMeta>,
 }
 
@@ -624,6 +684,8 @@ impl Object {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct TagDef {
     pub id: String,
@@ -634,6 +696,8 @@ pub struct TagDef {
 /// Selection union (preserves the legacy `SceneSelection` shape: `tag = "kind"`).
 /// `multi` is ephemeral shell-only; the canonical persisted selection is single.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ObjectSelection {
     Canvas,
@@ -648,9 +712,14 @@ impl Default for ObjectSelection {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectScene {
+    // i64 on the wire is a plain JSON number (JS `number`), not a `bigint`; ts-rs
+    // would default i64/u64 to `bigint`, so every such field overrides to `number`.
     #[serde(default)]
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub scene_version: i64,
     /// Insertion order preserved; canonical paint order is `order` (fractional).
     #[serde(default)]

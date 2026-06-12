@@ -66,7 +66,7 @@ describe("freehand release merges into a nearby open endpoint (merge-first branc
     expect(ops![0].id).toBe("draw-1");
     // The survivor's new path is the chained ⊓ — one OPEN path, corners kept.
     expect(ops![0].geometry.d).toBe(`M 0 ${100 * Q} L 0 0 L ${100 * Q} 0 L ${100 * Q} ${100 * Q}`);
-    expect(core.isOpenClassD(ops![0].geometry.d)).toBe(true);
+    expect(core.isOpenClassD(ops![0].geometry.d ?? "")).toBe(true);
   });
 
   it("THE acceptance: three strokes — vertical, ㄱ, bottom bar — close into ONE rect object", () => {
@@ -86,7 +86,7 @@ describe("freehand release merges into a nearby open endpoint (merge-first branc
     expect(scene.objects).toHaveLength(1);
     expect(scene.objects[0].id).toBe("draw-1");
     expect(scene.objects[0].geometry.d).toBe(`M 0 0 L ${100 * Q} 0 L ${100 * Q} ${100 * Q} L 0 ${100 * Q} Z`);
-    expect(core.isOpenClassD(scene.objects[0].geometry.d)).toBe(false);
+    expect(core.isOpenClassD(scene.objects[0].geometry.d ?? "")).toBe(false);
   });
 
   it("a release away from every open endpoint returns null — the existing insert + anchor path runs", () => {
@@ -100,7 +100,7 @@ describe("freehand release merges into a nearby open endpoint (merge-first branc
     expect(ops).toBeNull();
     // Fall-through (the shell's else path): recognize + insert + release anchors.
     const object = core.freehandToObject(stroke, PEN.color, PEN.widthPx, "draw-2", "a2", "basic");
-    expect(core.isOpenClassD(object.geometry.d)).toBe(true);
+    expect(core.isOpenClassD(object.geometry.d ?? "")).toBe(true);
     const anchors = synthesizeReleaseAnchors(core, objects, object, [
       null,
       { target: "rect-b", at: { x: 500, y: 30 } }

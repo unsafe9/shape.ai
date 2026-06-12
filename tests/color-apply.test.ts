@@ -63,7 +63,7 @@ describe("buildSetStyleOp recolor (AP1 recolor-selection path)", () => {
   it("emits a set-style op recoloring both fill and stroke of a filled shape", () => {
     const object = obj({
       fill: { paint: { kind: "solid", color: "#000000" }, opacity: 1 },
-      stroke: { paint: { kind: "solid", color: "#111111" }, width: 16 }
+      stroke: { paint: { kind: "solid", color: "#111111" }, width: 16, opacity: 1, cap: "butt", join: "miter" }
     });
     const op = core.buildSetStyleOp(object, COLOR);
     // The core re-serializes the canonical Stroke, so the recolored stroke carries
@@ -80,7 +80,7 @@ describe("buildSetStyleOp recolor (AP1 recolor-selection path)", () => {
   });
 
   it("recolors only the stroke for a stroke-only object (no fill added)", () => {
-    const object = obj({ stroke: { paint: { kind: "solid", color: "#111111" }, width: 16 } });
+    const object = obj({ stroke: { paint: { kind: "solid", color: "#111111" }, width: 16, opacity: 1, cap: "butt", join: "miter" } });
     const op = core.buildSetStyleOp(object, COLOR);
     expect(op.kind).toBe("set-style");
     if (op.kind !== "set-style") throw new Error("expected set-style");
@@ -111,7 +111,7 @@ describe("open-class recolor routes to the stroke (anchor-semantics v3 §1)", ()
   it("recolors the stroke and leaves a legacy fill untouched", () => {
     const object = openObj({
       fill: { paint: { kind: "solid", color: "#000000" }, opacity: 1 },
-      stroke: { paint: { kind: "solid", color: "#111111" }, width: 16 }
+      stroke: { paint: { kind: "solid", color: "#111111" }, width: 16, opacity: 1, cap: "butt", join: "miter" }
     });
     const op = core.buildSetStyleOp(object, COLOR);
     if (op.kind !== "set-style") throw new Error("expected set-style");
@@ -163,7 +163,7 @@ describe("theme-default token (S2 / #5 — resolves through the core)", () => {
       id: "o1",
       order: "a0",
       geometry: { d: "M 0 0 L 8 0" },
-      stroke: { paint: { kind: "solid", color: "#111111" }, width: 16 }
+      stroke: { paint: { kind: "solid", color: "#111111" }, width: 16, opacity: 1, cap: "butt", join: "miter" }
     } as SceneObject;
     const op = core.buildSetStyleOp(object, THEME_DEFAULT_COLOR);
     if (op.kind !== "set-style") throw new Error("expected set-style");
@@ -190,7 +190,7 @@ describe("controller color wiring (AP1)", () => {
   });
 
   it("authors a set-style op (core.buildSetStyleOp) when a single object is selected", () => {
-    const object = { id: "o1", order: "a0", geometry: { d: "M 0 0 L 8 0" }, stroke: { paint: { kind: "solid", color: "#111111" }, width: 16 } } as SceneObject;
+    const object = { id: "o1", order: "a0", geometry: { d: "M 0 0 L 8 0" }, stroke: { paint: { kind: "solid", color: "#111111" }, width: 16, opacity: 1, cap: "butt", join: "miter" } } as SceneObject;
     const op = buildColorApplyOp(core, sceneWith(object), { kind: "object", id: "o1" }, COLOR);
     expect(op).not.toBeNull();
     expect(op!.kind).toBe("set-style");

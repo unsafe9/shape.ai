@@ -12,11 +12,18 @@ crate-type = ["cdylib", "rlib"]
 # off by default so native test/build (and a bare `wasm32` check) never touch
 # wasm-bindgen; the web client builds it on with `wasm-pack --features wasm`.
 wasm = ["dep:wasm-bindgen"]
+# `ts-gen` derives ts-rs `TS` on the serde wire surface and turns on the generator
+# test that emits the committed TS mirror. Dev-only and OFF by default: it must
+# never enter the `wasm` bundle or a default build — ts-rs is not a runtime
+# dependency and would not belong in wasm32. It exists solely for `npm run types:gen`.
+ts-gen = ["dep:ts-rs"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-bindgen = { version = "0.2", optional = true }
+# serde-json-impl: ts-rs needs a `TS` impl for `serde_json::Value` (WireOp.prop_delta).
+ts-rs = { version = "12", features = ["serde-json-impl"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"

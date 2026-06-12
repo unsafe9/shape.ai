@@ -108,7 +108,7 @@ function wireOp(op: ObjectOp, clientId: string, localSeq: number): WireOp {
 
 const insertA: ObjectOp = {
   kind: "insert-object",
-  object: { id: "a", order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z" } }
+  object: { id: "a", order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z", fillRule: "nonZero" } }
 };
 
 describe("WsTransport handshake", () => {

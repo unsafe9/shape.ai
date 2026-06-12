@@ -32,7 +32,7 @@ function targetRect(id: string, tx: number, ty: number): SceneObject {
 
 /** The world position of an object's geometry node `i` under its transform. */
 function worldNode(obj: SceneObject, i: number): { x: number; y: number } {
-  const nums = obj.geometry.d.match(/-?\d+(?:\.\d+)?/g)!;
+  const nums = (obj.geometry.d ?? "").match(/-?\d+(?:\.\d+)?/g)!;
   const lx = Number(nums[i * 2]) / Q;
   const ly = Number(nums[i * 2 + 1]) / Q;
   const t = obj.transform;

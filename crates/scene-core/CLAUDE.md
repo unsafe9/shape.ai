@@ -16,7 +16,10 @@ Adding an op (do every step, in order):
 2. Apply + emit its inverse in `object/kernel/apply.rs`.
 3. Validate it in `object/kernel/validate.rs`.
 4. Wire it through authoring/binding/catalog as the feature needs.
-5. Mirror the wire shape in the TS bridge.
+5. Regenerate the TS wire types (`npm run types:gen`) and commit
+   `platforms/web/shared/generated/`. The types are ts-rs-derived from this serde
+   surface (behind the dev-only `ts-gen` feature); never hand-edit the TS mirror.
+   `npm run types:check` fails the unit gate on drift.
 6. Add a golden test driving the real core (no second apply, ever).
 
 Tier dependency direction is one-way: `kernel <- {authoring, binding, catalog}`.

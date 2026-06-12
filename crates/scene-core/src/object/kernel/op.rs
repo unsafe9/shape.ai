@@ -17,6 +17,8 @@ use crate::object::model::{
 /// (`Set`) and "remove the field" (`Clear`). Lets one `set-style` op touch fill
 /// without implying anything about stroke.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum FieldEdit<T> {
     Set { value: T },
@@ -47,6 +49,8 @@ impl<T> FieldEdit<T> {
 /// fields are the per-property delta. This is what a `WireOp.propDelta` decodes
 /// into server-side, so the wire stays decoupled from the op shape.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ObjectOp {
     /// Insert a fully-formed object. Inverse: `delete { id }`.
@@ -60,7 +64,12 @@ pub enum ObjectOp {
 
     /// Replace the 3x3 transform. 0-rebake (D7). Inverse: old transform.
     #[serde(rename_all = "camelCase")]
-    SetTransform { id: ObjectId, transform: Transform3x3 },
+    SetTransform {
+        id: ObjectId,
+        // See `Object.transform`: emit the transparent matrix AS its bare array.
+        #[cfg_attr(feature = "ts-gen", ts(as = "[[f64; 3]; 3]"))]
+        transform: Transform3x3,
+    },
 
     /// Edit fill and/or stroke. Each present `FieldEdit` is its own LWW property.
     #[serde(rename_all = "camelCase")]
@@ -246,6 +255,8 @@ impl ObjectOp {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(tag = "feature", rename_all = "camelCase")]
 pub enum FeatureRequest {
     CanvasSwitch {
@@ -272,9 +283,18 @@ pub enum FeatureRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(tag = "feature", rename_all = "camelCase")]
 pub enum FeatureResponse {
-    CanvasSwitched { canvas_id: String, seq: u64, revision: u64 },
+    CanvasSwitched {
+        canvas_id: String,
+        // u64 is a JSON number (JS `number`), not ts-rs's default `bigint`.
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+        seq: u64,
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+        revision: u64,
+    },
     CommentUpserted { object_id: ObjectId, comment_id: String },
     TemplateApplied { object_ids: Vec<String> },
     ExportReady { request_id: String, artifact_ref: String, content_type: String },

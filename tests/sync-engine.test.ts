@@ -52,7 +52,7 @@ function rect(id: string, order = "a0"): SceneObject {
 const insertA: ObjectOp = { kind: "insert-object", object: rect("a", "a0") };
 const insertB: ObjectOp = { kind: "insert-object", object: rect("b", "a1") };
 const moveA = (x: number, y: number): ObjectOp => ({ kind: "set-transform", id: "a", transform: translateTransform(x, y) });
-const textA = (value: string): ObjectOp => ({ kind: "set-text", id: "a", text: { runs: [{ text: value }] } });
+const textA = (value: string): ObjectOp => ({ kind: "set-text", id: "a", text: { runs: [{ text: value, bold: false, italic: false }], align: "start", valign: "top" } });
 
 /** A mock EngineTransport that records flushed batches. */
 class CaptureTransport implements EngineTransport {
@@ -344,7 +344,7 @@ describe("reconnect reconcile (OB4.3)", () => {
       ...snapshot,
       sceneVersion: 3,
       objects: snapshot.objects.map((o) =>
-        o.id === "a" ? { ...o, text: { runs: [{ text: "peer-text" }] }, transform: IDENTITY_TRANSFORM } : o
+        o.id === "a" ? { ...o, text: { runs: [{ text: "peer-text", bold: false, italic: false }], align: "start", valign: "top" }, transform: IDENTITY_TRANSFORM } : o
       )
     };
 
