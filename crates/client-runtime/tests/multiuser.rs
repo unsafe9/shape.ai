@@ -1,8 +1,5 @@
-//! Port of `tests/multiuser.test.ts`: the client side of the realtime tail on the
-//! object model. The TS suite drives `SceneClient` over a mock socket; the
-//! behavioral assertions are engine decisions (`apply_remote` discard path) plus
-//! the peer registry (presence latest-wins, self-skip, TTL expiry), covered here
-//! directly since the socket itself is shell-side.
+//! The client side of the realtime tail: engine decisions (`apply_remote`
+//! discard) plus the peer registry (latest-wins, self-skip, TTL expiry).
 
 mod common;
 
@@ -27,8 +24,6 @@ fn seeded_scene(version: i64) -> shape_scene_core::object::model::ObjectScene {
     scene
 }
 
-// --- peer patch apply ----------------------------------------------------------
-
 #[test]
 fn applies_a_peer_patch_to_the_local_scene() {
     let (mut engine, _now) = boot_engine(empty_scene());
@@ -44,8 +39,6 @@ fn applies_a_peers_create_then_move_in_arrival_order() {
     assert_eq!(object_transform(engine.scene(), "a"), Some(translate(99.0, 88.0)));
 }
 
-// --- mid-drag transient ownership ---------------------------------------------
-
 #[test]
 fn ignores_peer_write_to_field_client_is_mid_drag_on_then_applies_after_ack() {
     let (mut engine, mut now) = boot_engine(seeded_scene(2));
@@ -54,13 +47,12 @@ fn ignores_peer_write_to_field_client_is_mid_drag_on_then_applies_after_ack() {
     assert_eq!(object_transform(engine.scene(), "a"), Some(translate(200.0, 200.0)));
     engine.on_flush_due();
 
-    // A peer move to the owned (a, transform) is IGNORED while unacked.
+    // A peer move to the owned (a, transform) is ignored while unacked.
     assert!(!engine.apply_remote(move_op("a", 7.0, 7.0)));
     assert_eq!(object_transform(engine.scene(), "a"), Some(translate(200.0, 200.0)));
 
     engine.on_ack(&[res.op_id.unwrap()], Some(4)).unwrap();
 
-    // After ack, a later peer write applies.
     assert!(engine.apply_remote(move_op("a", 7.0, 7.0)));
     assert_eq!(object_transform(engine.scene(), "a"), Some(translate(7.0, 7.0)));
 }
@@ -75,8 +67,6 @@ fn applies_peer_write_to_a_different_field_while_a_drag_is_in_flight() {
     assert_eq!(object_text(engine.scene(), "a").as_deref(), Some("from-peer"));
     assert_eq!(object_transform(engine.scene(), "a"), Some(translate(200.0, 200.0)));
 }
-
-// --- peer presence cursors -----------------------------------------------------
 
 #[test]
 fn renders_a_peer_cursor_from_an_inbound_presence_frame() {
@@ -114,7 +104,7 @@ fn expires_a_peer_cursor_after_the_ttl_window() {
     let mut peers = PeerRegistry::new(None, None);
     peers.ingest(&json!({ "userId": "peer-9", "cursor": { "x": 1.0, "y": 1.0 } }), 1_000);
     assert_eq!(peers.list().len(), 1);
-    // Lazily expire at +11s (TTL is 10s).
+    // Expire at +11s (TTL is 10s).
     peers.expire(12_000);
     assert_eq!(peers.list().len(), 0);
 }
@@ -123,13 +113,10 @@ fn expires_a_peer_cursor_after_the_ttl_window() {
 fn expires_a_stale_peer_when_a_fresh_peer_frame_arrives() {
     let mut peers = PeerRegistry::new(None, None);
     peers.ingest(&json!({ "userId": "peer-9", "cursor": { "x": 1.0, "y": 1.0 } }), 1_000);
-    // A fresh frame at +11s, then expire vs the same clock: the stale peer drops.
     peers.ingest(&json!({ "userId": "peer-2", "cursor": { "x": 2.0, "y": 2.0 } }), 12_000);
     peers.expire(12_000);
     assert_eq!(peers.list().iter().map(|p| p.user_id.clone()).collect::<Vec<_>>(), vec!["peer-2"]);
 }
-
-// --- concurrent-edit convergence ----------------------------------------------
 
 #[test]
 fn converges_to_server_arrival_order_for_concurrent_edits_on_a_shared_field() {

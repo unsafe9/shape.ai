@@ -1,21 +1,13 @@
-// OB-3 MSDF text shader (OB3.R8 / OB3.R9 crispness at any zoom + D19 text runs).
+// MSDF text shader: per-glyph quads (laid out on the CPU) sampling a multi-channel
+// signed distance field atlas. The median of the three channels reconstructs the
+// signed distance, staying sharp under arbitrary scaling where a single raster
+// would blur.
 //
-// Glyphs are drawn as per-glyph quads positioned by the run layout (computed on
-// the CPU: shaped runs -> glyph quads with atlas UVs). Each quad samples an MSDF
-// (multi-channel signed distance field) atlas. The median of the three color
-// channels reconstructs the true signed distance to the glyph outline, which
-// stays sharp under arbitrary scaling — the whole point of MSDF over a single
-// fontdue raster, which blurs when zoomed past its baked size (OB3.R9).
+// screenPxRange AA: the atlas bakes a fixed distance range in texels; we convert
+// it to screen pixels via the texcoord derivative and smoothstep one screen pixel
+// around the 0.5 threshold, so the edge stays one pixel soft at any zoom.
 //
-// screenPxRange-based AA (the canonical MSDF technique): the atlas bakes a fixed
-// distance range in *texels*; we convert that to a screen-pixel range using the
-// derivative of the texture coordinates, then smoothstep one screen pixel around
-// the 0.5 threshold. This keeps the edge exactly one pixel soft regardless of
-// camera zoom, so text neither aliases when zoomed in nor fattens when zoomed
-// out.
-//
-// Camera + per-object projective transform mirror object_fill.wgsl so a text run
-// inherits the same world placement as the object that owns it.
+// Camera + per-object projective transform mirror object_fill.wgsl.
 
 struct View {
   camera: vec4<f32>,
@@ -32,8 +24,7 @@ var msdf_atlas: texture_2d<f32>;
 var msdf_sampler: sampler;
 
 struct TextUniform {
-  // x: pxRange baked into the atlas (in atlas texels). y: atlas width in texels.
-  // z: atlas height in texels. w: unused.
+  // x: atlas pxRange (texels), y: atlas width (texels), z: atlas height (texels), w: unused.
   atlas: vec4<f32>,
 };
 
@@ -41,13 +32,12 @@ struct TextUniform {
 var<uniform> text_params: TextUniform;
 
 struct VertexIn {
-  // Per-glyph-quad corner, object-local CSS px (already laid out by the run).
+  // Glyph-quad corner, object-local CSS px (laid out by the run).
   @location(0) position: vec2<f32>,
-  // Atlas UV (0..1) for this corner.
   @location(1) uv: vec2<f32>,
-  // Per-run text color (D19 run.color), inline.
+  // Per-run text color, inline.
   @location(2) color: vec4<f32>,
-  // Instance-step per-object projective matrix columns.
+  // Instance-step projective matrix columns.
   @location(3) m0: vec3<f32>,
   @location(4) m1: vec3<f32>,
   @location(5) m2: vec3<f32>,
@@ -91,13 +81,10 @@ fn vs_main(input: VertexIn) -> VertexOut {
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
   let msd = textureSample(msdf_atlas, msdf_sampler, input.uv).rgb;
-  // Reconstruct the signed distance (0.5 == on the outline).
+  // 0.5 == on the outline.
   let sd = median3(msd);
 
-  // screenPxRange: convert the atlas's baked texel range into screen pixels at
-  // this fragment. unitRange is the pxRange expressed in UV units; its length in
-  // screen space (via fwidth of uv) tells us how many screen pixels one unit of
-  // signed distance spans here.
+  // screenPxRange: convert the baked texel range to screen pixels at this fragment.
   let atlas_size = vec2<f32>(text_params.atlas.y, text_params.atlas.z);
   let unit_range = vec2<f32>(text_params.atlas.x) / atlas_size;
   let screen_tex_size = vec2<f32>(1.0) / fwidth(input.uv);

@@ -1,16 +1,3 @@
-// Client realtime multiuser tests (OB4.3 object data layer).
-//
-// These drive `SceneClient` over a MockWebSocket plus an injected manual timer.
-// They prove the client side of the realtime tail on the object model:
-//
-//   - a peer `patch` frame (WireOp) applies to the local optimistic scene;
-//   - a peer `patch` to a field the client is MID-DRAG on (an unacked local write)
-//     is IGNORED until the local op is acked, then a later peer write applies —
-//     transient ownership / no snap-back during a drag;
-//   - a peer `presence` frame renders a peer cursor;
-//   - the client never surfaces its OWN presence as a peer (self-skip);
-//   - concurrent edits converge to the server-ordered (arrival-seq) result.
-
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { SceneClient } from "../platforms/web/runtime/sceneClient";
@@ -77,7 +64,7 @@ function rect(id: string): SceneObject {
   return { id, order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z", fillRule: "nonZero" } };
 }
 
-/** Wrap an ObjectOp as a peer WireOp for a `patch` fan-out frame. */
+// Wrap an ObjectOp as a peer WireOp for a `patch` fan-out frame.
 function peerWire(op: ObjectOp, seq: number): WireOp {
   return {
     opId: { clientId: "peer", localSeq: seq },
@@ -147,7 +134,7 @@ async function boot(
   return { client, outbox, timer, socket: socket!, scene };
 }
 
-/** A scene with object "a" already present so move/text ops validate. */
+// Scene with object "a" already present so move/text ops validate.
 function seededScene(seq = 2): ObjectScene {
   const scene = emptyObjectScene();
   scene.sceneVersion = seq;

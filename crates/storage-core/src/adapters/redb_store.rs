@@ -1,30 +1,17 @@
-//! Native redb-on-file adapter (OB3.T1 + T2 Morton region index + T4 zstd).
+//! Native redb-on-file adapter: an embedded, sync, single-writer KV engine with
+//! two tables in one `Database` file:
 //!
-//! redb is an embedded, sync, single-writer transactional KV engine. This
-//! adapter backs a store with two redb tables in one `Database` file:
+//! * **main** (`id -> value`): the store-neutral [`Record`], with the payload
+//!   **zstd-compressed at rest**; `load` decompresses transparently (byte-exact).
+//! * **region** (`region_row_key(canvas, morton, object_id) -> value`): the
+//!   Morton (Z-order) index, whose value frames `{object_id, bbox}` so
+//!   [`query_region`](AsyncStorageAdapter::query_region) range-scans the window
+//!   and refilters on bbox without loading the main record — only the survivors.
 //!
-//! * **main** (`id -> value`): the store-neutral [`Record`]. The value frames
-//!   `{kind, version, payload}` with the payload **zstd-compressed at rest**
-//!   (T4); `load` decompresses transparently, so the payload round-trips byte
-//!   for byte.
-//! * **region** (`region_row_key(canvas, morton, object_id) -> value`): the Morton (Z-order)
-//!   region index (T2). The value frames `{object_id, bbox}`, so
-//!   [`query_region`](AsyncStorageAdapter::query_region) can range-scan the
-//!   Z-order window and refilter on the exact bbox **without loading the main
-//!   record** — it only loads the survivors. See [`crate::morton`].
-//!
-//! Native-only: redb, zstd, and the redb file all assume `std::fs`, so the whole
-//! module is gated `#[cfg(not(target_arch = "wasm32"))]` at the module site
-//! (see `adapters/mod.rs`), exactly like the file/sqlite adapters. It is also
-//! behind a `redb` cargo feature the Integrate phase adds.
-//!
-//! The async surface ([`AsyncStorageAdapter`]) is the redb cutover target
-//! (OB1.4): redb is sync, so each async method runs the sync redb op inside an
-//! immediately-ready `async { ... }` block. No `.await` is held across any
-//! non-`Send` value, so the returned futures are `Send` as the trait requires.
-//!
-//! Pointer-width-agnostic: every framed field is a fixed-width big-endian
-//! integer or length-prefixed bytes; no `usize` ever reaches the wire/keys.
+//! The async surface runs each sync redb op inside an immediately-ready
+//! `async { ... }` block; no `.await` holds a non-`Send` value, so the returned
+//! futures are `Send`. Pointer-width-agnostic: every framed field is a fixed-
+//! width big-endian integer or length-prefixed bytes; no `usize` reaches keys.
 
 use crate::adapter::{AdapterKind, RecordCursor, StorageAdapter};
 use crate::adapter_async::{AsyncStorageAdapter, RegionWindow};
@@ -36,31 +23,26 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
 
-/// The main record table: `id -> framed record value`.
 const MAIN: TableDefinition<&str, &[u8]> = TableDefinition::new("main");
-
-/// The region index table: `region_row_key(canvas, morton, object_id) -> framed region value`.
 const REGION: TableDefinition<&[u8], &[u8]> = TableDefinition::new("region");
 
-/// redb-on-file store. Cloneable: the underlying [`Database`] is shared behind an
-/// [`Arc`] (redb is internally `Send + Sync`), so cheap clones share one file
-/// handle — which the async trait's `&self` methods rely on.
+/// redb-on-file store. Cloneable: the [`Database`] is shared behind an [`Arc`]
+/// (redb is internally `Send + Sync`), so cheap clones share one file handle —
+/// which the async trait's `&self` methods rely on.
 #[derive(Clone)]
 pub struct RedbAdapter {
     db: Arc<Database>,
 }
 
 impl RedbAdapter {
-    /// Open (or create) a redb store at `path`. The two tables are created lazily
-    /// on first write; opening only needs the database file.
+    /// Open (or create) a redb store at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Database::create(path.as_ref()).map_err(map_db)?;
         Self::from_db(db)
     }
 
-    /// Open a redb store backed by an in-memory backend (for tests). Shares the
-    /// same surface as [`open`](Self::open) but never touches the filesystem, so
-    /// the server's in-memory registry/actor tests run without a temp file.
+    /// Open a redb store on an in-memory backend (for tests), never touching the
+    /// filesystem.
     pub fn open_in_memory() -> Result<Self> {
         let db = Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
@@ -69,8 +51,7 @@ impl RedbAdapter {
     }
 
     /// Materialize both tables so reads on a fresh store see empty tables rather
-    /// than "table not found", then wrap the database. Shared by `open` and
-    /// `open_in_memory`.
+    /// than "table not found".
     fn from_db(db: Database) -> Result<Self> {
         let txn = db.begin_write().map_err(map_txn)?;
         {
@@ -86,7 +67,6 @@ impl RedbAdapter {
         self.try_len().unwrap_or(0)
     }
 
-    /// Whether the store is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -129,9 +109,8 @@ impl RedbAdapter {
         {
             let mut main = txn.open_table(MAIN).map_err(map_table)?;
             removed = main.remove(id).map_err(map_storage)?.is_some();
-            // Delete removes the record AND any stale region row(s) for it, so the
-            // index never outlives its record. The region key is canvas-prefixed,
-            // so we scan and drop every region row whose framed object_id matches.
+            // Drop any region row(s) for this id too, so the index never
+            // outlives its record.
             if removed {
                 let mut region = txn.open_table(REGION).map_err(map_table)?;
                 let stale: Vec<Vec<u8>> = collect_region_rows_for(&region, id)?;
@@ -170,9 +149,7 @@ impl RedbAdapter {
     fn replace_all(&self, snapshot: &StoreSnapshot) -> Result<()> {
         let txn = self.db.begin_write().map_err(map_txn)?;
         {
-            // Clear both tables by reopening them empty: redb has no "truncate",
-            // so drop every existing key. `retain` would also work; explicit
-            // removal keeps the single-writer txn obvious.
+            // redb has no "truncate", so drop every existing key.
             let mut main = txn.open_table(MAIN).map_err(map_table)?;
             let keys: Vec<String> = {
                 let mut ks = Vec::new();
@@ -192,9 +169,8 @@ impl RedbAdapter {
             }
         }
         {
-            // restore replaces the logical store; region rows are not part of the
-            // portable snapshot, so clear the index too rather than leaving it
-            // pointing at records that may no longer exist.
+            // region rows aren't part of the portable snapshot, so clear the
+            // index too rather than leave it pointing at records that may be gone.
             let mut region = txn.open_table(REGION).map_err(map_table)?;
             let keys: Vec<Vec<u8>> = {
                 let mut ks = Vec::new();
@@ -222,16 +198,15 @@ impl RedbAdapter {
         }
         {
             let mut region = txn.open_table(REGION).map_err(map_table)?;
-            // Always drop any prior region row(s) for this id first so a moved or
-            // un-indexed record never leaves a stale Z-order entry behind.
+            // Drop any prior region row(s) for this id first so a moved or
+            // un-indexed record leaves no stale Z-order entry behind.
             let stale: Vec<Vec<u8>> = collect_region_rows_for(&region, &record.id)?;
             for k in stale {
                 region.remove(k.as_slice()).map_err(map_storage)?;
             }
             if let Some(key) = key {
-                // Index at the bbox center's Morton code (the usual choice): the
-                // window query range-scans by center and refilters on the stored
-                // bbox, so the exact bbox is what decides membership.
+                // Index at the bbox center's Morton code; the window query
+                // range-scans by center and refilters on the stored bbox.
                 let cx = (key.min_x + key.max_x) / 2.0;
                 let cy = (key.min_y + key.max_y) / 2.0;
                 let morton = morton_of_world(cx, cy);
@@ -254,11 +229,9 @@ impl RedbAdapter {
         let txn = self.db.begin_read().map_err(map_txn)?;
         let region = txn.open_table(REGION).map_err(map_table)?;
 
-        // Decide the half-open key range to scan: a Morton window for a bounded
-        // query, or the whole canvas's Morton space when `window` is None. The
-        // row keys carry an `object_id` tail (so co-located objects don't collide),
-        // so the end is the EXCLUSIVE first key of the cell past `hi` — covering
-        // every object id within the `hi` cell.
+        // Half-open key range: the Morton window, or the whole canvas when
+        // `window` is None. The end is the EXCLUSIVE first key past cell `hi`,
+        // covering every object_id tail within that cell.
         let (lo, hi) = match window {
             Some(w) => w.morton_range(),
             None => (u64::MIN, u64::MAX),
@@ -266,10 +239,8 @@ impl RedbAdapter {
         let lo_key = region_scan_start(canvas_id, lo);
         let hi_key = region_scan_end_excl(canvas_id, hi);
 
-        // Range-scan the Z-order window, refilter each candidate on its exact
-        // bbox, and collect surviving object ids. Only the survivors' main
-        // records are loaded — the index value carries the bbox so the refilter
-        // never touches the main table.
+        // Range-scan, refilter each candidate on its exact bbox (carried in the
+        // index value, so this never touches the main table), and collect ids.
         let mut ids: Vec<String> = Vec::new();
         let range = region
             .range(lo_key.as_slice()..hi_key.as_slice())
@@ -294,7 +265,7 @@ impl RedbAdapter {
         }
         drop(region);
 
-        // Load the survivors from the main table and return them id-sorted.
+        // Load the survivors from the main table, id-sorted.
         ids.sort();
         ids.dedup();
         let main = txn.open_table(MAIN).map_err(map_table)?;
@@ -310,7 +281,6 @@ impl RedbAdapter {
 
 impl StorageAdapter for RedbAdapter {
     fn kind(&self) -> AdapterKind {
-        // INTEGRATE: add `AdapterKind::Redb` (+ `as_str` => "redb") in adapter.rs.
         AdapterKind::Redb
     }
 
@@ -331,13 +301,11 @@ impl StorageAdapter for RedbAdapter {
     }
 
     fn records(&self) -> Result<RecordCursor<'_>> {
-        // redb's range iterator borrows the read transaction, which would need a
-        // self-referential cursor to stream lazily. The portable-format contract
-        // only needs an id-sorted cursor, so we materialize the id-sorted records
-        // up front (redb keys are already sorted) and hand back an owning
-        // iterator. INTEGRATE NOTE: if a very large redb store must export in
-        // strictly bounded memory, replace this with a keyset-paginated cursor
-        // like sqlite's `KeysetCursor` (page by id ranges).
+        // redb's range iterator borrows the read transaction, so streaming lazily
+        // would need a self-referential cursor. We instead materialize the
+        // id-sorted records (redb keys are already sorted) and hand back an owning
+        // iterator; a keyset-paginated cursor would be needed for strictly
+        // bounded export of a very large redb store.
         let records = self.all_records()?;
         Ok(Box::new(records.into_iter().map(Ok)))
     }
@@ -427,10 +395,9 @@ impl SpatialStore for RedbAdapter {
         canvas_id: &str,
         bbox: Option<(f64, f64, f64, f64)>,
     ) -> Result<RecordCursor<'_>> {
-        // The sync `SpatialStore` window is a raw `(min, max)` AABB tuple; the
-        // redb core scans by `RegionWindow`. region_query already returns the
-        // window's records id-sorted, so hand back an owning iterator (bounded by
-        // the window, exactly like the async surface).
+        // The sync window is a raw `(min, max)` tuple; the core scans by
+        // `RegionWindow`. region_query already returns id-sorted records, so
+        // hand back an owning iterator (bounded by the window).
         let window = bbox.map(|(min_x, min_y, max_x, max_y)| RegionWindow {
             min_x,
             min_y,
@@ -444,19 +411,15 @@ impl SpatialStore for RedbAdapter {
 
 // ---- value framing ---------------------------------------------------------
 //
-// Manual, pointer-width-agnostic framing keeps the value bytes dependency-light
-// and lets the main value carry the T4 zstd marker inline. All multi-byte
-// integers are big-endian; all variable bytes are u32-BE length-prefixed.
+// All multi-byte integers are big-endian; all variable bytes are u32-BE
+// length-prefixed. No `usize` ever reaches the bytes.
 
 /// Frame a [`Record`] for the main table:
 ///   kind_len(u32) | kind | version(u64) | payload_marker(u8) | raw_len(u32) | payload_bytes
 ///
-/// The payload is zstd-compressed at rest (T4). `payload_marker` records whether
-/// `payload_bytes` is the compressed stream (`1`) or stored raw (`0`); `raw_len`
-/// is the original uncompressed length, used both to size the decode buffer and
-/// to round-trip empty payloads exactly. Tiny/empty payloads are stored raw when
-/// compression would not shrink them, so `load` round-trips byte for byte either
-/// way.
+/// `payload_marker` is `1` when `payload_bytes` is the zstd stream, `0` when
+/// stored raw; `raw_len` is the original length. Tiny/empty payloads stay raw
+/// when compression wouldn't shrink them, so `load` round-trips byte for byte.
 fn encode_record_value(record: &Record) -> Vec<u8> {
     let mut out = Vec::new();
     put_bytes(&mut out, record.kind.as_bytes());
@@ -481,8 +444,7 @@ fn encode_record_value(record: &Record) -> Vec<u8> {
     out
 }
 
-/// Inverse of [`encode_record_value`]; decompresses the payload (T4) when the
-/// marker says so, restoring the original bytes exactly.
+/// Inverse of [`encode_record_value`]; decompresses when the marker says so.
 fn decode_record_value(id: &str, bytes: &[u8]) -> Result<Record> {
     let mut cur = Cursor::new(bytes);
     let kind = cur.take_bytes()?;
@@ -534,9 +496,8 @@ fn decode_region_value(bytes: &[u8]) -> Result<(String, (f64, f64, f64, f64))> {
     Ok((object_id, (min_x, min_y, max_x, max_y)))
 }
 
-/// Collect every region row key whose framed object_id equals `id`. Used to drop
-/// stale index rows on re-index and on delete. Bounded by the index size; the
-/// common case is zero or one row.
+/// Collect every region row key whose framed object_id equals `id`, to drop
+/// stale rows on re-index and delete (the common case is zero or one row).
 fn collect_region_rows_for(
     region: &impl ReadableTable<&'static [u8], &'static [u8]>,
     id: &str,
@@ -559,7 +520,7 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// A minimal big-endian byte reader for the framed values.
+/// A minimal big-endian reader for the framed values.
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -614,33 +575,23 @@ impl<'a> Cursor<'a> {
     }
 }
 
-// ---- zstd (T4) -------------------------------------------------------------
+// ---- zstd ------------------------------------------------------------------
 
-/// Default zstd level: a balanced speed/ratio point for at-rest payloads.
+/// A balanced speed/ratio point for at-rest payloads.
 const ZSTD_LEVEL: i32 = 3;
 
-/// Compress with zstd at [`ZSTD_LEVEL`]. On the (practically impossible) error
-/// path, fall back to a copy of the raw bytes; the caller only adopts the result
-/// when it is strictly smaller than raw, so a copy is harmless.
+/// Compress with zstd. On the (practically impossible) error path, fall back to
+/// a raw copy; the caller adopts the result only when strictly smaller than raw.
 fn zstd_compress(raw: &[u8]) -> Vec<u8> {
     zstd::encode_all(raw, ZSTD_LEVEL).unwrap_or_else(|_| raw.to_vec())
 }
 
-/// Decompress a zstd stream into a `raw_len`-sized payload.
 fn zstd_decompress(compressed: &[u8], _raw_len: usize) -> Result<Vec<u8>> {
     zstd::decode_all(compressed)
         .map_err(|e| StorageError::Format(format!("redb: zstd decode failed: {e}")))
 }
 
-// ---- error mapping ---------------------------------------------------------
-//
-// INTEGRATE NOTE: these map redb's distinct error types into `StorageError`.
-// They are written against redb 2.x's error enum split (DatabaseError /
-// TransactionError / TableError / StorageError / CommitError). If the resolved
-// redb major version merges or renames these, collapse these helpers to match —
-// the call sites only need `Fn(E) -> StorageError`. A dedicated
-// `StorageError::Backend(String)` variant could replace the `Io(...)` reuse if
-// the Integrate phase prefers; `Io` is used here to avoid editing error.rs.
+// ---- error mapping (redb 2.x error enum split into one StorageError) --------
 
 fn map_db(e: redb::DatabaseError) -> StorageError {
     StorageError::Io(format!("redb open: {e}"))
@@ -665,13 +616,9 @@ fn map_commit(e: redb::CommitError) -> StorageError {
     reason = "test fixtures intentionally truncate to byte values"
 )]
 mod tests {
-    // `RedbAdapter` implements BOTH the sync `StorageAdapter` and the async
-    // `AsyncStorageAdapter`, which share method names (save/load/delete/list/
-    // snapshot/restore). Having both traits in method scope makes every
-    // `store.save(..)` ambiguous, so the two surfaces are tested in separate
-    // modules: this one brings only the SYNC trait into scope; the nested
-    // `region` module (below) brings only the ASYNC trait. Shared helpers live
-    // here and are imported by the nested module via `use super::*`.
+    // RedbAdapter impls both sync and async traits, which share method names;
+    // having both in scope makes `store.save(..)` ambiguous, so each surface is
+    // tested in its own module (this one brings only the SYNC trait into scope).
     use super::{
         decode_record_value, encode_record_value, Path, Record, RedbAdapter, RegionKey,
         StorageError,
@@ -680,8 +627,7 @@ mod tests {
     use std::env;
     use std::path::PathBuf;
 
-    /// A unique temp dir under the OS temp root, cleaned up on drop. `pub(super)`
-    /// so the sibling `region_tests` module can reuse it.
+    /// `pub(super)` so the sibling `region_tests` module can reuse it.
     pub(super) struct TempDir(PathBuf);
     impl TempDir {
         pub(super) fn new(tag: &str) -> Self {
@@ -709,7 +655,6 @@ mod tests {
     }
 
     /// A record on `canvas` with a square bbox centered at `(cx, cy)`, half `r`.
-    /// `pub(super)` so the sibling `region_tests` module can reuse it.
     pub(super) fn at(id: &str, canvas: &str, cx: f64, cy: f64, r: f64) -> (Record, RegionKey) {
         (
             Record::new(id, "object", id.as_bytes().to_vec()),
@@ -724,8 +669,7 @@ mod tests {
     }
 
     pub(super) fn block_on<F: core::future::Future>(fut: F) -> F::Output {
-        // Minimal no-waker executor: every future here completes without ever
-        // yielding (the redb op is fully synchronous), so a single poll suffices.
+        // No-waker executor: the redb op is fully sync, so a single poll suffices.
         use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
         fn noop(_: *const ()) {}
         fn clone(_: *const ()) -> RawWaker {
@@ -752,7 +696,6 @@ mod tests {
         assert_eq!(store.len(), 2);
         assert_eq!(store.load("a").unwrap().payload, b"one");
 
-        // Upsert by id, preserving version + kind.
         store
             .save(Record {
                 id: "a".into(),
@@ -767,10 +710,8 @@ mod tests {
         assert_eq!(a.version, 7);
         assert_eq!(a.kind, "card");
 
-        // list is id-sorted.
         assert_eq!(store.list().unwrap(), vec!["a", "b"]);
 
-        // delete returns bool and is idempotent.
         assert!(store.delete("a").unwrap());
         assert!(!store.delete("a").unwrap());
         assert!(matches!(
@@ -779,7 +720,6 @@ mod tests {
         ));
         assert_eq!(store.list().unwrap(), vec!["b"]);
 
-        // missing id errors.
         assert!(matches!(
             store.load("missing"),
             Err(StorageError::NotFound { .. })
@@ -798,8 +738,8 @@ mod tests {
         assert_eq!(ids, vec!["a", "aa", "b", "c"]);
     }
 
-    /// T4: payload survives the zstd at-rest round-trip exactly, for empty,
-    /// highly-compressible, random-ish, and binary (NUL / 0xFF) payloads.
+    /// Payload survives the zstd at-rest round-trip exactly across empty,
+    /// compressible, random-ish, and binary (NUL / 0xFF) payloads.
     #[test]
     fn payload_survives_zstd_round_trip() {
         let tmp = TempDir::new("zstd");
@@ -829,9 +769,8 @@ mod tests {
         }
     }
 
-    /// The compressible payload must actually shrink on disk: the value bytes
-    /// stored for a 100k zero-run must be far smaller than the raw payload,
-    /// proving zstd is applied (not just round-tripping raw).
+    /// The compressible payload must actually shrink on disk, proving zstd is
+    /// applied (not just round-tripping raw).
     #[test]
     fn compressible_payload_actually_shrinks() {
         let raw = vec![7u8; 100_000];
@@ -843,33 +782,21 @@ mod tests {
             encoded.len(),
             raw.len()
         );
-        // And it still decodes back to the exact bytes.
         let back = decode_record_value("z", &encoded).unwrap();
         assert_eq!(back.payload, raw);
     }
 
-    /// OB5.4 data-size gate: the at-rest OBJECT payload stores geometry as a
-    /// compact path-string `d`, NEVER raw float point arrays or a tessellated
-    /// mesh. We build a realistic freehand-stroke object scene (a few hundred
-    /// M/L nodes as a compact integer path-string), serialize it the way it lives
-    /// at rest (the `Object`/`Geometry` serde shape: path-string `d`, no
-    /// `subpaths` — that field is `#[serde(skip)]`, runtime-only), and assert:
-    ///   1. the payload carries the path-string `d`,
-    ///   2. it carries NO tessellated `mesh`/`vertices`/`indices`, nor a raw
-    ///      `subpaths` array (raw points/mesh are not persisted), and
-    ///   3. zstd at rest shrinks the repetitive path-string materially (< 60%)
-    ///      while `load` round-trips the exact bytes.
+    /// Data-size gate: the at-rest OBJECT payload stores geometry as a compact
+    /// path-string `d`, never raw float point arrays or a tessellated mesh, and
+    /// zstd shrinks the repetitive path-string materially while `load` round-
+    /// trips the exact bytes.
     ///
-    /// shape_storage_core is store-neutral (it never depends on scene-core), so
-    /// the payload is hand-built JSON matching scene-core's `Object`/`Geometry`
-    /// serde surface (camelCase keys, geometry `{ "d": "...", "fillRule": ... }`,
-    /// parsed `subpaths` never serialized) rather than importing the crate.
+    /// store-neutral here means no scene-core dependency, so the payload is
+    /// hand-built JSON matching scene-core's `Object`/`Geometry` serde surface.
     #[test]
     fn object_payload_stores_path_string_not_raw_points_or_mesh() {
-        // A many-node freehand stroke as a compact integer path-string: one M
-        // moveto, then ~400 L linetos in object-local quantized integer units.
-        // Drawn as a gentle wiggle so the coords vary but stay short/repetitive,
-        // which is exactly the shape a real RDP-simplified sketch produces (D11).
+        // A many-node freehand stroke as a compact integer path-string (one M +
+        // ~400 L linetos), the shape a real RDP-simplified sketch produces.
         let mut d = String::from("M 0 0");
         for i in 1..=400i32 {
             let x = i * 3;
@@ -877,21 +804,16 @@ mod tests {
             d.push_str(&format!(" L {x} {y}"));
         }
 
-        // The at-rest object scene payload: scene-core's `Object`/`Geometry`
-        // serde shape. Geometry is the path-string `d` (+ fill rule); the parsed
-        // `subpaths` are runtime-only and never appear here. No mesh/vertices/
-        // indices anywhere — those are derived render artifacts, not persisted.
         let payload_json = format!(
             r##"{{"sceneVersion":1,"objects":[{{"id":"stroke-1","order":"a0","transform":[[1,0,0],[0,1,0],[0,0,1]],"geometry":{{"d":"{d}","fillRule":"nonZero"}},"stroke":{{"paint":{{"kind":"solid","color":"#1a1a1a"}},"width":2,"cap":"round","join":"round"}}}}],"tags":[],"selection":{{"kind":"canvas"}},"updatedAt":"1970-01-01T00:00:00Z"}}"##
         );
         let raw = payload_json.into_bytes();
 
-        // (1) The payload carries the path-string `d`.
         let text = std::str::from_utf8(&raw).unwrap();
         assert!(text.contains(r#""d":"M 0 0 L 3"#), "payload must carry the path-string d");
 
-        // (2) Raw points / tessellated mesh are NOT persisted: no mesh/vertices/
-        //     indices fields, and no raw `subpaths` array (it is #[serde(skip)]).
+        // Raw points / tessellated mesh are not persisted (`subpaths` is
+        // #[serde(skip)]).
         for forbidden in ["\"mesh\"", "\"vertices\"", "\"indices\"", "\"subpaths\""] {
             assert!(
                 !text.contains(forbidden),
@@ -899,8 +821,6 @@ mod tests {
             );
         }
 
-        // (3) zstd at rest shrinks the repetitive path-string materially, and the
-        //     stored value round-trips byte-for-byte through the redb adapter.
         let record = Record::new("stroke-1", "object", raw.clone());
         let encoded = encode_record_value(&record);
         assert!(
@@ -911,13 +831,9 @@ mod tests {
             raw.len()
         );
 
-        // Round-trip the exact at-rest bytes through the pure value codec
-        // (encode_record_value/decode_record_value is exactly what the adapter's
-        // save/load use). Using the codec rather than opening a redb Database
-        // keeps this size-gate test light: a file-backed redb DB allocates
-        // several MB that, under a parallel `cargo test`, would inflate the
-        // process-global allocator-probe peak of the bounded-memory integrity
-        // tests and flake them.
+        // Use the pure codec, not a file-backed redb DB, so this size-gate test
+        // stays light and doesn't inflate the allocator-probe peak of the
+        // bounded-memory integrity tests under parallel `cargo test`.
         let got = decode_record_value("stroke-1", &encoded).unwrap();
         assert_eq!(got.payload, raw, "codec must round-trip the exact at-rest bytes");
         assert_eq!(got.kind, "object");
@@ -942,8 +858,6 @@ mod tests {
         ));
     }
 
-    /// Persistence: reopen the Database from the same path and confirm the data
-    /// (and exact payloads) survive a fresh adapter instance.
     #[test]
     fn persists_across_reopen() {
         let tmp = TempDir::new("reopen");
@@ -961,10 +875,8 @@ mod tests {
     }
 }
 
-/// Async region-query tests. Kept in a separate module so the ASYNC trait — not
-/// the sync one — is the only `StorageAdapter`-shaped trait in method scope here,
-/// making `block_on(store.save_indexed/query_region/load/delete(..))` resolve to
-/// the async surface without colliding with the sync names tested above.
+/// Async region-query tests in a separate module so only the ASYNC trait is in
+/// method scope, without colliding with the sync names tested above.
 #[cfg(test)]
 mod region_tests {
     use super::tests::{at, block_on, TempDir};
@@ -975,16 +887,16 @@ mod region_tests {
         RedbAdapter::open(tmp.path().join(name)).unwrap()
     }
 
-    /// T2 + async: save_indexed + query_region returns only records overlapping
-    /// the window and excludes far-away ones, id-sorted; None clears the row;
-    /// delete drops the region row; canvases are isolated.
+    /// save_indexed + query_region returns only window-overlapping records
+    /// (id-sorted), None clears the row, delete drops the region row, canvases
+    /// stay isolated.
     #[test]
     fn region_query_filters_and_excludes_far_away() {
         let tmp = TempDir::new("region");
         let store = open(&tmp, "store.redb");
 
-        // alpha: three boxes along x; beta: two boxes sitting inside alpha's
-        // x-range (so a leak would show up). Inserted out of id order.
+        // alpha: three boxes along x; beta: two inside alpha's x-range (so a leak
+        // would show up). Inserted out of id order.
         let fixture = [
             at("a-30", "alpha", 30.0, 0.0, 5.0),
             at("a-10", "alpha", 10.0, 0.0, 5.0),
@@ -998,7 +910,6 @@ mod region_tests {
 
         let ids = |recs: Vec<Record>| -> Vec<String> { recs.into_iter().map(|r| r.id).collect() };
 
-        // Whole-canvas (None window), id-sorted, per-canvas isolation.
         assert_eq!(
             ids(block_on(store.query_region("alpha", None)).unwrap()),
             vec!["a-10", "a-20", "a-30"]
@@ -1020,7 +931,6 @@ mod region_tests {
             vec!["a-10", "a-20"]
         );
 
-        // A window far from everything returns nothing.
         let far = Some(RegionWindow {
             min_x: 1000.0,
             min_y: 1000.0,
@@ -1029,7 +939,7 @@ mod region_tests {
         });
         assert!(block_on(store.query_region("alpha", far)).unwrap().is_empty());
 
-        // beta's boxes never leak into an alpha query even though they share x.
+        // beta's boxes never leak into an alpha query despite sharing x.
         let alpha_all = ids(block_on(store.query_region("alpha", None)).unwrap());
         assert!(!alpha_all.iter().any(|id| id.starts_with("b-")));
 
@@ -1045,7 +955,6 @@ mod region_tests {
             "record survives un-indexing"
         );
 
-        // delete removes the record AND its region row.
         assert!(block_on(store.delete("a-10")).unwrap());
         assert_eq!(
             ids(block_on(store.query_region("alpha", None)).unwrap()),
@@ -1053,9 +962,7 @@ mod region_tests {
         );
     }
 
-    /// Re-indexing a moved record must not leave a stale Z-order row: after
-    /// moving a-10 far away, a window over its old position no longer returns it,
-    /// while a window over its new position does.
+    /// Re-indexing a moved record must not leave a stale Z-order row.
     #[test]
     fn reindex_moves_without_stale_rows() {
         let tmp = TempDir::new("reindex");
@@ -1064,7 +971,6 @@ mod region_tests {
         let (rec, key) = at("a-10", "alpha", 10.0, 0.0, 5.0);
         block_on(store.save_indexed(rec, Some(key))).unwrap();
 
-        // Move it to (500, 500).
         let (rec, key) = at("a-10", "alpha", 500.0, 500.0, 5.0);
         block_on(store.save_indexed(rec, Some(key))).unwrap();
 
@@ -1092,15 +998,13 @@ mod region_tests {
             .collect();
         assert_eq!(got, vec!["a-10"]);
 
-        // Whole-canvas still has exactly one row.
         assert_eq!(
             block_on(store.query_region("alpha", None)).unwrap().len(),
             1
         );
     }
 
-    /// Region index survives reopen: query_region works on a fresh adapter
-    /// instance reading the same file.
+    /// Region index survives reopen on a fresh adapter reading the same file.
     #[test]
     fn region_index_persists_across_reopen() {
         let tmp = TempDir::new("region-reopen");

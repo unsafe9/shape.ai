@@ -1,40 +1,16 @@
-//! # shape_storage_core
-//!
-//! Store-neutral storage layer for shape.ai. It abstracts where data lives
-//! behind one [`StorageAdapter`] trait and gives every backend a single,
-//! portable, parallel-friendly on-disk format to `export` to and `import`
-//! from. See [`idea1.md`](../../../docs/idea1.md) for the originating idea.
-//!
-//! ## Pieces
-//!
-//! * [`Record`] / [`StoreSnapshot`] — store-neutral data model (opaque,
-//!   versioned, byte-payload records).
-//! * [`StorageAdapter`] — `save`/`load`/`delete`/`list` per-record I/O, the
-//!   streaming pair `records`/`ingest`, and `snapshot`/`restore`, with
-//!   memory-bounded `export`/`import` provided on top of the streaming pair.
-//! * [`format`] — the one portable bundle format: a sharded directory written
-//!   and read incrementally (streaming, bounded buffers) and in parallel via
-//!   rayon, with per-shard CRCs for stability.
-//! * [`MemoryAdapter`] / [`FileAdapter`] / `RedbAdapter` —
-//!   real, fully-tested adapters living under [`adapters`]. (`RedbAdapter` is the
-//!   embedded redb-on-file store, the durable backend, native-only and behind the
-//!   default `redb` feature, adding the async region-query surface.)
-//! * [`PostgresAdapter`] / [`S3Adapter`] / [`RemoteServerAdapter`] —
-//!   clearly-marked stubs (drivers unavailable offline) that still keep the
-//!   portability contract.
+//! Store-neutral storage layer for shape.ai: data lives behind one
+//! [`StorageAdapter`] trait, with a single portable on-disk bundle format every
+//! backend can `export` to and `import` from.
 
 mod adapter;
 mod adapter_async;
 mod adapters;
 mod error;
 pub mod morton;
-// The OPFS redb backend is wasm32-only and behind the `opfs` feature; the
-// default wasm build never pulls redb/web-sys. The module's own inner `#![cfg]`
-// also gates it, so this mod line mirrors the file/sqlite gating style.
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
 pub mod opfs_backend;
-// The portable bundle format depends on std::fs + rayon, so it is native-only;
-// wasm32 keeps the data model + trait + MemoryAdapter and no on-disk format.
+// Native-only: the bundle format depends on std::fs + rayon. wasm32 keeps the
+// data model + trait + MemoryAdapter and no on-disk format.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod format;
 mod record;
@@ -86,8 +62,6 @@ mod tests {
         }
     }
 
-    /// Build a store with a spread of records (varied kinds, sizes, binary
-    /// payloads) so shard partitioning and framing are exercised.
     fn sample_store(n: usize) -> MemoryAdapter {
         let mut store = MemoryAdapter::new();
         for i in 0..n {
@@ -123,14 +97,12 @@ mod tests {
         assert_eq!(exported.total_records, 120);
         assert_eq!(exported.shard_count, DEFAULT_SHARD_COUNT);
 
-        // Import into a different adapter kind (file) and verify equality.
         let dest_root = tmp.path().join("dest.shapestore");
         let mut dest = FileAdapter::open(&dest_root).unwrap();
         dest.import(&bundle).unwrap();
 
         assert_eq!(dest.snapshot().unwrap(), source.snapshot().unwrap());
 
-        // And back into memory from the file store's own bundle.
         let mut mem = MemoryAdapter::new();
         mem.import(&dest_root).unwrap();
         assert_eq!(mem.snapshot().unwrap(), source.snapshot().unwrap());
@@ -164,10 +136,8 @@ mod tests {
         let man_a = store.export(&a).unwrap();
         let man_b = store.export(&b).unwrap();
 
-        // Manifests (incl. per-shard CRCs) must be identical.
         assert_eq!(man_a, man_b);
 
-        // Every shard file's bytes must match across the two exports.
         for entry in &man_a.shards {
             let name = format!("shard-{:05}.bin", entry.index);
             let bytes_a = std::fs::read(a.join(&name)).unwrap();
@@ -197,7 +167,6 @@ mod tests {
         let store = sample_store(40);
         let manifest = store.export(&bundle).unwrap();
 
-        // Corrupt the first non-empty shard.
         let target = manifest
             .shards
             .iter()
@@ -237,12 +206,9 @@ mod tests {
     }
 }
 
-/// A counting global allocator used only under `cfg(test)` to prove that the
-/// streaming export/import run in **bounded** memory. It tracks live bytes and
-/// the peak live bytes while "armed", so a test can measure peak heap residency
-/// across a full streaming export/import of a large dataset and assert it stays
-/// far below the dataset's total size — the regression guard against the old
-/// "snapshot the whole store, then write" pattern.
+/// Test-only counting global allocator: tracks live + peak heap bytes while
+/// "armed", so a test can assert streaming export/import stays far below the
+/// dataset's total size (regression guard against snapshot-the-whole-store).
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod alloc_probe {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -286,7 +252,6 @@ mod alloc_probe {
         }
     }
 
-    /// Arm the probe with a fresh peak baseline.
     pub fn arm() {
         LIVE.store(0, Ordering::Relaxed);
         PEAK.store(0, Ordering::Relaxed);
@@ -304,9 +269,6 @@ mod alloc_probe {
 #[global_allocator]
 static GLOBAL: alloc_probe::CountingAlloc = alloc_probe::CountingAlloc;
 
-/// Detailed integrity + memory-safety tests, run against BOTH the in-memory and
-/// the on-disk adapters via a shared harness. These enforce the integrity
-/// contract documented in `src/adapters/CLAUDE.md`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(
     clippy::cast_possible_truncation,
@@ -322,11 +284,9 @@ mod integrity {
     use std::rc::Rc;
     use std::sync::Mutex;
 
-    /// Serializes the allocator-probing tests (and any other test whose heavy,
-    /// concurrent allocations would pollute the process-global probe peak) so only
-    /// one of them is active at a time. Poison-tolerant: a probe-test assertion
-    /// failure poisons this guard, but it protects only a measurement window, not
-    /// shared data, so a later holder may safely reuse it.
+    /// Serializes allocator-probing tests so only one is active at a time
+    /// (the probe peak is process-global). Poison-tolerant: it guards only a
+    /// measurement window, not shared data, so a later holder may reuse it.
     static PROBE_LOCK: Mutex<()> = Mutex::new(());
 
     fn probe_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -355,10 +315,8 @@ mod integrity {
         }
     }
 
-    /// One fixed, varied dataset: mixed kinds, versions, and payload sizes
-    /// including empty and binary (incl. NUL and 0xFF) payloads, plus ids with
-    /// awkward characters. Returned in *insertion* order (not sorted) so tests
-    /// also prove the adapters impose deterministic ordering themselves.
+    /// One fixed, varied dataset returned in *insertion* order (not sorted) so
+    /// tests prove the adapters impose deterministic ordering themselves.
     fn fixed_dataset() -> Vec<Record> {
         let kinds = ["card", "edge", "group", "tag", "note"];
         let mut out = Vec::new();
@@ -367,11 +325,11 @@ mod integrity {
             let kind = kinds[i % kinds.len()].to_string();
             let version = (i as u64 * 3 + 1) % 17;
             let payload: Vec<u8> = match i % 5 {
-                0 => Vec::new(),                                  // empty
-                1 => vec![0u8; i % 11],                           // NUL run
-                2 => (0..(i % 257)).map(|b| (b * 31 % 256) as u8).collect(), // varied
-                3 => vec![0xffu8; i % 7],                         // high bytes
-                _ => format!("payload-{i}-\u{1f600}").into_bytes(), // utf-8 text
+                0 => Vec::new(),
+                1 => vec![0u8; i % 11],
+                2 => (0..(i % 257)).map(|b| (b * 31 % 256) as u8).collect(),
+                3 => vec![0xffu8; i % 7],
+                _ => format!("payload-{i}-\u{1f600}").into_bytes(),
             };
             out.push(Record {
                 id,
@@ -383,8 +341,6 @@ mod integrity {
         out
     }
 
-    /// Load the fixed dataset into a fresh adapter via `save`, deduping by id so
-    /// the expected map matches what the store keeps.
     fn loaded<A: StorageAdapter>(mut adapter: A) -> (A, Vec<Record>) {
         let mut by_id: std::collections::BTreeMap<String, Record> = Default::default();
         for r in fixed_dataset() {
@@ -405,33 +361,27 @@ mod integrity {
         let mut adapter = adapter;
         let expected_ids: Vec<String> = expected.iter().map(|r| r.id.clone()).collect();
 
-        // load: every id resolves to the exact record.
         for r in expected {
             let got = adapter.load(&r.id).unwrap();
             assert_eq!(&got, r, "load mismatch for {}", r.id);
         }
 
-        // list: deterministic id-sorted order + completeness.
         let ids = adapter.list().unwrap();
         assert_eq!(ids, expected_ids, "list order/completeness");
 
-        // records(): lazy cursor yields every record in id order.
         let via_cursor: Vec<Record> = adapter.records().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(&via_cursor, expected, "records() cursor");
 
-        // snapshot/restore round-trip equality.
         let snap = adapter.snapshot().unwrap();
         assert_eq!(snap.len(), expected.len());
         let snap_records: Vec<Record> = snap.records().cloned().collect();
         assert_eq!(&snap_records, expected, "snapshot contents");
 
-        // load of a missing id errors.
         assert!(matches!(
             adapter.load("does-not-exist"),
             Err(StorageError::NotFound { .. })
         ));
 
-        // delete: returns true once, gone afterwards, false on repeat.
         let victim = &expected[expected.len() / 2].id;
         assert!(adapter.delete(victim).unwrap(), "delete returns true");
         assert!(!adapter.delete(victim).unwrap(), "second delete returns false");
@@ -573,30 +523,23 @@ mod integrity {
         assert_imports_match(&expected, &mem2);
     }
 
-    /// The capstone byte-stability proof: the SAME logical dataset exported from
-    /// every real adapter — Memory (RAM), File (bundle dir), and Redb (native
-    /// embedded engine, in-memory backend) — must produce byte-identical bundles
-    /// (manifest + every shard), and each bundle must re-import into a fresh
-    /// MemoryAdapter reproducing the source snapshot exactly. This proves the redb
-    /// adapter is a first-class participant in the one portable, byte-stable
-    /// bundle format.
+    /// The SAME logical dataset exported from every real adapter (Memory, File,
+    /// Redb) must produce byte-identical bundles, and each must re-import into a
+    /// fresh MemoryAdapter reproducing the source snapshot exactly.
     #[cfg(feature = "redb")]
     #[test]
     fn all_adapters_export_byte_identical_and_reimport() {
-        // The redb in-memory backend + zstd buffers allocate several MB; hold the
-        // probe lock so this never overlaps an armed bounded-memory probe whose
-        // peak is process-global.
+        // redb in-memory backend + zstd buffers allocate several MB; hold the
+        // probe lock so this never overlaps an armed bounded-memory probe.
         let _probe = probe_guard();
         let tmp = TempDir::new("alladapters");
 
-        // Same dataset into all three adapter kinds.
         let (mem, expected) = loaded(MemoryAdapter::new());
         let (file, _) = loaded(open_file(&tmp, "store.shapestore"));
         let mut redb = RedbAdapter::open_in_memory().unwrap();
         for r in &expected {
-            // RedbAdapter impls both the sync `StorageAdapter` and the async
-            // `AsyncStorageAdapter` (both in scope via `use super::*`); disambiguate
-            // to the sync save the export path here relies on.
+            // RedbAdapter impls both sync and async traits (both in scope);
+            // disambiguate to the sync save the export path relies on.
             StorageAdapter::save(&mut redb, r.clone()).unwrap();
         }
 
@@ -607,16 +550,13 @@ mod integrity {
         let man_file = file.export(&file_bundle).unwrap();
         let man_redb = redb.export(&redb_bundle).unwrap();
 
-        // Manifests identical across all three adapter kinds.
         assert_eq!(man_mem, man_file, "memory vs file manifest");
         assert_eq!(man_mem, man_redb, "memory vs redb manifest");
 
-        // And the full on-disk bundle bytes (manifest + every shard) identical.
         let bytes_mem = read_bundle_bytes(&mem_bundle);
         assert_eq!(bytes_mem, read_bundle_bytes(&file_bundle), "memory vs file bytes");
         assert_eq!(bytes_mem, read_bundle_bytes(&redb_bundle), "memory vs redb bytes");
 
-        // Every bundle re-imports into a fresh MemoryAdapter reproducing the snapshot.
         let source_snapshot = mem.snapshot().unwrap();
         for bundle in [&mem_bundle, &file_bundle, &redb_bundle] {
             let mut into = MemoryAdapter::new();
@@ -630,17 +570,15 @@ mod integrity {
         }
     }
 
-    // ---- BUNDLE ATOMICITY (MG1.4) ----------------------------------------
+    // ---- BUNDLE ATOMICITY ------------------------------------------------
 
     /// A FileAdapter import that fails partway (corrupt incoming bundle) must
     /// leave the existing on-disk bundle fully intact — the swap-in-place write
-    /// goes through a sibling temp dir and only renames on success, so a failed
-    /// import never corrupts or truncates the live store.
+    /// goes through a sibling temp dir and only renames on success.
     #[test]
     fn file_import_failure_leaves_existing_bundle_intact() {
         let tmp = TempDir::new("atomic");
 
-        // A populated, healthy file store; capture its exact on-disk bytes.
         let (file_seed, expected) = loaded(open_file(&tmp, "live.shapestore"));
         let live_root = file_seed.root().to_path_buf();
         let before = read_bundle_bytes(&live_root);
@@ -661,17 +599,14 @@ mod integrity {
         shard_bytes[last] ^= 0xff;
         std::fs::write(&shard_path, &shard_bytes).unwrap();
 
-        // Import must fail on the corrupt shard's CRC.
         let mut live = FileAdapter::open(&live_root).unwrap();
         let err = live.import(&incoming).unwrap_err();
         assert!(matches!(err, StorageError::Format(_)), "got {err:?}");
 
-        // The live bundle's bytes are unchanged, and it still serves every record.
         assert_eq!(read_bundle_bytes(&live_root), before, "live bundle bytes changed");
         let reopened = FileAdapter::open(&live_root).unwrap();
         assert_imports_match(&expected, &reopened);
 
-        // No orphan temp bundle leaked next to the live store.
         let leaked: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -683,8 +618,8 @@ mod integrity {
 
     // ---- LARGE-DATA / BOUNDED-MEMORY -------------------------------------
 
-    /// A lazy, O(1)-resident generator of `n` synthetic records. Crucially it
-    /// never stores the whole set: each record is built on demand inside `map`.
+    /// A lazy, O(1)-resident generator of `n` synthetic records: each is built
+    /// on demand inside `map`, never storing the whole set.
     fn big_records(n: usize, payload_len: usize) -> impl Iterator<Item = Result<Record>> {
         (0..n).map(move |i| {
             let payload = vec![(i % 251) as u8; payload_len];
@@ -697,10 +632,9 @@ mod integrity {
         })
     }
 
-    /// A streaming sink that wraps each ingested record in a drop-tracking guard
-    /// and records the PEAK number of guards alive at once. For a true streaming
-    /// import this stays at 1; the old "build the whole snapshot first" path
-    /// would spike to O(total).
+    /// A streaming sink that records the PEAK number of records resident at once
+    /// via a drop-tracking guard: a true streaming import stays at 1, while
+    /// "build the whole snapshot first" would spike to O(total).
     struct ResidentProbe {
         live: Rc<Cell<usize>>,
         peak: Rc<Cell<usize>>,
@@ -724,8 +658,6 @@ mod integrity {
                 seen: 0,
             }
         }
-        /// Ingest one record: become "resident" (guard alive) for the duration
-        /// of processing, update peak, then drop the guard.
         fn ingest(&mut self, _record: Record) {
             let now = self.live.get() + 1;
             self.live.set(now);
@@ -736,7 +668,6 @@ mod integrity {
                 live: self.live.clone(),
             };
             self.seen += 1;
-            // _guard drops here, marking the record no longer resident.
         }
     }
 
@@ -753,7 +684,7 @@ mod integrity {
         let tmp = TempDir::new("large");
         let bundle = tmp.path().join("big.shapestore");
 
-        // EXPORT straight from a lazy generator (no full set in RAM), measuring
+        // Export straight from a lazy generator (no full set in RAM), measuring
         // peak heap residency across the streaming, sharded, parallel write.
         let start = std::time::Instant::now();
         super::alloc_probe::arm();
@@ -763,8 +694,6 @@ mod integrity {
         let export_peak = super::alloc_probe::disarm_peak();
         assert_eq!(manifest.total_records as usize, N);
 
-        // IMPORT through a resident-tracking streaming sink: peak simultaneously
-        // resident records must stay tiny (1), proving frame-by-frame ingest.
         let mut probe = ResidentProbe::new();
         super::alloc_probe::arm();
         import_stream(&bundle, |record| {
@@ -791,8 +720,7 @@ mod integrity {
         );
 
         // Heap peak during export/import must be a small fraction of the total
-        // payload — proving neither materialized the whole store. Allow generous
-        // headroom (shard buffers, rayon, copy chunks) but far below O(total).
+        // payload, proving neither materialized the whole store.
         let bound = total_payload_bytes / 2;
         assert!(
             export_peak < bound,
@@ -803,17 +731,14 @@ mod integrity {
             "import peak heap {import_peak_bytes} not bounded (>= {bound}, total {total_payload_bytes})"
         );
 
-        // Sanity: should be fast.
         assert!(
             elapsed.as_secs() < 30,
             "large roundtrip too slow: {elapsed:?}"
         );
 
-        // And fully correct: a real import reproduces every record.
         let mut into = MemoryAdapter::new();
         into.import(&bundle).unwrap();
         assert_eq!(into.len(), N);
-        // Spot-check first/last/middle for exact payload + metadata.
         for i in [0usize, N / 2, N - 1] {
             let got = into.load(&format!("big-{i:08}")).unwrap();
             assert_eq!(got.payload, vec![(i % 251) as u8; PAYLOAD]);
@@ -823,7 +748,7 @@ mod integrity {
 
     #[test]
     fn large_file_adapter_import_export_roundtrip() {
-        // Same scale, but exercising the FileAdapter's streaming import (2-way
+        // Same scale, exercising the FileAdapter's streaming import (2-way
         // merge + re-shard) and streaming export off disk.
         const N: usize = 20_000;
         const PAYLOAD: usize = 48;
@@ -838,12 +763,10 @@ mod integrity {
         file.import(&src).unwrap();
         assert_eq!(file.len(), N);
 
-        // Re-export off disk equals the source bundle byte-for-byte.
         let re = tmp.path().join("re.shapestore");
         file.export(&re).unwrap();
         assert_eq!(read_bundle_bytes(&src), read_bundle_bytes(&re));
 
-        // Single-shard per-record ops still work at scale.
         let probe_id = format!("big-{:08}", N / 3);
         assert!(shard_index_of(&probe_id, DEFAULT_SHARD_COUNT) < DEFAULT_SHARD_COUNT);
         assert!(file.delete(&probe_id).unwrap());

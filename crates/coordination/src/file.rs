@@ -1,21 +1,12 @@
-//! File-backed [`Coordinator`] for single-host multi-process dev (MG8.6).
+//! File-backed [`Coordinator`] for single-host multi-process dev.
 //!
-//! The part that matters for correct handoff is the **lease**, and it is made
-//! cross-process safe by an OS advisory lock: every acquire/renew/release on a
-//! canvas takes an exclusive `fs2` lock on a per-canvas `.lock` sidecar, reads
-//! the lease JSON, applies the steal/deny/renew rule against the local clock,
-//! and writes it back — all under the lock — so two processes racing on the same
-//! canvas serialize and exactly one wins.
-//!
-//! Presence is stored the same way (a per-canvas JSON map guarded by the same
-//! lock) and so is also correct across processes.
-//!
-//! Pub/sub is **best-effort**: `publish` appends a length-prefixed frame to a
-//! per-canvas log and a background poll task tails new frames into a local
-//! `broadcast` channel for in-process subscribers. There is no fsync fan-out
-//! signal, so cross-process delivery is bounded by the poll interval and is not
-//! guaranteed under crashes. Use the in-memory coordinator (or a real broker)
-//! when pub/sub must be reliable; the file impl exists for lease handoff.
+//! Lease ops take an exclusive `fs2` advisory lock on a per-canvas `.lock`
+//! sidecar, then read/apply/write the lease JSON under the lock, so racing
+//! processes serialize and exactly one wins. Presence is guarded the same way.
+//! Pub/sub is best-effort: `publish` appends a length-prefixed frame to a
+//! per-canvas log; a poll task tails new frames into a local `broadcast`
+//! channel. Cross-process delivery is bounded by the poll interval and is not
+//! crash-guaranteed — use the in-memory coordinator when pub/sub must be reliable.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -51,25 +42,20 @@ struct PresenceFile {
     entries: HashMap<String, PresenceRecord>,
 }
 
-/// File-backed coordinator rooted at a directory.
 pub struct FileCoordinator {
     dir: PathBuf,
     counter: AtomicU64,
     clock: Arc<dyn Clock>,
     channel_capacity: usize,
     poll_interval: Duration,
-    // Local broadcast fan-out + the tail task per canvas. Created lazily on the
-    // first subscribe/publish for a canvas.
     channels: StdMutex<HashMap<String, broadcast::Sender<Vec<u8>>>>,
 }
 
 impl FileCoordinator {
-    /// Open (creating if needed) a coordinator rooted at `dir`, using wall time.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_clock(dir, Arc::new(SystemClock))
     }
 
-    /// Open with an injected clock (deterministic tests).
     pub fn open_with_clock(dir: impl AsRef<Path>, clock: Arc<dyn Clock>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -88,16 +74,9 @@ impl FileCoordinator {
         format!("{owner}-{n}")
     }
 
-    /// Filesystem-safe, collision-free stem for a canvas id.
-    ///
-    /// A readable sanitized prefix (non-alphanumerics → `_`) keeps the on-disk
-    /// files debuggable, but that mapping is lossy, so distinct ids like
-    /// `canvas-1` and `canvas_1` would otherwise collapse to one stem and share a
-    /// lock/lease/presence/log. We append a `-{hex}` suffix derived from a stable
-    /// FNV-1a hash of the *full* raw id; equal ids always hash equally and
-    /// distinct ids effectively never share both prefix and hash, so each canvas
-    /// gets its own files. The hash is fixed and inline (no rng, no time) to keep
-    /// the crate deterministic across processes and restarts.
+    /// Filesystem-safe, collision-free stem: the sanitized prefix is lossy, so a
+    /// `-{hex}` suffix from a deterministic FNV-1a hash of the full raw id keeps
+    /// distinct ids (e.g. `canvas-1` vs `canvas_1`) on separate files.
     fn stem(canvas_id: &str) -> String {
         let prefix: String = canvas_id
             .chars()
@@ -120,7 +99,6 @@ impl FileCoordinator {
         self.dir.join(format!("{}.log", Self::stem(canvas_id)))
     }
 
-    /// Run `f` while holding the exclusive cross-process lock for `canvas_id`.
     fn with_lock<T>(&self, canvas_id: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let lock = OpenOptions::new()
             .create(true)
@@ -129,7 +107,6 @@ impl FileCoordinator {
             .open(self.lock_path(canvas_id))?;
         lock.lock_exclusive()?;
         let out = f();
-        // Release regardless of f's result; ignore unlock errors.
         let _ = FileExt::unlock(&lock);
         out
     }
@@ -164,8 +141,6 @@ impl FileCoordinator {
         Ok(())
     }
 
-    /// Get-or-create the local broadcast sender for a canvas, spawning the tail
-    /// task that polls the log file the first time.
     fn sender(&self, canvas_id: &str) -> broadcast::Sender<Vec<u8>> {
         let mut chans = self.channels.lock().expect("channels mutex poisoned");
         if let Some(tx) = chans.get(canvas_id) {
@@ -178,14 +153,11 @@ impl FileCoordinator {
         tx
     }
 
-    /// Background task: tail the per-canvas log and forward new frames to `tx`.
     fn spawn_tail(&self, canvas_id: String, tx: broadcast::Sender<Vec<u8>>) {
         let log_path = self.log_path(&canvas_id);
         let interval = self.poll_interval;
-        // Capture the start offset *synchronously*, before spawning: the task
-        // body runs whenever the runtime first polls it, which may be after a
-        // publish has already appended, so reading the length inside the task
-        // would skip that frame.
+        // Capture the start offset synchronously, before spawning: the task body
+        // is first polled later and could otherwise skip a frame already appended.
         let mut offset: u64 = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
         tokio::spawn(async move {
             loop {
@@ -201,7 +173,6 @@ impl FileCoordinator {
                             }
                         }
                     } else if len < offset {
-                        // Log was truncated/rotated; resync to its new end.
                         offset = len;
                     }
                 }
@@ -211,8 +182,7 @@ impl FileCoordinator {
     }
 }
 
-/// FNV-1a 64-bit hash. A small, stable, deterministic non-cryptographic hash
-/// used to disambiguate canvas-id file stems (no external crate, no rng).
+/// Deterministic FNV-1a 64-bit hash for disambiguating canvas-id file stems.
 fn fnv1a64(s: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -237,9 +207,8 @@ fn append_frame(log_path: &Path, msg: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Decode as many whole length-prefixed frames as `buf` contains. A trailing
-/// partial frame (a torn append we caught mid-write) is dropped; the next poll
-/// re-reads from the same offset once it is complete.
+/// Decode whole length-prefixed frames; a trailing partial frame (torn append
+/// caught mid-write) is dropped and re-read from the same offset on the next poll.
 fn decode_frames(buf: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -375,7 +344,6 @@ impl Coordinator for FileCoordinator {
                 .iter()
                 .map(|(k, r)| (k.clone(), r.val.clone()))
                 .collect::<Vec<_>>();
-            // Persist the pruned set so expired entries do not accumulate.
             self.write_presence(canvas_id, &presence)?;
             Ok(out)
         })

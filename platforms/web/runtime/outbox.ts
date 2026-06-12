@@ -1,71 +1,42 @@
-// Durable outbox PERSISTENCE for unacked client ops.
-//
-// The collaboration session (crates/client-runtime, wasm) does the outbox
-// BOOKKEEPING — minting the monotonic `localSeq`, append/remove on author/ack,
-// replay order. This module keeps only the DURABILITY port: where those rows
-// live so the unacked tail survives a reload/reconnect. On (re)connect the engine
-// reads the persisted rows back and the session replays them in `localSeq` order
-// so an op authored offline (or in flight when the socket dropped) is re-sent
-// rather than lost. Re-sending the same `opId` is safe — the server dedups by it
-// and re-acks the original seq (idempotent).
-//
-// An entry is a `WireOp` (the exact wire envelope, `propDelta` carrying the
-// `ObjectOp` delta), so a row can be re-sent verbatim with no re-encoding.
+// Durable persistence for unacked client ops. The collaboration session (wasm) does the bookkeeping
+// (minting `localSeq`, append/remove on author/ack, replay order); this module is only the DURABILITY
+// port so the unacked tail survives a reload/reconnect. Re-sending the same `opId` is safe — the server
+// dedups by it and re-acks the original seq. An entry is a `WireOp`, so a row re-sends verbatim.
 
 import type { WireOp } from "../shared/object";
 
-/** `(clientId, localSeq)` idempotency key — mirrors the server `OpId`. */
+// `(clientId, localSeq)` idempotency key — mirrors the server `OpId`.
 export type OpId = {
   clientId: string;
   localSeq: number;
 };
 
-/**
- * One outbox row: an opId-stamped `WireOp` envelope around an `ObjectOp` delta.
- * Field-for-field the `ops` envelope the WS protocol carries, so an entry can be
- * re-sent verbatim with no re-encoding.
- */
+// One outbox row: an opId-stamped `WireOp` envelope, field-for-field the WS `ops` envelope, so it re-sends verbatim.
 export type OutboxEntry = WireOp;
 
-/**
- * Durable persistence port for the session's unacked-op log, keyed by `opId`.
- *
- * `append` persists a row the session minted (before send); `remove` drops acked
- * ids; `all` returns the replay set in `localSeq` order, which the session reseeds
- * its bookkeeping from on a fresh-session reconnect. The `localSeq` high-water is
- * recovered from the rows themselves (each carries its seq), so the port holds no
- * separate counter — bookkeeping lives in the session.
- */
+// Durable persistence port for the session's unacked-op log, keyed by `opId`. The `localSeq` high-water
+// is recovered from the rows themselves (each carries its seq), so the port holds no separate counter.
 export interface OutboxStore {
-  /** Persist an entry (call before sending it on the wire). */
+  // Persist an entry (call before sending it on the wire).
   append(entry: OutboxEntry): Promise<void>;
-  /** All unacked entries, ascending by `localSeq` (replay order). */
+  // All unacked entries, ascending by `localSeq` (replay order).
   all(): Promise<OutboxEntry[]>;
-  /** Drop the entries whose `opId` is in `opIds` (on ack/rejected). */
+  // Drop the entries whose `opId` is in `opIds` (on ack/rejected).
   remove(opIds: OpId[]): Promise<void>;
-  /** Drop everything (e.g. a hard reset). */
   clear(): Promise<void>;
 }
 
-/** True when two opIds are the same logical op. */
 export function opIdEquals(a: OpId, b: OpId): boolean {
   return a.clientId === b.clientId && a.localSeq === b.localSeq;
 }
 
-/** Stable string key for an opId (Set/Map membership). */
+// Stable string key for an opId (Set/Map membership).
 export function opIdKey(opId: OpId): string {
   return `${opId.clientId}:${opId.localSeq}`;
 }
 
-// ---------------------------------------------------------------------------
-// In-memory impl — used by tests and as a no-persistence fallback.
-// ---------------------------------------------------------------------------
-
-/**
- * Non-durable `OutboxStore` backed by a plain array. Entries are lost on reload;
- * tests simulate a "reconnect" by reusing the SAME instance (the durable case),
- * which is what the IndexedDB impl guarantees across a real reload.
- */
+// Non-durable `OutboxStore` backed by a plain array (tests + no-persistence fallback). Tests simulate a
+// "reconnect" by reusing the SAME instance, which the IndexedDB impl guarantees across a real reload.
 export class InMemoryOutboxStore implements OutboxStore {
   private entries: OutboxEntry[] = [];
 
@@ -88,20 +59,11 @@ export class InMemoryOutboxStore implements OutboxStore {
   }
 }
 
-// ---------------------------------------------------------------------------
-// IndexedDB impl — the interim durable backing (C11).
-// ---------------------------------------------------------------------------
-
 const DB_NAME = "shape-ai-outbox";
 const STORE = "ops";
 
-/**
- * Durable `OutboxStore` on IndexedDB. One object store keyed by `opIdKey`. The
- * `clientId` namespaces this client's rows so two tabs sharing the DB never
- * collide; the `localSeq` high-water is recovered from the persisted rows on
- * reconnect (the session reseeds its bookkeeping from them), so no separate
- * counter store is kept.
- */
+// Durable `OutboxStore` on IndexedDB, one object store keyed by `opIdKey`. The `clientId` namespaces
+// this client's rows so two tabs sharing the DB never collide.
 export class IndexedDbOutboxStore implements OutboxStore {
   private readonly clientId: string;
   private dbPromise: Promise<IDBDatabase> | null = null;

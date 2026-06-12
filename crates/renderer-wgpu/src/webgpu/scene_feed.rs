@@ -1,4 +1,4 @@
-//! Scene load + feed + slot retention (W2-13/S8): the legacy scene path
+//! Scene load + feed + slot retention: the legacy scene path
 //! (`load_scene`/`applyPatchBatch`/`apply_render_patch` with incremental
 //! dirty/new/grow/compact/clear slot bookkeeping) and the object path
 //! (`load_object_scene`/`draw_objects`). `target_arch = "wasm32"` gated.
@@ -26,9 +26,8 @@ impl ShapeWebGpuRenderer {
     pub fn load_scene(&mut self, scene_json: &str) -> Result<(), JsValue> {
         let mut scene = serde_json::from_str::<SceneSnapshot>(scene_json)
             .map_err(|error| JsValue::from_str(&format!("Invalid scene snapshot: {error}")))?;
-        // The transient multi-select set is shell-owned and not in the wire format,
-        // so a reload would otherwise drop it. Re-apply the renderer-held set so the
-        // highlight survives scene reloads, mirroring how `active_tool` persists.
+        // The multi-select set is shell-owned and not in the wire format; re-apply the
+        // renderer-held set so the highlight survives reloads.
         scene.multi_select = self.multi_select.clone();
         self.camera = CameraState {
             x: scene.camera.x,
@@ -58,15 +57,10 @@ impl ShapeWebGpuRenderer {
     }
 
 
-    /// OB-4 object draw entry: parse a [`RenderObjectScene`] and build + upload its
-    /// object geometry (fill megabuffer + stroke ribbons + per-object instances)
-    /// through an [`ObjectRenderer`] on this renderer's existing device/queue.
-    /// The `ObjectPipeline` is built lazily against the live surface format on the
-    /// first call. Additive: the legacy `load_scene` 2D path is untouched.
-    ///
-    /// Returns the built draw counts `{ objects, fillIndices, strokeVertices }` so
-    /// the client can confirm the object scene reached the renderer. The live GPU
-    /// PASS (recording the object render) is [`Self::draw_objects`].
+    /// Parse a [`RenderObjectScene`] and build + upload its geometry through an
+    /// [`ObjectRenderer`] on this renderer's device/queue (the `ObjectPipeline` is
+    /// built lazily against the live surface format on the first call). Returns the
+    /// built draw counts; the live GPU PASS is [`Self::draw_objects`].
     #[wasm_bindgen(js_name = loadObjectScene)]
     pub fn load_object_scene(&mut self, scene_json: &str) -> Result<JsValue, JsValue> {
         let scene: RenderObjectScene = serde_json::from_str(scene_json)
@@ -78,15 +72,11 @@ impl ShapeWebGpuRenderer {
                 self.config.format,
             ));
         }
-        // FramePlan IR consumer: when a compatible renderer already exists, DIFF the
-        // freshly-built plan against its retained one and apply targeted patches
-        // (transform/style writes, or a single object's geometry re-send) instead of
-        // reconstructing every buffer — the canonical re-feed (pan/move/recolor/edit)
-        // is now O(changed objects), not O(scene). A structural change or an
-        // unfittable geometry update falls back to a full `ObjectRenderer::new`.
-        // The renderer's live theme is kept in lockstep with the persisted
-        // `object_theme` (via `set_object_theme` -> `set_theme`), so the diff base is
-        // the right theme; if they ever diverge we reconstruct to stay correct.
+        // When a compatible renderer exists, DIFF the freshly-built plan and apply
+        // targeted patches instead of reconstructing — O(changed objects), not
+        // O(scene). A structural / unfittable / theme-divergent diff falls back to a
+        // full `ObjectRenderer::new`. The diff base must be the persisted theme, so we
+        // reconstruct on any divergence.
         let theme_matches = self
             .object_renderer
             .as_ref()
@@ -103,10 +93,9 @@ impl ShapeWebGpuRenderer {
         if let Some(stats) = patched {
             self.object_patch_count += stats.patch_count;
         } else {
-            // First feed, structural change, theme divergence, or an unfittable
-            // geometry update: rebuild the renderer in the PERSISTED theme so the
-            // dark canvas-bg survives every re-feed (W3-G6/#3 — the bit is owned by
-            // the wrapper, not the per-scene renderer this throws away).
+            // First feed / structural / theme-divergent / unfittable update: rebuild
+            // in the PERSISTED theme so the dark canvas-bg survives the re-feed (the
+            // bit is owned by the wrapper, not the per-scene renderer this throws away).
             let pipeline = self.object_pipeline.as_ref().unwrap();
             self.object_renderer = Some(ObjectRenderer::new(
                 &self.device,
@@ -125,50 +114,39 @@ impl ShapeWebGpuRenderer {
             fill_indices: renderer.fill_index_count() as usize,
             stroke_vertices: renderer.stroke_vertex_count() as usize,
         };
-        // FC-04: derive + retain each object's local-space region for hit-test /
-        // marquee, then keep the parsed scene as the live-object branch switch.
+        // Derive + retain each object's local-space region for hit-test / marquee.
         self.object_regions = derive_object_regions(&scene);
-        // W3-G9/#2: the wire now carries `multiSelect`; mirror it onto the renderer
-        // so a later object re-feed (which throws away the per-scene renderer) keeps
-        // the highlight set, matching how the legacy `load_scene` retains it.
+        // Mirror `multiSelect` onto the renderer so a later re-feed keeps the highlight.
         self.multi_select = scene.multi_select.clone();
-        // W3-G9/#5: precompute the move-together propagation graph ONCE per feed so
-        // each drag preview is O(closure), not O(scene).
+        // Precompute the move-together propagation graph ONCE per feed so each drag
+        // preview is O(closure), not O(scene).
         self.object_bindings = BindingGraph::build(&binding_nodes(&scene));
-        // v3 §2b: the re-feed just rebuilt every baked geometry from the canonical
-        // scene, so no live chord deform survives it — reset the patch bookkeeping.
+        // The re-feed rebuilt every baked geometry, so no live chord deform survives.
         self.preview_deformed.clear();
         self.endpoint_preview = None;
         self.object_scene = Some(scene);
-        // The renderer is already in place (patched or rebuilt above).
         serde_wasm(counts)
     }
 
-    /// OB-4 live GPU object PASS: now a thin wrapper over [`Self::render_frame`],
-    /// which is the single live frame driver (FC-05). The object pass is recorded
-    /// inside `render_frame` against the same acquired surface texture, so a separate
-    /// acquire/present here would double-acquire the swapchain. Kept as a harmless
-    /// optional wasm export; the client RAF loop calls `render_frame` directly.
+    /// A thin wrapper over [`Self::render_frame`] (the single live frame driver),
+    /// since the object pass is recorded there against the same acquired surface
+    /// texture — a separate acquire here would double-acquire the swapchain. The
+    /// client RAF loop calls `render_frame` directly.
     #[wasm_bindgen(js_name = drawObjects)]
     pub fn draw_objects(&mut self) -> Result<(), JsValue> {
         self.render_frame()?;
         Ok(())
     }
 
-    /// W2-11 drag zero-rebake: push ONLY the affected objects' instance model
-    /// matrices to the GPU. `matrix_json` is a row-major `[[f64;3];3]` CUMULATIVE
-    /// world-space DELTA (the same contract as `ObjectTransformDelta.matrix`). The
-    /// canonical `object_scene` / `object_regions` are NOT mutated — each affected
-    /// object's base transform is read from the untouched scene and `delta * base` is
-    /// written straight to its instance buffer (no re-tessellation, no region
-    /// re-derive). The RAF `render_frame` loop then draws from the updated instance
-    /// buffer on the next tick, so no explicit redraw is needed. No-op if the object
-    /// scene is unloaded or the id is absent.
+    /// Zero-rebake drag: push ONLY the affected objects' instance matrices to the GPU.
+    /// `matrix_json` is a row-major `[[f64;3];3]` CUMULATIVE world-space DELTA. The
+    /// canonical scene / regions are NOT mutated — `delta * base` is written straight
+    /// to each instance buffer (no re-tessellation), and the RAF loop draws it next
+    /// tick. No-op if the scene is unloaded or the id is absent.
     ///
-    /// W3-G9/#5: the affected set is the SameDelta closure of the bindings graph —
-    /// the dragged id (or, if it is a `multi_select` member, every member) plus their
-    /// children/descendants — so group children and multi members move LIVE during
-    /// the drag, each against its own base. O(closure) instance writes, zero rebake.
+    /// The affected set is the SameDelta closure of the bindings graph (the dragged
+    /// id, or every `multi_select` member, plus their descendants), each against its
+    /// own base — O(closure) writes.
     #[wasm_bindgen(js_name = setObjectPreviewTransform)]
     pub fn set_object_preview_transform(
         &mut self,
@@ -181,18 +159,16 @@ impl ShapeWebGpuRenderer {
             return Ok(());
         };
         let write_set = preview_write_set(scene, &self.object_bindings, id);
-        // W3-G9/#4: the closure also yields `reproject_followers` — objects whose
-        // anchored geometry must reproject through a moved target LIVE. A follower is
-        // NOT uniformly transformed (one bound node moves, the rest stay), so the
-        // instance-matrix preview above cannot express it; instead each follower's
-        // geometry is rewritten with the reprojected node and re-expanded in place.
+        // The closure also yields `reproject_followers` — objects whose anchored
+        // geometry must reproject through a moved target LIVE. A follower is NOT
+        // uniformly transformed, so the instance-matrix preview cannot express it;
+        // instead each follower's geometry is rewritten and re-expanded in place.
         let followers = preview_reproject_followers(scene, &self.object_bindings, id);
         let follower_patches = self.reexpand_reprojected_followers(scene, Some(&delta), &followers);
-        // v3 §2b/§3: route each moved member through the scene-core endpoint
-        // decision table. A pure-translate / closed-class / legacy member keeps the
-        // 0-rebake instance-matrix write; an open-class member under a non-translate
-        // delta (or with a pinned endpoint) chord-deforms instead — its instance
-        // matrix stays at BASE and its geometry rides the G14 reexpand+patch path.
+        // Route each moved member through the endpoint decision table: pure-translate
+        // / closed-class / legacy keeps the 0-rebake matrix write; an open-class member
+        // under a non-translate delta (or with a pinned endpoint) chord-deforms (its
+        // matrix stays at BASE, its geometry rides the reexpand+patch path).
         let moved_ids: Vec<String> = write_set.iter().map(|(id, _)| id.clone()).collect();
         let mut matrix_writes: Vec<(String, [[f64; 3]; 3])> = Vec::new();
         let mut deform_ids: Vec<String> = Vec::new();
@@ -204,10 +180,9 @@ impl ShapeWebGpuRenderer {
                     patch_pairs.push((target, geometry_d));
                 }
                 route => {
-                    // A member leaving the deform route mid-gesture (e.g. a snapped
-                    // rotate passing back through identity) snaps its geometry back
-                    // to canonical; a member that was never deformed adds nothing,
-                    // so the pure-translate hot path stays patch-free.
+                    // A member leaving the deform route mid-gesture snaps its geometry
+                    // back to canonical; one never deformed adds nothing, so the
+                    // pure-translate hot path stays patch-free.
                     if self.preview_deformed.contains(&target) {
                         if let Some(object) = scene.objects.iter().find(|o| o.id == target) {
                             patch_pairs.push((target.clone(), object.geometry_d.clone()));
@@ -237,16 +212,12 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
-    /// W2-11: revert the affected objects' instance matrices to their canonical baked
-    /// transforms (`delta = identity`), dropping the live preview. No-op if the
-    /// object scene is unloaded or the id is absent.
-    ///
-    /// W3-G9/#5: symmetric with the preview — reverts the SAME SameDelta closure
-    /// (group children + multi members), not just the picked id.
+    /// Revert the affected objects' instance matrices to their canonical baked
+    /// transforms (`delta = identity`), dropping the live preview — the SAME SameDelta
+    /// closure the preview wrote, not just the picked id. No-op when unloaded or absent.
     #[wasm_bindgen(js_name = clearObjectPreview)]
     pub fn clear_object_preview(&mut self, id: &str) -> Result<(), JsValue> {
-        // v3 §2b/§3: every geometry a live chord deform patched (open-class moved
-        // members + any in-flight endpoint drag) snaps back to canonical with the
+        // Every geometry a live chord deform patched snaps back to canonical with the
         // same restore pass the followers get.
         let deformed = std::mem::take(&mut self.preview_deformed);
         self.endpoint_preview = None;
@@ -254,9 +225,8 @@ impl ShapeWebGpuRenderer {
             return Ok(());
         };
         let write_set = preview_write_set(scene, &self.object_bindings, id);
-        // W3-G9/#4: restore each follower's CANONICAL baked geometry (re-expand from
-        // the untouched scene object) so a cancelled/failed drag reverts the live
-        // reproject too, not just the same-delta instance matrices.
+        // Restore each follower's CANONICAL geometry so a cancelled drag reverts the
+        // live reproject too, not just the same-delta matrices.
         let followers = preview_reproject_followers(scene, &self.object_bindings, id);
         let restored = self.reexpand_reprojected_followers(scene, None, &followers);
         let restore_pairs: Vec<(String, String)> = deformed
@@ -281,14 +251,11 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
-    /// v3 §2b endpoint-drag LIVE path: chord-deform ONE open-class object so its
-    /// dragged endpoint (`node_index`, geometry PAIR space: 0 | last) lands on the
-    /// live pointer WORLD position, then re-expand + in-place patch that single
-    /// object (the G14 `reexpand_single_object` + `patch_follower_geometry` path —
-    /// no new bypass). The deform itself is scene-core `endpoint_release_ops` /
-    /// `deform_open_path` — the SAME function the release commit runs, so the live
-    /// and committed bytes cannot drift. No-op when the scene is unloaded, the id
-    /// is unknown, or the target is not an open-class endpoint.
+    /// Endpoint-drag LIVE path: chord-deform ONE open-class object so its dragged
+    /// endpoint (`node_index`, geometry PAIR space: 0 | last) lands on the live
+    /// pointer WORLD position, then re-expand + in-place patch that single object. The
+    /// deform is the SAME `endpoint_release_ops` the release commit runs, so live and
+    /// committed bytes cannot drift. No-op when unloaded / unknown / not an endpoint.
     #[wasm_bindgen(js_name = setObjectEndpointPreview)]
     pub fn set_object_endpoint_preview(
         &mut self,
@@ -319,10 +286,8 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
-    /// v3 §2b: symmetric clear — re-expand the object's CANONICAL geometry back in,
-    /// dropping the live endpoint deform (the shell calls this on release/cancel
-    /// after committing `endpoint_release_ops`). No-op when no endpoint preview
-    /// patched this id.
+    /// Symmetric clear: re-expand the object's CANONICAL geometry back in, dropping
+    /// the live endpoint deform. No-op when no endpoint preview patched this id.
     #[wasm_bindgen(js_name = clearObjectEndpointPreview)]
     pub fn clear_object_endpoint_preview(&mut self, id: &str) -> Result<(), JsValue> {
         self.endpoint_preview = None;
@@ -345,17 +310,12 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
-    /// W3-G9/#4: re-expand each follower's geometry for an in-place GPU patch. With
-    /// `Some(delta)` (the live preview), every node of the follower anchored onto a
-    /// moved target is rewritten to track the target's PREVIEWED transform
-    /// (`delta * target_base`) before the re-expand. With `None` (the restore on
-    /// cancel/commit), the follower's CANONICAL geometry is re-expanded untouched,
-    /// so the live reproject is patched back out exactly.
-    ///
-    /// W3-G13: the pairs are GROUPED by follower first ([`reprojected_follower_geometries`])
-    /// — a follower anchored to TWO moved targets accumulates both rewrites into ONE
-    /// geometry, then ONE re-expand + ONE patch. O(unique followers), each a single
-    /// small object — never a full-scene rebake.
+    /// Re-expand each follower's geometry for an in-place GPU patch. With
+    /// `Some(delta)`, every node anchored onto a moved target is rewritten to track
+    /// the target's PREVIEWED transform; with `None`, the CANONICAL geometry is
+    /// re-expanded untouched (the restore). Pairs are grouped by follower
+    /// ([`reprojected_follower_geometries`]) so two moved targets accumulate into ONE
+    /// geometry + ONE patch.
     fn reexpand_reprojected_followers(
         &self,
         scene: &RenderObjectScene,
@@ -365,11 +325,10 @@ impl ShapeWebGpuRenderer {
         self.reexpand_geometries(scene, reprojected_follower_geometries(scene, delta, followers))
     }
 
-    /// The shared G14 re-expand consumer: each `(id, geometry_d)` pair is the
-    /// scene object rebuilt with that geometry through `reexpand_single_object`
-    /// (live theme + camera), ready for an in-place `patch_follower_geometry`.
-    /// Used by the follower reproject, the v3 §2b/§3 member chord deforms, and
-    /// the endpoint preview — ONE patch pipeline, no bypass.
+    /// The shared re-expand consumer: each `(id, geometry_d)` pair is the scene object
+    /// rebuilt with that geometry through `reexpand_single_object` (live theme +
+    /// camera), ready for an in-place `patch_follower_geometry`. The one patch pipeline
+    /// for the follower reproject, member chord deforms, and endpoint preview.
     fn reexpand_geometries(
         &self,
         scene: &RenderObjectScene,
@@ -396,10 +355,8 @@ impl ShapeWebGpuRenderer {
 
 }
 
-/// W3-G9/#5: the tiny binding projection of `scene` the move-together graph is
-/// built from — each object's id, containment parent, and anchor targets. O(objects)
-/// cheap String clones, no geometry/transform copied. Paid once per feed at build
-/// time, never per frame.
+/// The binding projection the move-together graph is built from — each object's id,
+/// parent, and anchor targets. O(objects) String clones, paid once per feed.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn binding_nodes(scene: &RenderObjectScene) -> Vec<BindingNode> {
     scene
@@ -413,11 +370,8 @@ pub(crate) fn binding_nodes(scene: &RenderObjectScene) -> Vec<BindingNode> {
         .collect()
 }
 
-/// W3-G9/#5: the propagation ROOTS for a drag of `dragged`. If `dragged` is a
-/// member of the scene's `multi_select` set, every member is a root (deduped,
-/// canonical order preserved), so the whole selection drives the closure; otherwise
-/// just the dragged id — so dragging a non-member is a fresh single drag even when a
-/// multi-select exists. Pure (no device/GPU), host-testable under `wgpu-probe`.
+/// The propagation ROOTS for a drag of `dragged`: every `multi_select` member if
+/// `dragged` is one (deduped, canonical order), else just the dragged id. Pure.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn preview_roots(scene: &RenderObjectScene, dragged: &str) -> Vec<String> {
     if !scene.multi_select.iter().any(|id| id == dragged) {
@@ -432,12 +386,10 @@ pub(crate) fn preview_roots(scene: &RenderObjectScene, dragged: &str) -> Vec<Str
     roots
 }
 
-/// W3-G9/#5: the `(id, base)` GPU write-set for a drag of `dragged` — the SameDelta
-/// closure of the bindings graph from [`preview_roots`], each id paired with its
-/// canonical base transform from `scene`. This is the pure half of
-/// [`ShapeWebGpuRenderer::set_object_preview_transform`]: every same-delta id gets
-/// the same world delta applied against its own base, so group children + multi
-/// members move LIVE. Ids absent from `scene.objects` are dropped. Host-testable.
+/// The `(id, base)` GPU write-set for a drag of `dragged`: the SameDelta closure
+/// from [`preview_roots`], each id paired with its canonical base. The pure half of
+/// [`ShapeWebGpuRenderer::set_object_preview_transform`] — same delta against each
+/// own base. Ids absent from `scene.objects` are dropped.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn preview_write_set(
     scene: &RenderObjectScene,
@@ -458,12 +410,10 @@ pub(crate) fn preview_write_set(
         .collect()
 }
 
-/// W3-G9/#4: the `(follower_id, target_id)` reproject pairs for a drag of `dragged`
-/// — the Reproject half of the same closure [`preview_write_set`] consumes the
-/// SameDelta half of. Each pair names a follower whose anchored geometry must
-/// reproject through a moved `target` (a same-delta object). Pure (no device/GPU),
-/// host-testable under `wgpu-probe`; the wasm32 preview path turns each pair into an
-/// in-place follower vertex patch.
+/// The `(follower_id, target_id)` reproject pairs for a drag of `dragged` — the
+/// Reproject half of the closure [`preview_write_set`] consumes the SameDelta half
+/// of. Each pair names a follower whose anchored geometry must reproject through a
+/// moved `target`. Pure; the wasm32 path turns each into an in-place vertex patch.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn preview_reproject_followers(
     scene: &RenderObjectScene,
@@ -475,30 +425,24 @@ pub(crate) fn preview_reproject_followers(
     reproject_followers
 }
 
-/// W3-G13: GROUP the `(follower, target)` reproject pairs by FOLLOWER and fold every
-/// paired target's node rewrites into ONE cumulative `geometry_d` per follower (the
-/// closure dedupes by PAIR, so a follower anchored to two moved targets arrives
-/// twice — restarting from the canonical path per pair would stomp the first
-/// target's rewrite). Returns one `(follower_id, geometry_d)` per unique follower in
-/// first-appearance order; with `delta = None` (the restore path) each unique
-/// follower comes back once with its CANONICAL geometry.
+/// GROUP the `(follower, target)` reproject pairs by FOLLOWER and fold each paired
+/// target's node rewrites into ONE cumulative `geometry_d` per follower (the closure
+/// dedupes by PAIR, so a follower anchored to two moved targets arrives twice;
+/// restarting per pair would stomp the first rewrite). One entry per follower in
+/// first-appearance order; with `delta = None` each comes back with its CANONICAL
+/// geometry.
 ///
-/// Anchor-semantics v3 §3: an open-class follower whose anchors all bind ENDPOINTS
-/// deforms as ONE chord ([`open_follower_chord_d`] → scene-core `deform_open_path`)
-/// — the same route the commit's `anchor_follow_ops` takes, so the live patch and
-/// the committed `edit-geometry` stay byte-equivalent. Everything else (closed,
-/// legacy multi-subpath, an interior-node anchor) keeps the node-splice fold via
-/// scene-core's `reproject_geometry_node` (rule 5 — no regression).
-///
-/// Pure (no device/GPU), host-testable under `wgpu-probe`; the wasm32
-/// `reexpand_reprojected_followers` is a thin re-expand consumer.
+/// An open-class follower whose anchors all bind ENDPOINTS deforms as ONE chord
+/// ([`open_follower_chord_d`]) — the same route the commit's `anchor_follow_ops`
+/// takes, so the live and committed bytes stay equivalent. Everything else keeps the
+/// node-splice fold via `reproject_geometry_node`. Pure.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn reprojected_follower_geometries(
     scene: &RenderObjectScene,
     delta: Option<&[[f64; 3]; 3]>,
     followers: &[(String, String)],
 ) -> Vec<(String, String)> {
-    // Group by follower, first-appearance order (the W3-G13 contract).
+    // Group by follower, first-appearance order.
     let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
     for (follower_id, target_id) in followers {
         match grouped.iter_mut().find(|(id, _)| *id == follower_id.as_str()) {
@@ -522,14 +466,11 @@ pub(crate) fn reprojected_follower_geometries(
     out
 }
 
-/// The §3 chord follow for ONE open-class endpoint-anchored follower, mirroring
-/// the `endpoint_deform` branch of scene-core's `anchor_follow_ops` with the SAME
-/// scene-core functions (`local_nodes` pair space, `reproject_geometry_node`
-/// quantization, `deform_open_path` similarity): each anchored ENDPOINT moves to
-/// its reprojected position, the un-anchored endpoint pins at its original
-/// position, and the whole silhouette rides the chord. Returns `None` when the
-/// follower is not an open-class endpoint case (the caller keeps the legacy
-/// splice, rule 5).
+/// The chord follow for ONE open-class endpoint-anchored follower, mirroring the
+/// `endpoint_deform` branch of `anchor_follow_ops` with the same scene-core
+/// functions: each anchored ENDPOINT moves to its reprojected position, the
+/// un-anchored endpoint pins, and the silhouette rides the chord. `None` when the
+/// follower is not an open-class endpoint case (the caller keeps the legacy splice).
 #[cfg(feature = "wgpu-probe")]
 fn open_follower_chord_d(
     scene: &RenderObjectScene,
@@ -553,10 +494,8 @@ fn open_follower_chord_d(
         if !target_ids.contains(&anchor.target.as_str()) {
             continue;
         }
-        // The reproject through the SAME scene-core quantization the commit uses:
-        // splice the endpoint on the BASE path, then read the pair back. A `None`
-        // splice is a no-op rewrite — the endpoint already sits at its reprojected
-        // position, which the seeds above carry.
+        // Splice the endpoint on the BASE path, then read the pair back. A `None`
+        // splice is a no-op (the endpoint already sits there, which the seeds carry).
         let point = reprojected_node_pair(scene, follower, anchor, delta);
         if anchor.node_index == 0 {
             new_start = point.unwrap_or(new_start);
@@ -567,10 +506,9 @@ fn open_follower_chord_d(
     deform_open_path(base, new_start, new_end)
 }
 
-/// One anchored node's reprojected pair-space position under `delta`, read back
-/// from scene-core's `reproject_geometry_node` splice of the CANONICAL path (so
-/// the quantization is byte-identical to the commit). `None` when the rewrite is
-/// a no-op (the node already sits there).
+/// One anchored node's reprojected pair-space position under `delta`, read back from
+/// a `reproject_geometry_node` splice of the CANONICAL path (byte-identical to the
+/// commit). `None` when the rewrite is a no-op.
 #[cfg(feature = "wgpu-probe")]
 fn reprojected_node_pair(
     scene: &RenderObjectScene,
@@ -594,9 +532,8 @@ fn reprojected_node_pair(
     local_nodes(&rewritten).get(anchor.node_index).copied()
 }
 
-/// The legacy node-splice fold (rule 5): every moved-target anchor's node
-/// rewrites cumulatively through scene-core's `reproject_geometry_node`, exactly
-/// the pre-v3 behavior for closed-class / multi-subpath / interior-node cases.
+/// The node-splice fold: every moved-target anchor's node rewrites cumulatively
+/// through `reproject_geometry_node` (closed-class / multi-subpath / interior-node).
 #[cfg(feature = "wgpu-probe")]
 fn spliced_follower_d(
     scene: &RenderObjectScene,
@@ -633,25 +570,21 @@ fn spliced_follower_d(
 }
 
 /// How ONE moved member previews live — the renderer-side mirror of scene-core's
-/// `cascade::push_member_op` (§2b/§2c/§3 decision table, single source =
-/// scene-core `open_endpoint_pins` + `route_open_endpoints` + `deform_open_path`).
+/// `cascade::push_member_op` decision table.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) enum PreviewMemberRoute {
-    /// Rules 1/5: the existing 0-rebake instance-matrix write (pure-translate
-    /// fast path, closed-class, and every legacy case).
+    /// The 0-rebake instance-matrix write (pure-translate, closed-class, legacy).
     Matrix,
-    /// Rule 3 no-op: both endpoints pinned by unmoved anchor targets — write
-    /// nothing (the commit authors nothing either).
+    /// Both endpoints pinned by unmoved anchor targets — write nothing.
     Pinned,
-    /// Rules 2/3: chord-deform the geometry to this path-string and patch it in
-    /// place; the instance matrix stays at BASE.
+    /// Chord-deform the geometry to this path-string and patch it; the instance
+    /// matrix stays at BASE.
     Deform { geometry_d: String },
 }
 
-/// Route one SameDelta-closure member of a live preview (`moved_ids` = the whole
-/// closure, the §3 `target_moved` predicate). Mirrors `push_member_op` branch for
-/// branch so the live frame and the commit ops route identically. Pure,
-/// host-testable under `wgpu-probe`.
+/// Route one SameDelta-closure member of a live preview (`moved_ids` = the closure).
+/// Mirrors `push_member_op` branch for branch so the live frame and commit ops route
+/// identically. Pure.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn route_preview_member(
     scene: &RenderObjectScene,
@@ -667,8 +600,8 @@ pub(crate) fn route_preview_member(
         return PreviewMemberRoute::Matrix;
     };
     let delta_t = Transform3x3 { m: *delta };
-    // Rule 1 fast path: an unanchored pure-translate member keeps the 0-rebake
-    // instance write without parsing any geometry (the common drag).
+    // Fast path: an unanchored pure-translate member keeps the 0-rebake write without
+    // parsing geometry (the common drag).
     if object.anchors.is_empty() && is_pure_translate(&delta_t) {
         return PreviewMemberRoute::Matrix;
     }
@@ -690,8 +623,7 @@ pub(crate) fn route_preview_member(
         .collect();
     let target_moved = |target: &str| moved_ids.iter().any(|moved| moved == target);
     let Some((start_pinned, end_pinned)) = open_endpoint_pins(d, &anchors, target_moved) else {
-        // Rule 5: an interior-node anchor (node-splice era) rides the whole
-        // transform exactly as before.
+        // An interior-node anchor rides the whole transform.
         return PreviewMemberRoute::Matrix;
     };
     match route_open_endpoints(
@@ -712,14 +644,11 @@ pub(crate) fn route_preview_member(
     }
 }
 
-/// v3 §2b: the live endpoint-drag geometry for `id` — the EditGeometry path-string
-/// scene-core's `endpoint_release_ops` (the release COMMIT function, run here
-/// against a one-object scene with no snap) authors for moving `node_index` to the
-/// WORLD point. A no-op rewrite (the pointer back at the start) returns the
-/// canonical geometry so the patch restores the canonical bytes mid-gesture.
-/// `None` when the id is unknown or not an open-class endpoint (closed-class,
-/// interior node) — the endpoint surface only exists on open-class ends.
-/// Pure, host-testable under `wgpu-probe`.
+/// The live endpoint-drag geometry for `id` — the EditGeometry path-string
+/// `endpoint_release_ops` (the release COMMIT function, run here against a one-object
+/// scene with no snap) authors for moving `node_index` to the WORLD point. A no-op
+/// rewrite returns the canonical geometry. `None` when the id is unknown or not an
+/// open-class endpoint. Pure.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn endpoint_preview_geometry(
     scene: &RenderObjectScene,
@@ -2200,7 +2129,6 @@ mod tests {
     #[test]
     fn dragging_a_member_roots_the_whole_set_in_canonical_order() {
         let scene = scene_with_multi_select(vec!["a", "b", "c"]);
-        // The bug returned only ["b"]; the fix roots every member together.
         assert_eq!(preview_roots(&scene, "b"), vec!["a", "b", "c"]);
     }
 
@@ -2280,14 +2208,10 @@ mod tests {
         }
     }
 
-    /// CROSS-CORE BINDING-GRAPH GUARD. Proves the renderer live-preview CLOSURE half
-    /// (`preview_reproject_followers` + `preview_write_set`) drives the SAME pinned
-    /// numeric vector scene-core's `anchor_follow::tests::reproject_matches_cross_core_vector`
-    /// pins (`"M 0 0 L -664 224"`), closing the gap between "the math matches" and
-    /// "the closure actually routes the follower to that math". The renderer now
-    /// drives the SAME scene-core math: the closure is `BindingGraph` and the
-    /// reproject is `reproject_geometry_node`, so this guard pins the renderer's
-    /// real call path against the cross-core vector.
+    /// The renderer's live-preview closure (`preview_reproject_followers` +
+    /// `preview_write_set`) must drive the SAME pinned vector scene-core's
+    /// `reproject_matches_cross_core_vector` pins (`"M 0 0 L -664 224"`), via the same
+    /// `BindingGraph` + `reproject_geometry_node` call path.
     #[cfg(feature = "wgpu-probe")]
     #[test]
     fn anchor_follower_closure_agrees_with_scene_core_vector() {
@@ -2368,22 +2292,14 @@ mod tests {
         assert_eq!(d, "M 0 0 L -664 224");
     }
 
-    /// PRODUCTION WIRE-SERDE GUARD. The closure guard above builds `RenderObject`
-    /// structs directly, BYPASSING serde. Production (`scene_feed.rs` load path,
-    /// line ~109) instead PARSES the wire JSON the shell sends
-    /// (`objectSceneToRenderObjectScene` -> camelCase `nodeIndex`/`geometryD`/
-    /// `multiSelect`) and builds the bindings from THAT. A silent serde field
-    /// mismatch would drop `anchors` -> empty reproject graph -> no live follow,
-    /// invisible to the struct-based guard. This parses the EXACT wire shape, then
-    /// asserts the anchor survived and the bindings still route the follower. Its
-    /// scene-core twin (`anchor_serializes_with_camelcase_wire_keys`) pins that
-    /// scene-core EMITS this casing, so the two cores meet on one wire.
+    /// Production parses the camelCase wire (`nodeIndex`/`geometryD`/`multiSelect`),
+    /// not structs; a silent serde field mismatch would drop `anchors` -> empty
+    /// reproject graph -> no live follow, invisible to the struct guard above. Parses
+    /// the EXACT wire shape and asserts the anchor survived + still routes the follower.
     #[cfg(feature = "wgpu-probe")]
     #[test]
     fn anchored_follower_survives_wire_serde_round_trip() {
         use super::preview_reproject_followers;
-        // The exact camelCase wire an anchored line B (node 1 bound to target A)
-        // produces via the shell projection.
         let wire = r#"{
           "sceneId": "anchor-follow",
           "camera": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
@@ -2400,24 +2316,18 @@ mod tests {
         }"#;
         let scene: RenderObjectScene =
             serde_json::from_str(wire).expect("wire parses into RenderObjectScene");
-        // The anchor SURVIVED the parse — the silent-drop check that the struct guard
-        // cannot make (a serde key mismatch would leave this empty).
         let b = scene.objects.iter().find(|o| o.id == "b").expect("b present");
         assert_eq!(b.anchors.len(), 1, "serde dropped `anchors` => empty reproject graph");
         assert_eq!(b.anchors[0].node_index, 1);
         assert_eq!(b.anchors[0].target, "a");
-        // Bindings built from the PARSED scene (the scene_feed.rs:109 production path)
-        // route B to follow A.
         let bindings = BindingGraph::build(&binding_nodes(&scene));
         let followers = preview_reproject_followers(&scene, &bindings, "a");
         assert_eq!(followers, vec![("b".to_string(), "a".to_string())]);
     }
 
-    /// W3-G13 GROUPING GUARD: the closure dedupes by (follower, target) PAIR, so a
-    /// follower anchored to TWO moved targets arrives twice. The grouping must fold
-    /// BOTH targets' rewrites into ONE cumulative geometry per follower — RED if it
-    /// restarts from the canonical path per pair (the second pair would stomp the
-    /// first target's rewrite, exactly the per-pair patch bug).
+    /// A follower anchored to TWO moved targets arrives twice (the closure dedupes by
+    /// PAIR); the grouping must fold BOTH rewrites into ONE cumulative geometry, not
+    /// restart from canonical per pair (which would stomp the first rewrite).
     #[cfg(feature = "wgpu-probe")]
     #[test]
     fn follower_paired_with_two_moved_targets_accumulates_one_geometry() {
@@ -2511,7 +2421,7 @@ mod tests {
         );
     }
 
-    // ----- anchor-semantics v3 §2b/§3: live endpoint routing ------------------
+    // ----- live endpoint routing ------------------
 
     use super::{endpoint_preview_geometry, route_preview_member, PreviewMemberRoute};
     use shape_renderer_core::render_object::{RAnchor, RLocalPoint, RStroke, RStrokeCap, RStrokeJoin};
@@ -2542,9 +2452,7 @@ mod tests {
         }
     }
 
-    /// v3 §2b/§2c/§3 decision table, live side — each row mirrors scene-core's
-    /// commit `push_member_op` (the single source: `open_endpoint_pins` +
-    /// `route_open_endpoints` + `deform_open_path`).
+    /// Each row mirrors scene-core's commit `push_member_op` decision table.
     #[test]
     fn route_preview_member_follows_the_endpoint_decision_table() {
         let ids = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -2552,7 +2460,7 @@ mod tests {
             anchored_object("l", None, translate(0.0, 0.0), "M 0 0 L 320 0", anchors)
         };
 
-        // Closed-class member: any delta keeps the instance-matrix write (rule 5).
+        // Closed-class: any delta keeps the instance-matrix write.
         let rect = anchored_object("l", None, translate(0.0, 0.0), "M 0 0 L 8 0 L 8 8 L 0 8 Z", Vec::new());
         let scene = feed_scene(vec![rect]);
         assert!(matches!(
@@ -2560,15 +2468,15 @@ mod tests {
             PreviewMemberRoute::Matrix
         ));
 
-        // Rule 1: unanchored open member under a pure translate — 0-rebake matrix.
+        // Unanchored open member, pure translate: 0-rebake matrix.
         let scene = feed_scene(vec![open(Vec::new())]);
         assert!(matches!(
             route_preview_member(&scene, &ids(&["l"]), "l", &translate(10.0, 5.0)),
             PreviewMemberRoute::Matrix
         ));
 
-        // Rule 2: unanchored open member under a NON-translate delta deforms — a
-        // 90° rotation maps the (0,0)->(40,0)px chord to (0,0)->(0,40)px.
+        // Unanchored open member, NON-translate delta: a 90° rotation deforms the
+        // (0,0)->(40,0)px chord to (0,0)->(0,40)px.
         let PreviewMemberRoute::Deform { geometry_d } =
             route_preview_member(&scene, &ids(&["l"]), "l", &rot90())
         else {
@@ -2576,8 +2484,8 @@ mod tests {
         };
         assert_eq!(geometry_d, "M 0 0 L 0 320");
 
-        // Rule 3, pinned start: the free end takes the whole body delta, the
-        // anchored end (target NOT in the moved set) holds its glue point.
+        // Pinned start: the free end takes the body delta, the anchored end (target
+        // not in the moved set) holds its glue point.
         let scene = feed_scene(vec![open(vec![endpoint_anchor(0, "t")])]);
         let PreviewMemberRoute::Deform { geometry_d } =
             route_preview_member(&scene, &ids(&["l"]), "l", &translate(10.0, 0.0))
@@ -2586,14 +2494,14 @@ mod tests {
         };
         assert_eq!(geometry_d, "M 0 0 L 400 0");
 
-        // Rule 3 reduction: the anchor's target moved in the SAME batch — the delta
-        // cancels, so the pure translate keeps the SetTransform fast path.
+        // The anchor's target moved in the SAME batch: the delta cancels, so the pure
+        // translate keeps the SetTransform fast path.
         assert!(matches!(
             route_preview_member(&scene, &ids(&["l", "t"]), "l", &translate(10.0, 0.0)),
             PreviewMemberRoute::Matrix
         ));
 
-        // Rule 3 no-op: both endpoints pinned by unmoved targets — nothing moves.
+        // Both endpoints pinned by unmoved targets: nothing moves.
         let scene = feed_scene(vec![open(vec![
             endpoint_anchor(0, "t"),
             endpoint_anchor(1, "u"),
@@ -2603,7 +2511,7 @@ mod tests {
             PreviewMemberRoute::Pinned
         ));
 
-        // Rule 5: an interior-node anchor is the node-splice era — whole transform.
+        // An interior-node anchor rides the whole transform.
         let wire = anchored_object(
             "l",
             None,
@@ -2618,11 +2526,9 @@ mod tests {
         ));
     }
 
-    /// COMMIT-LIVE EQUIVALENCE PIN (group rotate): the open member's LIVE deform
-    /// bytes equal the `edit-geometry` scene-core's commit cascade authors for the
-    /// same multi-rotate — and re-expanding that live geometry equals a FULL
-    /// rebake of the scene with the committed geometry applied. Both sides call
-    /// the same scene-core functions, so a drift in either fails here.
+    /// On a group rotate, the open member's LIVE deform bytes must equal the
+    /// `edit-geometry` the commit cascade authors, and re-expanding that geometry must
+    /// equal a FULL rebake of the committed scene.
     #[test]
     fn open_member_group_rotate_live_matches_scene_core_commit_and_rebake() {
         use crate::object_pipeline::{
@@ -2681,7 +2587,7 @@ mod tests {
         };
         let ops = cascade_multi_transform_ops(&core_scene, &moved, &Transform3x3 { m: delta });
         // The closed member keeps SetTransform; the open member commits ONE
-        // edit-geometry and NO set-transform (§2c slave rule).
+        // edit-geometry and NO set-transform.
         assert!(ops
             .iter()
             .any(|op| matches!(op, ObjectOp::SetTransform { id, .. } if id == "r")));
@@ -2730,10 +2636,9 @@ mod tests {
         );
     }
 
-    /// v3 §3 rule 4 (the spike fix), live side: an open-class follower whose
-    /// anchored ENDPOINT follows a moved target deforms the WHOLE chord — the
-    /// interior node rides along — and the bytes equal scene-core's commit
-    /// `anchor_follow_ops` for the same move (same functions, automatic).
+    /// An open-class follower whose anchored ENDPOINT follows a moved target deforms
+    /// the WHOLE chord (the interior node rides along), and the bytes must equal
+    /// `anchor_follow_ops` for the same move.
     #[test]
     fn open_follower_live_chord_matches_anchor_follow_commit() {
         use super::reprojected_follower_geometries;
@@ -2742,9 +2647,8 @@ mod tests {
             ObjectScene, ObjectSelection, Transform3x3,
         };
 
-        // The scene-core spike vector: target at (200,0), 3-node follower
-        // (0,0)->(100,0)->(200,0)px with its END anchored to the target's origin;
-        // the target moves +160px x (target_new = translate(360,0)).
+        // Target at (200,0); 3-node follower with its END anchored to the target's
+        // origin; the target moves +160px x.
         let target = anchored_object("t", None, translate(200.0, 0.0), "M 0 0 L 0 0", Vec::new());
         let follower = anchored_object(
             "f",
@@ -2813,8 +2717,8 @@ mod tests {
         assert_eq!(id, "f");
         assert_eq!(live[0].1, geometry.path_string, "live follower bytes == commit bytes");
 
-        // Rule 5 regression: an INTERIOR-node anchor keeps the legacy splice — only
-        // the bound node rewrites, the endpoints stay (and it still matches commit).
+        // An INTERIOR-node anchor keeps the splice: only the bound node rewrites, the
+        // endpoints stay.
         let mut interior_scene = scene.clone();
         interior_scene.objects[1].anchors = vec![endpoint_anchor(1, "t")];
         let live_interior = reprojected_follower_geometries(
@@ -2825,9 +2729,8 @@ mod tests {
         assert_eq!(live_interior[0].1, "M 0 0 L 2880 0 L 1600 0");
     }
 
-    /// v3 §2b: the endpoint-drag live geometry comes from the SAME scene-core
-    /// commit function the release runs (`endpoint_release_ops`), pinned on the
-    /// deform-module vector; non-endpoint targets have no surface.
+    /// The endpoint-drag live geometry comes from the SAME `endpoint_release_ops` the
+    /// release runs; non-endpoint targets have no surface.
     #[test]
     fn endpoint_preview_geometry_matches_endpoint_release_ops() {
         let edge = anchored_object("e", None, translate(0.0, 0.0), "M 0 0 L 800 0", Vec::new());
@@ -2835,7 +2738,7 @@ mod tests {
         let wire = anchored_object("w", None, translate(0.0, 0.0), "M 0 0 L 80 0 L 160 0", Vec::new());
         let scene = feed_scene(vec![edge, rect, wire]);
 
-        // The deform.rs release vector: node 1 of the 100px edge to world (150,10).
+        // Node 1 of the 100px edge to world (150,10).
         assert_eq!(
             endpoint_preview_geometry(&scene, "e", 1, (150.0, 10.0)),
             Some("M 0 0 L 1200 80".to_string())
@@ -2851,9 +2754,8 @@ mod tests {
         assert!(endpoint_preview_geometry(&scene, "ghost", 0, (0.0, 0.0)).is_none());
     }
 
-    /// G14 parity, endpoint flavor: re-expanding the endpoint-preview geometry
-    /// fills the canonical baked ranges exactly (size-safe patch) and the bytes
-    /// equal a FULL rebake of the deformed scene.
+    /// Re-expanding the endpoint-preview geometry fills the canonical baked ranges
+    /// exactly (size-safe patch) and equals a FULL rebake of the deformed scene.
     #[test]
     fn endpoint_preview_patch_matches_a_full_rebake() {
         use crate::object_pipeline::{

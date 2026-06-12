@@ -1,11 +1,6 @@
-//! WebGPU/web half of the shape.ai renderer.
-//!
-//! Holds the `wgpu` GPU pipelines, the drop-shadow blur passes, the WGSL shaders,
-//! the web surface lifecycle, and the `#[wasm_bindgen]` renderer surface. The pure
-//! CPU half (tessellation, text layout, hit testing, object geometry build, render
-//! model) lives in the [`shape_renderer_core`] crate, which this depends on by
-//! path. The package name stays `shape_canvas_core` so the wasm-pack JS module name
-//! and the client loader path are unchanged.
+//! WebGPU/web half of the shape.ai renderer. The pure CPU half lives in
+//! [`shape_renderer_core`]. The package name stays `shape_canvas_core` so the
+//! wasm-pack JS module name and the client loader path are unchanged.
 
 mod object_pipeline;
 mod shaders;
@@ -27,13 +22,10 @@ use shape_renderer_core::WebGpuProbeReport;
 #[allow(unused_imports)]
 pub use webgpu::ShapeWebGpuRenderer;
 
-// OB-4 object GPU pipeline (needs `wgpu`; the client flips to it at the cutover).
 #[cfg(feature = "wgpu-probe")]
 #[allow(unused_imports)]
 pub use object_pipeline::{ObjectPipeline, ObjectRenderer};
 
-// W3-G8/A real drop-shadow blur GPU offscreen-target + pipeline holder. Re-exported
-// so the wasm32-only consumer (the live frame loop) isn't the lone reference.
 #[cfg(feature = "wgpu-probe")]
 #[allow(unused_imports)]
 pub use shadow_blur::ShadowBlur;
@@ -50,15 +42,9 @@ pub fn renderer_backend() -> String {
     "rust-wasm-scene-core".to_string()
 }
 
-/// OB-4 object render entry (web build). Parses a [`shape_renderer_core::RenderObjectScene`]
-/// (the object-substrate render view) from JSON and builds the CPU-side draw
-/// geometry — fill megabuffer + stroke ribbons — that the GPU `ObjectPipeline`
-/// uploads. Returns a summary `{ objects, fillVertices, fillTriangles,
-/// strokeVertices, draws }` so the client can confirm the object scene reaches the
-/// renderer in the web wasm. This proves the object render model + geometry build
-/// compile and run for the web target (not only `wgpu-probe` tests); the full GPU
-/// draw wiring (device/surface, `ObjectRenderer::render`) is wired at the renderer
-/// cutover alongside the client object render adapter.
+/// Parse a [`shape_renderer_core::RenderObjectScene`] from JSON and build the
+/// CPU-side draw geometry (fill megabuffer + stroke ribbons) the GPU
+/// `ObjectPipeline` uploads, returning a summary.
 #[wasm_bindgen(js_name = buildObjectSceneGeometry)]
 pub fn build_object_scene_geometry(scene_json: &str) -> Result<JsValue, JsValue> {
     let scene: shape_renderer_core::RenderObjectScene = serde_json::from_str(scene_json)
@@ -73,7 +59,6 @@ pub fn build_object_scene_geometry(scene_json: &str) -> Result<JsValue, JsValue>
     })
 }
 
-/// The CPU geometry summary returned by [`build_object_scene_geometry`].
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ObjectGeometrySummary {

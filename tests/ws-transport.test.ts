@@ -13,9 +13,8 @@ import type {
 import type { OutboxEntry } from "../platforms/web/runtime/outbox";
 import { emptyObjectScene, translateTransform, type ObjectOp, type WireOp } from "../platforms/web/shared/object";
 
-// A minimal WebSocket double implementing the slice WsTransport drives. Tests
-// drive the lifecycle manually: `open()` fires onopen, `emit(frame)` delivers a
-// server frame, `sent` records the JSON strings the transport wrote.
+// open() fires onopen, emit(frame) delivers a server frame, sent records the JSON
+// strings the transport wrote.
 class MockWebSocket implements WebSocketLike {
   onopen: ((ev: unknown) => void) | null = null;
   onclose: ((ev: unknown) => void) | null = null;
@@ -93,7 +92,7 @@ const emptyWelcome: WelcomeMessage = {
   revision: 0
 };
 
-/** A WireOp envelope around an ObjectOp delta (the outbox/wire shape). */
+// A WireOp envelope around an ObjectOp delta (the outbox/wire shape).
 function wireOp(op: ObjectOp, clientId: string, localSeq: number): WireOp {
   return {
     opId: { clientId, localSeq },
@@ -176,7 +175,7 @@ describe("WsTransport outbound frames", () => {
     });
   });
 
-  it("emits a feature request frame on the single feature channel (OB4.5)", async () => {
+  it("emits a feature request frame on the single feature channel", async () => {
     const { transport, socket } = await connected();
 
     transport.sendFeature({ feature: "canvasSwitch", canvas_id: "c-ws" });

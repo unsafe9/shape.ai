@@ -26,39 +26,31 @@
   import type { ConnectionStatus } from "../runtime/wsTransport";
   import type { Object as SceneObject } from "../shared/object";
 
-  // U1 — the single persistent floating UI: the bottom-center toolbar (tools,
-  // object-primitive inserters, template trigger, zoom) plus the absorbed canvas
-  // switcher, connection status, diagnostics toggle, export trigger, and a
-  // selected-object property panel (the old SelectedNodeInspector). Every action
-  // routes through the parent; this component renders + dispatches only.
+  // The single persistent floating UI: the bottom-center toolbar plus the canvas switcher, connection
+  // status, diagnostics/export triggers, and a selected-object property panel. This component renders +
+  // dispatches only; every action routes through the parent.
   type Props = {
     activeTool: ActiveTool;
-    // W2-07: the armed drag-create shape (rect/ellipse/line), or null. Highlights
-    // the active shape button while the create tool is armed.
+    // The armed drag-create shape, or null.
     createKind: DragCreateShape | null;
-    // W2-08: brush state the Stroke popup drives. Color is owned by the separate
-    // Color control (selectedColor), so the Stroke popup carries width only.
+    // Color is owned by the separate Color control, so the Stroke popup carries width only.
     penWidthPx: number;
     penPalette: string[];
     penWidths: number[];
-    // D1/#5: always-visible toolbar color. AP1 applies this to the selection via
-    // SetStyle; the toolbar owns only the swatch palette + native-picker UI.
+    // Always-visible toolbar color, applied to the selection via SetStyle.
     selectedColor: string;
-    // S2 (#5): dark-mode flag so the theme-default swatch renders contrasting
-    // (white in dark, black in light) instead of the raw sentinel string.
+    // Dark-mode flag so the theme-default swatch renders contrasting instead of the raw sentinel string.
     dark: boolean;
     busy: boolean;
     templateOpen: boolean;
     diagnosticsOpen: boolean;
-    // Selected object (object-native property edit), or null for canvas/multi.
+    // Selected object, or null for canvas/multi.
     selectedObject: SceneObject | null;
-    // Canvas switcher state.
     canvases: CanvasSummary[];
     activeCanvasId: string;
     connectionStatus: ConnectionStatus;
     canvasBusy: boolean;
     onSetTool: (tool: ActiveTool) => void;
-    // W2-08: Stroke popup width setter (color is set via onSelectColor).
     onSetPenWidth: (widthPx: number) => void;
     onSelectColor: (color: string) => void;
     onInsertPrimitive: (kind: PrimitiveKindId) => void;
@@ -110,9 +102,7 @@
     onDeleteSelected
   }: Props = $props();
 
-  // D7: the basic-shape inserters (Rect / Ellipse / Line). Text is authored by
-  // rect + double-click and Frame is not a basic shape, so neither has a button —
-  // `toolbarShapeKinds` (toolbar.ts) is the single source of which buttons render.
+  // The basic-shape inserters; `toolbarShapeKinds` is the single source of which buttons render.
   const SHAPE_META: Record<DragCreateShape, { label: string; icon: typeof Square }> = {
     rectangle: { label: "Rectangle (R)", icon: Square },
     ellipse: { label: "Ellipse (O)", icon: Circle },
@@ -123,16 +113,13 @@
   // First text run of the selected object, the editable label in the property panel.
   const selectedText = $derived(selectedObject?.text?.runs?.map((run) => run.text).join("") ?? "");
 
-  // TB1 (#3): the color control is a single rainbow swatch that toggles a popup
-  // holding BOTH the native picker and the fixed PEN_PALETTE swatches. Local UI
-  // state only — the selected color + apply contract still live in the parent.
+  // The color control toggles a popup holding the native picker + fixed swatches. Local UI state only.
   let colorPopupOpen = $state(false);
   let colorControl = $state<HTMLDivElement | null>(null);
   function toggleColorPopupOpen(): void {
     colorPopupOpen = toggleColorPopup(colorPopupOpen);
   }
-  // Close on outside-click / Escape while the popup is open (re-click on the
-  // button is handled by the toggle above; this only catches clicks elsewhere).
+  // Close on outside-click / Escape (re-click on the button is handled by the toggle above).
   $effect(() => {
     if (!colorPopupOpen) return;
     const onPointerDown = (event: PointerEvent) => {
@@ -149,18 +136,14 @@
     };
   });
 
-  // S1 (#4): the Stroke control mirrors the color control — a single button that
-  // toggles a popup holding the brush size + color (the old auto draw sub-toolbar's
-  // contents). Independent open state so it never fights the color popup.
+  // The Stroke control mirrors the color control; independent open state so it never fights the color popup.
   let strokePopupOpen = $state(false);
   let strokeControl = $state<HTMLDivElement | null>(null);
   function toggleStrokePopupOpen(): void {
     strokePopupOpen = toggleStrokePopup(strokePopupOpen);
   }
 
-  // S2 (#5): the theme-default swatch authors a Paint::Token, not a hex; render it
-  // contrasting (white in dark, black in light) with a "Theme default" label so the
-  // sentinel string never reaches the UI. Every other swatch renders its hex as-is.
+  // The theme-default swatch authors a Paint::Token; render it contrasting with a "Theme default" label so the sentinel never reaches the UI.
   function swatchFill(color: string): string {
     return color === THEME_DEFAULT_COLOR ? (dark ? "#ffffff" : "#000000") : color;
   }
@@ -243,8 +226,7 @@
 
 <!-- Bottom-center toolbar: the sole persistent floating UI. -->
 <div class="toolbar-remote" role="toolbar" tabindex="-1" aria-label="Canvas toolbar" onpointerdown={(event) => event.stopPropagation()}>
-  <!-- W2-03: one unified Move/Select pointer (picks/drags/marquees). Pan rides
-       Space-hold / middle-button / wheel, so there is no separate Hand tool. -->
+  <!-- One unified Move/Select pointer; pan rides Space-hold / middle-button / wheel, no separate Hand tool. -->
   <div class="toolbar-group" aria-label="Move">
     <span class="toolbar-group-label">Move</span>
     <div class="toolbar-group-buttons">
@@ -263,8 +245,7 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <!-- Draw: the Pen is a tool toggle (free-draw), not an inserter. The Eraser is
-       a sibling draw-mode tool (whole-stroke delete, or partial cut with Alt). -->
+  <!-- The Eraser does whole-stroke delete, or a partial cut with Alt. -->
   <div class="toolbar-group" aria-label="Draw">
     <span class="toolbar-group-label">Draw</span>
     <div class="toolbar-group-buttons">
@@ -293,7 +274,6 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <!-- Shapes: the basic-shape inserters (Rect / Ellipse / Line / Text). -->
   <div class="toolbar-group" aria-label="Shapes">
     <span class="toolbar-group-label">Shapes</span>
     <div class="toolbar-group-buttons">
@@ -315,9 +295,7 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <!-- S1 (#4): the Stroke button toggles a popup with the brush size + color
-       (the old auto draw sub-toolbar's contents). Always visible, sibling left of
-       Color. The popup stops pointerdown so the canvas never sees the click. -->
+  <!-- The popup stops pointerdown so the canvas never sees the click. -->
   <div class="toolbar-group" aria-label="Stroke" bind:this={strokeControl}>
     <span class="toolbar-group-label">Stroke</span>
     <div class="toolbar-group-buttons">
@@ -358,10 +336,6 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <!-- TB1 (#3): one rainbow-gradient swatch BUTTON toggles a color popup holding
-       BOTH the native picker and the fixed PEN_PALETTE swatches (presets + custom
-       in one place). AP1 reads `selectedColor` and applies it to the selection via
-       SetStyle; the toggle + popup are local UI chrome only. -->
   <div class="toolbar-group" aria-label="Color" bind:this={colorControl}>
     <span class="toolbar-group-label">Color</span>
     <div class="toolbar-group-buttons">

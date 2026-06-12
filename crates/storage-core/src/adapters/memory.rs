@@ -1,13 +1,6 @@
-//! Fully-working in-memory adapter.
-//!
-//! Backs tests and serves as the default in-process store. Implements all of
-//! the per-record I/O directly against an in-memory [`StoreSnapshot`].
-//!
-//! This is the in-RAM backend, so the store itself is necessarily resident.
-//! Its export/import are still **streaming**: [`records`](StorageAdapter::records)
-//! hands the streaming export a lazy id-sorted cursor, and `import` ingests one
-//! record at a time. That keeps export/import from duplicating the whole
-//! serialized bundle in memory on top of the store.
+//! In-memory adapter backing tests and the default in-process store, over a
+//! resident [`StoreSnapshot`]. Its export/import stay **streaming** so they
+//! don't duplicate the whole serialized bundle on top of the store.
 
 use crate::adapter::{AdapterKind, RecordCursor, StorageAdapter};
 use crate::error::{Result, StorageError};
@@ -15,11 +8,9 @@ use crate::record::{Record, StoreSnapshot};
 use crate::spatial::{bbox_overlaps, RegionKey, SpatialStore};
 use std::collections::BTreeMap;
 
-/// In-process store holding records in a sorted map.
-///
-/// `regions` is the optional spatial side index keyed by record id (see
-/// [`SpatialStore`]); it stays empty unless [`save_indexed`](SpatialStore::save_indexed)
-/// is used, so the plain [`StorageAdapter`] path is unaffected.
+/// In-process store holding records in a sorted map. `regions` is the optional
+/// spatial side index (see [`SpatialStore`]), empty unless
+/// [`save_indexed`](SpatialStore::save_indexed) is used.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryAdapter {
     snapshot: StoreSnapshot,
@@ -27,12 +18,10 @@ pub struct MemoryAdapter {
 }
 
 impl MemoryAdapter {
-    /// A new empty in-memory store.
     pub fn new() -> Self {
         MemoryAdapter::default()
     }
 
-    /// Build directly from an existing snapshot.
     pub fn from_snapshot(snapshot: StoreSnapshot) -> Self {
         MemoryAdapter {
             snapshot,
@@ -40,12 +29,10 @@ impl MemoryAdapter {
         }
     }
 
-    /// Number of records held.
     pub fn len(&self) -> usize {
         self.snapshot.len()
     }
 
-    /// Whether the store is empty.
     pub fn is_empty(&self) -> bool {
         self.snapshot.is_empty()
     }
@@ -78,7 +65,6 @@ impl StorageAdapter for MemoryAdapter {
     }
 
     fn records(&self) -> Result<RecordCursor<'_>> {
-        // Lazy: clones one record at a time, in BTreeMap (id-sorted) order.
         Ok(Box::new(self.snapshot.records().cloned().map(Ok)))
     }
 
@@ -88,8 +74,7 @@ impl StorageAdapter for MemoryAdapter {
 
     fn restore(&mut self, snapshot: StoreSnapshot) -> Result<()> {
         self.snapshot = snapshot;
-        // The region index pointed at the previous contents; drop it so no stale
-        // rows survive a replace.
+        // Drop the region index so no stale rows survive a replace.
         self.regions.clear();
         Ok(())
     }
@@ -115,8 +100,8 @@ impl SpatialStore for MemoryAdapter {
         bbox: Option<(f64, f64, f64, f64)>,
     ) -> Result<RecordCursor<'_>> {
         let canvas_id = canvas_id.to_string();
-        // `regions` is a BTreeMap, so iterating it gives id-sorted order, and the
-        // snapshot is keyed by the same ids. We clone matched records lazily.
+        // `regions` is a BTreeMap, so iteration is id-sorted; matched records are
+        // cloned lazily.
         let cursor = self
             .regions
             .iter()
@@ -148,7 +133,6 @@ mod tests {
         assert_eq!(store.load("a").unwrap().payload, b"one");
         assert_eq!(store.list().unwrap(), vec!["a", "b"]);
 
-        // Overwrite by id.
         store
             .save(Record::new("a", "card", b"one-v2".to_vec()))
             .unwrap();

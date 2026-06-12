@@ -1,9 +1,6 @@
-//! MG-8 / MG-9 scale-out integration tests: single-writer lease + handoff
-//! (MG8.2a, MG8.5), owner routing cache (MG8.2b), canvas CRUD (MG9.1), and
-//! graceful shutdown / drain (MG8.3) — object-native (OB4.1).
-//!
-//! Two registries share one [`InMemoryCoordinator`] and one [`SharedStore`] to
-//! model two app instances in front of the same coordinator + storage.
+//! Scale-out integration tests: single-writer lease + handoff, owner routing
+//! cache, canvas CRUD, and graceful shutdown / drain. Two registries share one
+//! [`InMemoryCoordinator`] and one [`SharedStore`] to model two app instances.
 
 use std::sync::{Arc, Mutex};
 
@@ -38,10 +35,6 @@ fn insert(id: &str, order: &str) -> ObjectOp {
         object: Object::new(id, order, rect_geometry()),
     }
 }
-
-// ---------------------------------------------------------------------------
-// MG8.2a + MG8.5: single-writer lease across two registries + handoff recovery.
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn second_registry_cannot_spawn_while_first_holds_lease() {
@@ -112,10 +105,6 @@ async fn handoff_after_release_recovers_durable_scene_with_no_data_loss() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// MG8.2b: owner routing cache returns the owner without re-hitting coordination.
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn routing_cache_returns_owner_without_rehitting_coordination() {
     let coordinator: Arc<dyn Coordinator> = Arc::new(InMemoryCoordinator::new());
@@ -138,10 +127,6 @@ async fn routing_cache_returns_owner_without_rehitting_coordination() {
     let cached = reg.resolve_owner(&canvas).await;
     assert_eq!(cached, "owner-self", "cached owner is returned (0 coordination hops)");
 }
-
-// ---------------------------------------------------------------------------
-// MG9.1: canvas CRUD create / list / delete round-trip.
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn canvas_crud_create_list_delete_round_trip() {
@@ -182,7 +167,7 @@ async fn delete_canvas_prunes_scene_records() {
     let summary = registry.create_canvas_with_id("c-prune", "Pruned").unwrap();
     let handle = registry.get_or_spawn(&summary.id).await.unwrap();
     handle.apply_op(insert("o1", "a0"), "user-1").await;
-    handle.shutdown().await; // write-through left per-object Records.
+    handle.shutdown().await;
 
     {
         use shape_storage_core::StorageAdapter;
@@ -210,10 +195,6 @@ async fn delete_canvas_prunes_scene_records() {
         assert!(post.is_empty(), "all scene records pruned after delete, found {post:?}");
     }
 }
-
-// ---------------------------------------------------------------------------
-// MG8.3: graceful shutdown / drain flushes + releases.
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn graceful_shutdown_flushes_and_frees_leases() {

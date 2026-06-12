@@ -1,27 +1,12 @@
-//! OB-4 object render-geometry build (pure CPU half).
+//! Object render-geometry build (pure CPU half): the `bytemuck` vertex/instance
+//! layout structs, the per-object [`ObjectDraw`] index, and the scene tessellation
+//! into a [`MegaBuffer`] + instance data. No `wgpu`; runs on every target.
 //!
-//! This module builds the device-independent CPU geometry for the OB-3 object
-//! model (`RenderObjectScene` / `RenderObject`): the `bytemuck` vertex/instance
-//! layout structs, the per-object [`ObjectDraw`] index, and the scene
-//! tessellation into a [`MegaBuffer`] + instance data ([`build_scene_geometry`]).
-//! It needs no `wgpu` and runs on every target (web wasm, native, host tests).
-//!
-//! The GPU half — the `wgpu` render pipelines (`ObjectPipeline`) and the buffer
-//! uploader / render-pass recorder (`ObjectRenderer`) that consume this geometry —
-//! lives in the `shape_canvas_core` (renderer-wgpu) crate's `object_pipeline`
-//! module, gated behind its `wgpu-probe` feature.
-//!
-//! ## Per-object 3x3 matrix strategy: instance attributes
-//!
-//! `wgpu`'s WebGPU backend exposes no push constants, so the per-object 3x3
-//! projective transform (D7) cannot be a push constant. The WGSL contract
-//! declares the matrix as three **instance-step** `vec3` columns (`m0`/`m1`/`m2`)
-//! plus the inline paint color, so the instance structs here match that exactly:
-//! one instance record per object carries its matrix columns + color, and each
-//! object draws as a single instance. This keeps the matrix out of the shared
-//! `view` uniform — which stays the affine camera, byte-identical to the legacy
-//! `ViewUniform` — and lets the VS do the projective `M * vec3(local, 1)` divide
-//! per object.
+//! Per-object 3x3 matrix strategy: WebGPU has no push constants, so the projective
+//! transform rides as three instance-step `vec3` columns (`m0`/`m1`/`m2`) plus the
+//! inline paint color. Each object draws as one instance; the shared `view` uniform
+//! stays the affine camera (byte-identical to the legacy `ViewUniform`) and the VS
+//! does the projective `M * vec3(local, 1)` divide per object.
 
 use crate::model::CameraState;
 use crate::object_theme::{resolve_token_f32, Theme};
@@ -40,23 +25,19 @@ use crate::tessellate::{
 // Uniform + vertex/instance GPU layouts
 // ---------------------------------------------------------------------------
 
-/// Shared camera uniform for the object pipelines. Replaces `ViewUniform`'s
-/// affine-only role for the object path: the same affine `camera`/`viewport`
-/// fields the WGSL `View` struct reads, while every object's *projective* 3x3
-/// matrix rides on the instance buffer (see module docs), not here. Byte-layout
-/// identical to the legacy `ViewUniform` so the two pipelines share a coordinate
-/// frame during the cutover.
+/// Shared camera uniform (WGSL `View`): the affine camera, with every object's
+/// projective matrix on the instance buffer instead. Byte-identical to the legacy
+/// `ViewUniform` so the two pipelines share a coordinate frame.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ObjectMatrixUniform {
-    /// `vec4(translate.x, translate.y, zoom, _)` — the affine camera.
+    /// `vec4(translate.x, translate.y, zoom, _)`.
     pub camera: [f32; 4],
-    /// `vec4(px_w, px_h, _, _)` — the device-pixel viewport.
+    /// `vec4(px_w, px_h, _, _)`.
     pub viewport: [f32; 4],
 }
 
 impl ObjectMatrixUniform {
-    /// Build the camera uniform from a scene's camera and a device-pixel viewport.
     pub fn from_scene(scene: &RenderObjectScene, pixel_width: f32, pixel_height: f32) -> Self {
         ObjectMatrixUniform {
             camera: [
@@ -70,12 +51,9 @@ impl ObjectMatrixUniform {
     }
 }
 
-/// Per-vertex fill attributes matching `object_fill.wgsl`'s `VertexIn`
-/// (`position` @0, `edge` @1). Positions are object-local **pixels**
-/// (`tessellate::Mesh` vertices); `edge` is the analytic-AA silhouette flag (D4):
-/// `1.0` on a boundary vertex, `0.0` interior (from `Mesh::boundary_flags`), which
-/// the FS fades over the last screen pixel before the silhouette. All-zero edges
-/// (no boundary data) degrade gracefully to opaque interior fill.
+/// Per-vertex fill attributes matching `object_fill.wgsl`'s `VertexIn` (`position`
+/// @0, `edge` @1). Positions are object-local pixels; `edge` is the analytic-AA
+/// silhouette flag (1.0 boundary, 0.0 interior); all-zero degrades to opaque fill.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FillVertex {
@@ -83,9 +61,8 @@ pub struct FillVertex {
     pub edge: f32,
 }
 
-/// Per-object instance attributes for the fill pipeline matching
-/// `object_fill.wgsl` (`m0`/`m1`/`m2` @2..4, `fill` @5). The 3x3 projective
-/// matrix is stored as three `vec3` columns; `fill` is the resolved solid paint.
+/// Fill instance matching `object_fill.wgsl` (`m0`/`m1`/`m2` @2..4, `fill` @5):
+/// the 3x3 matrix as three `vec3` columns plus the resolved solid paint.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FillInstance {
@@ -95,11 +72,9 @@ pub struct FillInstance {
     pub fill: [f32; 4],
 }
 
-/// Per-vertex drop-shadow attributes matching `object_shadow.wgsl`'s `VertexIn`
-/// (`position` @0, `feather` @1). Positions are object-local **pixels** (the
-/// object's own fill silhouette translated by the drop-shadow offset); `feather`
-/// is the per-vertex 0..1 blur falloff, uniformly `0` for the flat offset
-/// silhouette (the FS falloff is then 1) — a soft blur is the GPU-cutover residual.
+/// Per-vertex shadow attributes matching `object_shadow.wgsl`'s `VertexIn`
+/// (`position` @0, `feather` @1). Positions are the offset fill silhouette;
+/// `feather` is uniformly `0` for the flat silhouette (a soft blur is a GPU residual).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowVertex {
@@ -107,10 +82,8 @@ pub struct ShadowVertex {
     pub feather: f32,
 }
 
-/// Per-object instance attributes for the drop-shadow pipeline matching
-/// `object_shadow.wgsl` (`m0`/`m1`/`m2` @2..4, `shadow` @5). The 3x3 projective
-/// matrix is the same one the fill/stroke instances carry; `shadow` is the theme
-/// `shadow` token color (translucent), re-resolved on a theme flip.
+/// Shadow instance matching `object_shadow.wgsl` (`m0`/`m1`/`m2` @2..4, `shadow`
+/// @5). `shadow` is the translucent theme `shadow` token, re-resolved on a theme flip.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowInstance {
@@ -132,8 +105,7 @@ pub struct StrokeVertex {
     pub distance_along: f32,
 }
 
-/// Per-object instance attributes for the stroke pipeline matching
-/// `object_stroke.wgsl` (`m0`/`m1`/`m2` @5..7, `stroke` @8).
+/// Stroke instance matching `object_stroke.wgsl` (`m0`/`m1`/`m2` @5..7, `stroke` @8).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct StrokeInstance {
@@ -143,8 +115,7 @@ pub struct StrokeInstance {
     pub stroke: [f32; 4],
 }
 
-/// `object_stroke.wgsl`'s `StrokeUniform` (binding 1): dash on-length, period,
-/// opacity, and a solid/dashed flag.
+/// `object_stroke.wgsl`'s `StrokeUniform` (binding 1).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct StrokeParamsUniform {
@@ -153,9 +124,7 @@ pub struct StrokeParamsUniform {
 }
 
 impl StrokeParamsUniform {
-    /// Solid (no-dash) params at full opacity. Per-object dash gating is folded
-    /// into the CPU dash split for the first cutover, so the shader-side uniform
-    /// stays solid; richer per-instance dashing gets its own buffer later.
+    /// Solid (no-dash) params at full opacity; per-object dashing is in the CPU split.
     pub fn solid() -> Self {
         StrokeParamsUniform {
             dash: [0.0, 0.0, 1.0, 0.0],
@@ -163,12 +132,9 @@ impl StrokeParamsUniform {
     }
 }
 
-/// Per-glyph-quad-corner attributes matching `msdf_text.wgsl`'s `VertexIn`
-/// (`position` @0, `uv` @1, `color` @2). `position` is object-local **pixels**
-/// (the region-local glyph quad corner, already laid out by `layout_runs`); `uv`
-/// is the atlas UV (0..1) for the corner; `color` is the inline per-run paint
-/// (D19 `run.color`). Color rides per-glyph here, not on the instance — the
-/// instance carries only the matrix so one object's runs can mix colors.
+/// Per-glyph-corner attributes matching `msdf_text.wgsl`'s `VertexIn` (`position`
+/// @0, `uv` @1, `color` @2). Color rides per-glyph (not on the instance) so one
+/// object's runs can mix colors.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TextVertex {
@@ -177,11 +143,8 @@ pub struct TextVertex {
     pub color: [f32; 4],
 }
 
-/// Per-object instance attributes for the text pipeline matching
-/// `msdf_text.wgsl` (`m0`/`m1`/`m2` @3..5). Color is per-glyph in [`TextVertex`],
-/// so the text instance carries only the 3x3 projective matrix columns — the same
-/// region-local-px -> world bridge the fill/stroke instances use, index-aligned
-/// with `draws[i]`.
+/// Text instance matching `msdf_text.wgsl` (`m0`/`m1`/`m2` @3..5); matrix only,
+/// since color is per-glyph in [`TextVertex`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TextInstance {
@@ -190,8 +153,7 @@ pub struct TextInstance {
     pub m2: [f32; 3],
 }
 
-/// `msdf_text.wgsl`'s `TextUniform` (binding 3): MSDF atlas params the
-/// `screenPxRange` AA reads. `atlas = vec4(distance_range, atlas_w, atlas_h, _)`.
+/// `msdf_text.wgsl`'s `TextUniform` (binding 3) — MSDF atlas params for `screenPxRange` AA.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TextUniform {
@@ -204,58 +166,40 @@ pub struct TextUniform {
 // CPU scene build
 // ---------------------------------------------------------------------------
 
-/// The CPU-built draw data for one object: where its fill triangles live in the
-/// megabuffer and the instance record (matrix + color) drawn against them, plus
-/// its stroke vertices and stroke instance. Held by [`ObjectRenderer`] so each
-/// object becomes one indexed fill draw + one stroke draw at record time.
+/// The CPU-built draw data for one object: where its fill/stroke/shadow/text live in
+/// the shared buffers and the instance records drawn against them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObjectDraw {
     pub id: String,
-    /// Index range into the shared fill megabuffer (`fill_indices`), or an empty
-    /// range when the object has no fillable region.
+    /// Index range into the shared fill megabuffer, or empty for no fillable region.
     pub fill_range: DrawRange,
-    /// VERTEX range of this object's fill inside the shared fill vertex buffer
-    /// (`[start, end)`), distinct from `fill_range` which indexes the INDEX buffer.
-    /// W3-G9/#4 needs the vertex base/length to patch a follower's fill positions in
-    /// place during a live anchor reproject (the megabuffer rebases indices by this
-    /// vertex offset). Empty when the object has no fillable region.
+    /// VERTEX range of this object's fill (distinct from `fill_range`, an INDEX
+    /// range), so a follower's fill positions can be patched in place during a live
+    /// anchor reproject. Empty for no fillable region.
     pub fill_vertex_range: DrawRange,
     pub fill_instance: FillInstance,
-    /// RB3 drop-shadow quad vertex range into the shared `shadow_vertices` buffer.
-    /// Empty when the object has no boundable region (nothing to cast a shadow).
-    /// Drawn BEFORE fill (beneath the object).
+    /// Shadow quad vertex range; empty for no boundable region. Drawn beneath fill.
     pub shadow_range: DrawRange,
     pub shadow_instance: ShadowInstance,
-    /// Stroke ribbon vertices for this object (own buffer slice via `stroke_range`).
     pub stroke_range: DrawRange,
     pub stroke_instance: StrokeInstance,
-    /// Glyph-quad vertex range into the shared `text_vertices` buffer (RB2). Empty
-    /// when the object carries no text (or only whitespace). Drawn after stroke.
+    /// Glyph-quad vertex range; empty when no text (or whitespace). Drawn after stroke.
     pub text_range: DrawRange,
-    /// Whether a focus ring should be drawn for this object (selection/focus).
     pub focus_ring: bool,
-    /// RB1 theme toggle: the semantic token name backing this object's fill, if
-    /// the fill is a [`RPaint::Token`]. `Some` => the fill color re-resolves on a
-    /// theme flip; `None` (raw hex / gradient / image) is theme-invariant. Lets
-    /// [`ObjectRenderer::set_theme`] write ONLY token-backed instance colors
-    /// (zero re-tessellation, P4).
+    /// The token name backing this object's fill, if a [`RPaint::Token`]. `Some` =>
+    /// the color re-resolves on a theme flip (raw hex/gradient/image is invariant),
+    /// so a theme toggle writes only token-backed colors with zero re-tessellation.
     pub fill_token: Option<String>,
-    /// RB1 theme toggle: the token name backing this object's stroke, if any.
     pub stroke_token: Option<String>,
 }
 
-/// RB3: the renderer-default drop-shadow color is the theme `shadow` token. This
-/// is the ONLY tie of the shadow pass to the C1 token table — it is wired, never
-/// hardcoded, so the shadow flips dark-translucent (light mode) <-> light-
-/// translucent (dark mode) with the theme bit (zero-rebake color refresh, P4).
+/// The renderer-default shadow color is the theme `shadow` token — wired, never
+/// hardcoded, so the shadow flips with the theme bit (zero-rebake color refresh).
 const SHADOW_TOKEN: &str = "shadow";
 
-/// W3-G8/A drop-shadow constants (object-local px). The shadow is a SINGLE offset
-/// silhouette copy of the object's OWN fill, offset by [`SHADOW_OFFSET_PX`] in y.
-/// Softness no longer comes from stacked tiers — the offscreen separable-Gaussian
-/// blur pass (see [`crate::shadow_blur`]) provides the uniform feather. W3-G9/#1:
-/// the offset is 0 so the halo is fully symmetric on ALL sides (macOS ambient
-/// look) — the wide quarter-res blur owns the soft spread, no downward bias.
+/// Drop-shadow offset (object-local px). The shadow is a single offset silhouette
+/// copy of the object's own fill; the offscreen Gaussian blur owns the softness.
+/// Offset is 0 so the halo is symmetric on all sides (no downward bias).
 const SHADOW_OFFSET_PX: f32 = 0.0;
 
 
@@ -263,73 +207,54 @@ const SHADOW_OFFSET_PX: f32 = 0.0;
 // CPU geometry build (device-independent, unit-testable)
 // ---------------------------------------------------------------------------
 
-/// The device-independent result of building a scene's GPU geometry: a merged
-/// fill megabuffer + per-object fill instances, and a flat stroke ribbon vertex
-/// array + per-object stroke instances, plus the per-object [`ObjectDraw`] index.
+/// The device-independent result of building a scene's GPU geometry: merged fill
+/// megabuffer + per-object instances, stroke/shadow/text vertex arrays + instances,
+/// and the per-object [`ObjectDraw`] index. The `*_instances`/`draws` arrays are
+/// index-aligned.
 #[derive(Clone, Debug, Default)]
 pub struct SceneGeometry {
     pub fill: MegaBuffer,
-    /// Per-vertex analytic-AA silhouette flags (D4), index-aligned with
-    /// `fill.vertices`: `1.0` on a boundary (silhouette) vertex, `0.0` interior.
-    /// Built once with the mesh topology; `ObjectRenderer::new` widens it into each
-    /// `FillVertex.edge` so the FS fades the silhouette pixel (zero per-frame work).
+    /// Per-vertex analytic-AA silhouette flags, index-aligned with `fill.vertices`
+    /// (1.0 boundary, 0.0 interior). Built once with the mesh topology.
     pub fill_edges: Vec<f32>,
     pub fill_instances: Vec<FillInstance>,
-    /// RB3 drop-shadow quad vertices (6 per object with a boundable region,
-    /// tri-list), object-local px + per-vertex feather. Per-object slices via
-    /// `draws[i].shadow_range`.
+    /// Shadow quad vertices (6 per boundable object, tri-list); per-object slices
+    /// via `draws[i].shadow_range`.
     pub shadow_vertices: Vec<ShadowVertex>,
-    /// Per-object shadow instances (matrix columns + theme `shadow` color),
-    /// index-aligned with `draws`.
     pub shadow_instances: Vec<ShadowInstance>,
     pub stroke_vertices: Vec<StrokeVertex>,
     pub stroke_instances: Vec<StrokeInstance>,
-    /// Positioned glyph-quad vertices (6 per visible glyph, tri-list), object-local
-    /// px + atlas UV + per-run color. Per-object slices via `draws[i].text_range`.
+    /// Glyph-quad vertices (6 per visible glyph, tri-list); per-object slices via
+    /// `draws[i].text_range`.
     pub text_vertices: Vec<TextVertex>,
-    /// Per-object text instances (matrix columns only), index-aligned with `draws`.
     pub text_instances: Vec<TextInstance>,
     pub draws: Vec<ObjectDraw>,
 }
 
-/// Build all CPU geometry for `scene` in light mode (no device needed). Thin
-/// wrapper over [`build_scene_geometry_themed`] for callers that don't carry a
-/// theme yet (the web geometry-summary export + light-mode tests). Token paints
-/// resolve against the light table here.
+/// Build all CPU geometry for `scene` in light mode.
 pub fn build_scene_geometry(scene: &RenderObjectScene) -> SceneGeometry {
     build_scene_geometry_themed(scene, Theme::light())
 }
 
-/// Default device-free glyph-advance stub for the text-build path: a
-/// size-proportional advance (`STUB_ADVANCE_RATIO * size`), pure and
-/// deterministic, with no fontdue / I-O (CLAUDE.md pure-core rule). The real
-/// fontdue-backed `TextEngine::measure_text_width` is injected at the GPU cutover
-/// via [`build_scene_geometry_themed_with_measure`]; until then committed text
-/// still reaches the geometry/draw path at proportional positions.
+/// Device-free glyph-advance stub: a size-proportional advance, pure and
+/// deterministic (no fontdue/IO). The real fontdue shaper is injected at the GPU
+/// cutover via [`build_scene_geometry_themed_with_measure`].
 pub const STUB_ADVANCE_RATIO: f32 = 0.6;
 
 fn stub_measure(_ch: char, size: f32) -> f32 {
     STUB_ADVANCE_RATIO * size
 }
 
-/// Build all CPU geometry for `scene` under `theme` (no device needed): for each
-/// object, tessellate its fill into the shared megabuffer, expand its stroke into
-/// a ribbon, resolve its instance data (3x3 matrix columns + theme-resolved paint
-/// color), and lay out its text runs into positioned glyph quads. This is the
-/// unit-testable core of [`ObjectRenderer::new`]. The `theme` bit only affects
-/// token paint COLORS — tessellation/ranges are theme-invariant, which is what
-/// makes the toggle a zero-rebake color refresh. Text advances use the
-/// size-proportional [`stub_measure`]; the live fontdue shaper is injected via
-/// [`build_scene_geometry_themed_with_measure`] at the GPU cutover.
+/// Build all CPU geometry for `scene` under `theme`: tessellate fill, expand stroke,
+/// resolve instance data, lay out text. The `theme` bit only affects token paint
+/// COLORS (tessellation/ranges are theme-invariant), which makes the toggle a
+/// zero-rebake color refresh.
 pub fn build_scene_geometry_themed(scene: &RenderObjectScene, theme: Theme) -> SceneGeometry {
     build_scene_geometry_themed_with_measure(scene, theme, &stub_measure)
 }
 
-/// As [`build_scene_geometry_themed`], but with an injected per-char glyph-advance
-/// `measure` closure. The pure core never calls fontdue itself (CLAUDE.md: no
-/// I-O); the GPU cutover supplies the real `TextEngine::measure_text_width`, while
-/// tests pass a deterministic stub. Identical to the themed wrapper for non-text
-/// objects.
+/// As [`build_scene_geometry_themed`], with an injected per-char `measure` closure
+/// (the pure core never calls fontdue itself; the GPU cutover supplies the real one).
 pub fn build_scene_geometry_themed_with_measure(
     scene: &RenderObjectScene,
     theme: Theme,
@@ -343,16 +268,12 @@ pub fn build_scene_geometry_themed_with_measure(
 
         let subpaths = flatten_object_subpaths(obj, scene.camera.zoom);
 
-        // W3-G7/#3: an OPEN-only path with NO explicit fill is NOT filled (Figma /
-        // macOS convention) — a freehand brush stroke commits as an open subpath
-        // with `fill: None`, and tessellating it as a chord region showed an ugly
-        // default-white fill. Closed shapes (rect/ellipse) and any explicit fill are
-        // unaffected. When skipped we still push a Fill/Shadow instance below so the
-        // per-object instance buffers stay index-aligned with `draws`.
+        // An open-only path with no explicit fill is not filled (Figma convention).
+        // A skipped object still pushes a Fill/Shadow instance below so the per-object
+        // buffers stay index-aligned with `draws`.
         let skip_fill =
             obj.fill.is_none() && subpaths.iter().all(|(closed, _)| !closed);
 
-        // ---- Fill: tessellate the closed region into the megabuffer --------
         let mesh = if skip_fill {
             crate::tessellate::Mesh::default()
         } else {
@@ -362,12 +283,10 @@ pub fn build_scene_geometry_themed_with_measure(
                 .collect();
             tessellate_fill(&fill_input, FillRuleKind::NonZero)
         };
-        // Silhouette flags travel index-aligned with the megabuffer's vertex array:
-        // `push` appends this mesh's vertices, so we extend `fill_edges` with this
-        // mesh's boundary flags in lockstep (D4 analytic fill AA).
+        // Silhouette flags stay index-aligned with the megabuffer's vertex array.
         geometry.fill_edges.extend_from_slice(&mesh.boundary_flags());
-        // Record the fill VERTEX sub-range (distinct from the index range `push`
-        // returns) so a follower's fill positions can be patched in place (W3-G9/#4).
+        // Vertex sub-range (distinct from the index range `push` returns) so a
+        // follower's fill positions can be patched in place.
         let fill_vertex_start = geometry.fill.vertices.len() as u32;
         let fill_range = geometry.fill.push(&mesh);
         let fill_vertex_range = DrawRange {
@@ -396,9 +315,8 @@ pub fn build_scene_geometry_themed_with_measure(
             crate::render_object::RStrokeJoin::Round => Join::Miter,
         };
         let width = resolved.stroke.width as f32;
-        // Collect the object's stroke ribbon triangle meshes so a fill-LESS object
-        // (open/free-draw stroke) can still cast a shadow from its line outline
-        // (W3-G10/#3); a filled object ignores these and casts from its fill mesh.
+        // Keep the stroke ribbon meshes so a fill-less object can cast a shadow from
+        // its line; a filled object casts from its fill mesh instead.
         let mut stroke_meshes: Vec<crate::stroke_expand::Mesh> = Vec::new();
         for (closed, pts) in &subpaths {
             let runs = dash_segments(pts, &dash_px(&resolved.stroke.dash));
@@ -410,18 +328,9 @@ pub fn build_scene_geometry_themed_with_measure(
         }
         let stroke_end = geometry.stroke_vertices.len() as u32;
 
-        // ---- Shadow: an offset copy of the silhouette (RB3 #11) ------------
-        // The shadow REUSES the object's own fill `mesh` (the exact, hole-aware,
-        // concavity-correct region triangulation), translated by the drop offset
-        // and drawn beneath the fill. Its color is the theme `shadow` token, NEVER
-        // hardcoded — so a theme flip is a per-instance color refresh, the geometry
-        // stays put (zero rebake, P4). No extra tessellation.
-        //
-        // W3-G10/#3: when the fill mesh is EMPTY (an open/stroke-only free-draw
-        // object) but the object has a stroke ribbon, build the silhouette from the
-        // STROKE RIBBON instead so the line itself casts a soft shadow. The ribbon
-        // is the already-expanded triangle list `append_stroke_ribbon` consumed, so
-        // this is still a copy of baked geometry — zero re-tessellation.
+        // Shadow: an offset copy of the fill `mesh` (no extra tessellation). When the
+        // fill is empty (open/stroke-only), cast from the stroke ribbon instead so the
+        // line itself casts a shadow.
         let shadow_start = geometry.shadow_vertices.len() as u32;
         if mesh.indices.is_empty() {
             for stroke_mesh in &stroke_meshes {
@@ -439,8 +348,6 @@ pub fn build_scene_geometry_themed_with_measure(
             m0: matrix_col(&obj.transform, 0),
             m1: matrix_col(&obj.transform, 1),
             m2: matrix_col(&obj.transform, 2),
-            // The drop-shadow color is the `shadow` token resolved against the
-            // active theme — wired through the token table, never a hardcoded RGBA.
             shadow: resolve_token_f32(SHADOW_TOKEN, theme.dark).unwrap_or([0.0, 0.0, 0.0, 0.25]),
         });
         geometry.stroke_instances.push(StrokeInstance {
@@ -450,11 +357,8 @@ pub fn build_scene_geometry_themed_with_measure(
             stroke: paint_color(&resolved.stroke.paint, resolved.stroke.opacity as f32, theme),
         });
 
-        // ---- Text: lay out runs into positioned glyph quads ----------------
-        // The region bbox is derived from the SAME flattened pixel subpaths the
-        // fill/stroke use (single pixel space, no re-parse). `layout_runs` bakes
-        // align/valign/wrap into region-local px pen origins; the per-object 3x3
-        // instance carries region-local-px -> world, so no extra CPU transform.
+        // Text: the region bbox derives from the same flattened subpaths the fill/
+        // stroke use; the per-object instance carries region-local-px -> world.
         let text_start = geometry.text_vertices.len() as u32;
         if let Some(text) = &obj.text {
             append_text_quads(&mut geometry.text_vertices, text, &subpaths, scene.camera.zoom, measure);
@@ -503,9 +407,8 @@ pub fn build_scene_geometry_themed_with_measure(
     geometry
 }
 
-/// Resolve the visual state (selected via single anchor or transient
-/// multi-select) for an object id, so `resolve_visual` adds a focus ring for the
-/// selection set.
+/// Resolve the visual state (selected via single anchor or multi-select) for an
+/// object id.
 fn visual_state_for(scene: &RenderObjectScene, id: &str) -> VisualState {
     let selected = scene.selection.as_deref() == Some(id)
         || scene.multi_select.iter().any(|candidate| candidate == id);
@@ -516,9 +419,8 @@ fn visual_state_for(scene: &RenderObjectScene, id: &str) -> VisualState {
     }
 }
 
-/// Parse an object's geometry and flatten each subpath into an object-local
-/// **pixel** polyline, flattening cubics via the zoom-bucket LOD flattener.
-/// Returns `(closed, points)` per subpath.
+/// Parse an object's geometry into object-local pixel polylines, flattening cubics
+/// via the zoom-bucket LOD flattener. Returns `(closed, points)` per subpath.
 fn flatten_object_subpaths(obj: &RenderObject, zoom: f64) -> Vec<(bool, Vec<(f32, f32)>)> {
     let bucket = crate::curve_lod::zoom_bucket(zoom);
     let flatness = crate::curve_lod::flatness_for_bucket(bucket);
@@ -549,8 +451,7 @@ fn flatten_object_subpaths(obj: &RenderObject, zoom: f64) -> Vec<(bool, Vec<(f32
                     let c2 = (quantized_to_px(c2x), quantized_to_px(c2y));
                     let end = (quantized_to_px(x), quantized_to_px(y));
                     let flat = crate::curve_lod::flatten_cubic(cursor, c1, c2, end, flatness);
-                    // `flatten_cubic` includes both endpoints; the start duplicates
-                    // the cursor already pushed, so skip it.
+                    // Skip the start: it duplicates the cursor already pushed.
                     for &p in flat.iter().skip(1) {
                         pts.push(p);
                     }
@@ -564,26 +465,12 @@ fn flatten_object_subpaths(obj: &RenderObject, zoom: f64) -> Vec<(bool, Vec<(f32
     out
 }
 
-/// Append one object's drop-shadow geometry (W3-G8/A) to `out`: a SINGLE
-/// translucent silhouette copy of the object's OWN fill `mesh` (the exact region
-/// triangulation lyon already produced — concave, curved, hole-aware for free),
-/// translated down by [`SHADOW_OFFSET_PX`]. There is no extra tessellation: this is
-/// one triangle-list copy of an already-tessellated mesh.
-///
-/// Softness is NOT baked here. The silhouette is rendered ONCE to an offscreen
-/// target and a separable Gaussian blur ([`crate::shadow_blur`]) feathers it
-/// uniformly before it composites under the fill — a true blur, not a stacked-tier
-/// approximation. `feather` is emitted `0` (the slot stays for the shader contract;
-/// the offscreen blur owns softness now).
-///
-/// An empty mesh (an open polyline / no fillable interior, with no stroke ribbon)
-/// casts nothing, so the object's `shadow_range` stays empty — matching the fill's
-/// "no boundable region emits nothing" contract.
-///
-/// Takes the triangle-list as bare `(vertices, indices)` slices so it serves both
-/// the fill mesh ([`crate::tessellate::Mesh`]) and the stroke ribbon
-/// ([`crate::stroke_expand::Mesh`]) — same `[[f32;2]]` + `[u32]` shape — without
-/// coupling to either concrete type.
+/// Append one object's drop-shadow geometry: a single silhouette copy of the
+/// triangle-list (the already-tessellated fill or stroke ribbon), translated by
+/// [`SHADOW_OFFSET_PX`] — no extra tessellation. Softness is not baked here; the
+/// offscreen Gaussian blur owns it, so `feather` is emitted `0` (the slot stays for
+/// the shader contract). An empty mesh casts nothing. Takes bare `(vertices,
+/// indices)` slices so it serves both the fill mesh and the stroke ribbon.
 fn append_shadow_quad(out: &mut Vec<ShadowVertex>, vertices: &[[f32; 2]], indices: &[u32]) {
     if indices.is_empty() {
         return;
@@ -597,11 +484,9 @@ fn append_shadow_quad(out: &mut Vec<ShadowVertex>, vertices: &[[f32; 2]], indice
     }
 }
 
-/// Append a stroke ribbon `mesh` (triangle-list of `[x,y]` positions) as
-/// expanded [`StrokeVertex`]es. The CPU ribbon already bakes the normal offset
-/// into the positions, so the GPU stroke shader must not offset again: we emit a
-/// zero normal and `side = 0`, carrying only the pre-offset position, with the
-/// per-node `width` and a running arc-length `distance_along`.
+/// Append a stroke ribbon `mesh` as [`StrokeVertex`]es. The CPU ribbon already bakes
+/// the normal offset into positions, so we emit a zero normal and `side = 0` (the
+/// shader must not offset again), with per-node `width` and arc-length `distance_along`.
 fn append_stroke_ribbon(out: &mut Vec<StrokeVertex>, mesh: &crate::stroke_expand::Mesh, width: f32) {
     let mut distance = 0.0f32;
     let mut prev: Option<[f32; 2]> = None;
@@ -623,19 +508,11 @@ fn append_stroke_ribbon(out: &mut Vec<StrokeVertex>, mesh: &crate::stroke_expand
     }
 }
 
-/// Lay out an object's text runs against its derived region and append one
-/// 2-triangle (6-vertex) quad per visible glyph to `out`, in object-local px with
-/// per-run color. The region bbox comes from the SAME flattened pixel `subpaths`
-/// the fill/stroke use, via [`crate::outline::derive_region`] (single pixel space,
-/// no re-parse). Run `size` is DE-QUANTIZED (`/QUANT_PER_PX`) so committed text
-/// lays out at edit-time pixels, joining the same pixel space as the geometry.
-///
-/// The glyph quad geometry is currently a placement-sized cell spanning the full
-/// atlas (`uv 0..1`): the live MSDF atlas (per-glyph bearing/width/height/uv) is
-/// populated at the GPU cutover, so at build-level the quad's ORIGIN — the
-/// load-bearing layout result — is what the golden pins. The pen origin equals
-/// `layout_runs`' region-local px position, so de-quant + align + wrap are all
-/// verifiable device-free; real per-glyph atlas UVs swap in at GPU wiring.
+/// Lay out an object's text runs against its derived region and append one 6-vertex
+/// quad per visible glyph (object-local px, per-run color). The region bbox comes
+/// from the same flattened `subpaths` the fill/stroke use; run `size` is de-quantized
+/// (`/QUANT_PER_PX`) to edit-time pixels. The quad is a placement-sized cell spanning
+/// the whole atlas (`uv 0..1`) until the GPU cutover registers per-glyph atlas slots.
 fn append_text_quads(
     out: &mut Vec<TextVertex>,
     text: &RText,
@@ -657,8 +534,7 @@ fn append_text_quads(
         .map(|run| TextRunInput {
             text: run.text.clone(),
             color: text_run_color(&run.color),
-            // DE-QUANT (commit C): wire size is quantized at `QUANT_PER_PX` units/px,
-            // matching the geometry coords; divide to recover edit-time pixels.
+            // Wire size is quantized at `QUANT_PER_PX` units/px; divide to px.
             size: (run.size / QUANT_PER_PX) as f32,
             bold: run.bold,
             italic: run.italic,
@@ -680,8 +556,6 @@ fn append_text_quads(
 
     let placements = layout_runs(&runs, region_min, region_max, align, valign, measure);
     for p in &placements {
-        // Placement-sized cell at the pen origin; UVs span the whole atlas until
-        // the GPU cutover registers per-glyph atlas slots. Top-left -> bottom-right.
         let x0 = p.x;
         let y0 = p.y;
         let x1 = p.x + p.size;
@@ -700,15 +574,14 @@ fn append_text_quads(
     }
 }
 
-/// Parse a text run's `#rrggbb` color into RGBA (alpha 1.0). Mirrors
-/// [`parse_hex_rgb`]; a bad value falls back to opaque white.
+/// Parse a text run's `#rrggbb` color into RGBA; a bad value falls back to white.
 fn text_run_color(value: &str) -> [f32; 4] {
     let [r, g, b] = parse_hex_rgb(value);
     [r, g, b, 1.0]
 }
 
-/// Extract column `col` of a row-major 3x3 transform as a `vec3` for the
-/// column-major `mat3x3` reconstruction in the WGSL (`M = [m0 | m1 | m2]`).
+/// Column `col` of a row-major 3x3 transform as a `vec3` for the WGSL column-major
+/// `mat3x3` reconstruction (`M = [m0 | m1 | m2]`).
 fn matrix_col(transform: &[[f64; 3]; 3], col: usize) -> [f32; 3] {
     [
         transform[0][col] as f32,
@@ -717,14 +590,10 @@ fn matrix_col(transform: &[[f64; 3]; 3], col: usize) -> [f32; 3] {
     ]
 }
 
-/// W2-11 drag zero-rebake: compose the preview world matrix `delta * base` and
-/// return its three instance columns in the exact same packing
-/// [`build_scene_geometry`] uses for [`FillInstance`]/[`StrokeInstance`]
-/// (`M = [m0 | m1 | m2]`). This is the single source of truth for the preview
-/// matrix: the GPU writer ([`ObjectRenderer::set_preview_transform`]) and the
-/// perf-gate test both call it, so the live-drag instance push is byte-equivalent
-/// to a full rebake of the same object at `compose(delta, base)`. Pure and
-/// device-free so it runs under `cargo test --workspace` too.
+/// Compose the preview world matrix `delta * base` and return its three instance
+/// columns in the same packing [`build_scene_geometry`] uses. The single source of
+/// truth for the preview matrix (GPU writer + perf-gate test both call it), so the
+/// live-drag push is byte-equivalent to a full rebake at `compose(delta, base)`.
 pub fn preview_instance_columns(
     delta: &[[f64; 3]; 3],
     base: &[[f64; 3]; 3],
@@ -737,14 +606,9 @@ pub fn preview_instance_columns(
     )
 }
 
-/// The per-buffer strides [`ObjectRenderer::set_preview_transform`] writes the
-/// previewed matrix into, in lockstep with its `[fill, stroke, text, shadow]`
-/// buffer array: the matrix lands at `i * stride` in EACH. Fill/stroke moved the
-/// region from W2-11; text (G3) makes the glyphs follow the same drag; shadow (G5)
-/// makes the drop shadow follow it too, instead of lagging at canonical until the
-/// rebake. Pure and device-free so the live-drag follow set is testable under
-/// `cargo test` without a GPU — a dropped entry here means a sub-visual stops
-/// tracking the preview.
+/// Per-buffer strides the previewed matrix is written into, in lockstep with the
+/// `[fill, stroke, text, shadow]` buffer array: it lands at `i * stride` in each, so
+/// every sub-visual follows the same drag. A dropped entry means one stops tracking.
 pub fn preview_instance_strides() -> [u64; 4] {
     [
         std::mem::size_of::<FillInstance>() as u64,
@@ -754,13 +618,10 @@ pub fn preview_instance_strides() -> [u64; 4] {
     ]
 }
 
-/// W3-G9/#4: the re-expanded geometry for ONE object, used to patch a follower's
-/// baked vertices in place during a live anchor reproject. The fill indices are
-/// object-LOCAL (0-based); the caller rebases them by the follower's vertex base
-/// in the shared megabuffer before writing. W3-G13: carries EVERY per-object baked
-/// vertex artifact — fill, stroke, shadow silhouette, text glyph quads — so no
-/// sub-visual lags at the old geometry until the commit rebake (the dragged-target
-/// follower-shadow bug).
+/// Re-expanded geometry for one object, to patch a follower's baked vertices in
+/// place during a live anchor reproject. Fill indices are object-local (0-based);
+/// the caller rebases them by the follower's vertex base. Carries every per-object
+/// baked vertex artifact so no sub-visual lags at the old geometry until the commit.
 pub struct FollowerReexpand {
     pub fill_vertices: Vec<FillVertex>,
     pub fill_indices: Vec<u32>,
@@ -769,15 +630,10 @@ pub struct FollowerReexpand {
     pub text_vertices: Vec<TextVertex>,
 }
 
-/// W3-G9/#4: re-expand a SINGLE object's fill + stroke geometry, reusing the exact
-/// build-loop path ([`build_scene_geometry_themed`]) so the result is byte-identical
-/// to what a full rebake of that object would produce. The object is built alone in
-/// a one-object scene carrying the live `camera` (so the zoom/LOD bucket matches the
-/// canonical bake) and `theme` (so the silhouette-AA `edge` flags match); selection
-/// is dropped because it only adds a focus ring, never changing fill/stroke vertex
-/// COUNT. Returns the widened fill vertices, the object-local fill indices, and the
-/// stroke ribbon vertices. Pure (device-free), so the COUNT-equality that makes the
-/// in-place patch size-safe is host-testable without a GPU.
+/// Re-expand a single object's geometry, reusing the exact build-loop path so the
+/// result is byte-identical to a full rebake. Built alone in a one-object scene with
+/// the live `camera` (matching zoom/LOD bucket) and `theme` (matching the AA `edge`
+/// flags); selection is dropped (it only adds a focus ring, never changing counts).
 pub fn reexpand_single_object(
     obj: &RenderObject,
     theme: Theme,
@@ -790,13 +646,9 @@ pub fn reexpand_single_object(
         selection: None,
         multi_select: Vec::new(),
     };
-    // W3-G13 ENFORCED artifact contract: every per-object BAKED VERTEX artifact
-    // must reach the follower patch (a dropped one lags at the old geometry until
-    // the commit rebake — the shadow bug). Instance matrices/colors belong to the
-    // instance-preview write-set (`preview_instance_strides`), and `draws` is the
-    // canonical bake's index, rebuilt only on a full re-feed. Destructuring WITHOUT
-    // `..` makes adding a SceneGeometry artifact a COMPILE ERROR here until its
-    // patch story is decided.
+    // Destructuring WITHOUT `..` makes a new SceneGeometry artifact a compile error
+    // here until its follower-patch story is decided (instances/draws are not the
+    // patch's business — see `preview_instance_strides`).
     let SceneGeometry {
         fill,
         fill_edges,
@@ -824,44 +676,27 @@ pub fn reexpand_single_object(
     }
 }
 
-/// W3-G9/#4: the byte offsets + element counts for writing a follower's re-expanded
-/// geometry over its EXISTING megabuffer ranges, or `None` when the re-expand is not
-/// size-safe (topology/LOD edge case: a vertex/index count changed). Skipping on
-/// `None` is the defensive guard — a mismatched write would bleed into another
-/// object's range or corrupt the buffer. Pure (no GPU), so the count-safety decision
-/// is host-testable; the actual `queue.write_buffer` consuming this is GPU-only.
+/// Byte offsets for writing a follower's re-expanded geometry over its existing
+/// megabuffer ranges. Produced only when the re-expand is size-safe; a count
+/// mismatch yields `None` so the write never bleeds into another object's range.
 pub struct FollowerPatchPlan {
-    /// Byte offset of the follower's fill vertices in the shared fill vertex buffer.
     pub fill_vertex_byte_offset: u64,
-    /// Byte offset of the follower's fill indices in the shared fill index buffer.
     pub fill_index_byte_offset: u64,
-    /// Amount to add to each object-local fill index so it points at the follower's
-    /// vertices inside the merged megabuffer (the build-time rebase).
+    /// Added to each object-local fill index to point at the follower's vertices in
+    /// the merged megabuffer (the build-time rebase).
     pub fill_index_rebase: u32,
-    /// Byte offset of the follower's stroke vertices in the shared stroke buffer.
     pub stroke_vertex_byte_offset: u64,
-    /// W3-G13: byte offset of the follower's drop-shadow silhouette vertices in the
-    /// shared shadow buffer.
     pub shadow_vertex_byte_offset: u64,
-    /// W3-G13: byte offset of the follower's glyph-quad vertices in the shared text
-    /// buffer.
     pub text_vertex_byte_offset: u64,
 }
 
-/// W3-G9/#4: validate that `rebuilt` exactly fills the follower `draw`'s existing
-/// megabuffer ranges (same fill vertex count, fill index count, stroke vertex count,
-/// and — W3-G13 — shadow + text vertex counts) and, if so, return the
-/// [`FollowerPatchPlan`] byte offsets. Returns `None` on ANY count mismatch so the
-/// caller SKIPS the patch this frame rather than writing a mismatched range. The
-/// node COUNT is unchanged during a drag (only positions move) and the LOD bucket
-/// is fixed, so the counts normally match; a `None` is the rare topology edge case
-/// the guard exists for. Pure + falsifiable without a device.
+/// Validate that `rebuilt` exactly fills the follower `draw`'s existing ranges and,
+/// if so, return the [`FollowerPatchPlan`]. `None` on any count mismatch so the
+/// caller skips the patch rather than writing a mismatched range (the rare topology
+/// edge case; counts normally match since a drag only moves positions).
 pub fn follower_patch_plan(draw: &ObjectDraw, rebuilt: &FollowerReexpand) -> Option<FollowerPatchPlan> {
-    // W3-G13 ENFORCED artifact contract (the ObjectDraw side): destructuring WITHOUT
-    // `..` binds every field, so a new per-object vertex RANGE is a COMPILE ERROR
-    // here until it is guarded + planned. The non-range fields are explicitly not
-    // the patch's business: instances are the instance-preview write-set's
-    // (`preview_instance_strides`), and id/focus/tokens are draw-record metadata.
+    // Destructuring WITHOUT `..` makes a new per-object vertex RANGE a compile error
+    // here until it is guarded + planned.
     let ObjectDraw {
         id: _,
         fill_range,
@@ -898,15 +733,10 @@ pub fn follower_patch_plan(draw: &ObjectDraw, rebuilt: &FollowerReexpand) -> Opt
     })
 }
 
-/// Resolve a paint to a single RGBA color for the inline-solid first cutover,
-/// theme-aware (RB1/D1). `theme` selects the light/dark token table for
-/// [`RPaint::Token`]. Gradient/image paints collapse to their representative
-/// color (first stop / neutral) here; richer paints get their own bind group
-/// later (D7 note).
-///
-/// A token carries its own alpha (e.g. translucent `shadow`); the per-paint
-/// `opacity` multiplies it. Solid/gradient hex paints have no inherent alpha, so
-/// `opacity` becomes the alpha directly (unchanged from the inline-solid path).
+/// Resolve a paint to a single theme-aware RGBA. `theme` selects the token table for
+/// [`RPaint::Token`]; gradient/image paints collapse to a representative color. A
+/// token carries its own alpha (e.g. translucent `shadow`) that `opacity` multiplies;
+/// hex paints have no inherent alpha, so `opacity` becomes the alpha directly.
 fn paint_color(paint: &RPaint, opacity: f32, theme: Theme) -> [f32; 4] {
     let opacity = opacity.clamp(0.0, 1.0);
     match paint {
@@ -915,8 +745,7 @@ fn paint_color(paint: &RPaint, opacity: f32, theme: Theme) -> [f32; 4] {
             [rgb[0], rgb[1], rgb[2], opacity]
         }
         RPaint::Token { name } => {
-            // Unknown token names fall back to opaque white so a bad token never
-            // poisons the draw (mirrors `parse_hex_rgb`).
+            // Unknown tokens fall back to opaque white so a bad token never poisons the draw.
             let [r, g, b, a] = resolve_token_f32(name, theme.dark).unwrap_or([1.0, 1.0, 1.0, 1.0]);
             [r, g, b, a * opacity]
         }
@@ -931,9 +760,8 @@ fn paint_color(paint: &RPaint, opacity: f32, theme: Theme) -> [f32; 4] {
     }
 }
 
-/// The token name backing a paint, if it is an [`RPaint::Token`]. Used to mark
-/// an [`ObjectDraw`] as token-backed so a theme toggle can re-resolve ONLY those
-/// instances' colors (zero-rebake, P4) — non-token paints are theme-invariant.
+/// The token name backing a paint, if a [`RPaint::Token`]. Marks an [`ObjectDraw`]
+/// token-backed so a theme toggle re-resolves only those colors.
 fn paint_token_name(paint: &RPaint) -> Option<String> {
     match paint {
         RPaint::Token { name } => Some(name.clone()),
@@ -1080,16 +908,8 @@ mod tests {
         assert_eq!(geo.stroke_instances[0].stroke, [0.0, 1.0, 0.0, 1.0]);
     }
 
-    /// W3-G7/#3: an OPEN-only path with NO explicit fill renders fill-less (no
-    /// default white chord region), while a CLOSED path with no fill keeps the
-    /// structural default fill. The per-object instance buffers stay index-aligned.
-    /// FAILS if open brush strokes still tessellate a fill (the ugly white region).
-    /// W3-G10/#3: the open stroke now casts a shadow from its stroke ribbon (its
-    /// fill mesh is empty), so its `shadow_range` is non-empty.
     #[test]
     fn open_path_without_fill_skips_fill_but_shadows_the_stroke() {
-        // A bare-bones object factory: identity transform, the given geometry, no
-        // inline fill, no stroke.
         let fill_less = |id: &str, d: &str| RenderObject {
             id: id.to_string(),
             parent: None,
@@ -1103,7 +923,6 @@ mod tests {
             clip: false,
         };
 
-        // (open) a freehand-style open polyline; (closed) a rect ending in Z.
         let open = fill_less("brush", "M0 0 L80 40 L20 90");
         let closed = fill_less("rect", "M0 0 L800 0 L800 800 L0 800 Z");
         let scene = scene_with(vec![open, closed], None);
@@ -1112,36 +931,29 @@ mod tests {
         let open_draw = &geo.draws[0];
         let closed_draw = &geo.draws[1];
 
-        // (a) Open + fill:None => NO fill region, but the stroke ribbon STILL casts a
-        // shadow (W3-G10/#3: a free-draw line floats over the canvas too).
+        // Open + fill:None => no fill region, but the stroke ribbon still casts a shadow.
         assert!(
             open_draw.fill_range.is_empty(),
             "open brush stroke must not tessellate a fill region"
         );
-        // It still strokes (an open path is a visible line).
         assert!(!open_draw.stroke_range.is_empty(), "open stroke still draws a ribbon");
         assert!(
             !open_draw.shadow_range.is_empty(),
             "an unfilled open stroke casts a shadow from its stroke ribbon"
         );
 
-        // (b) Closed + fill:None => the structural default fill STILL applies.
+        // Closed + fill:None => the structural default fill still applies.
         assert!(
             !closed_draw.fill_range.is_empty(),
             "a closed shape with no fill keeps the default white fill"
         );
         assert!(!closed_draw.shadow_range.is_empty(), "the filled rect casts a shadow");
 
-        // (c) Per-object instance buffers stay index-aligned with `draws`.
         assert_eq!(geo.fill_instances.len(), geo.draws.len());
         assert_eq!(geo.shadow_instances.len(), geo.draws.len());
         assert_eq!(geo.stroke_instances.len(), geo.draws.len());
     }
 
-    /// D4 analytic fill AA: the build populates `fill_edges` index-aligned with the
-    /// megabuffer vertices, flags the rect's silhouette (perimeter) vertices non-zero
-    /// so the FS can fade the edge, and never marks an off-perimeter vertex. Fails if
-    /// `edge` stays all-zero (the pre-D4 placeholder) or flags an interior vertex.
     #[test]
     fn build_populates_fill_edge_on_silhouette_vertices() {
         let scene = scene_with(vec![rect_object("o1")], None);
@@ -1159,8 +971,7 @@ mod tests {
             geo.fill_edges.iter().any(|&e| e != 0.0),
             "rect silhouette vertices must be flagged non-zero"
         );
-        // Every flagged vertex sits on the 100px-square perimeter (x or y is 0/100);
-        // an interior vertex (if lyon emitted one) would stay 0.0.
+        // Every flagged vertex sits on the 100px-square perimeter; interior stays 0.0.
         for (&[x, y], &edge) in geo.fill.vertices.iter().zip(&geo.fill_edges) {
             if edge != 0.0 {
                 let on_perimeter =
@@ -1281,12 +1092,6 @@ mod tests {
         );
     }
 
-    /// W2-11 perf gate (the whole point of S7): a sustained drag updates ONLY each
-    /// dragged object's instance model matrix via `preview_instance_columns` — a
-    /// pure column compose — and NEVER re-runs `build_scene_geometry`. We bake a
-    /// 10_000-object scene once (the single tessellation entry), then drive
-    /// DRAG_FRAMES of per-object preview pushes and assert the bake closure ran
-    /// exactly once across the whole scenario (zero re-tessellation, P4).
     #[test]
     fn perf_gate_drag_10k_objects_zero_retessellation_instance_path() {
         const N: usize = 10_000;
@@ -1294,9 +1099,7 @@ mod tests {
 
         let scene = scene_with((0..N).map(|i| rect_object(&format!("obj-{i}"))).collect(), None);
 
-        // The ONLY tessellation entry: bake the whole scene once. A counter pins
-        // the ground-truth `build_scene_geometry` call count; the drag must not move
-        // it past 1.
+        // The sole tessellation: bake once. The drag must not move the counter past 1.
         let mut bake_calls = 0usize;
         let geo = {
             bake_calls += 1;
@@ -1305,18 +1108,15 @@ mod tests {
         assert_eq!(geo.draws.len(), N);
         assert_eq!(bake_calls, 1, "initial bake is the sole tessellation");
 
-        // A cumulative translate delta, advancing each frame so the matrix actually
-        // moves (a real drag, not a no-op).
+        // A cumulative translate delta advancing each frame (a real drag).
         for frame in 0..DRAG_FRAMES {
             let delta = crate::hit_test_object::translate_3x3((frame as f64) + 1.0, -(frame as f64));
             for obj in &scene.objects {
                 let (m0, m1, m2) = preview_instance_columns(&delta, &obj.transform);
-                // Finite, no NaN/inf on the hot path.
                 for v in m0.iter().chain(m1.iter()).chain(m2.iter()) {
                     assert!(v.is_finite(), "preview columns stay finite");
                 }
-                // Correctness: the pushed columns equal `delta * base`'s columns,
-                // exactly the packing `build_scene_geometry` would have baked.
+                // The pushed columns equal `delta * base`'s columns, the packing a bake would use.
                 let world = crate::hit_test_object::mat3_mul(&delta, &obj.transform);
                 assert_eq!(m0, matrix_col(&world, 0));
                 assert_eq!(m1, matrix_col(&world, 1));
@@ -1363,14 +1163,6 @@ mod tests {
         assert_eq!(preview.2, stroke.m2);
     }
 
-    /// G3 (RB2 follow-up): the live text-drag preview moves the GLYPHS with the
-    /// fill/stroke. `set_preview_transform` writes the previewed columns into the
-    /// text instance buffer at `i * size_of::<TextInstance>()` — the same matrix-at-
-    /// offset-0, index-aligned write fill/stroke get. This proves, device-free, that
-    /// (a) the previewed text instance equals the composed `delta*base` transform —
-    /// exactly what the write pushes — and (b) it DIFFERS from the canonical baked
-    /// text instance, so a missing text write would leave the glyphs at canonical
-    /// (the bug this card closes). Mirrors `preview_columns_equal_full_rebake_at_*`.
     #[test]
     fn text_preview_follows_drag_matches_composed_transform() {
         let base = [[2.0, 0.0, 30.0], [0.0, 2.0, -10.0], [0.0, 0.0, 1.0]];
@@ -1418,14 +1210,10 @@ mod tests {
         assert_eq!(moved_text.m2, moved_geo.fill_instances[0].m2);
     }
 
-    /// G3 byte-layout pin: the text instance preview write `set_preview_transform`
-    /// performs targets offset `i * size_of::<TextInstance>()` and overwrites the
-    /// 36-byte `m0,m1,m2` region at struct offset 0 — identical to the fill/stroke
-    /// writes (matrix-at-0). FAILS if `TextInstance` ever grows a field before the
-    /// matrix or stops being a clean 3-column struct, which would corrupt the write.
+    /// Pins the matrix-at-offset-0 layout the preview write depends on; a field
+    /// before the matrix would corrupt the write.
     #[test]
     fn text_instance_matrix_region_matches_preview_write_layout() {
-        // The preview writes `[[f32;3];3]` (36 bytes) at the struct's matrix region.
         assert_eq!(std::mem::size_of::<[[f32; 3]; 3]>(), 36);
         assert_eq!(std::mem::size_of::<TextInstance>(), 36);
         assert_eq!(std::mem::offset_of!(TextInstance, m0), 0);
@@ -1433,31 +1221,19 @@ mod tests {
         assert_eq!(std::mem::offset_of!(TextInstance, m2), 24);
     }
 
-    /// G3/G5 write-set pin: `set_preview_transform` writes the previewed matrix into
-    /// the `[fill, stroke, text, shadow]` buffer array, striding each by
-    /// `preview_instance_strides()`. This is the single source of truth for WHICH
-    /// buffers follow the drag. FAILS if the text entry is dropped (the RB2 bug:
-    /// glyphs left at canonical during a live drag) or the shadow entry is dropped
-    /// (the G5 bug: drop shadow lagging at canonical until rebake) — the strides set
-    /// must carry all four per-object instance buffers.
+    /// Pins which buffers follow the drag: all four per-object instance buffers must
+    /// be in the stride set, or a sub-visual lags at canonical during a live drag.
     #[test]
     fn preview_write_set_includes_text_instance_buffer() {
         let strides = preview_instance_strides();
-        // Four per-object instance buffers must follow the preview: fill, stroke,
-        // text, shadow.
         assert_eq!(strides.len(), 4, "fill + stroke + text + shadow all follow the drag");
         assert_eq!(strides[0], std::mem::size_of::<FillInstance>() as u64);
         assert_eq!(strides[1], std::mem::size_of::<StrokeInstance>() as u64);
-        // The load-bearing G3 assertion: the text buffer IS in the write set, strided
-        // by `TextInstance`. Drop the text write and this entry vanishes — failing here.
         assert_eq!(
             strides[2],
             std::mem::size_of::<TextInstance>() as u64,
             "text instance buffer must be in the preview write set (G3)"
         );
-        // The load-bearing G5 assertion: the shadow buffer IS in the write set, strided
-        // by `ShadowInstance`. Drop the shadow write and this entry vanishes — failing
-        // here (the shadow would lag at canonical during a live drag).
         assert_eq!(
             strides[3],
             std::mem::size_of::<ShadowInstance>() as u64,
@@ -1465,35 +1241,19 @@ mod tests {
         );
     }
 
-    /// G5 byte-layout pin: the shadow instance preview write `set_preview_transform`
-    /// performs targets offset `i * size_of::<ShadowInstance>()` and overwrites the
-    /// 36-byte `m0,m1,m2` region at struct offset 0 — identical to the fill/stroke/
-    /// text writes (matrix-at-0). The baked `shadow` color sits at offset 36, past the
-    /// matrix, so it survives the write exactly like the fill/stroke color slot. FAILS
-    /// if `ShadowInstance` ever grows a field before the matrix, which would corrupt
-    /// the write or clobber the shadow color.
+    /// Pins the matrix-at-offset-0 layout so the preview write never clobbers the
+    /// baked shadow color (which sits at offset 36, past the matrix).
     #[test]
     fn shadow_instance_matrix_region_matches_preview_write_layout() {
         assert_eq!(std::mem::offset_of!(ShadowInstance, m0), 0);
         assert_eq!(std::mem::offset_of!(ShadowInstance, m1), 12);
         assert_eq!(std::mem::offset_of!(ShadowInstance, m2), 24);
-        // The 36-byte matrix region the preview overwrites sits strictly before the
-        // color slot, so the matrix write never clobbers the baked shadow color.
         assert_eq!(std::mem::offset_of!(ShadowInstance, shadow), 36);
         assert!(
             std::mem::offset_of!(ShadowInstance, shadow) >= 3 * std::mem::size_of::<[f32; 3]>()
         );
     }
 
-    /// G5 (the live-drag follow card): the drop SHADOW moves with the fill/stroke/
-    /// text under a live drag. `set_preview_transform` writes the previewed columns
-    /// into the shadow instance buffer at `i * size_of::<ShadowInstance>()` — the same
-    /// matrix-at-offset-0, index-aligned write the other three buffers get. This proves,
-    /// device-free, that (a) the previewed shadow instance equals the composed
-    /// `delta*base` transform — exactly what the write pushes — and matches fill/stroke,
-    /// and (b) it DIFFERS from the canonical baked shadow instance, so a missing shadow
-    /// write would leave the shadow at canonical (the bug this card closes). Mirrors
-    /// `text_preview_follows_drag_matches_composed_transform`.
     #[test]
     fn shadow_preview_follows_drag_matches_composed_transform() {
         let base = [[2.0, 0.0, 30.0], [0.0, 2.0, -10.0], [0.0, 0.0, 1.0]];
@@ -1533,11 +1293,9 @@ mod tests {
         assert_eq!(moved_shadow.m0, moved_geo.stroke_instances[0].m0);
     }
 
-    /// W2-11 index==offset invariant: `draws[i].id` ↔ instance `i` in BOTH the fill
-    /// and stroke instance buffers. `set_preview_transform` looks up `i` via
-    /// `draws.position(id)` and writes `i * size_of` in both buffers, so this
-    /// alignment is load-bearing. Pin it so a future reorder of draws-vs-instances
-    /// can't silently corrupt the preview write.
+    /// `draws[i].id` <-> instance `i` in both the fill and stroke buffers. The
+    /// preview write looks up `i` and writes `i * size_of` in both, so the alignment
+    /// is load-bearing.
     #[test]
     fn draws_index_aligns_with_both_instance_buffers() {
         let scene = scene_with(
@@ -1554,17 +1312,14 @@ mod tests {
         }
     }
 
-    // ---- RB2 live text render: geometry contract + de-quant -----------------
-
-    /// Stub measure: every char advances `size` px (matches `text_layout`'s
-    /// `unit_measure`), so glyph N's pen origin is `region_min.x + N*size_px`.
+    /// Stub measure: every char advances `size` px, so glyph N's origin is
+    /// `region_min.x + N*size_px`.
     fn unit_measure(_ch: char, size: f32) -> f32 {
         size
     }
 
-    /// A rect text object: a 200x100px region (1600x800 quantized) carrying one
-    /// run. `size` is the WIRE (quantized) size; align Start / valign Top so the
-    /// first glyph lands exactly at the region top-left.
+    /// A rect text object with one run; `size` is the WIRE (quantized) size, align
+    /// Start / valign Top so the first glyph lands at the region top-left.
     fn text_rect(id: &str, run_text: &str, wire_size: f64, color: &str) -> RenderObject {
         let mut obj = rect_object(id);
         obj.geometry_d = "M0 0 L1600 0 L1600 800 L0 800 Z".to_string();
@@ -1583,11 +1338,6 @@ mod tests {
         obj
     }
 
-    /// PRIMARY GOLDEN (commit A): a text object's committed runs produce a
-    /// NON-EMPTY set of positioned glyph quads in `text_vertices`, one quad
-    /// (6 verts) per visible glyph, with the first glyph's origin at `region_min.x`
-    /// and the second at `region_min.x + advance(size_px)` where `size_px` is the
-    /// DE-QUANTIZED size (16, not the wire 128), and each quad carries the run color.
     #[test]
     fn text_object_produces_positioned_glyph_quads() {
         // Wire size 128 = 16px * 8 quantum. "AB" -> two visible glyphs.
@@ -1596,18 +1346,15 @@ mod tests {
         let geo =
             build_scene_geometry_themed_with_measure(&scene, Theme::light(), &unit_measure);
 
-        // (1) Text reaches the geometry — FAILS today (build never called layout).
         assert!(
             !geo.text_vertices.is_empty(),
             "committed text must produce glyph quads"
         );
-        // (2) Exactly two glyphs' worth of quads: 6 verts/glyph * 2 = 12.
         let range = geo.draws[0].text_range;
         assert_eq!(range.start, 0);
         assert_eq!(range.len(), 12, "two glyphs -> 12 tri-list verts");
         assert_eq!(geo.text_vertices.len(), 12);
 
-        // (3) Glyph origins prove de-quant + layout: region_min.x is 0; size_px=16.
         // The quad top-left vertex (index 0 of each glyph's 6) is the pen origin.
         let g0_origin_x = geo.text_vertices[0].position[0];
         let g1_origin_x = geo.text_vertices[6].position[0];
@@ -1617,7 +1364,6 @@ mod tests {
             "second glyph at region_min.x + 16 (de-quant px advance), got {g1_origin_x}"
         );
 
-        // (4) Each quad carries the run color.
         for v in &geo.text_vertices {
             assert_eq!(v.color, [1.0, 0x88 as f32 / 255.0, 0.0, 1.0]);
         }
@@ -1633,10 +1379,6 @@ mod tests {
         assert!(empty_geo.text_vertices.is_empty());
     }
 
-    /// COMMIT B (frame wiring, device-free): for [text-object, no-text-object],
-    /// `draws[0].text_range` is non-empty and `draws[1].text_range` is empty, and
-    /// `text_instances` is index-aligned with `draws` (the invariant render()'s
-    /// per-object text loop relies on). Mirrors `draws_index_aligns_with_both_instance_buffers`.
     #[test]
     fn text_range_is_drawn_after_stroke_for_each_object() {
         let text_obj = text_rect("with-text", "Ab", 128.0, "#111111");
@@ -1648,41 +1390,26 @@ mod tests {
         assert!(!geo.draws[0].text_range.is_empty(), "text object draws glyphs");
         assert!(geo.draws[1].text_range.is_empty(), "plain object draws no glyphs");
 
-        // Index-alignment: draws[i] <-> text_instances[i], in scene order.
         assert_eq!(geo.draws.len(), geo.text_instances.len());
         for (i, draw) in geo.draws.iter().enumerate() {
             assert_eq!(draw.id, scene.objects[i].id);
-            // The text instance carries the same matrix columns as the fill instance.
             assert_eq!(geo.text_instances[i].m0, geo.fill_instances[i].m0);
             assert_eq!(geo.text_instances[i].m1, geo.fill_instances[i].m1);
             assert_eq!(geo.text_instances[i].m2, geo.fill_instances[i].m2);
         }
-        // Text vertex ranges tile the shared buffer contiguously.
         assert_eq!(geo.draws[0].text_range.end, geo.text_vertices.len() as u32);
     }
 
-    /// COMMIT A (packing): the text vertex/instance byte packing matches the
-    /// msdf_text.wgsl contract — `TextVertex` is 32 bytes (position+uv+color),
-    /// `TextInstance` is 36 bytes (3 matrix columns, NO color). FAILS if the
-    /// packing drifts. The instance attribute @location wiring is pinned by the
-    /// wgpu-probe pipeline golden in commit B.
     #[test]
     fn text_vertex_and_instance_sizes_match_shader_contract() {
         // TextVertex: vec2 position + vec2 uv + vec4 color = 8 floats = 32 bytes.
         assert_eq!(std::mem::size_of::<TextVertex>(), 32);
-        // TextInstance: 3 vec3 columns = 9 floats = 36 bytes, no color.
+        // TextInstance: 3 vec3 columns = 36 bytes, no color.
         assert_eq!(std::mem::size_of::<TextInstance>(), 36);
     }
 
-
-    /// COMMIT C (de-quant): a wire run size of 128 (= 16px * 8) lays out the second
-    /// glyph at `region_min.x + 16`, NOT +128, and the glyph quad height tracks
-    /// 16px not 128px. Building the SAME object with the already-de-quantized 16px
-    /// run through the px path yields a byte-identical glyph quad set (committed ==
-    /// edited).
     #[test]
     fn committed_text_size_dequantizes_to_pixels() {
-        // Committed object: wire size 128.
         let committed = text_rect("c", "AB", 128.0, "#000000");
         let geo =
             build_scene_geometry_themed_with_measure(&scene_with(vec![committed], None), Theme::light(), &unit_measure);
@@ -1702,11 +1429,8 @@ mod tests {
             g0_bottom_y - g0_top_y
         );
 
-        // Committed (wire 128) == edited (px-overlay intent 16) through the px path:
-        // a scene whose run already carries the de-quantized 16 must yield the SAME
-        // glyph quads. The build de-quants by /QUANT_PER_PX, so to feed 16px through
-        // the same path we set the wire to 16*QUANT_PER_PX = 128 — which is exactly
-        // the committed run. The equivalence holds because there is ONE de-quant site.
+        // Feeding 16px through the same path means wire 16*QUANT_PER_PX = 128, exactly
+        // the committed run — so committed == the 16px edit (one de-quant site).
         let edited = text_rect("c", "AB", 16.0 * QUANT_PER_PX, "#000000");
         let edited_geo =
             build_scene_geometry_themed_with_measure(&scene_with(vec![edited], None), Theme::light(), &unit_measure);
@@ -1744,7 +1468,7 @@ mod tests {
         );
     }
 
-    // ---- RB1 theme resolution + zero-rebake toggle --------------------------
+    // ---- theme resolution + zero-rebake toggle --------------------------
 
     /// A rect whose fill + stroke are semantic theme TOKENS (not raw hex), so its
     /// instance colors re-resolve when the theme bit flips.
@@ -1769,8 +1493,6 @@ mod tests {
         obj
     }
 
-    /// (c) `RPaint::Token` serde round-trips on the `{"kind":"token","name":...}`
-    /// wire form and the renderer resolves the name to the theme table value.
     #[test]
     fn rpaint_token_serde_roundtrips_and_resolves_to_table() {
         let paint = RPaint::Token {
@@ -1789,50 +1511,27 @@ mod tests {
         assert_ne!(light, dark, "selection-ring flips light vs dark");
     }
 
-    /// W3-G6/#3 STICKY THEME ACROSS RE-FEED: the bug was that every scene re-feed
-    /// (`load_object_scene`: pan/move/create) rebuilt the `ObjectRenderer` with a
-    /// HARDCODED `Theme::light()`, so a dark canvas reverted to white on the next
-    /// re-render. The fix persists the bit on the wasm wrapper (`self.object_theme`,
-    /// written by `set_object_theme`) and feeds THAT into the rebuilt renderer.
-    ///
-    /// This pure-core test models that exact two-step wrapper flow — toggle dark,
-    /// then a re-feed reads the persisted bit to choose the rebuild theme — and pins
-    /// that the rebuilt renderer clears with the DARK canvas-bg, not light. It FAILS
-    /// on the pre-fix code (where the re-feed step substitutes `Theme::light()`):
-    /// `rebuilt.canvas_bg()` would equal the light clear.
+    /// A scene re-feed rebuilds the renderer with the persisted theme bit, not a
+    /// hardcoded light theme, so a dark canvas survives the rebuild.
     #[test]
     fn refeed_preserves_persisted_dark_theme_clear() {
-        // The wasm wrapper's persisted bit (`ShapeWebGpuRenderer::object_theme`),
-        // initialized light like the real constructor.
         let mut persisted = Theme::light();
         assert!(!persisted.dark, "wrapper starts on the light bit");
 
-        // `set_object_theme(true)` persists the dark bit FIRST (input.rs).
         persisted = Theme { dark: true };
-
-        // A scene re-feed (`load_object_scene`) now rebuilds the renderer with the
-        // PERSISTED bit (scene_feed.rs), not a hardcoded `Theme::light()`. The
-        // rebuilt renderer's `self.theme` IS this value, and `render`'s `LoadOp::Clear`
-        // reads `self.theme.canvas_bg()`.
         let rebuilt = persisted;
 
-        // The re-feed clears DARK, surviving the rebuild...
         assert_eq!(
             rebuilt.canvas_bg(),
             Theme::dark().canvas_bg(),
             "re-feed must clear with the persisted dark canvas-bg"
         );
-        // ...and must NOT revert to the light clear (the reported bug).
         assert_ne!(
             rebuilt.canvas_bg(),
             Theme::light().canvas_bg(),
             "re-feed must NOT revert to the light canvas-bg"
         );
 
-        // The rebuilt renderer actually bakes geometry through the persisted theme:
-        // token colors resolve dark, proving the bit threads the real build path the
-        // re-feed uses (`ObjectRenderer::new` -> `build_scene_geometry_themed`), not
-        // just an abstract value.
         let scene = scene_with(vec![token_rect("o1")], None);
         let refed = build_scene_geometry_themed(&scene, rebuilt);
         assert_eq!(
@@ -1842,21 +1541,14 @@ mod tests {
         );
     }
 
-    /// (a) The SAME scene yields DIFFERENT chrome/instance RGBA when the theme bit
-    /// flips: token-backed fill/stroke colors change, the canvas clear color
-    /// (`canvas-bg`) differs light vs dark, AND the drop-shadow color (`shadow`)
-    /// flips light-translucent vs dark-translucent (G5: full dark mode, not just
-    /// the floating UI). The clear color and shadow color are BOTH sourced from the
-    /// theme bit at runtime — `render`'s `LoadOp::Clear` reads `self.theme.canvas_bg()`
-    /// and `set_theme` re-resolves `self.theme.shadow()` into each shadow instance —
-    /// so this asserts the renderer-side dark-mode halves both move.
+    /// The same scene yields different chrome/instance RGBA when the theme flips:
+    /// token fill/stroke colors, the canvas clear, and the drop-shadow all move.
     #[test]
     fn theme_flip_changes_token_instance_and_clear_rgba() {
         let scene = scene_with(vec![token_rect("o1")], None);
         let light = build_scene_geometry_themed(&scene, Theme::light());
         let dark = build_scene_geometry_themed(&scene, Theme::dark());
 
-        // Token fill/stroke instance colors differ between themes.
         assert_ne!(
             light.fill_instances[0].fill, dark.fill_instances[0].fill,
             "default-fill token re-resolves on theme flip"
@@ -1865,7 +1557,6 @@ mod tests {
             light.stroke_instances[0].stroke, dark.stroke_instances[0].stroke,
             "default-stroke token re-resolves on theme flip"
         );
-        // And they equal the table values for each mode.
         assert_eq!(
             light.fill_instances[0].fill,
             crate::object_theme::resolve_token_f32("default-fill", false).unwrap()
@@ -1875,52 +1566,36 @@ mod tests {
             crate::object_theme::resolve_token_f32("default-fill", true).unwrap()
         );
 
-        // Canvas CLEAR color (the backdrop `render` clears to) flips light vs dark:
-        // light `canvas-bg` is near-white, dark is near-black. This is the half the
-        // user reported missing (canvas background not inverting).
         let light_clear = Theme::light().canvas_bg();
         let dark_clear = Theme::dark().canvas_bg();
         assert_ne!(light_clear, dark_clear, "canvas clear RGBA flips with the theme bit");
-        // Light backdrop is bright, dark backdrop is near-black (a real inversion,
-        // not two arbitrary colors).
         assert!(light_clear[0] > 0.8, "light canvas-bg is near-white");
         assert!(dark_clear[0] < 0.2, "dark canvas-bg is near-black");
 
-        // Drop-SHADOW color flips too: dark-translucent (black) in light mode,
-        // light-translucent (whitish) in dark mode. The shadow instance color is
-        // re-resolved from `self.theme.shadow()` on every flip, never hardcoded.
         let light_shadow = light.shadow_instances[0].shadow;
         let dark_shadow = dark.shadow_instances[0].shadow;
         assert_ne!(light_shadow, dark_shadow, "shadow RGBA flips with the theme bit");
         assert_eq!(light_shadow, Theme::light().shadow(), "shadow sourced from token");
         assert_eq!(dark_shadow, Theme::dark().shadow());
-        // Light-mode shadow is a dark cast (black-ish); dark-mode shadow is a light
-        // cast (whitish) — the user's requested flip. Both translucent.
         assert!(light_shadow[0] < 0.2, "light-mode shadow casts dark");
         assert!(dark_shadow[0] > 0.8, "dark-mode shadow casts whitish");
         assert!(light_shadow[3] < 1.0 && dark_shadow[3] < 1.0, "shadow stays translucent");
     }
 
-    /// (b) ZERO-REBAKE: flipping the theme must NOT re-tessellate. Across a theme
-    /// flip the fill megabuffer vertices/indices, the stroke ribbon vertices, and
-    /// EVERY per-object draw RANGE are byte-identical — only token instance COLORS
-    /// (past the matrix) move. This is the falsifiable "no rebake on toggle" gate.
+    /// A theme flip leaves tessellation byte-identical — only the token instance
+    /// colors move — so a real GPU toggle is a per-instance color write, not a rebuild.
     #[test]
     fn theme_flip_leaves_tessellation_byte_identical_zero_rebake() {
         let scene = scene_with(vec![token_rect("a"), token_rect("b")], None);
         let light = build_scene_geometry_themed(&scene, Theme::light());
         let dark = build_scene_geometry_themed(&scene, Theme::dark());
 
-        // Tessellation (the expensive product) is untouched by the theme bit.
         assert_eq!(light.fill.vertices, dark.fill.vertices, "fill verts unchanged");
         assert_eq!(light.fill.indices, dark.fill.indices, "fill indices unchanged");
         assert_eq!(
             light.stroke_vertices, dark.stroke_vertices,
             "stroke ribbon verts unchanged"
         );
-        // Per-object draw ranges + matrix columns are identical; ONLY the color
-        // slot differs, so a real GPU toggle is a per-instance color write, not a
-        // rebuild.
         assert_eq!(light.draws.len(), dark.draws.len());
         for (l, d) in light.draws.iter().zip(dark.draws.iter()) {
             assert_eq!(l.fill_range, d.fill_range, "fill range stable across theme");
@@ -1929,14 +1604,10 @@ mod tests {
             assert_eq!(l.fill_instance.m1, d.fill_instance.m1);
             assert_eq!(l.fill_instance.m2, d.fill_instance.m2);
             assert_eq!(l.fill_token, d.fill_token, "token name is theme-invariant");
-            // The color is the one thing that moves.
             assert_ne!(l.fill_instance.fill, d.fill_instance.fill);
         }
     }
 
-    /// Raw-hex / gradient paints are theme-INVARIANT: no token name is recorded,
-    /// so `set_theme` skips them (nothing to re-resolve). Guards against a theme
-    /// flip silently recoloring user-picked explicit colors.
     #[test]
     fn raw_hex_paint_is_theme_invariant() {
         let scene = scene_with(vec![rect_object("o1")], None); // #ff0000 / #00ff00 hex
@@ -1948,27 +1619,16 @@ mod tests {
         assert_eq!(light.stroke_instances[0].stroke, dark.stroke_instances[0].stroke);
     }
 
-    /// The byte offset `set_theme` writes (the color slot, past `m0,m1,m2`) is the
-    /// 36-byte matrix boundary the W2-11 preview write also assumes. Pin both the
-    /// `offset_of!` the toggle uses AND that the matrix region sits strictly
-    /// before it, so a layout change can't make `set_theme` clobber the matrix.
+    /// Pins the color slot at offset 36 (past the 36-byte matrix) so the theme color
+    /// write never clobbers the matrix the drag preview writes at offset 0.
     #[test]
     fn theme_color_write_targets_the_color_slot_past_the_matrix() {
         assert_eq!(std::mem::offset_of!(FillInstance, fill), 36);
         assert_eq!(std::mem::offset_of!(StrokeInstance, stroke), 36);
-        // m0,m1,m2 = three vec3 = 36 bytes, so the color write at offset 36 never
-        // overlaps the matrix the drag preview writes at offset 0.
         assert_eq!(std::mem::offset_of!(FillInstance, m0), 0);
         assert!(std::mem::offset_of!(FillInstance, fill) >= 3 * std::mem::size_of::<[f32; 3]>());
     }
 
-    // ---- RB3 default drop-shadow pass --------------------------------------
-
-    /// PRIMARY GOLDEN (RB3 #11): EVERY object emits a drop-shadow primitive
-    /// beneath its fill, and the shadow RGBA is the theme `shadow` token —
-    /// translucent, and DIFFERENT light vs dark. Fails if any object lacks a
-    /// shadow quad, if the shadow range is empty, or if the color is hardcoded
-    /// (does not flip with the theme bit).
     #[test]
     fn every_object_emits_a_themed_translucent_shadow() {
         let scene = scene_with(vec![rect_object("a"), rect_object("b")], None);
@@ -1977,7 +1637,6 @@ mod tests {
 
         assert_eq!(light.draws.len(), 2);
         assert_eq!(light.shadow_instances.len(), 2);
-        // (1) Every object emits a non-empty shadow primitive (the offset silhouette).
         for draw in &light.draws {
             assert!(
                 !draw.shadow_range.is_empty(),
@@ -1985,7 +1644,6 @@ mod tests {
                 draw.id
             );
         }
-        // The shadow vertex ranges tile the shared buffer contiguously.
         assert_eq!(light.draws[0].shadow_range.start, 0);
         assert_eq!(
             light.draws[0].shadow_range.end,
@@ -1996,29 +1654,22 @@ mod tests {
             light.shadow_vertices.len() as u32
         );
 
-        // (2) The shadow color is the `shadow` token, so it FLIPS with the theme
-        // bit and is NEVER hardcoded.
         let light_shadow = light.shadow_instances[0].shadow;
         let dark_shadow = dark.shadow_instances[0].shadow;
         assert_eq!(light_shadow, Theme::light().shadow(), "shadow sourced from token, not hardcoded");
         assert_eq!(dark_shadow, Theme::dark().shadow());
         assert_ne!(light_shadow, dark_shadow, "shadow RGBA flips light vs dark");
-        // (3) Translucent in both modes (a drop shadow, not an opaque block).
         assert!(light_shadow[3] < 1.0, "light shadow is translucent");
         assert!(dark_shadow[3] < 1.0, "dark shadow is translucent");
         assert!(light_shadow[3] > 0.0 && dark_shadow[3] > 0.0, "shadow is visible");
     }
 
-    /// ZERO-REBAKE (P4): flipping the theme leaves the shadow GEOMETRY byte-
-    /// identical — only the shadow instance COLOR moves. A theme flip is a per-
-    /// instance color refresh, not a re-tessellation of the shadow quads.
     #[test]
     fn shadow_geometry_is_theme_invariant_only_color_flips() {
         let scene = scene_with(vec![rect_object("a"), rect_object("b")], None);
         let light = build_scene_geometry_themed(&scene, Theme::light());
         let dark = build_scene_geometry_themed(&scene, Theme::dark());
 
-        // Quad vertices (positions + feather) never move with the theme bit.
         assert_eq!(
             light.shadow_vertices, dark.shadow_vertices,
             "shadow quad geometry is theme-invariant (zero rebake)"
@@ -2028,16 +1679,10 @@ mod tests {
             assert_eq!(l.shadow_instance.m0, d.shadow_instance.m0);
             assert_eq!(l.shadow_instance.m1, d.shadow_instance.m1);
             assert_eq!(l.shadow_instance.m2, d.shadow_instance.m2);
-            // The color is the ONLY thing that moves.
             assert_ne!(l.shadow_instance.shadow, d.shadow_instance.shadow);
         }
     }
 
-    /// W3-G8/A: the shadow is now a SINGLE offset silhouette copy of the object's
-    /// OWN fill mesh (count == fill triangle list, NOT *N) — softness comes from the
-    /// offscreen Gaussian blur, not stacked tiers. The vertex count is exactly the
-    /// fill index count and every `feather` is 0. FAILS if the old multi-tier stack
-    /// returns (count == fill-list * tiers, or any feather > 0).
     #[test]
     fn shadow_quad_is_single_offset_silhouette_of_fill_mesh() {
         let scene = scene_with(vec![rect_object("o1")], None);
@@ -2052,25 +1697,18 @@ mod tests {
         let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
         assert!(!mesh.indices.is_empty());
 
-        // (1) Single tier: ONE copy of the fill triangle list, never a *N stack.
+        // Single tier: one copy of the fill triangle list, never a *N stack.
         assert_eq!(
             verts.len(),
             mesh.indices.len(),
             "shadow is a single offset silhouette (one copy of the fill triangle list)"
         );
-
-        // (2) Flat feather: the blur owns softness now, so the silhouette is flat.
         assert!(
             verts.iter().all(|v| v.feather == 0.0),
             "single silhouette tier carries feather 0 (no baked-in ramp)"
         );
     }
 
-    /// W3-G9/#1: the drop offset is 0, so the shadow silhouette is a PERFECT
-    /// (untranslated) copy of the fill mesh — no downward bias. The wide quarter-res
-    /// blur owns the soft halo, which is symmetric on all sides only because the
-    /// silhouette is centered. FAILS if `SHADOW_OFFSET_PX` regresses to a non-zero
-    /// drop (the old +2px bottom-bias), which would push every shadow vertex in +y.
     #[test]
     fn shadow_offset_is_zero_so_silhouette_is_symmetric() {
         assert_eq!(SHADOW_OFFSET_PX, 0.0, "shadow drop offset is removed (all-sides symmetric)");
@@ -2083,45 +1721,35 @@ mod tests {
             subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();
         let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
 
-        // Every shadow vertex equals its fill-mesh source with NO y-offset (the emit
-        // is `p[1] + SHADOW_OFFSET_PX`, now `+0`): zero down-bias, fully symmetric.
+        // Every shadow vertex equals its fill-mesh source with no y-offset.
         for (sv, &idx) in geo.shadow_vertices.iter().zip(mesh.indices.iter()) {
             let src = mesh.vertices[idx as usize];
             assert_eq!(sv.position, src, "shadow vertex is untranslated (offset 0)");
         }
     }
 
-    /// CONCAVE shape (an arrowhead with a reflex vertex): the shadow is the EXACT
-    /// silhouette of the object's own fill triangulation (no centroid fan, no
-    /// per-edge feather ring), translated by the drop offset. FAILS on the old
-    /// centroid-fan build, which placed an apex outside this concave silhouette and
-    /// self-intersected into facets.
     #[test]
     fn shadow_is_exact_silhouette_of_fill_mesh_for_concave_shape() {
-        // A concave arrowhead: the reflex vertex at (300,400) is what makes a
-        // centroid fan invalid (the centroid lies outside the silhouette).
+        // A concave arrowhead: the reflex vertex at (300,400) makes a centroid fan
+        // invalid (the centroid lies outside the silhouette).
         let mut obj = rect_object("arrow");
         obj.geometry_d = "M0 0 L800 400 L0 800 L300 400 Z".to_string();
         let scene = scene_with(vec![obj], None);
         let geo = build_scene_geometry(&scene);
 
-        // Recompute the object's own fill mesh the same way the pipeline does.
         let subpaths = flatten_object_subpaths(&scene.objects[0], scene.camera.zoom);
         let fill_input: Vec<(bool, Vec<(f32, f32)>)> =
             subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();
         let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
         assert!(!mesh.indices.is_empty(), "concave arrow has a fillable interior");
 
-        // (1) Single tier: ONE copy of the fill triangle list.
         assert_eq!(
             geo.shadow_vertices.len(),
             mesh.indices.len(),
             "shadow is a single offset silhouette (one copy of the fill triangle list)"
         );
 
-        // (2) The silhouette is an EXACT copy of the fill mesh translated by the
-        // drop offset (+SHADOW_OFFSET_PX in y) — same silhouette, never a centroid
-        // fan. Undo the offset and compare against the un-offset fill triangulation.
+        // Undo the offset and compare against the un-offset fill triangulation.
         let n = mesh.indices.len();
         let mut expected: Vec<[f32; 2]> = mesh
             .indices
@@ -2144,9 +1772,8 @@ mod tests {
             "the silhouette reads flat (feather 0)"
         );
 
-        // (3) Regression guard against the centroid fan: NO shadow vertex sits at
-        // the (offset) outline CENTROID (the old core-fan apex), which for this
-        // concave shape lies outside the silhouette and produced overlapping facets.
+        // Regression guard: no shadow vertex sits at the outline centroid (the old
+        // core-fan apex, which lies outside this concave silhouette).
         let outline: Vec<(f32, f32)> = subpaths[0].1.clone();
         let cx = outline.iter().map(|p| p.0).sum::<f32>() / outline.len() as f32;
         let cy = outline.iter().map(|p| p.1).sum::<f32>() / outline.len() as f32 + SHADOW_OFFSET_PX;
@@ -2159,17 +1786,10 @@ mod tests {
         );
     }
 
-    /// W3-G10/#3: a stroke-only (free-draw) object — open path, `fill: None`, a
-    /// non-empty stroke ribbon — now casts a shadow built from the STROKE RIBBON
-    /// (its fill mesh is empty), so its `shadow_range` is non-empty. A filled object
-    /// still casts from its fill-mesh silhouette (unchanged). An object with neither
-    /// a fillable interior NOR a stroke ribbon casts nothing. FAILS if a stroke-only
-    /// object stays shadowless (the empty-fill fall-through is removed).
     #[test]
     fn stroke_only_object_casts_shadow_from_ribbon() {
-        // (1) Stroke-only: open 2-node line, fill None -> empty fill mesh, but a real
-        // stroke ribbon. Shadow must come from the ribbon (non-empty), and equal the
-        // ribbon triangle list exactly (one copy, untranslated at offset 0).
+        // Stroke-only (open, fill None): empty fill mesh, so the shadow comes from
+        // the ribbon.
         let stroke_only = open_stroke_object("line", "M0 0 L800 400");
         let scene = scene_with(vec![stroke_only], None);
         let geo = build_scene_geometry(&scene);
@@ -2190,7 +1810,7 @@ mod tests {
             "the stroke-ribbon silhouette reads flat (feather 0)"
         );
 
-        // (2) Filled object: shadow is STILL the fill-mesh silhouette, NOT the ribbon.
+        // Filled object: shadow is still the fill-mesh silhouette, not the ribbon.
         let filled = scene_with(vec![rect_object("r")], None);
         let fgeo = build_scene_geometry(&filled);
         let fdraw = &fgeo.draws[0];
@@ -2205,9 +1825,7 @@ mod tests {
             "a filled object's shadow is its fill-mesh silhouette (unchanged)"
         );
 
-        // (3) Neither fill nor stroke ribbon: a lone MoveTo (single point) — open so
-        // it does not fill, and a <2-node subpath expands to an empty ribbon — casts
-        // nothing.
+        // Neither fill nor stroke ribbon: a lone MoveTo casts nothing.
         let empty = open_stroke_object("dot", "M0 0");
         let egeo = build_scene_geometry(&scene_with(vec![empty], None));
         let edraw = &egeo.draws[0];
@@ -2219,16 +1837,10 @@ mod tests {
         );
     }
 
-    /// RB3 EXACT OUTLINE: a non-rectangular object casts a shadow that follows its
-    /// real path silhouette, NOT the axis-aligned bbox. We build an ellipse (four
-    /// cubic arcs) and assert the offset fill-mesh shadow vertices hug the curve —
-    /// none sit in a bbox CORNER region, which the curve never reaches. A 4-corner
-    /// AABB quad would place vertices exactly on the offset bbox corners, so this
-    /// assertion FAILS for a bbox shadow.
     #[test]
     fn nonrectangular_shadow_follows_path_outline_not_aabb() {
-        // An ellipse centered at (400,400), rx=ry=400 quantized units (50px @ 8/px),
-        // approximated by four cubic arcs (kappa = 0.5523). Closed (Z) so it fills.
+        // An ellipse (four cubic arcs, closed) so its silhouette hugs the curve; no
+        // shadow vertex should sit in a bbox corner the curve never reaches.
         let mut obj = rect_object("ellipse");
         obj.geometry_d = "M400 0 C621 0 800 179 800 400 C800 621 621 800 400 800 \
              C179 800 0 621 0 400 C0 179 179 0 400 0 Z"
@@ -2237,16 +1849,13 @@ mod tests {
         let geo = build_scene_geometry(&scene);
         assert!(!geo.shadow_vertices.is_empty(), "ellipse casts a shadow");
 
-        // The single offset silhouette is the whole shadow; check it against the
-        // region bbox corners (the drop offset is small vs the corner margin below).
         let subpaths = flatten_object_subpaths(&scene.objects[0], 1.0);
         let fill_input: Vec<(bool, Vec<(f32, f32)>)> =
             subpaths.iter().map(|(c, p)| (*c, p.clone())).collect();
         let mesh = tessellate_fill(&fill_input, FillRuleKind::NonZero);
         let core = &geo.shadow_vertices[..mesh.indices.len()];
 
-        // Region bbox in pixels (geometry de-quantizes at 8 units/px): ~0..100. The
-        // four bbox corners are the points a bbox-quad shadow would touch.
+        // The four bbox corners are the points a bbox-quad shadow would touch.
         let region = crate::outline::derive_region(
             &subpaths,
             crate::curve_lod::flatness_for_bucket(crate::curve_lod::zoom_bucket(1.0)),
@@ -2263,10 +1872,7 @@ mod tests {
             [min_x, max_y],
         ];
 
-        // No core-tier shadow vertex may coincide with a bbox corner: the ellipse
-        // silhouette (and its interior triangulation) pulls inward at every corner.
-        // Distance margin is a generous fraction of the radius so a flattened-curve
-        // vertex near (but not at) a corner still counts as "off the corner".
+        // No shadow vertex may coincide with a bbox corner (the ellipse pulls inward).
         let corner_margin = (max_x - min_x) * 0.1;
         for v in core.iter() {
             for c in &bbox_corners {
@@ -2280,8 +1886,7 @@ mod tests {
             }
         }
 
-        // And the silhouette is genuinely curved: the fill mesh spans many more than
-        // a rect's 4 vertices, so the shadow is not a 4-corner quad.
+        // The silhouette is genuinely curved (more than a rect's 4 vertices).
         let positions: std::collections::BTreeSet<[u32; 2]> = core
             .iter()
             .map(|v| [v.position[0].to_bits(), v.position[1].to_bits()])
@@ -2292,10 +1897,6 @@ mod tests {
         );
     }
 
-    /// Shadow packing matches `object_shadow.wgsl`: `ShadowVertex` is 12 bytes
-    /// (position + feather) and `ShadowInstance` is 52 bytes (3 matrix columns +
-    /// color), with the color slot at offset 36 (past the 36-byte matrix) so the
-    /// theme color write never clobbers the matrix.
     #[test]
     fn shadow_vertex_and_instance_sizes_match_shader_contract() {
         // ShadowVertex: vec2 position + f32 feather = 3 floats = 12 bytes.
@@ -2306,8 +1907,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShadowInstance, shadow), 36);
     }
 
-    /// The shadow uses the same `shadow` token RB1 exposes as `Theme::shadow()`,
-    /// pinning the wiring: a wrong token (or a hardcoded color) breaks the link.
+    /// The shadow uses the same `shadow` token `Theme::shadow()` exposes.
     #[test]
     fn shadow_token_constant_matches_theme_shadow_accessor() {
         assert_eq!(SHADOW_TOKEN, crate::object_theme::ThemeToken::Shadow.name());
@@ -2315,9 +1915,8 @@ mod tests {
         assert_eq!(light, Theme::light().shadow());
     }
 
-    /// A token paint's per-paint `opacity` multiplies the token's own alpha
-    /// (e.g. the translucent `shadow` token), so RB3's shadow paint can fade
-    /// without losing the token's baseline translucency.
+    /// A token paint's `opacity` multiplies the token's own alpha (e.g. translucent
+    /// `shadow`), so the paint fades without losing the baseline translucency.
     #[test]
     fn token_opacity_multiplies_token_alpha() {
         let shadow = RPaint::Token {
@@ -2331,8 +1930,7 @@ mod tests {
         assert!((half[3] - base_a * 0.5).abs() < 1e-6);
     }
 
-    /// An open 2-node stroke object (no fill, so the patch exercises only the stroke
-    /// ribbon) carrying `geometry_d`.
+    /// An open stroke object with no fill, so the patch exercises only the ribbon.
     fn open_stroke_object(id: &str, d: &str) -> RenderObject {
         RenderObject {
             id: id.to_string(),
@@ -2390,14 +1988,12 @@ mod tests {
 
     #[test]
     fn follower_patch_plan_is_none_on_a_topology_change() {
-        // Canonical: a 2-node open stroke. The baked draw has a fixed stroke range.
         let canonical = open_stroke_object("f", "M0 0 L800 0");
         let scene = scene_with(vec![canonical], None);
         let build = build_scene_geometry_themed(&scene, Theme::light());
         let draw = &build.draws[0];
 
-        // A 3-node re-expand changes the vertex COUNT — the guard must refuse it so a
-        // mismatched range is NEVER written to the GPU buffer.
+        // A 3-node re-expand changes the vertex count, so the guard must refuse it.
         let three_nodes = open_stroke_object("f", "M0 0 L800 0 L800 400");
         let rebuilt = reexpand_single_object(&three_nodes, Theme::light(), scene.camera.clone());
         assert_ne!(rebuilt.stroke_vertices.len() as u32, draw.stroke_range.len());
@@ -2407,13 +2003,10 @@ mod tests {
         );
     }
 
-    /// W3-G13: the count guard covers the NEW artifacts too — a rebuilt whose
-    /// shadow or text vertex count no longer matches the baked range must refuse
-    /// the whole plan, exactly like a fill/stroke mismatch.
+    /// The count guard covers shadow + text too: a mismatched count refuses the plan.
     #[test]
     fn follower_patch_plan_is_none_on_a_shadow_or_text_count_change() {
-        // A filled rect casts a fill-derived shadow, so its shadow_range is
-        // non-empty and the tamper below is a real mismatch, not 1-vs-0 noise.
+        // A filled rect casts a fill-derived shadow, so the tamper is a real mismatch.
         let canonical = rect_object("f");
         let scene = scene_with(vec![canonical.clone()], None);
         let build = build_scene_geometry_themed(&scene, Theme::light());
@@ -2445,15 +2038,9 @@ mod tests {
         );
     }
 
-    /// W3-G13 PARITY GUARD (the dragged-target follower-shadow bug): a follower
-    /// re-expanded with a reprojected node must carry shadow + text vertices that
-    /// EQUAL the corresponding `shadow_range`/`text_range` slices of a FULL rebake
-    /// of the whole deformed scene. Two followers cover both shadow sources: a
-    /// CLOSED filled follower with a text run (fill-derived shadow + glyph quads)
-    /// and an OPEN fill-less stroke follower (stroke-ribbon-derived shadow,
-    /// W3-G10/#3). FAILS if shadow or text is dropped from [`FollowerReexpand`]
-    /// (the plan refuses, or the slices diverge) — the live drag then shows a
-    /// stale shadow until the commit rebake, the user-reported bug.
+    /// A follower re-expanded with a reprojected node must carry shadow + text
+    /// vertices that equal the corresponding slices of a full rebake of the deformed
+    /// scene. Two followers cover both shadow sources (filled + stroke-only).
     #[test]
     fn reexpanded_follower_shadow_and_text_match_a_full_rebake() {
         use crate::render_object::{RAnchor, RLocalPoint};
@@ -2552,8 +2139,7 @@ mod tests {
             assert_eq!(rebuilt.text_vertices, full_text, "{id} text parity");
         }
 
-        // The text follower's glyphs are non-empty AND moved by the reproject
-        // (its region min changed), so a stale canonical text copy is caught too.
+        // The text follower's glyphs moved by the reproject (its region min changed).
         let fc_rebuilt = reexpand_single_object(
             &deformed.objects[1],
             Theme::light(),

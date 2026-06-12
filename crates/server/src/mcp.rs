@@ -1,19 +1,13 @@
-//! Object-native MCP server (OB4.1 / OB3.U6) on the official Rust SDK (`rmcp`).
+//! Object-native MCP server on the official Rust SDK (`rmcp`).
 //!
-//! A thin transport/orchestration seam in front of the canvas actors and the
-//! object-native toolset in [`crate::object_mcp`]. Each tool is a faithful wrapper
-//! of an `object_mcp` function: read tools reply from the actor's
-//! [`ObjectScene`](shape_scene_core::object::ObjectScene); write tools lower a
-//! spec to [`ObjectOp`](shape_scene_core::object::ObjectOp)s and funnel each
-//! through the per-canvas [`ActorHandle`] (the single op-apply path, P1). No
-//! canvas logic is reimplemented here.
+//! A thin transport seam in front of the canvas actors and the toolset in
+//! [`crate::object_mcp`]. Each tool wraps an `object_mcp` function: read tools
+//! reply from the actor's [`ObjectScene`](shape_scene_core::object::ObjectScene);
+//! write tools lower a spec to [`ObjectOp`](shape_scene_core::object::ObjectOp)s
+//! and funnel each through the per-canvas [`ActorHandle`]. No canvas logic here.
 //!
-//! The companion dock + per-client trace ring (the old `ClientRegistry` coupling)
-//! is removed (OB3.U6): the op-apply path is registry-free, so the server needs
-//! only the canvas registry.
-//!
-//! Identity is `userId`-only with no auth (C13); MCP writes are attributed to the
-//! actor `"mcp"`. TODO(auth): real authn/authz attaches at the transport boundary.
+//! Identity is `userId`-only with no auth; MCP writes are attributed to actor
+//! `"mcp"`. TODO(auth): real authn/authz attaches at the transport boundary.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -37,22 +31,16 @@ use crate::object_mcp::{
 };
 use crate::registry::CanvasRegistry;
 
-/// The single canvas id every tool operates on by default. Tools take an optional
-/// `canvasId` so the seam is already in place for canvas CRUD.
+/// The default canvas id every tool operates on; tools take an optional `canvasId`.
 pub const DEFAULT_CANVAS_ID: &str = "default";
 
-/// Process-local monotonic suffix so synthesized ids stay unique across rapid
-/// tool calls without scene-core needing randomness.
+/// Process-local monotonic suffix so synthesized ids stay unique without rng.
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_suffix() -> String {
     let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{n:x}")
 }
-
-// ---------------------------------------------------------------------------
-// Tool input parameter structs (schemars-derived JSON Schema for tools/list).
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -180,23 +168,17 @@ pub struct ExportArgs {
     pub canvas_id: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Server state
-// ---------------------------------------------------------------------------
-
-/// The MCP server: a handle to the shared canvas registry. Cloned per
-/// streamable-HTTP session by the transport's service factory.
+/// A handle to the shared canvas registry, cloned per streamable-HTTP session.
 #[derive(Clone)]
 pub struct SceneMcp {
     canvases: CanvasRegistry,
-    // Read by the `#[tool_handler]`-generated dispatch; the macro hides it from
-    // dead-code analysis, hence the allow.
+    // Read by `#[tool_handler]`-generated dispatch; the macro hides it from
+    // dead-code analysis.
     #[allow(dead_code)]
     tool_router: ToolRouter<SceneMcp>,
 }
 
 impl SceneMcp {
-    /// Build a server instance bound to the shared canvas registry.
     pub fn new(canvases: CanvasRegistry) -> Self {
         Self {
             canvases,
@@ -204,8 +186,7 @@ impl SceneMcp {
         }
     }
 
-    /// The registered tool definitions (name + input schema), as `tools/list`
-    /// returns them.
+    /// Tool definitions as `tools/list` returns them.
     pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
         Self::tool_router().list_all()
     }
@@ -214,8 +195,8 @@ impl SceneMcp {
         CanvasId::from(canvas_id.as_deref().unwrap_or(DEFAULT_CANVAS_ID))
     }
 
-    /// Acquire the lease + spawn (or reuse) the actor for `canvas_id`, surfacing a
-    /// denied lease / draining registry as a tool error rather than panicking.
+    /// Spawn (or reuse) the actor, surfacing a denied lease / draining registry as
+    /// a tool error rather than panicking.
     async fn open_canvas(&self, canvas_id: &Option<String>) -> Result<ActorHandle, McpError> {
         self.canvases
             .get_or_spawn(&self.canvas(canvas_id))
@@ -223,8 +204,8 @@ impl SceneMcp {
             .map_err(|e| invalid_params(format!("cannot open canvas: {e}")))
     }
 
-    /// Drive a sequence of ops through the actor's single op-apply path, returning
-    /// the post-apply scene or the first rejection.
+    /// Drive ops through the actor's apply path, returning the post-apply scene or
+    /// the first rejection.
     async fn apply_ops(
         &self,
         handle: &ActorHandle,
@@ -242,7 +223,6 @@ impl SceneMcp {
     }
 }
 
-/// Serialize any value to a one-content-block JSON tool result (pretty-printed).
 fn json_response(value: serde_json::Value) -> CallToolResult {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     CallToolResult::success(vec![Content::text(text)])
@@ -252,7 +232,6 @@ fn invalid_params(message: impl Into<String>) -> McpError {
     McpError::invalid_params(message.into(), None)
 }
 
-/// Parse a `rect`/`text` shape token into the `object_mcp` create spec shape.
 fn parse_shape(raw: &str) -> Result<object_mcp::CreateShape, McpError> {
     match raw {
         "rect" => Ok(object_mcp::CreateShape::Rect),
@@ -260,10 +239,6 @@ fn parse_shape(raw: &str) -> Result<object_mcp::CreateShape, McpError> {
         other => Err(invalid_params(format!("unknown shape: {other}"))),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tools
-// ---------------------------------------------------------------------------
 
 #[tool_router]
 impl SceneMcp {
@@ -414,9 +389,8 @@ impl SceneMcp {
         let selection: ObjectSelection = serde_json::from_value(args.selection.clone())
             .map_err(|e| invalid_params(format!("invalid selection: {e}")))?;
         let handle = self.open_canvas(&args.canvas_id).await?;
-        // Selection lives on the scene, not as an op. The actor has no selection
-        // command; surface it as a no-op read that echoes the requested selection
-        // (the shell drives selection over WS; MCP selection is advisory).
+        // The actor has no selection command; MCP selection is advisory (the shell
+        // drives it over WS), so echo the request as a no-op read.
         let _ = handle.get_scene().await;
         Ok(json_response(json!({ "selection": selection })))
     }
@@ -431,10 +405,6 @@ pub struct SetSelectionArgs {
     #[serde(default)]
     pub canvas_id: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// ServerHandler — registers tools + advertises capabilities.
-// ---------------------------------------------------------------------------
 
 #[tool_handler]
 impl ServerHandler for SceneMcp {

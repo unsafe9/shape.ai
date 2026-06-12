@@ -1,13 +1,3 @@
-// AP2 (#10/#7/#15) — selection UX. Pins, at the code level (no renderer / no Svelte
-// mount):
-//  (a) additive modifier-click accumulates a multi-select and a re-click removes
-//      (the pure `toggleObjectSelection`), and App.svelte routes the engine's C2
-//      additive flag through it;
-//  (b) the marquee ids (RA2a) are applied to the selection;
-//  (c) a parent/Multi drag cascades the world-space delta to its descendants via
-//      the scene-core `moveOps` core call — the delta reaches children (and
-//      grandchildren), with the multi-union deduped.
-
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   emptyObjectScene,
@@ -20,7 +10,7 @@ import {
 import { loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
 import { commitBodyDrag, routeMarquee, routeSelectObject } from "../platforms/web/controller/interactions";
 
-describe("toggleObjectSelection (additive modifier-click, #10)", () => {
+describe("toggleObjectSelection (additive modifier-click)", () => {
   it("accumulates a multi-select as ids are modifier-clicked in", () => {
     const a = toggleObjectSelection({ kind: "canvas" }, "o1");
     expect(a).toEqual({ kind: "object", id: "o1" });
@@ -32,7 +22,6 @@ describe("toggleObjectSelection (additive modifier-click, #10)", () => {
 
   it("removes an already-selected id on re-click, collapsing the kind", () => {
     const multi: ObjectSelection = { kind: "multi", ids: ["o1", "o2", "o3"] };
-    // Re-clicking the middle id drops it but keeps the multi.
     expect(toggleObjectSelection(multi, "o2")).toEqual({ kind: "multi", ids: ["o1", "o3"] });
     // Down to one id collapses to a single-object selection.
     expect(toggleObjectSelection({ kind: "multi", ids: ["o1", "o2"] }, "o2")).toEqual({
@@ -44,7 +33,7 @@ describe("toggleObjectSelection (additive modifier-click, #10)", () => {
   });
 });
 
-describe("onSelectObject routing (W3-G5 #10 — no collapse-on-drag)", () => {
+describe("onSelectObject routing (no collapse-on-drag)", () => {
   it("an additive pick over an existing single selection yields a Multi of both ids", () => {
     expect(routeSelectObject({ kind: "object", id: "o1" }, "o2", true)).toEqual({
       kind: "multi",
@@ -59,8 +48,6 @@ describe("onSelectObject routing (W3-G5 #10 — no collapse-on-drag)", () => {
 
   it("a PLAIN pick on a member of the Multi KEEPS the whole Multi (so a group-drag never collapses)", () => {
     const multi: ObjectSelection = { kind: "multi", ids: ["o1", "o2", "o3"] };
-    // Falsifiable: the pre-fix code returned { kind:"object", id:"o2" } here, which
-    // is exactly the collapse that broke multi-drag.
     expect(routeSelectObject(multi, "o2", false)).toBe(multi);
   });
 
@@ -74,8 +61,7 @@ describe("onSelectObject routing (W3-G5 #10 — no collapse-on-drag)", () => {
   });
 });
 
-// A translation delta (move by (dx,dy) in world space): the same matrix the
-// renderer hands the commit for a pure drag.
+// Move-by-(dx,dy) delta in world space — the matrix the renderer hands the commit.
 function translateDelta(dx: number, dy: number): [[number, number, number], [number, number, number], [number, number, number]] {
   return [
     [1, 0, dx],
@@ -102,23 +88,19 @@ function sceneOf(objects: SceneObject[]): ObjectScene {
   return { ...emptyObjectScene(), objects };
 }
 
-/** The ordered set-transform ids of a move-ops batch. */
 function setTransformIds(ops: ObjectOp[]): string[] {
   return ops.filter((o) => o.kind === "set-transform").map((o) => (o.kind === "set-transform" ? o.id : ""));
 }
 
-/** The composed `(x, y)` translate of the set-transform op for `id`. */
 function originOf(ops: ObjectOp[], id: string): [number, number] {
   const op = ops.find((o) => o.kind === "set-transform" && o.id === id);
   if (op?.kind !== "set-transform") throw new Error(`expected set-transform for ${id}`);
   return [op.transform[0][2], op.transform[1][2]];
 }
 
-// Tier-2: the cascade now lives in scene-core; these are CONTRACT tests over the
-// REAL wasm `sceneCore.moveOps` (single/multi roots), one-to-one with the deleted
-// `transformCascade.ts` shell tests. None of these objects carry anchors, so
-// move_ops returns the cascade only (no trailing edit-geometry follow ops).
-describe("sceneCore.moveOps cascade (parent-drag #15 / multi #10)", () => {
+// None of these objects carry anchors, so move_ops returns the cascade only (no
+// trailing edit-geometry follow ops).
+describe("sceneCore.moveOps cascade (parent-drag / multi)", () => {
   let core: SceneCore;
   beforeAll(async () => {
     core = await loadSceneCore();
@@ -127,10 +109,10 @@ describe("sceneCore.moveOps cascade (parent-drag #15 / multi #10)", () => {
   it("applies the world-space delta to the parent AND its children, parent first", () => {
     const scene = sceneOf([obj("frame", undefined, 100, 100), obj("c1", "frame", 110, 120), obj("c2", "frame", 130, 140)]);
     const ops = core.moveOps(scene, { kind: "single", id: "frame" }, translateDelta(40, 25));
-    // One op per object: the dragged frame first, then each child in scene order.
+    // One op per object: dragged frame first, then each child in scene order.
     expect(setTransformIds(ops)).toEqual(["frame", "c1", "c2"]);
     expect(originOf(ops, "frame")).toEqual([140, 125]);
-    expect(originOf(ops, "c1")).toEqual([150, 145]); // delta reached the child
+    expect(originOf(ops, "c1")).toEqual([150, 145]);
     expect(originOf(ops, "c2")).toEqual([170, 165]);
   });
 
@@ -152,9 +134,9 @@ describe("sceneCore.moveOps cascade (parent-drag #15 / multi #10)", () => {
     expect(core.moveOps(scene, { kind: "single", id: "ghost" }, translateDelta(1, 1))).toEqual([]);
   });
 
-  it("a Multi drag moves EVERY member together (#10) — same world delta to each, deduped", () => {
+  it("a Multi drag moves EVERY member together — same world delta to each, deduped", () => {
     const scene = sceneOf([obj("a", undefined, 100, 100), obj("b", undefined, 300, 50), obj("c", undefined, 500, 500)]);
-    // Drag the Multi {a, b}: both move by (40, 25); the unselected `c` does not.
+    // Drag {a, b}: both move by (40, 25); the unselected `c` does not.
     const ops = core.moveOps(scene, { kind: "multi", ids: ["a", "b"] }, translateDelta(40, 25));
     expect(setTransformIds(ops)).toEqual(["a", "b"]);
     expect(originOf(ops, "a")).toEqual([140, 125]);
@@ -162,19 +144,18 @@ describe("sceneCore.moveOps cascade (parent-drag #15 / multi #10)", () => {
   });
 
   it("a Multi drag where one member is a frame cascades to its children AND dedupes overlap", () => {
-    // `frame` contains `child`; the Multi also explicitly selects `child`. The
-    // delta must reach `child` exactly once (frame's cascade), not twice.
+    // `frame` contains `child` and the Multi also selects `child`; the delta must
+    // reach `child` exactly once.
     const scene = sceneOf([obj("frame", undefined, 0, 0), obj("child", "frame", 50, 50)]);
     const ops = core.moveOps(scene, { kind: "multi", ids: ["frame", "child"] }, translateDelta(10, 10));
-    expect(setTransformIds(ops).filter((id) => id === "child")).toHaveLength(1); // deduped
-    expect(originOf(ops, "child")).toEqual([60, 60]); // 50 + 10, applied once
+    expect(setTransformIds(ops).filter((id) => id === "child")).toHaveLength(1);
+    expect(originOf(ops, "child")).toEqual([60, 60]);
   });
 
   it("composes delta*base (pre-multiply), so a rotation about origin rotates the child position", () => {
-    // 90° rotation delta about the world origin; pre-multiply must move a child at
-    // (1,0) to (0,1), proving the core composes delta on the LEFT. A CLOSED rect:
-    // open-class members route non-translate deltas through their endpoints
-    // (anchor-semantics v3 §2c) instead of composing a set-transform.
+    // 90deg rotation about the origin: pre-multiply moves a child at (1,0) to (0,1),
+    // proving delta composes on the LEFT. A CLOSED rect; open-class members would
+    // route non-translate deltas through their endpoints instead.
     const rot90: [[number, number, number], [number, number, number], [number, number, number]] = [
       [0, -1, 0],
       [1, 0, 0],
@@ -189,24 +170,19 @@ describe("sceneCore.moveOps cascade (parent-drag #15 / multi #10)", () => {
   });
 });
 
-// The onSelectObject / onMarquee / onTransformCommit wiring, exercised through the
-// extracted controller functions the shell now composes (no .svelte source pin).
-// Falsifiable — dropping the additive toggle, the marquee apply, or the cascade
-// route all change these results.
-describe("controller selection-UX wiring (AP2)", () => {
+describe("controller selection-UX wiring", () => {
   it("routes the additive flag through toggleObjectSelection on pick", () => {
-    // routeSelectObject(additive=true) must equal the pure toggle the shell uses.
     const before: ObjectSelection = { kind: "object", id: "o1" };
     expect(routeSelectObject(before, "o2", true)).toEqual(toggleObjectSelection(before, "o2"));
   });
 
-  it("applies the marquee ids (RA2a) to the selection", () => {
+  it("applies the marquee ids to the selection", () => {
     expect(routeMarquee(["o1", "o2"])).toEqual({ kind: "multi", ids: ["o1", "o2"] });
     expect(routeMarquee(["o1"])).toEqual({ kind: "object", id: "o1" });
     expect(routeMarquee([])).toEqual({ kind: "canvas" });
   });
 
-  describe("commitBodyDrag (parent/Multi drag through the single moveOps call, #10/#15)", () => {
+  describe("commitBodyDrag (parent/Multi drag through the single moveOps call)", () => {
     let core: SceneCore;
     beforeAll(async () => {
       core = await loadSceneCore();
@@ -215,7 +191,7 @@ describe("controller selection-UX wiring (AP2)", () => {
     it("routes a single-object drag through { kind: 'single', id } and bare-ops the result", () => {
       const scene = sceneOf([obj("a", undefined, 100, 100)]);
       const { op, allOps } = commitBodyDrag(core, scene, { kind: "object", id: "a" }, "a", translateDelta(40, 25), "translate", false);
-      // One member dragged -> one set-transform op, returned bare (not wrapped in a batch).
+      // One member dragged -> one set-transform op, returned bare (not batched).
       expect(setTransformIds(allOps)).toEqual(["a"]);
       expect(originOf(allOps, "a")).toEqual([140, 125]);
       expect(op).toEqual(allOps[0]);
@@ -232,7 +208,7 @@ describe("controller selection-UX wiring (AP2)", () => {
     });
 
     it("anchors a plain drag on the picked id even when a different Multi is selected", () => {
-      // The picked id is NOT in the multi -> the drag falls back to the single root.
+      // Picked id is NOT in the multi -> the drag falls back to the single root.
       const scene = sceneOf([obj("frame", undefined, 0, 0), obj("c1", "frame", 10, 10), obj("loner", undefined, 200, 200)]);
       const { allOps } = commitBodyDrag(core, scene, { kind: "multi", ids: ["loner"] }, "frame", translateDelta(5, 5), "translate", false);
       expect(setTransformIds(allOps).sort()).toEqual(["c1", "frame"]);

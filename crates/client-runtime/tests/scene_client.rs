@@ -1,10 +1,5 @@
-//! Port of `tests/scene-client.test.ts`: the data-layer contract the shell
-//! consumes. The TS `SceneClient` composes transport + engine + outbox; the
-//! behavioral core (optimistic object-op apply -> outbox WireOp -> send -> drop on
-//! ack; reconnect reload + unacked replay) is engine logic and is covered here.
-//! The selection-is-presence-only and feature-channel assertions are pure routing
-//! decisions of the shell wrapper (no document op, no outbox entry), captured by
-//! the structural fact that only an `ObjectOp` ever reaches `author`.
+//! The data-layer contract the shell consumes: optimistic object-op apply ->
+//! outbox WireOp -> send -> drop on ack, plus reconnect reload + unacked replay.
 
 mod common;
 
@@ -34,13 +29,10 @@ fn applies_object_op_optimistically_enqueues_wireop_sends_it_and_drops_on_ack() 
     let res = engine.author(insert(rect("a", "a0")), &now.next()).unwrap();
     assert_eq!(res.errors, Vec::<String>::new());
     assert_eq!(res.op_id, Some(op_id("c1", 1)));
-    // The inverse op is captured (the undo entry, D21).
     assert_eq!(res.inverse, Some(ObjectOp::Delete { id: "a".to_string() }));
 
-    // Optimistic local apply happened immediately.
     assert_eq!(object_ids(engine.scene()), vec!["a"]);
 
-    // Persisted to the outbox as a WireOp before any send.
     assert_eq!(engine.outbox_len(), 1);
     assert_eq!(engine.transport().batches.len(), 0);
 
@@ -58,14 +50,13 @@ fn applies_object_op_optimistically_enqueues_wireop_sends_it_and_drops_on_ack() 
 #[test]
 fn a_rejected_op_never_enters_the_outbox_or_the_wire() {
     let (mut engine, mut now) = boot();
-    // Move a non-existent object: scene-core rejects (NotFound); nothing persists.
+    // Moving a non-existent object: scene-core rejects (NotFound).
     let res = engine.author(move_op("ghost", 10.0, 10.0), &now.next()).unwrap();
     assert!(!res.errors.is_empty());
     assert_eq!(res.op_id, None);
     assert_eq!(res.inverse, None);
     assert_eq!(engine.outbox_len(), 0);
     assert!(!engine.flush_armed());
-    // The scene is untouched.
     assert_eq!(object_ids(engine.scene()), Vec::<String>::new());
 }
 
@@ -81,7 +72,7 @@ fn reloads_the_snapshot_on_a_reconnect_welcome_and_replays_unacked_ops() {
     reconnected.scene_version = 5;
     engine.reconcile_snapshot(reconnected).unwrap();
 
-    // The unacked insert is replayed on top of the snapshot, so "a" survives.
+    // The unacked insert replays on top of the snapshot, so "a" survives.
     assert_eq!(object_ids(engine.scene()), vec!["a"]);
 
     let replayed: Vec<i64> = engine.transport().flat().iter().map(|e| e.op_id.local_seq).collect();

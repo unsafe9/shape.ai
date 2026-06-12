@@ -1,12 +1,6 @@
-// SM1 (#2) — the settings modal documents the hold-key gesture catalog.
-//
-// The Gestures section is fed by the wasm core's `object_gesture_catalog()` (C2,
-// no TS mirror), loaded here via the real scene-core WASM. The node test env has
-// no DOM, so we assert two things together: (1) the .svelte source renders the
-// Gestures section against that catalog (label + trigger + description), and
-// (2) `formatGestureTrigger` produces a readable trigger for every gesture,
-// including coarse-rotate's 15-degree step. Falsifiable: dropping the Gestures
-// section, or a gesture losing its label/trigger, fails the test.
+// The Gestures section is fed by the wasm core's object_gesture_catalog() (single
+// source, no TS mirror). No DOM in node, so assert the .svelte source renders the
+// section against the catalog and formatGestureTrigger produces a readable trigger.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -64,7 +58,7 @@ describe("formatGestureTrigger", () => {
   });
 });
 
-describe("SettingsModal Gestures section (SM1, against the .svelte source)", () => {
+describe("SettingsModal Gestures section (against the .svelte source)", () => {
   it("declares the gestures prop and a dedicated Gestures section", () => {
     expect(source).toMatch(/gestures:\s*ObjectGesture\[\]/);
     expect(source).toMatch(/<h3>Gestures<\/h3>/);

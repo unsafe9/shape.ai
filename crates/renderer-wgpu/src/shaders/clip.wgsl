@@ -1,34 +1,17 @@
-// OB-3 clip region shader (OB3.R7 nested stencil clipping).
+// Clip region shader: nested stencil clipping. An object with clip:true masks its
+// descendants to its arbitrary tessellated region (a scissor rect cannot express a
+// post-transform path), so this stencil-WRITE pass rasterizes the clipper's filled
+// region (the same tessellation object_fill.wgsl draws) writing only the stencil.
 //
-// An object with clip:true masks its descendants to its own filled region. We
-// implement this with the stencil buffer rather than a rectangular scissor,
-// because an object's clip region is its arbitrary tessellated path (after the
-// projective transform), not an axis-aligned rect.
+// The binding pipeline sets stencil front/back { compare: Equal, pass_op:
+// IncrementClamp, fail/depth_fail: Keep } and color write_mask NONE, rendered with
+// stencil_reference = parent_depth — so the increment lands only inside the parent
+// clip, marking the intersection. Descendants draw with compare = Equal + Keep, so
+// fragments outside fail; on leaving the subtree a matching DecrementClamp restores
+// the parent depth.
 //
-// This shader is the *stencil-write* pass: it rasterizes the clipper's filled
-// region (the same tessellation object_fill.wgsl draws) but writes no color —
-// only the stencil value. The render pipeline that binds this shader sets:
-//
-//   depth_stencil.stencil.front/back = {
-//     compare:        Equal,           // only write where parent clip already holds
-//     pass_op:        IncrementClamp,  // nest: child region = parent + 1
-//     fail_op / depth_fail_op: Keep,
-//   }
-//   color target write_mask = NONE     // stencil-only, no color
-//
-// and renders with stencil_reference = parent_depth. Drawing the clipper this
-// way increments the stencil only inside the parent's already-clipped area, so
-// the new reference value marks exactly the intersection (parent region AND this
-// object's region) — that is how nested clips intersect (OB3.R7).
-//
-// Children then draw with their normal pipelines but with stencil compare =
-// Equal against their clip depth and pass_op = Keep, so fragments outside the
-// accumulated region fail the stencil test and are discarded. On leaving the
-// clip subtree the controller issues a matching DecrementClamp pass (or restores
-// via a saved reference) so sibling subtrees see the correct parent depth.
-//
-// Camera + projective transform are identical to object_fill.wgsl: the clip
-// region must rasterize to the exact same pixels as the object's fill.
+// Camera + projective transform are identical to object_fill.wgsl so the clip
+// rasterizes to the same pixels as the object's fill.
 
 struct View {
   camera: vec4<f32>,
@@ -72,9 +55,8 @@ fn vs_main(input: VertexIn) -> VertexOut {
   return out;
 }
 
-// Stencil-only pass: the color attachment is masked off by the pipeline, so the
-// returned value is never written. We still emit a fragment so rasterization
-// (and therefore the stencil op) runs over the clipper's region.
+// Stencil-only pass: the color attachment is masked off, so the returned value is
+// never written; the fragment still runs so the stencil op covers the region.
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
   return vec4<f32>(0.0, 0.0, 0.0, 0.0);

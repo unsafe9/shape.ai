@@ -1,22 +1,12 @@
-//! OB3.S6 — the object-native MCP toolset (additive, parallel to the legacy
-//! [`crate::mcp`] `SceneMcp` that operates over `Group/Card/Edge`).
+//! The object-native MCP toolset: the AI-readable re-representation layer for the
+//! object model. There is no `kind`/type stored on objects, so the "kind" labels
+//! here are descriptive projections derived from geometry/anchors/text.
 //!
-//! This module is the AI-readable re-representation layer for the object model
-//! (P6): an agent reads, queries, and extends the canvas purely through the one
-//! [`Object`] substrate (P2) — there is no `kind`/type stored on objects, so the
-//! human-facing "kind" labels here are *descriptive* projections derived from
-//! geometry/anchors/text, never a persisted discriminant.
-//!
-//! Everything here is a **pure function over `&ObjectScene` / `&mut ObjectScene`**
-//! returning JSON-serializable results and/or [`ObjectOp`]s. Mutating tools never
-//! touch the scene themselves: they return ops, so the caller (the OB-4 cutover
-//! actor/transport seam) funnels them through the single op-apply path (P1) where
-//! time/ids/seq are injected. Read tools reply directly. This keeps the toolset
-//! free of time/rng/IO and lets tests drive it without standing up any transport.
-//!
-//! The router/transport wiring (`tools/list`, `tools/call`) lands in the OB-4
-//! cutover; here we ship the tool *bodies* plus a self-describing catalog
-//! ([`object_mcp_tools`]) so the cutover can register them mechanically.
+//! Everything is a pure function over `&ObjectScene` / `&mut ObjectScene`
+//! returning JSON-serializable results and/or [`ObjectOp`]s. Mutating tools
+//! return ops rather than touching the scene, so the caller funnels them through
+//! the single op-apply path where time/ids/seq are injected; reads reply
+//! directly. This keeps the toolset free of time/rng/IO.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -32,21 +22,11 @@ use shape_scene_core::object::op::{FieldEdit, ObjectOp};
 /// it; finest bucket so reported bounds match the true outline).
 const FLATNESS: i32 = 1;
 
-// ---------------------------------------------------------------------------
-// Descriptive "kind" projection (P2/P6) — NOT a stored type.
-// ---------------------------------------------------------------------------
-
-/// A human-readable label for what an object *looks like*, derived from its
-/// geometry/anchors/text. Purely descriptive (P2/P6): the object model has no
-/// shape discriminant, so this is recomputed on read and never persisted.
-///
-/// Precedence mirrors how an agent would name it:
-/// - an object with >= 2 anchor targets is a **connector** (an absorbed edge,
-///   D5) — even if it also carries text;
-/// - an object whose only meaningful content is text (no closed contour) is
-///   **text**;
-/// - a single closed subpath is a **shape**;
-/// - anything else with an open contour is a **stroke**.
+/// A descriptive label for what an object looks like, derived from
+/// geometry/anchors/text and never persisted. Precedence:
+/// - >= 2 anchor targets => `connector` (even with text);
+/// - only text, no closed contour => `text`;
+/// - one closed subpath => `shape`; an open contour => `stroke`.
 pub fn kind_label(object: &Object) -> &'static str {
     let distinct_targets = {
         let mut t: Vec<&ObjectId> = Vec::new();
@@ -69,8 +49,6 @@ pub fn kind_label(object: &Object) -> &'static str {
         .as_ref()
         .is_some_and(|t| t.runs.iter().any(|r| !r.text.trim().is_empty()));
 
-    // A non-closed contour that carries text reads as a text node (a label with
-    // no fillable region of its own).
     if has_text && closed_subpaths == 0 {
         return "text";
     }
@@ -78,8 +56,7 @@ pub fn kind_label(object: &Object) -> &'static str {
         return "shape";
     }
     if has_open {
-        // Open + single anchor target = a single-anchor attachment that still
-        // reads as a connector to the agent; otherwise it is a free stroke.
+        // A single anchor target still reads as a connector; otherwise a free stroke.
         if distinct_targets == 1 {
             return "connector";
         }
@@ -88,22 +65,18 @@ pub fn kind_label(object: &Object) -> &'static str {
     if closed_subpaths > 1 {
         return "shape";
     }
-    // Degenerate / empty geometry but text present.
     if has_text {
         return "text";
     }
     "shape"
 }
 
-/// Derived world-axis-aligned bounds of an object, in logical px (quantized
-/// object-local outline -> px -> transformed corners). `None` when the geometry
-/// is degenerate/empty and no region can be derived.
+/// World-axis-aligned bounds in logical px, or `None` for degenerate geometry.
 fn object_bounds_px(object: &Object) -> Option<Bounds> {
     let deriver = StubOutlineDeriver;
     let region = deriver.derive_region(&object.geometry, FLATNESS).ok()?;
     let q = f64::from(GEOMETRY_QUANTUM_PER_PX);
-    // Map the four local-bound corners through the transform, then re-AABB in
-    // world px (the transform can rotate/shear, so corner-mapping is required).
+    // The transform can rotate/shear, so map the four corners then re-AABB.
     let corners = [
         (region.bounds.min_x, region.bounds.min_y),
         (region.bounds.max_x, region.bounds.min_y),
@@ -133,12 +106,7 @@ pub struct Bounds {
     pub height: f64,
 }
 
-// ---------------------------------------------------------------------------
-// Read tools.
-// ---------------------------------------------------------------------------
-
-/// One row of [`list_objects`]: id, the descriptive kind label, world bounds,
-/// and the object's tag ids. `kind` is descriptive only (see [`kind_label`]).
+/// One row of [`list_objects`]. `kind` is descriptive only (see [`kind_label`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectSummary {
@@ -149,8 +117,7 @@ pub struct ObjectSummary {
     pub tags: Vec<String>,
 }
 
-/// List every object as a compact summary (id + descriptive kind + bounds +
-/// tags), in scene order.
+/// In scene order.
 pub fn list_objects(scene: &ObjectScene) -> Vec<ObjectSummary> {
     scene
         .objects
@@ -164,50 +131,37 @@ pub fn list_objects(scene: &ObjectScene) -> Vec<ObjectSummary> {
         .collect()
 }
 
-/// Read one full object by id (the whole [`Object`], geometry path-string and
-/// all). `None` when it is absent.
+/// The whole [`Object`], `None` when absent.
 pub fn get_object(scene: &ObjectScene, id: &str) -> Option<Object> {
     scene.get(id).cloned()
 }
 
-// ---------------------------------------------------------------------------
-// create_object — a simple spec -> one InsertObject op.
-// ---------------------------------------------------------------------------
-
-/// The minimal create spec an agent supplies. The geometry is expressed at a
-/// human scale (logical px) and lowered to the object-local quantized path
-/// substrate here; named `style` presets reuse [`semantic_preset_style`].
+/// The minimal create spec an agent supplies, expressed at human scale (logical
+/// px) and lowered to the object-local quantized substrate.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateObjectSpec {
-    /// Caller-allocated object id (ids never come from rng in the pure layer).
+    /// Caller-allocated (ids never come from rng in the pure layer).
     pub id: ObjectId,
-    /// Fractional z-order key (caller-allocated). Sorts by plain `str` Ord.
+    /// Fractional z-order key; sorts by plain `str` Ord.
     pub order: String,
-    /// What to build: `rect` (a closed box) or `text` (a box with a label, or a
-    /// pure label when `width`/`height` are omitted). Connectors are authored by
-    /// `patch_object`/templates via anchors, not this spec.
+    /// `rect` or `text`. Connectors are authored via anchors, not this spec.
     pub shape: CreateShape,
-    /// World placement in logical px (the object's transform translation).
+    /// World placement in logical px (the transform translation).
     #[serde(default)]
     pub x: f64,
     #[serde(default)]
     pub y: f64,
-    /// Box width/height in logical px (rect, or text background box). Integer px
-    /// so geometry coords never come from an f64 narrowing (only the transform
-    /// carries f64).
+    /// Integer px so geometry coords never come from an f64 narrowing.
     #[serde(default)]
     pub width: Option<i32>,
     #[serde(default)]
     pub height: Option<i32>,
-    /// Inline text label.
     #[serde(default)]
     pub text: Option<String>,
-    /// A named semantic preset (`decision`, `risk`, `task`, ...). Bakes inline
-    /// fill/stroke/text color via [`semantic_preset_style`].
+    /// A named semantic preset (`decision`, `risk`, `task`, ...).
     #[serde(default)]
     pub style: Option<String>,
-    /// Tag ids to attach at creation.
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -219,8 +173,8 @@ pub enum CreateShape {
     Text,
 }
 
-/// Logical px (integer) -> object-local quantized units. Multiply on integers is
-/// exact (no f64 narrowing); geometry coords stay quantized i32 (D2).
+/// Logical px (integer) -> object-local quantized units. Integer multiply stays
+/// exact (no f64 narrowing); geometry coords stay quantized i32.
 const fn px(p: i32) -> i32 {
     p * GEOMETRY_QUANTUM_PER_PX
 }
@@ -241,12 +195,8 @@ fn rect_geometry(w_q: i32, h_q: i32) -> Geometry {
     )
 }
 
-/// Build the [`ObjectOp::InsertObject`] for a create spec. Pure: the geometry is
-/// quantized from the human-scale spec, named styles resolve through
-/// [`semantic_preset_style`], and the world placement becomes the transform.
-///
-/// Returns `Err` with a human message on an invalid spec (a `text`/`rect` box
-/// needs a positive size).
+/// Build the [`ObjectOp::InsertObject`] for a create spec. `Err` on an invalid
+/// spec (a `text`/`rect` box needs a positive size).
 pub fn create_object(spec: CreateObjectSpec) -> Result<ObjectOp, String> {
     let (fill, stroke, text_color) = match &spec.style {
         Some(preset) => semantic_preset_style(preset),
@@ -273,8 +223,7 @@ pub fn create_object(spec: CreateObjectSpec) -> Result<ObjectOp, String> {
                 .as_deref()
                 .filter(|t| !t.trim().is_empty())
                 .ok_or("text object requires a non-empty text")?;
-            // A text object still needs a geometry box to lay out / hit-test in;
-            // default to a label-sized box when no size is given.
+            // A text object still needs a geometry box to lay out / hit-test in.
             let w = spec.width.unwrap_or(200);
             let h = spec.height.unwrap_or(40);
             if w <= 0 || h <= 0 {
@@ -293,7 +242,6 @@ pub fn create_object(spec: CreateObjectSpec) -> Result<ObjectOp, String> {
     Ok(ObjectOp::InsertObject { object })
 }
 
-/// A single centered text run with an optional inline color at a default size.
 fn label(text: &str, color: Option<String>) -> Text {
     Text {
         runs: vec![TextRun {
@@ -309,39 +257,30 @@ fn label(text: &str, color: Option<String>) -> Text {
     }
 }
 
-// ---------------------------------------------------------------------------
-// patch_object — a JSON patch -> Vec<ObjectOp>.
-// ---------------------------------------------------------------------------
-
-/// A declarative patch over one object. Each present field becomes its own
-/// [`ObjectOp`] (so the patch is a small batch the caller applies through the
-/// one apply path). Absent fields are left untouched.
+/// A declarative patch: each present field becomes its own [`ObjectOp`]; absent
+/// fields are untouched.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchObjectSpec {
     pub id: ObjectId,
-    /// Replace the whole text (a single centered run). `Some("")` clears text.
+    /// `Some("")` clears text.
     #[serde(default)]
     pub text: Option<String>,
-    /// Apply a named semantic preset's inline fill+stroke.
     #[serde(default)]
     pub style: Option<String>,
-    /// Move the object to this world translation (logical px).
     #[serde(default)]
     pub x: Option<f64>,
     #[serde(default)]
     pub y: Option<f64>,
-    /// Resize the rect geometry to this box (logical px, integer). Replaces
-    /// geometry.
+    /// Integer logical px; replaces the rect geometry.
     #[serde(default)]
     pub width: Option<i32>,
     #[serde(default)]
     pub height: Option<i32>,
 }
 
-/// Lower a patch into ops, in a deterministic order: geometry, transform, style,
-/// text. Each op routes through the single apply path (P1) at the caller.
-/// Returns `Err` on an inconsistent patch (e.g. only one of width/height).
+/// Lower a patch into ops in deterministic order: geometry, transform, style,
+/// text. `Err` on an inconsistent patch (e.g. only one of width/height).
 pub fn patch_object(spec: PatchObjectSpec) -> Result<Vec<ObjectOp>, String> {
     let mut ops: Vec<ObjectOp> = Vec::new();
 
@@ -392,20 +331,13 @@ pub fn patch_object(spec: PatchObjectSpec) -> Result<Vec<ObjectOp>, String> {
     Ok(ops)
 }
 
-// ---------------------------------------------------------------------------
-// tag_object / add_comment / set_selection.
-// ---------------------------------------------------------------------------
-
-/// Replace an object's tag id set (the [`ObjectOp::SetTags`] form). Reading the
-/// current tags so the agent can pass an additive set is left to the caller; the
-/// op itself is a full replace per the model.
+/// Full replace of an object's tag id set ([`ObjectOp::SetTags`]).
 pub fn tag_object(id: &str, tags: Vec<String>) -> ObjectOp {
     ObjectOp::SetTags { id: id.to_string(), tags }
 }
 
-/// Append a comment to an object (the [`ObjectOp::AddComment`] form). The comment
-/// id/author are caller-supplied (no rng in the pure layer); `node_index` anchors
-/// it to a geometry node when present.
+/// Comment id/author are caller-supplied (no rng); `node_index` anchors it to a
+/// geometry node when present.
 pub fn add_comment(
     id: &str,
     comment_id: &str,
@@ -425,36 +357,28 @@ pub fn add_comment(
     }
 }
 
-/// Set the persisted scene selection. The selection is applied directly to the
-/// scene (it is not an [`ObjectOp`]; selection lives on [`ObjectScene`] itself).
+/// Selection lives on [`ObjectScene`] itself, not as an [`ObjectOp`].
 pub fn set_selection(scene: &mut ObjectScene, selection: ObjectSelection) {
     scene.selection = selection;
 }
 
-// ---------------------------------------------------------------------------
-// query — by tag, by connection, by region.
-// ---------------------------------------------------------------------------
-
-/// A query filter over the scene. Any combination of the three predicates is
-/// ANDed; an empty filter matches every object.
+/// The three predicates are ANDed; an empty filter matches every object.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryFilter {
     /// Match objects carrying every listed tag id.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Match objects that are connected (in the anchor connection graph) to this
-    /// object id — i.e. its neighbors per [`anchors::neighbors`].
+    /// Match anchor-graph neighbors of this object id (per [`anchors::neighbors`]).
     #[serde(default)]
     pub connected_to: Option<ObjectId>,
-    /// Match objects whose derived world bounds intersect this region (logical
-    /// px). Objects with degenerate/underivable bounds never match a region.
+    /// Match objects whose world bounds intersect this region (logical px);
+    /// underivable bounds never match.
     #[serde(default)]
     pub region: Option<Bounds>,
 }
 
-/// Return the ids of objects matching `filter`, in scene order. Tag, connection
-/// (via [`anchors::neighbors`]), and region predicates are ANDed.
+/// Matching ids in scene order; the predicates are ANDed.
 pub fn query(scene: &ObjectScene, filter: &QueryFilter) -> Vec<ObjectId> {
     let connected: Option<Vec<ObjectId>> = filter
         .connected_to
@@ -493,16 +417,9 @@ fn bounds_intersect(a: &Bounds, b: &Bounds) -> bool {
         && b.y <= a.y + a.height
 }
 
-// ---------------------------------------------------------------------------
-// export — the AI-readable re-representation (P6).
-// ---------------------------------------------------------------------------
-
-/// Produce a text digest of (a scope of) the scene: the AI-readable
-/// re-representation of the canvas (P6). `scope_ids` empty => the whole scene;
-/// otherwise only those objects (and the connection edges entirely within the
-/// scope) are rendered. Supported `export_type`s: `mermaid` (a flowchart of the
-/// connection graph) and `digest` (a plain-text node + edge listing). Unknown
-/// types fall back to `digest`.
+/// Text digest of (a scope of) the scene. Empty `scope_ids` => the whole scene;
+/// otherwise only those objects and the edges entirely within scope. `mermaid` is
+/// a flowchart, `digest` a node/edge listing; unknown types fall back to `digest`.
 pub fn export(scene: &ObjectScene, scope_ids: &[String], export_type: &str) -> String {
     let in_scope = |id: &str| scope_ids.is_empty() || scope_ids.iter().any(|s| s == id);
 
@@ -518,8 +435,7 @@ pub fn export(scene: &ObjectScene, scope_ids: &[String], export_type: &str) -> S
     }
 }
 
-/// The agent-facing display label for an object: its first non-empty text run,
-/// else the descriptive kind + id.
+/// First non-empty text run, else the descriptive kind + id.
 fn display_label(object: &Object) -> String {
     let text = object
         .text
@@ -531,8 +447,6 @@ fn display_label(object: &Object) -> String {
     }
 }
 
-/// A mermaid `flowchart LR` of the connection graph: one node per in-scope
-/// object, one edge per connection-graph pair.
 fn render_mermaid(nodes: &[&Object], edges: &[(ObjectId, ObjectId)]) -> String {
     let mut out = String::from("flowchart LR\n");
     for n in nodes {
@@ -548,8 +462,6 @@ fn render_mermaid(nodes: &[&Object], edges: &[(ObjectId, ObjectId)]) -> String {
     out
 }
 
-/// A plain-text digest: an `Objects:` listing then an `Edges:` listing. Used as
-/// the default export and the fallback for unknown types.
 fn render_digest(nodes: &[&Object], edges: &[(ObjectId, ObjectId)]) -> String {
     let mut out = String::new();
     out.push_str("Objects:\n");
@@ -567,7 +479,6 @@ fn render_digest(nodes: &[&Object], edges: &[(ObjectId, ObjectId)]) -> String {
     out
 }
 
-/// Sanitize an object id into a mermaid-safe node identifier.
 fn mermaid_id(id: &str) -> String {
     let mut out = String::new();
     for ch in id.chars() {
@@ -583,29 +494,21 @@ fn mermaid_id(id: &str) -> String {
     out
 }
 
-/// Escape a label for a mermaid quoted node (double-quotes only).
 fn escape_mermaid(s: &str) -> String {
     s.replace('"', "'")
 }
 
-// ---------------------------------------------------------------------------
-// Tool catalog.
-// ---------------------------------------------------------------------------
-
-/// Self-describing metadata for one object-MCP tool: the wire name, a one-line
-/// description, and a JSON-schema-ish input shape. The OB-4 cutover registers
-/// these mechanically; tests assert the toolset is complete.
+/// Self-describing metadata for one object-MCP tool.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolMeta {
     pub name: &'static str,
     pub description: &'static str,
-    /// A JSON object describing the input fields (a light schema, not a full
-    /// JSON-Schema document — the cutover lifts it into the rmcp tool schema).
+    /// A light input schema, not a full JSON-Schema document.
     pub schema: Value,
 }
 
-/// The full object-native MCP tool catalog. Order is the advertised order.
+/// The full tool catalog, in advertised order.
 pub fn object_mcp_tools() -> Vec<McpToolMeta> {
     vec![
         McpToolMeta {
@@ -738,22 +641,16 @@ pub fn object_mcp_tools() -> Vec<McpToolMeta> {
     ]
 }
 
-// ---------------------------------------------------------------------------
-// Tests — pure, no transport, no storage (a plain ObjectScene is enough).
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use shape_scene_core::object::{apply_object_op, Anchor, LocalPoint};
 
-    /// Apply an op to a scene through the single apply path (P1), panicking on
-    /// reject so a test failure is loud.
     fn apply(scene: &mut ObjectScene, op: ObjectOp) {
         apply_object_op(scene, op).expect("op applies");
     }
 
-    /// A connector object: open 2-node geometry anchored to two targets.
+    /// Open 2-node geometry anchored to two targets.
     fn connector(id: &str, order: &str, a: &str, b: &str) -> Object {
         let mut obj = Object::new(
             id,
@@ -793,7 +690,6 @@ mod tests {
         match &op {
             ObjectOp::InsertObject { object } => {
                 assert_eq!(object.id, "rect-1");
-                // The named style baked inline fill + stroke + a colored label.
                 assert!(object.fill.is_some());
                 assert!(object.stroke.is_some());
                 assert!(object.text.is_some());
@@ -809,7 +705,6 @@ mod tests {
         let summary = &list_objects(&scene)[0];
         assert_eq!(summary.id, "rect-1");
         assert_eq!(summary.tags, vec!["t-blue".to_string()]);
-        // The geometry is a 160x100 px box -> bounds reflect that at (100,50).
         let b = summary.bounds.expect("rect has bounds");
         assert!((b.x - 100.0).abs() < 1e-6);
         assert!((b.y - 50.0).abs() < 1e-6);
@@ -880,9 +775,8 @@ mod tests {
             })
             .unwrap(),
         );
-        // The text-object's geometry box is closed, so it reads as a shape; to be
-        // a pure "text" label it must have no closed contour. Verify the
-        // open-contour text path directly via kind_label.
+        // A pure "text" label needs no closed contour, so verify the open-contour
+        // path directly (the create_object box is closed and reads as a shape).
         let mut text_only = Object::new(
             "t",
             "a1",
@@ -916,7 +810,6 @@ mod tests {
         apply(&mut scene, tag_then_insert("a", "a0", &[]));
         apply(&mut scene, tag_then_insert("b", "a1", &[]));
         apply(&mut scene, ObjectOp::InsertObject { object: connector("edge", "a2", "a", "b") });
-        // a is connected to b through the connector.
         let ids = query(&scene, &QueryFilter { connected_to: Some("a".into()), ..Default::default() });
         assert_eq!(ids, vec!["b".to_string()]);
     }
@@ -1007,7 +900,6 @@ mod tests {
         assert!(mermaid.starts_with("flowchart LR"));
         assert!(mermaid.contains("src --> dst"));
         assert!(mermaid.contains("Source") && mermaid.contains("Dest"));
-        // Unknown export type falls back to the digest.
         assert_eq!(export(&scene, &[], "nope"), digest);
     }
 
@@ -1033,7 +925,6 @@ mod tests {
             height: Some(60),
         })
         .expect("valid patch");
-        // Deterministic order: geometry, transform, style, text.
         let kinds: Vec<&str> = ops.iter().map(|o| o.kind()).collect();
         assert_eq!(kinds, vec!["edit-geometry", "set-transform", "set-style", "set-text"]);
     }
@@ -1111,14 +1002,12 @@ mod tests {
         let before = sorted.len();
         sorted.dedup();
         assert_eq!(before, sorted.len(), "tool names are unique");
-        // Every tool advertises a non-empty description + an object schema.
         for t in &tools {
             assert!(!t.description.is_empty());
             assert_eq!(t.schema["type"], "object");
         }
     }
 
-    /// Build an insert-object op for an `id` rect carrying `tags`.
     fn tag_then_insert(id: &str, order: &str, tags: &[&str]) -> ObjectOp {
         create_object(CreateObjectSpec {
             id: id.into(),

@@ -1,40 +1,22 @@
-//! Object-native persistence + apply layer (OB4.2, store half).
+//! Object-native persistence + apply layer: maps an [`ObjectScene`] onto the
+//! store-neutral [`Record`] model so the spatial index can window large canvases.
 //!
-//! The legacy server checkpoints a whole [`Scene`](shape_scene_core::Scene) through
-//! [`scene_store`](crate::scene_store); this module is its object-native sibling,
-//! built **alongside** the legacy path during the OB-3/OB-4 parallel run. It maps
-//! an [`ObjectScene`] onto the store-neutral [`Record`] model the same way
-//! `scene_store` does: one `Record` per object plus one small canvas-meta record,
-//! so the spatial index can window large canvases by region.
-//!
-//! ## Record layout
-//!
-//! * Each [`Object`] is its own `Record`, id `"{canvasId}:object:{objId}"`,
-//!   kind [`KIND_OBJECT`]. Its payload is the object's JSON (path-string `d`, not
-//!   the parsed runtime mirror — see [`Object`]'s serde contract). Placement-bearing
-//!   objects also carry a [`RegionKey`] (world-space AABB) so region queries work.
+//! Record layout:
+//! * Each [`Object`] is one `Record`, id `"{canvasId}:object:{objId}"`, kind
+//!   [`KIND_OBJECT`]. Payload is the object's JSON (path-string `d`, not the
+//!   parsed mirror — see [`Object`]'s serde contract). Placement-bearing objects
+//!   carry a [`RegionKey`] (world-space AABB) for region queries.
 //! * One canvas-meta `Record`, id `"{canvasId}:canvas"`, kind [`KIND_CANVAS`],
-//!   holds the scene-level fields that belong to no single object
-//!   (`sceneVersion`, `selection`, `tags`, `updatedAt`).
+//!   holds scene-level fields (`sceneVersion`, `selection`, `tags`, `updatedAt`).
 //!
-//! ## Sync vs async storage
+//! Region indexing rides the storage core's [`SpatialStore`]. The store is built
+//! over the sync [`StorageAdapter`] (the only surface `MemoryAdapter` implements,
+//! so it stays testable) and over [`SpatialStore`] for indexed writes + queries.
 //!
-//! Region indexing rides the storage core's spatial capability. Two surfaces
-//! exist there: the **sync** [`SpatialStore`] (implemented by [`MemoryAdapter`]
-//! and `RedbAdapter`) and the **async** [`AsyncStorageAdapter`] (also implemented
-//! by `RedbAdapter`). `MemoryAdapter` does *not* implement `AsyncStorageAdapter`,
-//! so the testable store here is built generically over the **sync**
-//! [`StorageAdapter`] for the basic save/load path and over [`SpatialStore`] for
-//! indexed writes + region queries; the [`region_window_to_bbox`] helper and the
-//! [`RegionKey`] computation here are shared by both paths.
-//!
-//! ## Working set
-//!
-//! The store keeps a per-canvas in-memory [`ObjectScene`] + [`PropertyStore`] so an
-//! [`apply`](ObjectStore::apply) round-trip does not re-scan the backend on every
-//! op. [`load_scene`](ObjectStore::load_scene) rebuilds from the backend on a cold
-//! canvas (or after a fresh `ObjectStore` is constructed on the same adapter), then
-//! caches; the actor seam owns eviction, not this layer.
+//! The store caches a per-canvas in-memory [`ObjectScene`] + [`PropertyStore`] so
+//! an [`apply`](ObjectStore::apply) does not re-scan the backend per op;
+//! [`load_scene`](ObjectStore::load_scene) rebuilds on a cold canvas. The actor
+//! seam owns eviction, not this layer.
 
 use std::collections::HashMap;
 
@@ -45,18 +27,13 @@ use shape_scene_core::object::{
 use shape_scene_core::{CanvasId, PropertyStore};
 use shape_storage_core::{Record, RegionKey, RegionWindow, SpatialStore, StorageAdapter};
 
-/// Record `kind` for a per-object Record.
 pub const KIND_OBJECT: &str = "object";
-/// Record `kind` for the canvas-meta Record.
 pub const KIND_CANVAS: &str = "canvas";
 
-/// Errors the object store surfaces: an op that failed to apply against the
-/// scene, or a storage backend failure.
 #[derive(Debug)]
 pub enum ObjectStoreError {
-    /// The op could not be applied to the scene (pure-core rejection).
+    /// Pure-core rejection of the op.
     Apply(ApplyError),
-    /// The storage backend failed.
     Storage(shape_storage_core::StorageError),
 }
 
@@ -83,27 +60,20 @@ impl From<shape_storage_core::StorageError> for ObjectStoreError {
     }
 }
 
-/// The Record id for a per-object Record: `"{canvasId}:object:{objId}"`.
 pub fn object_record_id(canvas_id: &CanvasId, object_id: &str) -> String {
     format!("{canvas_id}:{KIND_OBJECT}:{object_id}")
 }
 
-/// The Record id for the canvas-meta Record: `"{canvasId}:canvas"`.
 pub fn canvas_record_id(canvas_id: &CanvasId) -> String {
     format!("{canvas_id}:{KIND_CANVAS}")
 }
 
-/// The id-prefix that scopes every Record belonging to `canvas_id`.
-///
 /// `list()` is global id-sorted, so a prefix scan enumerates exactly one canvas's
 /// object + canvas-meta records.
 pub fn canvas_record_prefix(canvas_id: &CanvasId) -> String {
     format!("{canvas_id}:")
 }
 
-/// The scene-level fields not attached to any single object, persisted as the
-/// canvas-meta Record payload so a reconstructed scene restores `sceneVersion`,
-/// `selection`, `tags`, and `updatedAt` exactly.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CanvasMeta {
@@ -113,27 +83,20 @@ struct CanvasMeta {
     updated_at: String,
 }
 
-/// Convert a [`RegionWindow`] (the async query surface's world AABB) into the
-/// sync [`SpatialStore::query_region`] bbox tuple. Shared so both storage paths
-/// window identically.
 pub fn region_window_to_bbox(window: RegionWindow) -> (f64, f64, f64, f64) {
     (window.min_x, window.min_y, window.max_x, window.max_y)
 }
 
-/// Compute an object's world-space AABB [`RegionKey`], or `None` when the object
-/// has no geometry to place (an empty path-string yields no extents).
+/// World-space AABB [`RegionKey`], or `None` when the object has no geometry.
 ///
-/// The bbox is approximate by design: it takes the parsed geometry node extents
-/// (object-local quantized i32, converted to logical px via
-/// [`GEOMETRY_QUANTUM_PER_PX`]), then maps the four local-bbox corners through the
-/// object's [`Transform3x3`] and hulls them. This captures translate/scale/rotate
-/// without flattening curves — bezier handles can bulge slightly outside, which is
-/// fine for a query *window* (over-inclusion only widens the candidate set, the
-/// exact refilter still runs in the spatial store).
+/// Approximate by design: hulls the four local-bbox corners mapped through the
+/// object's [`Transform3x3`] without flattening curves. Bezier handles can bulge
+/// slightly outside, which is fine for a query window — over-inclusion only widens
+/// the candidate set; the exact refilter runs in the spatial store.
 pub fn object_region_key(canvas_id: &CanvasId, object: &Object) -> Option<RegionKey> {
     let mut geometry = object.geometry.clone();
-    // Hydrate from the path-string if the parsed mirror is empty (the at-rest /
-    // wire form carries only `d`). A parse failure means no usable extents.
+    // Hydrate from the path-string `d` (the at-rest/wire form); a parse failure
+    // means no usable extents.
     if geometry.ensure_parsed().is_err() {
         return None;
     }
@@ -167,8 +130,8 @@ pub fn object_region_key(canvas_id: &CanvasId, object: &Object) -> Option<Region
     })
 }
 
-/// Object-local quantized i32 extents `(min_x, min_y, max_x, max_y)` over all
-/// parsed node positions, or `None` when there are no nodes.
+/// Object-local quantized i32 extents over all parsed node positions, or `None`
+/// when there are no nodes.
 fn local_extents(geometry: &Geometry) -> Option<(i32, i32, i32, i32)> {
     let mut seen = false;
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
@@ -184,8 +147,7 @@ fn local_extents(geometry: &Geometry) -> Option<(i32, i32, i32, i32)> {
     seen.then_some((min_x, min_y, max_x, max_y))
 }
 
-/// Encode an [`Object`] into its `Record` + optional [`RegionKey`]. `version` is
-/// stamped on the Record (the actor passes the server seq at write time).
+/// `version` is stamped on the Record (the actor passes the server seq).
 fn object_to_record(canvas_id: &CanvasId, object: &Object, version: u64) -> (Record, Option<RegionKey>) {
     let record = Record {
         id: object_record_id(canvas_id, &object.id),
@@ -196,7 +158,6 @@ fn object_to_record(canvas_id: &CanvasId, object: &Object, version: u64) -> (Rec
     (record, object_region_key(canvas_id, object))
 }
 
-/// Encode the scene-level meta into the canvas-meta `Record`.
 fn meta_to_record(canvas_id: &CanvasId, scene: &ObjectScene, version: u64) -> Record {
     let meta = CanvasMeta {
         scene_version: scene.scene_version,
@@ -212,8 +173,7 @@ fn meta_to_record(canvas_id: &CanvasId, scene: &ObjectScene, version: u64) -> Re
     }
 }
 
-/// Decode a Record's payload into `T`, mapping a malformed payload to a storage
-/// error (a persisted object that fails to decode is a backend corruption).
+/// Maps a malformed payload to a storage error (decode failure = backend corruption).
 fn decode<T: for<'de> serde::Deserialize<'de>>(
     record: &Record,
 ) -> Result<T, shape_storage_core::StorageError> {
@@ -221,12 +181,9 @@ fn decode<T: for<'de> serde::Deserialize<'de>>(
         .map_err(|e| shape_storage_core::StorageError::Serde(format!("record {}: {e}", record.id)))
 }
 
-/// Object-native persistence + apply layer over a storage backend.
-///
-/// Generic over the **sync** [`StorageAdapter`]; the indexed-write and
-/// region-query methods add a [`SpatialStore`] bound so they compile only for
-/// backends that maintain a region index ([`MemoryAdapter`], `RedbAdapter`), reusing
-/// [`object_region_key`] and [`region_window_to_bbox`].
+/// Generic over the sync [`StorageAdapter`]; indexed-write and region-query
+/// methods add a [`SpatialStore`] bound so they compile only for backends that
+/// maintain a region index.
 pub struct ObjectStore<A: StorageAdapter> {
     adapter: A,
     /// Per-canvas working set: the hydrated scene plus its LWW property gate.
@@ -234,29 +191,21 @@ pub struct ObjectStore<A: StorageAdapter> {
 }
 
 impl<A: StorageAdapter> ObjectStore<A> {
-    /// Wrap a storage backend in a fresh, empty working set.
     pub fn new(adapter: A) -> Self {
         ObjectStore { adapter, working: HashMap::new() }
     }
 
-    /// Borrow the underlying adapter.
     pub fn adapter(&self) -> &A {
         &self.adapter
     }
 
-    /// Consume the store, returning the adapter.
     pub fn into_adapter(self) -> A {
         self.adapter
     }
 
-    /// Rebuild an [`ObjectScene`] for `canvas_id` from its persisted records.
-    ///
-    /// Prefix-scans the backend, decodes every `object`/`canvas` Record, and
-    /// orders objects by id for a canonical result (storage addresses by id and
-    /// yields them id-sorted; the scene's `objects` is a `Vec`). When no
-    /// canvas-meta Record exists (a brand-new canvas) scene-level defaults are
-    /// used. The rebuilt scene is *not* cached here — callers that want the cached
-    /// working-set scene use [`ObjectStore::scene`].
+    /// Rebuild an [`ObjectScene`] from persisted records, objects id-sorted for a
+    /// canonical result. No canvas-meta Record means scene-level defaults. The
+    /// result is not cached — use [`ObjectStore::scene`] for the working-set scene.
     pub fn load_scene(&self, canvas_id: &CanvasId) -> Result<ObjectScene, ObjectStoreError> {
         let prefix = canvas_record_prefix(canvas_id);
         let canvas_rec_id = canvas_record_id(canvas_id);
@@ -272,7 +221,6 @@ impl<A: StorageAdapter> ObjectStore<A> {
             match record.kind.as_str() {
                 KIND_OBJECT => {
                     let mut object: Object = decode(&record)?;
-                    // Hydrate the parsed geometry so the scene is apply-ready.
                     let _ = object.ensure_parsed();
                     objects.push(object);
                 }
@@ -299,14 +247,12 @@ impl<A: StorageAdapter> ObjectStore<A> {
         })
     }
 
-    /// Borrow the cached working-set scene for `canvas_id`, loading + caching it
-    /// from the backend on a cold canvas.
+    /// The cached working-set scene, loading + caching it on a cold canvas.
     pub fn scene(&mut self, canvas_id: &CanvasId) -> Result<&ObjectScene, ObjectStoreError> {
         self.ensure_loaded(canvas_id)?;
         Ok(&self.working.get(&canvas_id.0).expect("just loaded").0)
     }
 
-    /// Ensure `canvas_id`'s scene is hydrated into the working set.
     fn ensure_loaded(&mut self, canvas_id: &CanvasId) -> Result<(), ObjectStoreError> {
         if !self.working.contains_key(&canvas_id.0) {
             let scene = self.load_scene(canvas_id)?;
@@ -317,8 +263,7 @@ impl<A: StorageAdapter> ObjectStore<A> {
 }
 
 impl<A: StorageAdapter + SpatialStore> ObjectStore<A> {
-    /// Persist one object: write its `Record` + region row via the spatial store.
-    /// `version` is stamped on the Record (the actor passes the server seq).
+    /// Write the object's `Record` + region row via the spatial store.
     pub fn save_object(
         &mut self,
         canvas_id: &CanvasId,
@@ -330,8 +275,7 @@ impl<A: StorageAdapter + SpatialStore> ObjectStore<A> {
         Ok(())
     }
 
-    /// Persist the canvas-meta Record (scene-level fields). The meta carries no
-    /// region key.
+    /// The canvas-meta Record carries no region key.
     pub fn save_meta(
         &mut self,
         canvas_id: &CanvasId,
@@ -343,15 +287,10 @@ impl<A: StorageAdapter + SpatialStore> ObjectStore<A> {
         Ok(())
     }
 
-    /// Apply `op` to `canvas_id`'s scene under server-authoritative per-property
-    /// LWW at arrival sequence `seq`, persisting the touched objects, and return
-    /// the inverse op for undo.
-    ///
-    /// The scene is loaded into (or read from) the working set, mutated through
-    /// the pure-core [`apply_object_op_lww`], then the objects the op named are
-    /// re-persisted (or deleted, when the op removed them). A stale op — one whose
-    /// `seq` lost the LWW race — applies as a no-op `Batch` and persists nothing.
-    /// The canvas-meta Record is refreshed on every winning op so `sceneVersion`
+    /// Apply `op` under server-authoritative per-property LWW at sequence `seq`,
+    /// persisting the touched objects, and return the inverse for undo. A stale op
+    /// (its `seq` lost the LWW race) applies as a no-op `Batch` and persists
+    /// nothing; the canvas-meta is refreshed on every winning op so `sceneVersion`
     /// stays in step.
     pub fn apply(
         &mut self,
@@ -365,21 +304,21 @@ impl<A: StorageAdapter + SpatialStore> ObjectStore<A> {
         let (scene, store) = self.working.get_mut(&canvas_id.0).expect("just loaded");
         let inverse = apply_object_op_lww(scene, store, op, seq)?;
 
-        // A stale op loses the LWW race: the scene is untouched and the inverse is
-        // an empty `Batch`. Persist nothing (the backend already holds the winner).
+        // Stale op: scene untouched, inverse is an empty `Batch`, backend already
+        // holds the winner — persist nothing.
         if inverse == (ObjectOp::Batch { ops: Vec::new() }) {
             return Ok(inverse);
         }
 
-        // Snapshot what we need before dropping the &mut borrow on `working`.
+        // Snapshot before dropping the &mut borrow on `working`.
         let persist: Vec<(String, Option<Object>)> = touched
             .into_iter()
             .map(|id| (id.clone(), scene.get(&id).cloned()))
             .collect();
         let scene_for_meta = scene.clone();
 
-        // Persist each touched object: present -> upsert its Record + region row,
-        // absent (a Delete) -> remove the Record (which drops its region row too).
+        // Present -> upsert Record + region row; absent (a Delete) -> remove the
+        // Record (and its region row).
         for (id, object) in persist {
             match object {
                 Some(object) => self.save_object(canvas_id, &object, seq)?,
@@ -388,18 +327,14 @@ impl<A: StorageAdapter + SpatialStore> ObjectStore<A> {
                 }
             }
         }
-        // Refresh the canvas-meta so a reload sees the new sceneVersion.
         self.save_meta(canvas_id, &scene_for_meta, seq)?;
 
         Ok(inverse)
     }
 
-    /// Windowed read: the objects of `canvas_id` whose bbox overlaps `window`
-    /// (`None` = whole canvas), id-sorted.
-    ///
-    /// Reads straight from the spatial backend (not the working set) so it sees
-    /// exactly what is persisted — the spatial store does the Morton/bbox refilter,
-    /// this layer only decodes the matched `object` Records.
+    /// Objects whose bbox overlaps `window` (`None` = whole canvas), id-sorted.
+    /// Reads straight from the spatial backend (not the working set), which does
+    /// the Morton/bbox refilter.
     pub fn query_region(
         &self,
         canvas_id: &CanvasId,
@@ -425,7 +360,7 @@ mod tests {
     use shape_scene_core::object::{FillRule, PathNode, SubPath, Transform3x3};
     use shape_storage_core::MemoryAdapter;
 
-    /// A closed unit rect at object-local (0,0)-(80,40) in quantized units.
+    /// A closed rect at object-local (0,0)-(80,40) in quantized units.
     fn rect_geometry() -> Geometry {
         Geometry::from_subpaths(
             vec![SubPath {
@@ -474,10 +409,8 @@ mod tests {
         let inverse = store
             .apply(&canvas, ObjectOp::InsertObject { object: rect_object("r1") }, 1)
             .expect("insert applies");
-        // Inverse of an insert is a delete of the same id.
         assert_eq!(inverse, ObjectOp::Delete { id: "r1".into() });
 
-        // load_scene reads back from the backend and shows the inserted object.
         let scene = store.load_scene(&canvas).expect("load");
         assert_eq!(scene.objects.len(), 1);
         assert_eq!(scene.objects[0].id, "r1");
@@ -499,11 +432,9 @@ mod tests {
             )
             .expect("set-transform");
 
-        // The persisted Record reflects the moved transform.
         let scene = store.load_scene(&canvas).expect("load");
         assert_eq!(scene.objects[0].transform, Transform3x3::translate(10.0, 20.0));
 
-        // And the persisted region row tracks the new world position.
         let rec = store
             .adapter()
             .load(&object_record_id(&canvas, "r1"))
@@ -527,7 +458,6 @@ mod tests {
             )
             .expect("move");
 
-        // Tear down the working set: reconstruct an ObjectStore on the same backend.
         let adapter = store.into_adapter();
         let reopened = ObjectStore::new(adapter);
         let scene = reopened.load_scene(&canvas).expect("reload");
@@ -551,7 +481,6 @@ mod tests {
 
         let scene = store.load_scene(&canvas).expect("load");
         assert!(scene.objects.is_empty(), "deleted object is gone from the scene");
-        // Its Record is removed too (and with it, the spatial index row).
         assert!(store.adapter().load(&object_record_id(&canvas, "r1")).is_err());
     }
 
@@ -570,12 +499,10 @@ mod tests {
             .apply(&canvas, ObjectOp::InsertObject { object: far }, 2)
             .expect("insert far");
 
-        // Whole-canvas window returns both, id-sorted.
         let all = store.query_region(&canvas, None).expect("query all");
         let ids: Vec<&str> = all.iter().map(|o| o.id.as_str()).collect();
         assert_eq!(ids, vec!["r-far", "r-near"]);
 
-        // A window around the origin returns only r-near.
         let near = store
             .query_region(
                 &canvas,
@@ -601,7 +528,7 @@ mod tests {
             )
             .expect("winning move");
 
-        // A transform at an older seq loses the LWW race -> no-op Batch, no change.
+        // A transform at an older seq loses the LWW race -> no-op Batch.
         let inverse = store
             .apply(
                 &canvas,

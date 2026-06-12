@@ -1,27 +1,10 @@
-//! Canvas / document concept (PC9).
-//!
-//! A **canvas** is the unit of document, sync, actor, lease, and routing in
-//! shape.ai. It owns exactly one [`Scene`](crate::model::Scene) at runtime.
-//!
-//! Per the PC9 design decision, the in-memory `Scene` stays byte-identical to
-//! the legacy TS `schema.ts` model and deliberately does **not** carry a
-//! `canvasId` on each object. The canvas is a document/storage dimension, not a
-//! per-object property, so it is modeled here at the wrapper level. Storage keys
-//! its `Record`s by `canvasId`; an operation envelope's actor/lease/routing all
-//! resolve against the owning canvas rather than against any field inside the
-//! scene graph.
-//!
-//! Region queries (PC10) follow the same separation: they key on
-//! `(canvasId, bbox)` at the storage layer, again never on `Scene` objects. This
-//! keeps the scene model portable and golden-verifiable against the TS source
-//! while letting the document/storage layer scale on the canvas dimension.
+//! The canvas is the unit of document, sync, actor, lease, and routing. It owns
+//! one scene; `canvasId` is a document/storage dimension keyed at the wrapper
+//! level, never a per-object property.
 
 use serde::{Deserialize, Serialize};
 
-/// Opaque identifier for a [`Canvas`].
-///
-/// Serializes transparently as a bare JSON string so wire/storage payloads see
-/// `"my-canvas"`, not `{ "0": "my-canvas" }`.
+/// Serializes transparently as a bare JSON string (`"my-canvas"`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CanvasId(pub String);
@@ -44,8 +27,6 @@ impl From<String> for CanvasId {
     }
 }
 
-/// A document wrapper that owns exactly one [`Scene`](crate::model::Scene) at
-/// runtime. The scene itself is stored separately and keyed by [`CanvasId`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Canvas {
@@ -55,7 +36,6 @@ pub struct Canvas {
     pub updated_at: String,
 }
 
-/// Lightweight projection of a [`Canvas`] for list views.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CanvasSummary {
@@ -64,9 +44,7 @@ pub struct CanvasSummary {
     pub updated_at: String,
 }
 
-/// Create a new canvas. `now` is the injected clock value (RFC3339 timestamp
-/// string) used for both `created_at` and `updated_at`, keeping this function
-/// free of ambient time per scene-core's purity invariant.
+/// `now` is the injected clock value (RFC3339 string) for both timestamps.
 pub fn new_canvas(id: &str, title: &str, now: &str) -> Canvas {
     Canvas {
         id: CanvasId::from(id),
@@ -113,7 +91,6 @@ mod tests {
         let c = new_canvas("c-1", "My Canvas", "2026-06-07T12:00:00Z");
         let json = serde_json::to_string(&c).unwrap();
 
-        // camelCase keys; canvasId nested as a bare string.
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["id"], serde_json::json!("c-1"));
         assert_eq!(value["title"], serde_json::json!("My Canvas"));

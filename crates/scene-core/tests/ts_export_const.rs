@@ -1,13 +1,7 @@
-//! Dev-only TS generation companion to the ts-rs `#[ts(export)]` tests.
-//!
-//! ts-rs derives the wire *types* into `object-wire.ts`, but it has no notion of
-//! a `const`. The TS facade still needs `GEOMETRY_QUANTUM_PER_PX` to be sourced
-//! from the crate rather than hand-copied, so this gated test writes it next to
-//! the generated types into a single `geometry-const.ts`. It honours the same
-//! `TS_RS_EXPORT_DIR` env var ts-rs uses (default `bindings/`), so
-//! `npm run types:gen` lands both files in `platforms/web/shared/generated/`.
-//!
-//! Gated on `ts-gen` so it never runs in the default test gate (no IO there).
+//! Writes `GEOMETRY_QUANTUM_PER_PX` into `geometry-const.ts` alongside the
+//! ts-rs-derived wire types (ts-rs has no notion of a `const`). Honours the same
+//! `TS_RS_EXPORT_DIR` env var ts-rs uses (default `bindings/`). Gated on `ts-gen`
+//! so it never runs in the default test gate (no IO there).
 
 #![cfg(feature = "ts-gen")]
 

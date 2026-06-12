@@ -1,8 +1,3 @@
-// W2-07 — shape drag-create: the pure shell pieces that size a primitive to a drag
-// bbox, classify which primitives drag-create, and decide whether a create phase
-// runs the outline snap (the "modifier nullifies snap" rule). Framework-neutral so
-// they pin without a renderer or a Svelte mount (the engine/App only wire them).
-
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   type DragSpan,
@@ -16,9 +11,7 @@ import { GEOMETRY_QUANTUM_PER_PX } from "../platforms/web/shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 
-// Contract test over the REAL scene-core wasm builder (Tier-3): the drag-create
-// geometry/transform the core authors is what the committed object carries.
-describe("sceneCore.buildPrimitiveFromDrag (W2-07 bbox sizing)", () => {
+describe("sceneCore.buildPrimitiveFromDrag (bbox sizing)", () => {
   let core: SceneCore;
   beforeAll(async () => {
     await ensureSceneCore();
@@ -28,7 +21,7 @@ describe("sceneCore.buildPrimitiveFromDrag (W2-07 bbox sizing)", () => {
   it("sizes a rectangle to the normalized drag bbox and positions it at the top-left", () => {
     const span: DragSpan = { start: { x: 100, y: 200 }, end: { x: 260, y: 300 } };
     const object = core.buildPrimitiveFromDrag("rectangle", span, "rect-1", "a0");
-    // The pure-translation transform sits at the bbox top-left (D7).
+    // Pure-translation transform at the bbox top-left.
     expect(object.transform).toEqual([
       [1, 0, 100],
       [0, 1, 200],
@@ -54,7 +47,6 @@ describe("sceneCore.buildPrimitiveFromDrag (W2-07 bbox sizing)", () => {
       [0, 1, 60],
       [0, 0, 1]
     ]);
-    // Object-local from (0,0) to the end delta (100, 50).
     expect((object.geometry.d ?? "")).toBe(`M 0 0 L ${100 * Q} ${50 * Q}`);
   });
 
@@ -68,7 +60,7 @@ describe("sceneCore.buildPrimitiveFromDrag (W2-07 bbox sizing)", () => {
   });
 });
 
-describe("isDragCreateShape (W2-07 tool routing)", () => {
+describe("isDragCreateShape (tool routing)", () => {
   it("rect/ellipse/line drag-create", () => {
     expect(isDragCreateShape("rectangle")).toBe(true);
     expect(isDragCreateShape("ellipse")).toBe(true);
@@ -81,7 +73,7 @@ describe("isDragCreateShape (W2-07 tool routing)", () => {
   });
 });
 
-describe("shouldQuerySnap (W2-07 modifier nullifies snap)", () => {
+describe("shouldQuerySnap (modifier nullifies snap)", () => {
   it("snaps on a normal drag move/start/end", () => {
     expect(shouldQuerySnap({ altHeld: false, phase: "start" })).toBe(true);
     expect(shouldQuerySnap({ altHeld: false, phase: "move" })).toBe(true);
@@ -99,7 +91,7 @@ describe("shouldQuerySnap (W2-07 modifier nullifies snap)", () => {
   });
 });
 
-describe("resolveCreateRelease (AP5/#4 anchor-on-release reuse)", () => {
+describe("resolveCreateRelease (anchor-on-release reuse)", () => {
   const lastSnap: CreateSnap = { at: { x: 200, y: 30 }, target: "rect-a" };
 
   it("honors the release-time snap when it hit (no reuse needed)", () => {
@@ -112,9 +104,8 @@ describe("resolveCreateRelease (AP5/#4 anchor-on-release reuse)", () => {
   });
 
   it("reuses the gesture's last snap when the release MISSED but landed within tolerance", () => {
-    // Release at (205,33) missed the 8px snap but is ~6.4 world units from the last
-    // snap (200,30) — inside tolerance 24 — so the anchor is still authored and the
-    // endpoint is pulled onto the edge point.
+    // Release missed the 8px snap but is ~6.4 world units from the last snap, inside
+    // tolerance 24, so the endpoint is pulled onto the edge point.
     const r = resolveCreateRelease(
       { end: { x: 205, y: 33 }, snapped: false, target: null },
       lastSnap,

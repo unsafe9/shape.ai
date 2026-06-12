@@ -1,9 +1,6 @@
-//! OB4.1 WebSocket transport integration tests (object-native).
-//!
-//! These bind the full router (`build_router_with_mcp`) on an ephemeral port and
-//! drive it with a real WebSocket client (`tokio-tungstenite`) over the loopback
-//! socket. Each test gets its own in-memory registry, so canvases never leak
-//! state between tests.
+//! WebSocket transport integration tests: bind the full router on an ephemeral
+//! port and drive it with a real `tokio-tungstenite` client. Each test gets its
+//! own in-memory registry so canvases never leak state.
 
 use std::net::SocketAddr;
 
@@ -22,7 +19,6 @@ fn test_config() -> Config {
     }
 }
 
-/// Bind the full router on an ephemeral port and serve it on a background task.
 async fn spawn_server() -> SocketAddr {
     let canvases = CanvasRegistry::open_in_memory().unwrap();
     let router = build_router_with_mcp(&test_config(), canvases);
@@ -58,7 +54,6 @@ async fn recv_json(ws: &mut WsStream) -> Value {
     }
 }
 
-/// Receive frames until one of the given `type` is seen.
 async fn recv_json_of(ws: &mut WsStream, ty: &str) -> Value {
     loop {
         let v = recv_json(ws).await;
@@ -68,7 +63,6 @@ async fn recv_json_of(ws: &mut WsStream, ty: &str) -> Value {
     }
 }
 
-/// The object-op delta for an insert-object of a closed rect at world (x, y).
 /// `Transform3x3` is `#[serde(transparent)]`, so the wire transform is a bare 3x3
 /// array, not `{ "m": [...] }`.
 fn insert_delta(id: &str, order: &str, x: f64, y: f64) -> Value {
@@ -83,7 +77,6 @@ fn insert_delta(id: &str, order: &str, x: f64, y: f64) -> Value {
     })
 }
 
-/// The object-op delta for a set-transform moving `id` to world (x, y).
 fn move_delta(id: &str, x: f64, y: f64) -> Value {
     json!({
         "kind": "set-transform",
@@ -92,7 +85,6 @@ fn move_delta(id: &str, x: f64, y: f64) -> Value {
     })
 }
 
-/// A region/window message body: a `region` with a `canvasId` + optional `bbox`.
 fn region(canvas_id: &str, bbox: Option<(f64, f64, f64, f64)>) -> Value {
     match bbox {
         None => json!({ "canvasId": canvas_id }),
@@ -103,7 +95,6 @@ fn region(canvas_id: &str, bbox: Option<(f64, f64, f64, f64)>) -> Value {
     }
 }
 
-/// Wrap an object-op delta in a WireOp with the given opId coordinates.
 fn wire_op(client_id: &str, local_seq: i64, base_revision: i64, object_id: &str, kind: &str, delta: Value) -> Value {
     json!({
         "opId": { "clientId": client_id, "localSeq": local_seq },
@@ -188,7 +179,6 @@ async fn rejected_ops_yield_rejected_message() {
     send_json(&mut ws, json!({ "type": "hello", "canvasId": "c-reject", "lastAckSeq": 0 })).await;
     assert_eq!(recv_json(&mut ws).await["type"], "welcome");
 
-    // set-transform against a missing object is rejected by scene-core.
     send_json(
         &mut ws,
         json!({ "type": "ops", "ops": [wire_op("user-1", 1, 0, "missing", "set-transform", move_delta("missing", 1.0, 1.0))] }),
@@ -275,10 +265,6 @@ async fn non_hello_first_message_errors() {
     assert_eq!(reply["type"], "error", "got {reply}");
 }
 
-// ---------------------------------------------------------------------------
-// Feature channel over the wire: comment upsert lowers to an op + replies.
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn feature_comment_upsert_round_trips_over_ws() {
     let addr = spawn_server().await;
@@ -287,7 +273,6 @@ async fn feature_comment_upsert_round_trips_over_ws() {
     send_json(&mut ws, json!({ "type": "hello", "canvasId": "c-feature", "lastAckSeq": 0 })).await;
     assert_eq!(recv_json(&mut ws).await["type"], "welcome");
 
-    // Seed an object to comment on.
     send_json(
         &mut ws,
         json!({ "type": "ops", "ops": [wire_op("u", 1, 0, "o1", "insert-object", insert_delta("o1", "a0", 0.0, 0.0))] }),
@@ -295,9 +280,8 @@ async fn feature_comment_upsert_round_trips_over_ws() {
     .await;
     assert_eq!(recv_json_of(&mut ws, "ack").await["seq"], json!(1));
 
-    // Feature request: upsert a comment on o1. The scene-core `FeatureRequest`
-    // serde tags variants on `feature` (camelCase) but leaves the variant fields
-    // snake_case, so the wire uses `canvas_id` / `object_id`.
+    // `FeatureRequest` serde tags variants on `feature` (camelCase) but leaves the
+    // variant fields snake_case, so the wire uses `canvas_id` / `object_id`.
     send_json(
         &mut ws,
         json!({
@@ -316,16 +300,11 @@ async fn feature_comment_upsert_round_trips_over_ws() {
     assert_eq!(resp["response"]["object_id"], json!("o1"));
     assert_eq!(resp["response"]["comment_id"], json!("c-1"));
 
-    // The comment is durable: resume snapshot shows it on the object.
     send_json(&mut ws, json!({ "type": "resume", "canvasId": "c-feature", "lastAckSeq": 0 })).await;
     let welcome = recv_json_of(&mut ws, "welcome").await;
     let obj = &welcome["scene"]["objects"][0];
     assert_eq!(obj["comments"].as_array().unwrap().len(), 1, "comment persisted");
 }
-
-// ---------------------------------------------------------------------------
-// Region-scoped subscription / data-layer windowing over the wire.
-// ---------------------------------------------------------------------------
 
 use std::time::Duration;
 
@@ -350,11 +329,6 @@ async fn try_recv_json_of(ws: &mut WsStream, ty: &str, ms: u64) -> Option<Value>
     }
 }
 
-/// Region-windowed clients: seed two far-apart clusters, then verify (1) a
-/// region-A subscriber's welcome contains only A's objects, (2) an op applied in
-/// region B is delivered to a region-B subscriber but NOT to the region-A
-/// subscriber, (3) re-subscribing the A client to region B delivers B's snapshot,
-/// and (4) a whole-canvas (None) subscriber sees everything.
 #[tokio::test]
 async fn region_windowing_filters_welcome_and_fanout() {
     let addr = spawn_server().await;
@@ -382,7 +356,6 @@ async fn region_windowing_filters_welcome_and_fanout() {
     let win_a = Some((-50.0, -50.0, 600.0, 500.0));
     let win_b = Some((99_900.0, 99_900.0, 700.0, 600.0));
 
-    // (1) Region-A subscriber: welcome holds only A's objects.
     let mut a = connect(addr).await;
     send_json(
         &mut a,
@@ -400,7 +373,6 @@ async fn region_windowing_filters_welcome_and_fanout() {
     a_ids_sorted.sort();
     assert_eq!(a_ids_sorted, vec!["oA1", "oA2"], "region-A welcome has A's objects");
 
-    // Region-B subscriber: welcome holds only B's object.
     let mut b = connect(addr).await;
     send_json(
         &mut b,
@@ -410,7 +382,6 @@ async fn region_windowing_filters_welcome_and_fanout() {
     let welcome_b = recv_json_of(&mut b, "welcome").await;
     assert_eq!(welcome_b["scene"]["objects"][0]["id"], json!("oB1"), "region-B welcome is oB1");
 
-    // (2) Seeder applies an op in region B.
     send_json(
         &mut seed,
         json!({ "type": "ops", "ops": [wire_op("seed", 4, 3, "oB2", "insert-object", insert_delta("oB2", "a3", 100_200.0, 100_010.0))] }),
@@ -428,7 +399,6 @@ async fn region_windowing_filters_welcome_and_fanout() {
         "region-A subscriber does not receive the region-B op"
     );
 
-    // (3) Re-subscribe the A client to region B: it gets a region-B snapshot now.
     send_json(
         &mut a,
         json!({ "type": "subscribe", "canvasId": canvas, "region": region(canvas, win_b) }),
@@ -444,7 +414,6 @@ async fn region_windowing_filters_welcome_and_fanout() {
     ids.sort();
     assert_eq!(ids, vec!["oB1", "oB2"], "after re-subscribe, A's snapshot has B's objects");
 
-    // (4) Whole-canvas (None bbox) subscriber sees everything.
     let mut all = connect(addr).await;
     send_json(
         &mut all,
@@ -454,11 +423,6 @@ async fn region_windowing_filters_welcome_and_fanout() {
     let welcome_all = recv_json_of(&mut all, "welcome").await;
     assert_eq!(welcome_all["scene"]["objects"].as_array().unwrap().len(), 4, "None sees all four objects");
 }
-
-// ---------------------------------------------------------------------------
-// Author self-skip — the originator is not echoed its own applied op; other
-// connections still receive it.
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn author_does_not_receive_own_op_but_peer_does() {

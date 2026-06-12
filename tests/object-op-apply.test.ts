@@ -1,11 +1,3 @@
-// OB4.3 / OB4.4 — object op-apply driven through the real scene-core wasm core.
-//
-// This is the Rust-first object path proof: vitest loads the SAME wasm the
-// object-native server runs (`apply_object_op`) and asserts the object op union,
-// inverse-op capture (D21), the derived-region contract (OB1.3), the object
-// command catalog (OB3.S9), and template lowering (build_object_template). There
-// is NO TS op-apply here — all domain logic lives in the wasm core (P1).
-
 import { beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -30,7 +22,7 @@ beforeAll(async () => {
   core = await loadSceneCore();
 });
 
-/** A closed unit rect at object-local (0,0)-(80,40), quantized integer coords. */
+// Closed unit rect at object-local (0,0)-(80,40), quantized integer coords.
 function rect(id: string, order = "a0"): SceneObject {
   return {
     id,
@@ -50,11 +42,10 @@ describe("object op-apply (scene-core wasm)", () => {
     const result = core.applyObjectOp(scene, insert(rect("rect-1")));
     expect(result.errors).toEqual([]);
     expect(result.scene.objects.map((o) => o.id)).toEqual(["rect-1"]);
-    // Inverse of an insert is a delete of the same id (D21).
     expect(result.inverse).toEqual({ kind: "delete", id: "rect-1" });
   });
 
-  it("moves via set-transform with zero geometry rebake (P4) and an inverse", () => {
+  it("moves via set-transform with zero geometry rebake and an inverse", () => {
     const inserted = core.applyObjectOp(emptyObjectScene(), insert(rect("rect-1")));
     const geomBefore = inserted.scene.objects[0].geometry;
 
@@ -79,7 +70,7 @@ describe("object op-apply (scene-core wasm)", () => {
     });
   });
 
-  it("undoes by authoring the inverse op through the same path (D21)", () => {
+  it("undoes by authoring the inverse op through the same path", () => {
     const base = core.applyObjectOp(emptyObjectScene(), insert(rect("r"))).scene;
     const move: ObjectOp = { kind: "set-transform", id: "r", transform: translateTransform(5, 5) };
     const after = core.applyObjectOp(base, move);
@@ -90,8 +81,8 @@ describe("object op-apply (scene-core wasm)", () => {
 
   it("rejects a domain-invalid op without mutating the scene", () => {
     const scene = emptyObjectScene();
-    // set-transform on an absent object is a domain failure: scene unchanged,
-    // inverse null, message in errors (NOT thrown across the FFI boundary).
+    // Domain failure: scene unchanged, inverse null, message in errors (NOT thrown
+    // across the FFI boundary).
     const result = core.applyObjectOp(scene, {
       kind: "set-transform",
       id: "ghost",
@@ -120,7 +111,7 @@ describe("object op-apply (scene-core wasm)", () => {
   });
 });
 
-describe("derived region contract (OB1.3)", () => {
+describe("derived region contract", () => {
   it("derives a closed-rect region from geometry", () => {
     const region = core.deriveRegion(
       { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z", fillRule: "evenOdd" },
@@ -131,7 +122,7 @@ describe("derived region contract (OB1.3)", () => {
   });
 });
 
-describe("object command catalog (OB3.S9)", () => {
+describe("object command catalog", () => {
   it("returns a non-empty catalog with id/label/category rows", () => {
     const catalog = core.objectCommandCatalog();
     expect(catalog.length).toBeGreaterThan(0);
@@ -143,10 +134,9 @@ describe("object command catalog (OB3.S9)", () => {
   });
 });
 
-describe("undo stack (createUndoStack, FC-15)", () => {
-  // Drive the core's UndoStack the way the shell does: author -> record, then
-  // undo/redo by re-authoring the handed-out op through the SAME op-apply path
-  // and reporting the resulting inverse back (D21).
+describe("undo stack (createUndoStack)", () => {
+  // Drive the UndoStack the way the shell does: author -> record, then undo/redo by
+  // re-authoring the handed-out op through op-apply and reporting the inverse back.
   function authorAndRecord(
     stack: ReturnType<SceneCore["createUndoStack"]>,
     scene: ObjectScene,
@@ -167,7 +157,6 @@ describe("undo stack (createUndoStack, FC-15)", () => {
     expect(stack.canUndo()).toBe(true);
     expect(stack.canRedo()).toBe(false);
 
-    // Undo: apply the handed-out inverse, report the re-inverse.
     const undoOp = stack.undo();
     expect(undoOp).not.toBeNull();
     const undone = core.applyObjectOp(scene, undoOp!);
@@ -177,7 +166,6 @@ describe("undo stack (createUndoStack, FC-15)", () => {
     expect(stack.canUndo()).toBe(false);
     expect(stack.canRedo()).toBe(true);
 
-    // Redo: hands back the original forward, re-reaches the edit.
     const redoOp = stack.redo();
     expect(redoOp).toEqual(move);
     const redone = core.applyObjectOp(scene, redoOp!);
@@ -212,7 +200,6 @@ describe("undo stack (createUndoStack, FC-15)", () => {
     expect(undone.scene.objects[0].transform).toEqual(IDENTITY_TRANSFORM);
     expect(stack.canUndo()).toBe(false);
 
-    // One redo replays the gesture's final state.
     const redoOp = stack.redo();
     const redone = core.applyObjectOp(undone.scene, redoOp!);
     stack.noteRedoApplied(redone.inverse!);
@@ -250,15 +237,11 @@ describe("undo stack (createUndoStack, FC-15)", () => {
 
 describe("template lowering (build_object_template)", () => {
   it("builds a recipe of inline-styled objects and round-trips through op-apply", () => {
-    // `todo_board` is one of the crate's template ids (templates.rs registry).
     const templateId = "todo_board";
     const recipe = core.buildObjectTemplate(templateId, 100, 200, "tpl");
     expect(Array.isArray(recipe)).toBe(true);
     expect(recipe.length).toBeGreaterThan(0);
 
-    // The lowered recipe applies as a batch of insert-object ops (the shell sends
-    // these as a FeatureRequest.templateApply; the server lowers them server-side,
-    // but they are valid object-op inserts here too).
     let scene: ObjectScene = emptyObjectScene();
     for (const object of recipe) {
       const result = applyObjectOpSync(scene, insert(object));

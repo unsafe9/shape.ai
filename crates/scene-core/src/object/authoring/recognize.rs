@@ -1,42 +1,23 @@
-//! Anchor-semantics v3 §4 — pen-up stroke recognition (freehand → shape input).
+//! Pen-up stroke recognition (freehand as shape input): at pen-up the raw stroke
+//! is converted to its nearest canonical form, and one stroke commits as one
+//! object.
 //!
-//! Freehand is a SHAPE INPUT device, not ink: at pen-up the raw stroke is
-//! converted to its nearest canonical form, and one stroke commits as ONE
-//! object (replacing the D13 "session = one multi-subpath object" policy —
-//! a recognized rect and a recognized line have no reason to share an object).
+//! [`RecognizeMode::Free`] pipeline: (1) closure test — trim ladder
+//! ([`trim_overshoot`]) then `dist(start,end) < CLOSE_RATIO · bbox diagonal`;
+//! (2) canonical fits adopted when their confidence threshold passes (open ->
+//! line; closed -> ellipse / rect / triangle-polygon); (3) silhouette-preserving
+//! normalize fallback ([`rdp_simplify`] + corner detection + per-run
+//! [`fit_beziers`]), capped at [`MAX_FALLBACK_NODES`].
 //!
-//! Pipeline ([`recognize_stroke`], [`RecognizeMode::Free`]):
-//!   1. closure test — trim ladder first ([`trim_overshoot`]: a tail that
-//!      crosses back over the head closes at the crossing, and a near-miss
-//!      T-junction — an endpoint almost touching the far end's segments —
-//!      closes at its projection; dangles dropped either way), else
-//!      `dist(start, end) < CLOSE_RATIO · bbox diagonal`.
-//!   2. canonical fits, adopted when the confidence threshold passes:
-//!      open   → straight line (max perpendicular deviation / chord ratio);
-//!      closed → circle/ellipse (least-squares radial residual against the
-//!               bbox ellipse), rect (rotated min-area + 0°/90° angle snap),
-//!               triangle/polygon (coarse-RDP corner detection, 3–8 sides).
-//!   3. fallback — silhouette-preserving normalize: coarse
-//!      [`rdp_simplify`] + corner detection + per-run [`fit_beziers`]
-//!      smoothing (sharp turns stay corners, smooth runs stay curves; this is
-//!      also the open "smooth curve" fit when no corner is detected), capped
-//!      at [`MAX_FALLBACK_NODES`]; closed per the step-1 test.
+//! [`RecognizeMode::Basic`] (the toolbar default) shares step 1 then FORCE-snaps
+//! to a basic primitive — no thresholds, no polygon, no fallback: open -> the
+//! 2-node line between the exact endpoints; closed -> the best of ellipse / rect /
+//! triangle by normalized residual ([`basic_closed_fit`]).
 //!
-//! [`RecognizeMode::Basic`] (the toolbar default) shares step 1 and then
-//! FORCE-snaps to a basic primitive — no confidence thresholds, no polygon
-//! (5+ sides) and no silhouette fallback: open → the 2-node line between the
-//! exact input endpoints; closed → whichever of ellipse / rect / triangle
-//! carries the smallest normalized residual ([`basic_closed_fit`]).
-//!
-//! The recognizer's geometry helpers REUSE `drawing.rs` ([`rdp_simplify`],
-//! [`fit_beziers`], `perpendicular_distance`, `quantize_px`) — no duplicates.
-//! Endpoints of OPEN results are preserved exactly (the quantization of the
-//! input start/end), the premise the freehand anchoring path builds on.
-//!
-//! Pure (no time/rng/IO), pointer-width-agnostic; inputs are world-px samples,
-//! the emitted path-string is world-px-quantized (Q=8) — the commit
-//! ([`recognize_stroke_object`]) subtracts the origin so geometry stays
-//! object-local with the position riding the transform translate (P4).
+//! Endpoints of OPEN results are preserved exactly (the premise the freehand
+//! anchoring path builds on). Pure (no time/rng/IO); inputs are world-px samples,
+//! the emitted path-string is world-px-quantized (Q=8) — the commit subtracts the
+//! origin so geometry stays object-local with the position on the transform.
 
 use crate::object::drawing::{
     fit_beziers, perpendicular_distance, quantize_px, rdp_simplify, Brush,
@@ -99,10 +80,9 @@ const MAX_FALLBACK_NODES: usize = 24;
 /// Cubic-arc circle constant (matches the primitive ellipse builders).
 const KAPPA: f64 = 0.5523;
 
-/// Pen recognition mode. `Free` is the full module pipeline (polygon +
-/// silhouette fallbacks allowed); `Basic` (the toolbar default) force-snaps
-/// every stroke to a basic primitive — open → 2-node line, closed → the best
-/// of ellipse / rect / triangle by normalized residual, threshold-free.
+/// `Free` is the full pipeline; `Basic` (the toolbar default) force-snaps every
+/// stroke to a basic primitive (open -> 2-node line, closed -> best of ellipse /
+/// rect / triangle, threshold-free).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecognizeMode {
     Basic,
@@ -117,18 +97,16 @@ pub struct RecognizedStroke {
     pub closed: bool,
 }
 
-/// Recognize one freehand stroke (raw world-px samples) into its canonical
-/// form (module pipeline). Fewer than 3 points skip recognition and fit as-is
-/// (a 2-point stroke IS already a line; 0/1 points have no extent).
+/// Recognize one freehand stroke (raw world-px samples) into its canonical form.
+/// Fewer than 3 points skip recognition and fit as-is.
 pub fn recognize_stroke(points: &[(f64, f64)], mode: RecognizeMode) -> RecognizedStroke {
     let (nodes, closed) = recognize_nodes(points, mode);
     RecognizedStroke { d: path_string::serialize(&[SubPath { closed, nodes }]), closed }
 }
 
-/// Recognize + commit one stroke to an [`Object`]: the recognized geometry is
-/// translated to object-local coords relative to the stroke's bbox min (the
-/// origin rides the transform translate, P4 zero-rebake) and the brush lowers
-/// to the stroke style. `id`/`order` are caller-supplied (purity).
+/// Recognize + commit one stroke to an [`Object`]: geometry translated to
+/// object-local coords relative to the bbox min (origin on the transform), the
+/// brush lowered to the stroke style. `id`/`order` are caller-supplied.
 pub fn recognize_stroke_object(
     points: &[(f64, f64)],
     mode: RecognizeMode,
@@ -153,8 +131,8 @@ pub fn recognize_stroke_object(
     object
 }
 
-/// The recognition core: canonical-fit nodes (world-px quantized) + closure.
-/// The closure ladder is mode-independent; the mode picks the fit set.
+/// Canonical-fit nodes (world-px quantized) + closure. The closure ladder is
+/// mode-independent; the mode picks the fit set.
 fn recognize_nodes(points: &[(f64, f64)], mode: RecognizeMode) -> (Vec<PathNode>, bool) {
     if points.len() < 3 {
         return (fit_beziers(points), false);
@@ -235,13 +213,10 @@ fn arc_lengths(points: &[(f64, f64)]) -> (Vec<f64>, f64) {
     (cum, total)
 }
 
-/// Cross-closure overshoot trim: a stroke whose tail crosses back over its
-/// head (a hand-drawn triangle overshooting its start) closes at the crossing
-/// X, not at the pen-up gap — without this the crossed tail survives as a
-/// spur. Tail segments scan end-inward against head segments start-outward,
-/// both within [`OVERSHOOT_WINDOW_RATIO`] of the arc; a crossing trims only
-/// when both dangles stay under [`OVERSHOOT_MAX_DANGLE_RATIO`], yielding the
-/// loop that starts at X (the dangles dropped).
+/// A stroke whose tail crosses back over its head closes at the crossing X, not
+/// at the pen-up gap, dropping the dangles. Tail scans end-inward against head
+/// start-outward, both within [`OVERSHOOT_WINDOW_RATIO`] of the arc; a crossing
+/// trims only when both dangles stay under [`OVERSHOOT_MAX_DANGLE_RATIO`].
 fn trim_crossing(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
     let n = points.len();
     if n < 4 {
@@ -280,14 +255,10 @@ fn trim_crossing(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
     None
 }
 
-/// Near-miss T-junction trim: the pen-up END almost touches an early head
-/// segment without crossing it (the browser repro — a rect whose start
-/// dangles left of where the final edge lands on the top edge: no exact
-/// intersection, and the start→end gap fails CLOSE_RATIO because of the
-/// dangle). The nearest projection within [`NEAR_JUNCTION_RATIO`]·diag
-/// (floored at [`MIN_NEAR_JUNCTION_PX`]) becomes the junction X: the head
-/// dangle (start→X) is dropped and END snaps to X — an exactly-closed loop.
-/// Window, dangle, and index-gap rules match [`trim_crossing`].
+/// The pen-up END almost touches an early head segment without crossing it. The
+/// nearest projection within [`NEAR_JUNCTION_RATIO`]·diag (floored at
+/// [`MIN_NEAR_JUNCTION_PX`]) becomes the junction X: the head dangle is dropped
+/// and END snaps to X. Window/dangle/index-gap rules match [`trim_crossing`].
 fn trim_near_junction(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
     let n = points.len();
     if n < 4 {
@@ -416,10 +387,9 @@ fn fit_ellipse(
     Some(ellipse_nodes(cx, cy, rx, ry))
 }
 
-/// The standard four-cubic-arc closed ring for the axis-aligned ellipse, in
-/// the parse-canonical closed-curve form: the closing arc's landing node is
-/// explicit (last == first position), so `subpaths` and a re-parse of the
-/// serialized `d` are byte-identical (no runtime-mirror divergence).
+/// The four-cubic-arc closed ring for the axis-aligned ellipse. The closing arc's
+/// landing node is explicit (last == first position), so `subpaths` and a re-parse
+/// of the serialized `d` are byte-identical.
 fn ellipse_nodes(cx: f64, cy: f64, rx: f64, ry: f64) -> Vec<PathNode> {
     let kx = KAPPA * rx;
     let ky = KAPPA * ry;
@@ -572,23 +542,19 @@ fn basic_rect_corners(points: &[(f64, f64)]) -> [(f64, f64); 4] {
     oriented_rect_corners(points, 0.0)
 }
 
-/// Basic-mode triangle candidate: an axis-aligned ISOSCELES triangle filling the
-/// bbox, its apex pointing the same cardinal direction (up/down/left/right) as the
-/// drawn triangle's apex. Basic shapes resolve flat like the rect — the apex of
-/// the max-area triple over the coarse ring only picks the cardinal; the
-/// silhouette is otherwise normalized to a clean isosceles (the user rotates it
-/// by hand if they want it angled).
+/// Basic-mode triangle candidate: an axis-aligned isosceles triangle filling the
+/// bbox, apex in the same cardinal direction as the drawn triangle's apex (the
+/// silhouette is otherwise normalized; the user rotates by hand if they want it
+/// angled).
 fn basic_triangle_corners(points: &[(f64, f64)], diag: f64) -> [(f64, f64); 3] {
     let (min_x, min_y, max_x, max_y) = bbox(points);
     let cx = (min_x + max_x) / 2.0;
     let cy = (min_y + max_y) / 2.0;
-    // Apex direction over the max-area triple: of the three candidate apexes,
-    // the one whose median vector (vertex → opposite-edge midpoint) is the most
-    // AXIS-ALIGNED — `max(|dx|,|dy|) / |median|`, largest for the corner that
-    // points straightest along a cardinal. This is a scale-free ratio, so the
-    // near-equilateral case (three near-equal edges) no longer rides the
-    // longest-edge argmax, which flips under sub-pixel sample noise. Exact ties
-    // break by a fixed vertex order (the strict `>` keeps the first candidate).
+    // Apex direction: of the three candidate apexes of the max-area triple, the
+    // one whose median vector (vertex -> opposite-edge midpoint) is most
+    // axis-aligned (`max(|dx|,|dy|) / |median|`). Scale-free, so the
+    // near-equilateral case no longer rides a longest-edge argmax that flips under
+    // sub-pixel noise. Exact ties break by vertex order (strict `>`).
     let kept = rdp_simplify(points, normalize_epsilon(diag));
     let ring: &[(f64, f64)] = if kept.len() > 3 { &kept[..kept.len() - 1] } else { &kept };
     let (adx, ady) = if ring.len() >= 3 {

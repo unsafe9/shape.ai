@@ -1,8 +1,6 @@
 <script lang="ts" module>
-  // W2-09 — upward scroll-popup template list, opened from the toolbar's More
-  // group. Mirrors the ContextMenu pattern (items array, role=menu, pointerdown
-  // swallowed) but anchors above the bottom toolbar and reuses the floating
-  // template-library popover styles. Selecting an item inserts that template.
+  // Upward scroll-popup template list opened from the toolbar's More group. Mirrors the ContextMenu
+  // pattern but anchors above the bottom toolbar. Selecting an item inserts that template.
   export type TemplatePopupItem = {
     id: string;
     title: string;

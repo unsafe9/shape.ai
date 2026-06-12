@@ -1,6 +1,5 @@
-//! OB4.1 integration tests for the object-native MCP tool surface, driving the
-//! rmcp tool handler fns directly (the same fns the streamable-HTTP transport
-//! dispatches — no socket, no JSON-RPC framing).
+//! Integration tests for the MCP tool surface, driving the rmcp tool handler fns
+//! directly (no socket, no JSON-RPC framing).
 
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
@@ -10,13 +9,11 @@ use shape_server::mcp::{
 };
 use shape_server::{CanvasRegistry, SceneMcp};
 
-/// Build a SceneMcp over a fresh in-memory canvas registry.
 fn mcp_instance() -> SceneMcp {
     let canvases = CanvasRegistry::open_in_memory().unwrap();
     SceneMcp::new(canvases)
 }
 
-/// Extract the JSON text from a tool result's single text content block.
 fn result_json(result: &rmcp::model::CallToolResult) -> Value {
     let text = result
         .content
@@ -82,7 +79,6 @@ async fn create_object_then_list_and_get() {
     let created = result_json(&created);
     assert_eq!(created["object"]["id"], "rect-1");
 
-    // The change is durable: list + get see it.
     let listed = mcp
         .list_objects(Parameters(CanvasOnlyArgs::default()))
         .await
@@ -158,8 +154,8 @@ async fn patch_object_moves_and_resizes() {
         .await
         .expect("patch_object");
     let object = result_json(&patched)["object"].clone();
-    // Transform3x3 is `#[serde(transparent)]` over its 3x3 array, so the world
-    // placement is the translation column [0][2], [1][2].
+    // Transform3x3 is `#[serde(transparent)]` over its 3x3 array, so the
+    // translation column is [0][2], [1][2].
     assert_eq!(object["transform"][0][2], 10.0);
     assert_eq!(object["transform"][1][2], 20.0);
 }
@@ -185,7 +181,6 @@ async fn tag_object_then_query_by_tag() {
         .unwrap();
     }
 
-    // Retag b to also carry "keep".
     mcp.tag_object(Parameters(TagObjectArgs {
         id: "b".into(),
         tags: vec!["keep".into()],

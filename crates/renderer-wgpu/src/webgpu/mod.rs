@@ -1,23 +1,16 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
-//! WebGPU renderer module.
-//!
-//! Split by responsibility (W2-13/S8, behavior-preserving):
-//! - [`scene_build`] — portable pure-CPU layer: vertex/geometry build, style
-//!   resolve, hit-test math, marquee, object-region derive/hit, overlay geometry,
-//!   camera math, plus the consts/WGSL shader and the unit tests. Compiles and is
-//!   exercised on the host (no wgpu device).
-//! - [`device`] — web-only surface: `web_sys` + wgpu device/surface/config
-//!   lifecycle (`probe_web_gpu`, `create`, `resize`, the glyph atlas upload).
+//! WebGPU renderer module, split by responsibility:
+//! - [`scene_build`] — portable pure-CPU layer (geometry/style/hit-test/marquee/
+//!   overlay/camera math + the fallback WGSL shader), host-testable, no wgpu device.
+//! - [`device`] — web-only `web_sys` + wgpu device/surface/config lifecycle.
 //! - [`frame`] — the single-present render path (object pass + legacy fallback).
 //! - [`input`] — input state machine, hit-test routing, rollback, debug snapshot.
 //! - [`scene_feed`] — object/legacy scene load + feed + slot retention.
 //!
-//! This file owns the [`ShapeWebGpuRenderer`] struct and the small state/data
-//! types whose private fields the sibling-module impls touch (field privacy is
-//! scoped to the struct's defining module, so keeping them here lets every child
-//! submodule reach those fields without widening). `scene_build`'s shared items are
-//! re-exported crate-internally below so the web submodules and tests resolve them.
+//! This file owns [`ShapeWebGpuRenderer`] and the state/data types whose private
+//! fields the sibling-module impls touch (field privacy is module-scoped, so
+//! keeping them here lets every submodule reach the fields without widening).
 
 use std::{collections::HashMap, f32::consts::PI};
 
@@ -61,32 +54,29 @@ struct ObjectSceneLoadResult {
     stroke_vertices: usize,
 }
 
-/// Per-object derived region retained on the renderer for live hit-testing /
-/// marquee against the loaded object scene (FC-04). `outline` is the region
-/// boundary polygon in OBJECT-LOCAL pixels (D6); `transform` maps object-local px
-/// to world px (D7). The outline is local so a moving transform never forces a
-/// region rebuild — the query point is inverse-transformed into local space at
-/// hit time (D8, see [`shape_renderer_core::hit_test_object`]).
+/// Per-object derived region for live hit-test / marquee. `outline` is the region
+/// boundary polygon in OBJECT-LOCAL px; `transform` maps object-local px to world.
+/// The outline is local so a moving transform never forces a region rebuild — the
+/// query point is inverse-transformed into local space at hit time.
 #[cfg(feature = "wgpu-probe")]
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectRegion {
     id: String,
     transform: [[f64; 3]; 3],
     outline: Vec<(f32, f32)>,
-    /// W2-06: whether the source contour was closed (rect/ellipse fill) vs open
-    /// (line/freehand stroke). The nearest-point query (anchor snapping) includes
-    /// the implicit closing edge only for closed shapes; hit-test/marquee ignore it.
+    /// Whether the source contour was closed (rect/ellipse fill) vs open (line/
+    /// freehand). Nearest-point includes the implicit closing edge only for closed
+    /// shapes; hit-test/marquee ignore it.
     closed: bool,
-    /// Anchor-semantics v3 §2b: the OPEN-CLASS endpoint pair (scene-core
-    /// `is_open_class_d` + pair-space `local_nodes`), derived once per feed.
-    /// `Some` switches the selection surface to two endpoint handles (no bbox
-    /// 8-handle/rotate); `None` keeps the closed-class surface.
+    /// The OPEN-CLASS endpoint pair, derived once per feed. `Some` switches the
+    /// selection surface to two endpoint handles (no bbox 8-handle/rotate); `None`
+    /// keeps the closed-class surface.
     open_endpoints: Option<OpenEndpoints>,
 }
 
-/// v3 §2b: an open-class region's endpoints in OBJECT-LOCAL px, plus the END
-/// node's geometry PAIR index (node 0 is always pair 0) — the same pair space
-/// anchors and scene-core `endpoint_release_ops` address.
+/// An open-class region's endpoints in OBJECT-LOCAL px, plus the END node's
+/// geometry PAIR index (node 0 is always pair 0) — the same pair space anchors and
+/// scene-core `endpoint_release_ops` address.
 #[cfg(feature = "wgpu-probe")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OpenEndpoints {
@@ -95,23 +85,21 @@ pub(crate) struct OpenEndpoints {
     last_index: i32,
 }
 
-/// FC-07: per-batch accumulator for the object-path input results, threaded through
-/// [`ShapeWebGpuRenderer::apply_input_event`] and folded into the
+/// Per-batch accumulator for the object-path input results, folded into the
 /// [`CoreInputBatchResult`] at the end of the batch.
 #[cfg(feature = "wgpu-probe")]
 #[derive(Default)]
 pub(crate) struct ObjectInputOut {
     selection: Option<String>,
     transform_delta: Option<ObjectTransformDelta>,
-    // v3 §2b: a live endpoint-drag sample (open-class selection), emitted from the
-    // same move handler as `transform_delta` but as its own signal — one endpoint
-    // moves (chord deform), not the whole transform.
+    // A live endpoint-drag sample (open-class): one endpoint moves (chord deform),
+    // not the whole transform.
     endpoint_delta: Option<ObjectEndpointDelta>,
     marquee_ids: Option<Vec<String>>,
-    // W2-02: hover affordance for the shell's cursor, set on a no-button move.
-    // `None` outside object mode / when no hover move occurred in the batch.
+    // Hover affordance for the shell's cursor, set on a no-button move; `None`
+    // outside object mode / no hover move in the batch.
     hover_affordance: Option<HoverAffordance>,
-    // RA2b: a double-click that hit an object, branched by `has_children` (D6).
+    // A double-click that hit an object, branched by `has_children`.
     double_click: Option<ObjectDoubleClick>,
 }
 
@@ -170,8 +158,8 @@ struct FrameDrawList {
     shape_only_tier_count: usize,
     density_tier_count: usize,
     minimap_tier_count: usize,
-    /// Per-object LOD tier resolved this frame, keyed by object id. Carries the
-    /// hysteresis state forward to the next frame's `lod_tier` resolution.
+    /// Per-object LOD tier resolved this frame, carrying hysteresis state forward to
+    /// the next frame's `lod_tier` resolution.
     lod_tiers: HashMap<String, LodTier>,
 }
 
@@ -191,9 +179,8 @@ impl FrameDrawList {
         self.drawn_vertex_count += slot.capacity;
     }
 
-    /// Resolve and record a visible object's LOD tier. The tier is a derived
-    /// diagnostic value: it never alters slot identity, vertex ranges, or
-    /// culling — only which token groups the draw build consumes (T3.1 §2/§4).
+    /// Resolve and record a visible object's LOD tier — a derived diagnostic that
+    /// never alters slot identity, vertex ranges, or culling.
     fn record_tier(
         &mut self,
         id: &str,
@@ -272,19 +259,18 @@ pub(crate) enum InputDragState {
         start: WorldPoint,
         current: WorldPoint,
     },
-    // FC-07: dragging a selected object. `start` is the pointer-down WORLD point and
-    // stays FIXED for the gesture so each move emits a cumulative delta the shell
-    // turns into one undoable op; the renderer never mutates the object transform.
+    // Dragging a selected object. `start` is the FIXED pointer-down WORLD point so
+    // each move emits a cumulative delta the shell turns into one undoable op; the
+    // renderer never mutates the object transform.
     Object {
         pointer_id: i32,
         object_id: String,
         start: WorldPoint,
     },
-    // W2-04: resizing the selected object by a grabbed handle. `corner` is the
-    // grabbed resize affordance (anchor = its OPPOSITE). `start` is the fixed
-    // pointer-down WORLD point; `world_bbox` is the selection's WORLD AABB captured
-    // AT pointer-down (`(min_x, min_y, max_x, max_y)`) so the gesture is anchored
-    // and does not chase the live preview transform.
+    // Resizing by a grabbed handle. `corner` is the grabbed affordance (anchor = its
+    // OPPOSITE); `world_bbox` is the WORLD AABB captured AT pointer-down
+    // (`(min_x, min_y, max_x, max_y)`) so the gesture is anchored, not chasing the
+    // live preview transform.
     Resize {
         pointer_id: i32,
         object_id: String,
@@ -292,19 +278,17 @@ pub(crate) enum InputDragState {
         start: WorldPoint,
         world_bbox: (f64, f64, f64, f64),
     },
-    // W2-04: rotating the selected object about its bbox `center` (WORLD px,
-    // captured at pointer-down). `start` is the fixed pointer-down WORLD point.
+    // Rotating about the bbox `center` (WORLD px, captured at pointer-down).
     Rotate {
         pointer_id: i32,
         object_id: String,
         start: WorldPoint,
         center: WorldPoint,
     },
-    // v3 §2b: dragging an OPEN-CLASS selection's endpoint handle. `node_index` is
-    // the endpoint's geometry PAIR index (0 | last). Each move emits a cumulative
-    // world-position `ObjectEndpointDelta`; the shell previews the chord deform
-    // live and commits once on release (`endpoint_release_ops`, rebind/unbind
-    // included) — the renderer never mutates the geometry.
+    // Dragging an OPEN-CLASS endpoint handle. `node_index` is the endpoint's geometry
+    // PAIR index (0 | last). Each move emits a cumulative `ObjectEndpointDelta`; the
+    // shell previews the chord deform and commits once on release. The renderer never
+    // mutates the geometry.
     Endpoint {
         pointer_id: i32,
         object_id: String,
@@ -322,9 +306,8 @@ struct RendererRollbackState {
     last_hit: Option<CoreHitResult>,
     text_layout_cache: TextLayoutCache,
     counters: MutationCounters,
-    // FC-07: object selection lives on `object_scene.selection`; capture the whole
-    // scene so a failed input batch restores it (regions are local-space and follow
-    // the transform, so they need no rollback).
+    // Object selection lives on `object_scene.selection`; capture the whole scene so
+    // a failed input batch restores it (regions are local-space, so need no rollback).
     object_scene: Option<RenderObjectScene>,
 }
 
@@ -349,11 +332,11 @@ pub struct ShapeWebGpuRenderer {
     _text_sampler: wgpu::Sampler,
     vertex_buffer: wgpu::Buffer,
     overlay_vertex_buffer: wgpu::Buffer,
-    // W2-04: dedicated buffer for the selection-handle overlay (8 resize handles +
-    // rotate zone), written per-frame and drawn in a LoadOp::Load pass on top.
+    // Selection-handle overlay (8 resize handles + rotate zone), written per-frame,
+    // drawn in a LoadOp::Load pass on top.
     handle_vertex_buffer: wgpu::Buffer,
-    // W3-G7/#1: dedicated buffer for the per-object multi-select outline highlight,
-    // written per-frame and drawn in a LoadOp::Load pass on top of the object pass.
+    // Per-object multi-select outline highlight, written per-frame, drawn in a
+    // LoadOp::Load pass on top of the object pass.
     multi_select_overlay_vertex_buffer: wgpu::Buffer,
     vertex_ranges: VertexRanges,
     text_engine: TextEngine,
@@ -379,60 +362,47 @@ pub struct ShapeWebGpuRenderer {
     group_compaction_count: usize,
     input_drag: Option<InputDragState>,
     active_tool: ActiveTool,
-    // Transient multi-select highlight set. Held on the renderer (like
-    // `active_tool`) so it survives a `load_scene` rebuild, then mirrored into the
-    // scene snapshot the draw path reads. Never part of the serialized snapshot.
+    // Transient multi-select highlight set, renderer-held (like `active_tool`) so it
+    // survives a `load_scene` rebuild, then mirrored into the scene the draw path
+    // reads. Never serialized.
     multi_select: Vec<String>,
     last_hit: Option<CoreHitResult>,
     last_lod_tiers: HashMap<String, LodTier>,
-    // OB-4 object draw path (additive). The pipeline is built lazily on the first
-    // `load_object_scene`; the renderer holds the CPU-built + uploaded object
-    // geometry for the current object scene. The legacy `load_scene`/`render_frame`
-    // 2D path above is untouched — this is a parallel object pass that shares the
-    // same device/queue/surface/format.
+    // Object draw path: the pipeline is built lazily on the first
+    // `load_object_scene`; the renderer holds the CPU-built + uploaded geometry. A
+    // parallel pass sharing the legacy device/queue/surface/format.
     object_pipeline: Option<ObjectPipeline>,
     object_renderer: Option<ObjectRenderer>,
-    // FC-04: the parsed object scene + its per-object derived regions, retained so
-    // the live frame loop draws objects (render_frame) and pointer input hit-tests
-    // against them. `object_scene.is_some()` is the live-object branch switch; when
-    // None the legacy 2D path stays authoritative.
+    // The parsed object scene + per-object regions for draw + hit-test.
+    // `object_scene.is_some()` is the live-object branch switch; when None the
+    // legacy 2D path stays authoritative.
     object_scene: Option<RenderObjectScene>,
     object_regions: Vec<ObjectRegion>,
-    // FramePlan IR feed accounting (object path). A canonical re-feed
-    // (`load_object_scene`) diffs the freshly-built plan against the renderer's
-    // retained one and applies targeted patches; `object_patch_count` accumulates
-    // those patches, `object_rebuild_count` counts the feeds that fell back to a
-    // full `ObjectRenderer::new` (first feed, or a structural / unfittable diff).
-    // These keep the patch-vs-rebuild frame-stats meaningful for the object path,
-    // mirroring the legacy `dirty_range_write_count` / `full_buffer_rebuild_count`.
+    // FramePlan feed accounting: `object_patch_count` accumulates targeted re-feed
+    // patches, `object_rebuild_count` counts feeds that fell back to a full
+    // `ObjectRenderer::new`. Mirror the legacy `dirty_range_write_count` /
+    // `full_buffer_rebuild_count`.
     object_patch_count: usize,
     object_rebuild_count: usize,
-    // v3 §2b/§3: ids whose GPU-baked GEOMETRY currently deviates from canonical
-    // because a live chord deform patched it (a non-translate preview on an
-    // open-class moved member, or an endpoint drag). GPU-only transient state,
-    // like the instance-matrix previews: the next preview frame / `clearObjectPreview`
-    // / `clearObjectEndpointPreview` re-expands the canonical geometry back in
-    // (never rolled back — rollback leaves GPU previews alone too).
+    // Ids whose GPU-baked GEOMETRY deviates from canonical because a live chord
+    // deform patched it. GPU-only transient state (like instance-matrix previews);
+    // the next preview frame / clear re-expands canonical geometry back in, never
+    // rolled back.
     preview_deformed: std::collections::HashSet<String>,
-    // v3 §2b: the live endpoint-drag sample `(id, pair index, world point)`, held so
-    // the endpoint-handle overlay rides the pointer while the geometry patch lands.
+    // The live endpoint-drag sample `(id, pair index, world point)`, held so the
+    // endpoint-handle overlay rides the pointer while the geometry patch lands.
     endpoint_preview: Option<(String, i32, WorldPoint)>,
-    // W3-G9/#5: the move-together propagation graph (parent->child SameDelta +
-    // target->follower Reproject), built ONCE per `load_object_scene` from the
-    // parsed scene and held here so a per-drag preview is O(closure), never
-    // O(scene). Pure/derived from `object_scene`, so it is rebuilt (not rolled back)
-    // whenever the scene is restored.
+    // The move-together propagation graph (parent->child SameDelta + target->follower
+    // Reproject), built ONCE per `load_object_scene` so a per-drag preview is
+    // O(closure). Derived from `object_scene`, so rebuilt (not rolled back) on restore.
     object_bindings: shape_scene_core::object::move_together::BindingGraph,
-    // W3-G6/#3: the persisted light/dark theme bit. The live theme is owned by the
-    // per-scene `ObjectRenderer` (`self.theme`), which is destroyed and rebuilt on
-    // every `load_object_scene` re-feed (pan/move/create), so the dark bit would be
-    // lost on each re-feed. Holding it here (like `multi_select`/`active_tool`) lets
-    // `set_object_theme` remember the last-set theme and `load_object_scene` rebuild
-    // every renderer directly in that theme — sticky across reloads, zero rebake.
+    // The persisted light/dark theme bit. The live theme on the per-scene
+    // `ObjectRenderer` is destroyed and rebuilt on every re-feed, so holding the bit
+    // here lets `set_object_theme` remember it and rebuilds land in the right theme —
+    // sticky across reloads, zero rebake.
     object_theme: shape_renderer_core::object_theme::Theme,
-    // W3-G8/A: offscreen targets + pipelines for the real separable-Gaussian drop-
-    // shadow blur. Surface-sized (config.width x config.height); recreated in
-    // `resize` after the config updates. Isolated underlay — a fault here can at
-    // worst drop the shadow, never the fill/stroke/text on top.
+    // Offscreen targets + pipelines for the separable-Gaussian drop-shadow blur.
+    // Surface-sized, recreated in `resize`. Isolated underlay — a fault drops the
+    // shadow, never the fill/stroke/text on top.
     shadow_blur: crate::shadow_blur::ShadowBlur,
 }

@@ -1,11 +1,7 @@
-//! Object op-apply + inverse-op capture (foundation slice of OB3.S1/S8/D21).
-//!
-//! This is the single source of truth for applying an [`ObjectOp`] to an
-//! [`ObjectScene`]. Each apply returns the **inverse op** — a normal op that,
-//! authored through this same path, undoes the edit (D21: reverse-op, not state
-//! rollback, so undo composes with concurrent edits). Per-property seq LWW
-//! (PropertyStore in `lww.rs`) is layered on in OB3.S1; this slice mutates the
-//! scene directly and is enough to prove the vertical slice (OB2.1).
+//! The single source of truth for applying an [`ObjectOp`] to an [`ObjectScene`].
+//! Each apply returns the inverse op — a normal op that, authored through this
+//! same path, undoes the edit (reverse-op, not state rollback, so undo composes
+//! with concurrent edits).
 //!
 //! Pure: no IO/time/rng. `Batch` is atomic — it applies to a clone and commits
 //! only if every child op succeeds.
@@ -18,9 +14,8 @@ use crate::object::model::{
 use crate::object::op::{FieldEdit, ObjectOp};
 use crate::object::validate::{validate_geometry, ValidationError};
 
-/// Map a [`ValidationError`] from `validate.rs` onto the apply path's
-/// [`ApplyError`]. Geometry defects collapse to `BadGeometry`; structural ones
-/// keep their dedicated variant.
+/// Geometry defects collapse to `BadGeometry`; structural ones keep their
+/// dedicated variant.
 fn apply_error_from_validation(e: ValidationError) -> ApplyError {
     match e {
         ValidationError::EmptyGeometry
@@ -57,9 +52,8 @@ impl core::fmt::Display for ApplyError {
     }
 }
 
-/// Apply `op` to `scene`, returning the inverse op for undo (D21). On error the
-/// scene is left untouched (top-level ops mutate in place only after their
-/// checks pass; `Batch` commits atomically via a clone).
+/// Returns the inverse op for undo. On error the scene is left untouched (ops
+/// mutate in place only after checks pass; `Batch` commits atomically via clone).
 pub fn apply_object_op(scene: &mut ObjectScene, op: ObjectOp) -> Result<ObjectOp, ApplyError> {
     let inverse = apply_inner(scene, op)?;
     scene.scene_version += 1;
@@ -92,8 +86,8 @@ fn apply_inner(scene: &mut ObjectScene, op: ObjectOp) -> Result<ObjectOp, ApplyE
         ObjectOp::Delete { id } => {
             let idx = index_of(scene, &id)?;
             let removed = scene.objects.remove(idx);
-            // Capture + prune peer anchors that referenced the deleted object so
-            // the inverse can restore them alongside re-inserting the object.
+            // Capture + prune peer anchors referencing the deleted object so the
+            // inverse can restore them alongside re-inserting the object.
             let mut peer_restores: Vec<ObjectOp> = Vec::new();
             for peer in &mut scene.objects {
                 if peer.anchors.iter().any(|a| a.target == id) {
@@ -150,14 +144,10 @@ fn apply_inner(scene: &mut ObjectScene, op: ObjectOp) -> Result<ObjectOp, ApplyE
         }
 
         ObjectOp::SetAnchor { id, anchors } => {
-            // Anchors are a relational overlay over a windowed/collaborative scene,
-            // so SetAnchor degrades gracefully when an endpoint has diverged out of
-            // the local scene (windowed load, applyRemote echo, off-viewport) — this
-            // op exists only as the Delete-inverse peer restore, never authored
-            // forward with a missing endpoint. Missing OWNER => no-op with a no-op
-            // inverse (the InsertObject sibling in a Delete-inverse Batch must still
-            // commit). Missing TARGET => filter that anchor (cannot anchor to a
-            // ghost), keeping the ones whose target is present.
+            // Degrades gracefully when an endpoint has diverged out of the local
+            // (windowed/collaborative) scene. Missing OWNER => no-op with a no-op
+            // inverse, so the InsertObject sibling in a Delete-inverse Batch still
+            // commits. Missing TARGET => filter that anchor, keeping present ones.
             let Ok(idx) = index_of(scene, &id) else {
                 return Ok(ObjectOp::Batch { ops: Vec::new() });
             };
@@ -270,19 +260,12 @@ fn would_cycle(scene: &ObjectScene, id: &str, new_parent: &str) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------------
-// OB3.S3 — Split / Merge.
-//
-// Both rebuild geometry by re-bucketing subpaths across objects, then re-home
-// the peer anchors that addressed the touched objects (anchor `node_index` is a
-// flat index across all subpaths in declaration order, so any reshuffle of
-// subpaths must re-map it). Each returns a **faithful** inverse built from a
-// captured pre-op snapshot: rather than a clever structural reverse, the inverse
-// is a `Batch` that deletes whatever the op produced and re-inserts the exact
-// originals (objects + their peer anchors), so undo restores byte-identical
-// state. This trades a few extra ops for an inverse that is obviously correct
-// and test-provable (Split↔Merge round-trip).
-// ---------------------------------------------------------------------------
+// Split / Merge both rebuild geometry by re-bucketing subpaths across objects,
+// then re-home peer anchors addressing the touched objects (anchor `node_index`
+// is a flat index across all subpaths in declaration order, so any reshuffle
+// must re-map it). The inverse is a `Batch` built from a captured pre-op snapshot
+// that deletes what the op produced and re-inserts the exact originals — an
+// obviously-correct inverse over a clever structural reverse.
 
 /// Per-subpath node-index offsets for a geometry: `offsets[i]` is the flat index
 /// of subpath `i`'s first node; the final entry is the total node count. So
@@ -316,7 +299,7 @@ fn capture_peer_anchors(scene: &ObjectScene, target_ids: &[&str]) -> Vec<(Object
     out
 }
 
-/// Implement `Split`: peel the listed contours off `id` into one new object each.
+/// Peel the listed contours off `id` into one new object each.
 fn apply_split(
     scene: &mut ObjectScene,
     id: ObjectId,
@@ -325,7 +308,7 @@ fn apply_split(
 ) -> Result<ObjectOp, ApplyError> {
     let idx = index_of(scene, &id)?;
 
-    // Resolve which contour indices to peel (empty => all), validated + sorted.
+    // Contour indices to peel (empty => all), validated + sorted.
     let n_sub = scene.objects[idx].geometry.subpaths.len();
     let peel: Vec<usize> = if contours.is_empty() {
         (0..n_sub).collect()
@@ -365,15 +348,14 @@ fn apply_split(
     let peer_before = capture_peer_anchors(scene, &[id.as_str()]);
 
     let offsets = subpath_offsets(&original.geometry.subpaths);
-    // Flat index of each contour's first node + which new object (if any) it maps
-    // to. `dest[c]` = Some(new index k) if contour c is peeled, else None.
+    // `dest[c]` = Some(new index k) if contour c is peeled, else None.
     let mut dest: Vec<Option<usize>> = vec![None; n_sub];
     for (k, c) in peel.iter().enumerate() {
         dest[*c] = Some(k);
     }
 
-    // The remaining contours stay on the source, in original order. Build the
-    // source's new flat-offset map so kept-contour anchors can be re-indexed.
+    // Remaining contours stay on the source; build its new flat-offset map so
+    // kept-contour anchors can be re-indexed.
     let kept: Vec<usize> = (0..n_sub).filter(|c| dest[*c].is_none()).collect();
     let mut kept_new_base: Vec<i32> = vec![0; n_sub];
     {
@@ -386,9 +368,8 @@ fn apply_split(
         }
     }
 
-    // Allocate fractional order keys for the new objects, strictly after the
-    // source's order (append-style; deterministic). `a` ratchets forward so the
-    // keys stay distinct and ordered even with no successor bound.
+    // Fractional order keys strictly after the source's order; `prev` ratchets
+    // forward so the keys stay distinct and ordered with no successor bound.
     let mut order_keys = Vec::with_capacity(peel.len());
     let mut prev = original.order.clone();
     for _ in 0..peel.len() {
@@ -398,7 +379,6 @@ fn apply_split(
         order_keys.push(key);
     }
 
-    // Materialize the new objects (one per peeled contour, original peel order).
     let mut produced: Vec<ObjectId> = Vec::with_capacity(peel.len());
     let mut new_objects: Vec<Object> = Vec::with_capacity(peel.len());
     for (k, c) in peel.iter().enumerate() {
@@ -409,8 +389,7 @@ fn apply_split(
             vec![original.geometry.subpaths[*c].clone()],
             original.geometry.fill_rule,
         );
-        // The contour-peeled child carries no anchors of its own — anchors are an
-        // edge property re-homed from peers below, never inherited from source.
+        // Anchors are an edge property re-homed from peers below, never inherited.
         child.anchors = Vec::new();
         child.comments = Vec::new();
         produced.push(child.id.clone());
@@ -427,27 +406,24 @@ fn apply_split(
                 continue;
             }
             let flat = anchor.node_index;
-            // Find the source contour that owns this flat node index.
             let owner = (0..n_sub).find(|c| flat >= offsets[*c] && flat < offsets[*c + 1]);
             let Some(owner) = owner else { continue };
             let local = flat - offsets[owner];
             match dest[owner] {
                 Some(k) => {
-                    // Owner contour peeled => anchor follows it to the new object,
-                    // re-indexed relative to that object's single subpath.
+                    // Peeled: anchor follows the contour to its new single-subpath
+                    // object, re-indexed relative to it.
                     anchor.target = produced[k].clone();
                     anchor.node_index = local;
                 }
                 None => {
-                    // Owner contour stays on the source => re-index against the
-                    // source's compacted subpath order.
+                    // Kept: re-index against the source's compacted subpath order.
                     anchor.node_index = kept_new_base[owner] + local;
                 }
             }
         }
     }
 
-    // Update geometry of the source: keep remaining contours, or delete it.
     let source_survives = !kept.is_empty();
     if source_survives {
         let kept_subpaths: Vec<SubPath> = kept
@@ -460,11 +436,10 @@ fn apply_split(
         scene.objects.remove(idx);
     }
 
-    // Insert the new objects (append; canonical paint order is `order`).
     scene.objects.extend(new_objects);
 
-    // Build the faithful inverse: delete everything produced (+ source if it
-    // survived), re-insert the exact pre-split source, and restore peer anchors.
+    // Faithful inverse: delete everything produced (+ source if it survived),
+    // re-insert the exact pre-split source, restore peer anchors.
     let mut inverse_ops: Vec<ObjectOp> = Vec::new();
     for pid in &produced {
         inverse_ops.push(ObjectOp::Delete { id: pid.clone() });
@@ -479,8 +454,8 @@ fn apply_split(
     Ok(ObjectOp::Batch { ops: inverse_ops })
 }
 
-/// Implement `Merge`: concatenate the listed siblings' subpaths into the
-/// surviving object (`into`, else the first id); delete the others.
+/// Concatenate the listed siblings' subpaths into the survivor (`into`, else the
+/// first id); delete the others.
 fn apply_merge(
     scene: &mut ObjectScene,
     ids: Vec<ObjectId>,
@@ -495,7 +470,7 @@ fn apply_merge(
             "merge: into `{survivor_id}` not among merged ids"
         )));
     }
-    // Validate every id exists + dedupe-check before mutating.
+    // Validate every id exists + dedupe before mutating.
     {
         let mut seen: Vec<&str> = Vec::with_capacity(ids.len());
         for mid in &ids {
@@ -507,9 +482,9 @@ fn apply_merge(
         }
     }
 
-    // The merge order is: survivor's own subpaths first, then the others in the
-    // `ids` order given (excluding the survivor). This fixes the flat node-index
-    // base each merged object lands at, which the anchor re-home below relies on.
+    // Survivor's subpaths first, then the others in `ids` order. This fixes the
+    // flat node-index base each merged object lands at, which the anchor re-home
+    // below relies on.
     let mut merge_order: Vec<ObjectId> = vec![survivor_id.clone()];
     for mid in &ids {
         if *mid != survivor_id {
@@ -517,9 +492,8 @@ fn apply_merge(
         }
     }
 
-    // Capture faithful-inverse inputs: every merged object verbatim (in `ids`
-    // order, so Split can rebuild them) + every peer anchor that addressed any of
-    // them.
+    // Faithful-inverse inputs: every merged object verbatim (in `ids` order) +
+    // every peer anchor that addressed any of them.
     let originals: Vec<Object> = ids
         .iter()
         .map(|mid| scene.get(mid).expect("checked above").clone())
@@ -527,8 +501,8 @@ fn apply_merge(
     let merged_id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
     let peer_before = capture_peer_anchors(scene, &merged_id_refs);
 
-    // Compute each merged object's flat-index base in the combined geometry +
-    // assemble the concatenated subpaths.
+    // Each merged object's flat-index base in the combined geometry + the
+    // concatenated subpaths.
     let mut base_of: std::collections::HashMap<ObjectId, i32> = std::collections::HashMap::new();
     let mut combined: Vec<SubPath> = Vec::new();
     let mut acc: i32 = 0;
@@ -546,7 +520,6 @@ fn apply_merge(
         }
     }
 
-    // Remove the non-survivor merged objects.
     scene
         .objects
         .retain(|o| o.id == survivor_id || !ids.contains(&o.id));
@@ -555,8 +528,8 @@ fn apply_merge(
     let survivor_idx = index_of(scene, &survivor_id)?;
     scene.objects[survivor_idx].geometry = Geometry::from_subpaths(combined, survivor_fill_rule);
 
-    // Re-home peer anchors: any anchor that addressed a merged object now points
-    // at the survivor, with its flat node_index shifted by that object's base.
+    // Any anchor that addressed a merged object now points at the survivor, its
+    // flat node_index shifted by that object's base.
     for peer in &mut scene.objects {
         for anchor in &mut peer.anchors {
             if let Some(base) = base_of.get(&anchor.target) {
@@ -566,8 +539,8 @@ fn apply_merge(
         }
     }
 
-    // Faithful inverse: delete the merged result, re-insert every original
-    // (exact id/order/geometry/anchors), restore peer anchors.
+    // Faithful inverse: delete the merged result, re-insert every original,
+    // restore peer anchors.
     let mut inverse_ops: Vec<ObjectOp> = vec![ObjectOp::Delete { id: survivor_id.clone() }];
     for object in originals {
         inverse_ops.push(ObjectOp::InsertObject { object });
@@ -578,24 +551,13 @@ fn apply_merge(
     Ok(ObjectOp::Batch { ops: inverse_ops })
 }
 
-// ---------------------------------------------------------------------------
-// OB3.S1 — optional per-property server-authoritative LWW layer.
-//
-// `apply_object_op` stays the seq-less direct-apply (single actor + tests).
-// `apply_object_op_lww` wraps it with a [`PropertyStore`] gate: each op names
-// the properties it touches; for every property whose stored winning `seq` is
-// already `>=` the incoming `seq`, the write is *stale* and the whole op is
-// skipped (Figma server-authoritative LWW — server arrival seq is the
-// authority). A surviving op applies through the exact same path + records the
-// new seq for each touched property.
-// ---------------------------------------------------------------------------
+// `apply_object_op` is the seq-less direct-apply; `apply_object_op_lww` wraps it
+// with a per-property server-authoritative LWW gate keyed on a [`PropertyStore`].
 
-/// The properties an op writes, as `(object_id, property_name)` pairs. These key
-/// the [`PropertyStore`]; the names mirror the camelCase field/op vocabulary so
-/// the store stays human-legible. Structural ops that span objects
-/// (`Split`/`Merge`/`Batch`/`InsertObject`/`Delete`) return an empty slice and
-/// are treated as always-apply (they are not single-property LWW writes — the
-/// server orders them by seq globally, not per property).
+/// The properties an op writes, as `(object_id, property_name)` pairs keying the
+/// [`PropertyStore`]. Structural ops that span objects (Split/Merge/Batch/Insert/
+/// Delete) return an empty slice and always apply — the server orders them by seq
+/// globally, not per property.
 fn touched_properties(op: &ObjectOp) -> Vec<(ObjectId, &'static str)> {
     match op {
         ObjectOp::EditGeometry { id, .. } => vec![(id.clone(), "geometry")],
@@ -628,18 +590,10 @@ fn touched_properties(op: &ObjectOp) -> Vec<(ObjectId, &'static str)> {
     }
 }
 
-/// Apply `op` under per-property server-authoritative LWW (OB3.S1).
-///
-/// `seq` is the server's monotonic arrival sequence for this op (the authority
-/// token, identical role to `lww.rs`). For every property the op touches: if the
-/// [`PropertyStore`] already holds a winner whose `seq` is `>=` the incoming
-/// `seq`, the write is **stale** and the op is skipped entirely (the scene is
-/// left untouched and the returned inverse is a no-op `Batch`). Otherwise the op
-/// applies through [`apply_object_op`] and each touched property records the new
-/// `seq`. Structural ops (insert/delete/split/merge/batch) carry no
-/// single-property key and always apply.
-///
-/// The seq-less [`apply_object_op`] remains the single-actor / test path.
+/// `seq` is the server's monotonic arrival sequence (the authority token). If any
+/// touched property already holds a winner with `seq >= incoming`, the write is
+/// stale: the op is skipped, scene untouched, inverse a no-op `Batch`. Otherwise
+/// it applies through [`apply_object_op`] and records the new `seq` per property.
 pub fn apply_object_op_lww(
     scene: &mut ObjectScene,
     store: &mut crate::lww::PropertyStore,
@@ -649,10 +603,7 @@ pub fn apply_object_op_lww(
     let seq_i64 = i64::try_from(seq).unwrap_or(i64::MAX);
     let props = touched_properties(&op);
 
-    // Stale check: if ANY touched property already has a winner at >= this seq,
-    // the op lost the race for that property. Per-property LWW with a
-    // multi-property op (only `Reparent`/`SetStyle` touch >1) treats the op
-    // atomically — it applies as a unit or not at all — so a single stale
+    // A multi-property op (only Reparent/SetStyle) is atomic: a single stale
     // property vetoes the whole op. Equal seq is stale (idempotent re-apply).
     for (object_id, property) in &props {
         if let Some(entry) = store.get(object_id, *property) {
@@ -662,19 +613,17 @@ pub fn apply_object_op_lww(
         }
     }
 
-    // The op won every property it touches; apply it, then record the new seqs.
     let inverse = apply_object_op(scene, op)?;
     for (object_id, property) in &props {
-        // Value payload is informational here (the scene holds the authoritative
-        // value); record a null marker carrying the winning seq so future writes
-        // compare against it.
+        // The scene holds the authoritative value; record a null marker carrying
+        // the winning seq so future writes compare against it.
         store.apply(object_id, *property, serde_json::Value::Null, seq_i64);
     }
     Ok(inverse)
 }
 
-/// Convenience used by the vertical slice + undo engine: apply each op in order,
-/// collecting inverses (reversed) so the whole sequence can be undone as a unit.
+/// Apply each op in order, collecting inverses (reversed) so the whole sequence
+/// can be undone as a unit.
 pub fn apply_sequence(
     scene: &mut ObjectScene,
     ops: impl IntoIterator<Item = ObjectOp>,
@@ -687,17 +636,12 @@ pub fn apply_sequence(
     Ok(inverses)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lww::PropertyStore;
     use crate::object::model::{FillRule, LocalPoint, PathNode, Transform3x3};
 
-    /// A closed rect contour (4 corners) in quantized units.
     fn rect(x0: i32, y0: i32, x1: i32, y1: i32) -> SubPath {
         SubPath {
             closed: true,
@@ -710,7 +654,6 @@ mod tests {
         }
     }
 
-    /// An object with the given multi-subpath geometry.
     fn multi_obj(id: &str, order: &str, subpaths: Vec<SubPath>) -> Object {
         Object::new(id, order, Geometry::from_subpaths(subpaths, FillRule::EvenOdd))
     }
@@ -723,8 +666,6 @@ mod tests {
 
     #[test]
     fn split_peels_all_contours_into_new_objects() {
-        // A two-contour object split into both contours -> 2 new objects, source
-        // deleted (no contours remain).
         let src = multi_obj("src", "a5", vec![rect(0, 0, 80, 40), rect(100, 0, 180, 40)]);
         let mut scene = scene_of(vec![src]);
 
@@ -737,20 +678,16 @@ mod tests {
         assert!(scene.get("src").is_none(), "source deleted when no contour remains");
         assert!(scene.get("c0").is_some());
         assert!(scene.get("c1").is_some());
-        // Each new object carries exactly one contour.
         assert_eq!(scene.get("c0").unwrap().geometry.subpaths.len(), 1);
         assert_eq!(scene.get("c1").unwrap().geometry.subpaths.len(), 1);
-        // New keys sort strictly after the source order.
         assert!(scene.get("c0").unwrap().order.as_str() > "a5");
         assert!(scene.get("c1").unwrap().order.as_str() > scene.get("c0").unwrap().order.as_str());
 
-        // The inverse is a Batch.
         assert!(matches!(inverse, ObjectOp::Batch { .. }));
     }
 
     #[test]
     fn split_keeps_remaining_contours_on_source() {
-        // Peel only contour 1 of 3 -> source keeps contours 0 and 2.
         let src = multi_obj(
             "src",
             "a5",
@@ -766,7 +703,6 @@ mod tests {
 
         assert_eq!(scene.get("src").unwrap().geometry.subpaths.len(), 2, "two contours remain");
         assert_eq!(scene.get("c").unwrap().geometry.subpaths.len(), 1);
-        // The kept subpaths are the original 0 and 2 (first node x = 0 then 40).
         let kept = &scene.get("src").unwrap().geometry.subpaths;
         assert_eq!(kept[0].nodes[0].x, 0);
         assert_eq!(kept[1].nodes[0].x, 40);
@@ -774,8 +710,6 @@ mod tests {
 
     #[test]
     fn split_then_inverse_restores_original() {
-        // Faithful inverse: split, then apply the returned inverse -> byte-equal
-        // pre-split scene (geometry, order, ids).
         let src = multi_obj("src", "a5", vec![rect(0, 0, 80, 40), rect(100, 0, 180, 40)]);
         let mut scene = scene_of(vec![src]);
         let before = scene.clone();
@@ -787,8 +721,6 @@ mod tests {
         .expect("split");
         apply_object_op(&mut scene, inverse).expect("apply inverse");
 
-        // The single source object is back with its two-contour geometry; the
-        // produced children are gone.
         assert!(scene.get("c0").is_none());
         assert!(scene.get("c1").is_none());
         let restored = scene.get("src").expect("source restored");
@@ -800,10 +732,8 @@ mod tests {
 
     #[test]
     fn split_rehomes_and_reindexes_peer_anchors() {
-        // src has two 4-node contours: flat indices 0..4 (contour 0), 4..8
-        // (contour 1). An edge anchors node-index 0 (contour 0) and node-index 5
-        // (contour 1, local 1). After splitting both contours, anchor 0 follows
-        // c0 (stays index 0); anchor 5 follows c1 (re-indexed to local 1).
+        // Two 4-node contours: flat 0..4, 4..8. Anchor at flat 5 (contour 1 local
+        // 1) follows c1, re-indexed to local 1; anchor at flat 0 follows c0.
         let src = multi_obj("src", "a5", vec![rect(0, 0, 80, 40), rect(100, 0, 180, 40)]);
         let mut edge = multi_obj("edge", "a6", vec![rect(0, 0, 10, 10)]);
         edge.anchors = vec![
@@ -857,7 +787,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ApplyError::BadGeometry(_)));
-        // Scene untouched on rejection.
         assert_eq!(scene.objects.len(), 1);
         assert!(scene.get("only-one").is_none());
     }
@@ -924,7 +853,6 @@ mod tests {
         .expect("merge");
         apply_object_op(&mut scene, inverse).expect("apply inverse");
 
-        // Both originals are back with their exact geometry + order.
         assert_eq!(scene.get("a").unwrap().geometry, before.get("a").unwrap().geometry);
         assert_eq!(scene.get("b").unwrap().geometry, before.get("b").unwrap().geometry);
         assert_eq!(scene.get("a").unwrap().order, "a0");
@@ -934,8 +862,8 @@ mod tests {
 
     #[test]
     fn merge_rehomes_peer_anchors_to_survivor() {
-        // edge anchors b's node 0 (b is single 4-node rect). After merge into a
-        // (a has 4 nodes), b's nodes start at flat base 4, so anchor -> a node 4.
+        // edge anchors b's node 0; after merge into a (4 nodes), b's nodes start
+        // at flat base 4, so anchor -> a node 4.
         let a = multi_obj("a", "a0", vec![rect(0, 0, 10, 10)]);
         let b = multi_obj("b", "a1", vec![rect(20, 0, 30, 10)]);
         let mut edge = multi_obj("edge", "a2", vec![rect(0, 0, 5, 5)]);
@@ -1034,7 +962,6 @@ mod tests {
         let mut scene = scene_of(vec![multi_obj("o", "a0", vec![rect(0, 0, 10, 10)])]);
         let mut store = PropertyStore::new();
 
-        // seq 5 sets a transform; it wins (first writer).
         apply_object_op_lww(
             &mut scene,
             &mut store,
@@ -1044,7 +971,6 @@ mod tests {
         .expect("seq 5");
         assert_eq!(scene.get("o").unwrap().transform, Transform3x3::translate(10.0, 0.0));
 
-        // seq 3 (older) loses: scene unchanged, inverse is a no-op batch.
         let inv = apply_object_op_lww(
             &mut scene,
             &mut store,
@@ -1071,7 +997,6 @@ mod tests {
             7,
         )
         .expect("seq 7");
-        // Re-applying at the same seq is idempotent (does not flip).
         apply_object_op_lww(
             &mut scene,
             &mut store,
@@ -1105,10 +1030,8 @@ mod tests {
 
     #[test]
     fn lww_distinct_properties_are_independent() {
-        // A stale write to one property does not block a fresh write to another.
         let mut scene = scene_of(vec![multi_obj("o", "a0", vec![rect(0, 0, 10, 10)])]);
         let mut store = PropertyStore::new();
-        // transform wins at seq 10.
         apply_object_op_lww(
             &mut scene,
             &mut store,
@@ -1116,7 +1039,7 @@ mod tests {
             10,
         )
         .expect("transform seq 10");
-        // tags is a different property: a seq-3 write still wins (no prior tags seq).
+        // Different property: a seq-3 write still wins (no prior tags seq).
         apply_object_op_lww(
             &mut scene,
             &mut store,
@@ -1130,7 +1053,6 @@ mod tests {
 
     // ---- SetAnchor degrades gracefully over a windowed/divergent scene -------
 
-    /// An object carrying a single anchor whose `target` is `target`.
     fn anchored_obj(id: &str, order: &str, target: &str) -> Object {
         let mut o = multi_obj(id, order, vec![rect(0, 0, 10, 10)]);
         o.anchors = vec![Anchor { node_index: 0, target: target.into(), at: LocalPoint { x: 0, y: 0 } }];
@@ -1139,18 +1061,16 @@ mod tests {
 
     #[test]
     fn multidelete_undo_restores_object_when_peer_diverged() {
-        // The data-loss bug: seed A + B(anchor->A). `delete A` captures a Batch
-        // inverse [insert A, set-anchor B [target A]]. If B has since diverged out
-        // of the windowed/optimistic client scene, applying that inverse must STILL
-        // restore A — the set-anchor B restore no-ops (owner B absent) instead of
-        // throwing NotFound and discarding the InsertObject sibling.
+        // `delete A` captures a Batch inverse [insert A, set-anchor B]. If B has
+        // since diverged out of the windowed scene, the inverse must STILL restore
+        // A — the B restore no-ops instead of throwing NotFound and discarding the
+        // InsertObject sibling.
         let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
         let b = anchored_obj("B", "a1", "A");
         let mut scene = scene_of(vec![a, b]);
 
         let inverse = apply_object_op(&mut scene, ObjectOp::Delete { id: "A".into() })
             .expect("delete A");
-        // The inverse is the Batch[insert A, set-anchor B] described above.
         assert!(matches!(inverse, ObjectOp::Batch { .. }));
         assert!(scene.get("A").is_none());
 
@@ -1158,15 +1078,14 @@ mod tests {
         scene.objects.retain(|o| o.id != "B");
         assert!(scene.get("B").is_none());
 
-        // Apply the captured inverse: A is restored, no error, B-restore no-ops.
         apply_object_op(&mut scene, inverse).expect("undo must not fail when peer absent");
         assert!(scene.get("A").is_some(), "A restored despite absent peer B");
     }
 
     #[test]
     fn set_anchor_filters_absent_targets() {
-        // Owner present; anchor list has one present (A) + one absent (ghost)
-        // target -> only the present anchor is set (filtered, not failed).
+        // One present (A) + one absent (ghost) target -> only the present anchor
+        // is set (filtered, not failed).
         let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
         let edge = multi_obj("edge", "a1", vec![rect(0, 0, 5, 5)]);
         let mut scene = scene_of(vec![a, edge]);
@@ -1186,15 +1105,14 @@ mod tests {
         let anchors = &scene.get("edge").unwrap().anchors;
         assert_eq!(anchors.len(), 1, "ghost-target anchor filtered out");
         assert_eq!(anchors[0].target, "A");
-        // Inverse restores the prior (empty) anchor list exactly.
         apply_object_op(&mut scene, inverse).expect("apply inverse");
         assert!(scene.get("edge").unwrap().anchors.is_empty());
     }
 
     #[test]
     fn set_anchor_absent_owner_is_noop_with_noop_inverse() {
-        // Owner object id is absent -> Ok, scene unchanged, no-op (empty Batch)
-        // inverse so a Delete-inverse Batch sibling still commits.
+        // Absent owner -> Ok, scene unchanged, no-op (empty Batch) inverse so a
+        // Delete-inverse Batch sibling still commits.
         let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
         let mut scene = scene_of(vec![a]);
         let before = scene.clone();
@@ -1214,14 +1132,11 @@ mod tests {
 
     #[test]
     fn set_anchor_normal_set_round_trips() {
-        // Owner present, target present: a real set. apply-then-apply-inverse
-        // restores the prior anchors exactly.
         let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
         let edge = anchored_obj("edge", "a1", "A");
         let mut scene = scene_of(vec![a, edge]);
         let before = scene.clone();
 
-        // Replace edge's anchor with a different (still-present) target binding.
         let b = multi_obj("B", "a2", vec![rect(20, 0, 30, 10)]);
         scene.objects.push(b);
         let new_anchors = vec![Anchor { node_index: 0, target: "B".into(), at: LocalPoint { x: 20, y: 0 } }];
@@ -1232,17 +1147,14 @@ mod tests {
         .expect("set-anchor");
         assert_eq!(scene.get("edge").unwrap().anchors, new_anchors);
 
-        // Inverse restores the original (target-A) anchor exactly.
         apply_object_op(&mut scene, inverse).expect("apply inverse");
         assert_eq!(scene.get("edge").unwrap().anchors, before.get("edge").unwrap().anchors);
     }
 
     #[test]
     fn set_anchor_filtered_set_round_trips() {
-        // Filtered set (one present + one absent target) round-trips: the inverse
-        // restores whatever the filtered write replaced.
         let a = multi_obj("A", "a0", vec![rect(0, 0, 10, 10)]);
-        let edge = anchored_obj("edge", "a1", "A"); // starts anchored to A
+        let edge = anchored_obj("edge", "a1", "A");
         let mut scene = scene_of(vec![a, edge]);
         let before = scene.clone();
 

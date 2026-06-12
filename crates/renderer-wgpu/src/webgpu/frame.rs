@@ -1,7 +1,6 @@
-//! The single-present render path (W2-13/S8): `render_frame` (object pass +
-//! legacy fallback pass) plus the per-frame writers it drives — uniform upload,
-//! marquee overlay geometry, glyph-atlas flush, draw-list build, viewport cull.
-//! `target_arch = "wasm32"` gated; it runs against the live wgpu device.
+//! The single-present render path: `render_frame` (object pass + legacy fallback)
+//! plus the per-frame writers it drives. `target_arch = "wasm32"` gated; runs
+//! against the live wgpu device.
 
 use std::collections::HashMap;
 
@@ -25,9 +24,8 @@ impl ShapeWebGpuRenderer {
         let handle_vertex_count = self.write_handle_overlay();
         let multi_select_vertex_count = self.write_multi_select_overlay();
         let mut draw_list = self.build_draw_list();
-        // Carry this frame's per-object tiers forward so the next frame's
-        // hysteresis resolves against them (T3.1 §3). Tiers are diagnostics; they
-        // do not touch slot identity or vertex ranges.
+        // Carry this frame's per-object tiers forward so next frame's hysteresis
+        // resolves against them.
         self.last_lod_tiers = std::mem::take(&mut draw_list.lod_tiers);
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
@@ -46,10 +44,9 @@ impl ShapeWebGpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("shape.ai visible WebGPU encoder"),
             });
-        // FC-05/FC-06: when an object scene is loaded, this single frame records the
-        // OBJECT pass (clearing the surface) in place of the legacy 2D pass, so there
-        // is exactly one acquire/submit/present per frame. The camera uniform is
-        // refreshed every frame so pan/zoom moves objects with no scene reload.
+        // When an object scene is loaded, this frame records the OBJECT pass in place
+        // of the legacy 2D pass — exactly one acquire/submit/present. The camera
+        // uniform refreshes every frame so pan/zoom moves objects with no reload.
         if let (Some(pipeline), Some(renderer)) =
             (self.object_pipeline.as_ref(), self.object_renderer.as_ref())
         {
@@ -59,26 +56,21 @@ impl ShapeWebGpuRenderer {
                 self.width as f32,
                 self.height as f32,
             );
-            // W3-G8/A real drop-shadow blur: render the shadow silhouette ONCE into
-            // the offscreen mask, separable-Gaussian-blur it (H then V), then
-            // composite the blurred result onto the surface FIRST (it also clears the
-            // surface to the canvas-bg), so the fill/stroke/text pass below draws on
-            // top of the shadow. This whole block is an isolated underlay: the
-            // `render(clear=false)` call still runs the fill/stroke/text regardless,
-            // so a shadow fault degrades to "no shadow", never a blank canvas.
+            // Render the shadow silhouette into the offscreen mask, blur it (H then
+            // V), then composite it onto the surface FIRST (also clearing to
+            // canvas-bg) so fill/stroke/text draw on top. An isolated underlay: the
+            // `render(clear=false)` below runs regardless, so a shadow fault degrades
+            // to "no shadow", never a blank canvas.
             let theme = renderer.theme();
             self.shadow_blur.set_tint(&self.queue, theme.shadow());
             renderer.render_shadow_mask(&mut encoder, pipeline, self.shadow_blur.mask_view());
             self.shadow_blur.record_blur(&mut encoder);
             self.shadow_blur.record_composite(&mut encoder, &view, theme.canvas_bg());
-            // Fill/stroke/text load over the cleared + shadow-composited surface.
             renderer.render(&mut encoder, &view, pipeline, false);
-            // W3-G7/#1: per-object outline highlight for the multi-select set, drawn
-            // on top of the object pass with the world-space pipeline (LoadOp::Load
-            // preserves the fill/stroke output). Single selection draws no outline
-            // here — it keeps its 8-handle overlay below. The outline rectangles are
-            // world-space quads built from each region's world bbox, so the matrix
-            // transform path never re-tessellates them.
+            // Per-object outline highlight for the multi-select set, drawn on top with
+            // the world-space pipeline (LoadOp::Load preserves the object pass). Single
+            // selection keeps its 8-handle overlay below instead. World-space quads, so
+            // the matrix transform never re-tessellates them.
             if multi_select_vertex_count > 0 {
                 let color_attachments = [Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -102,11 +94,9 @@ impl ShapeWebGpuRenderer {
                 pass.set_vertex_buffer(0, self.multi_select_overlay_vertex_buffer.slice(..));
                 pass.draw(0..multi_select_vertex_count as u32, 0..1);
             }
-            // W2-04: selection-handle overlay, drawn on top of the object pass with
-            // the legacy world-space pipeline (LoadOp::Load preserves the object
-            // pass output). The handles are screen-fixed world quads (see
-            // `build_handle_overlay_vertices`); the matrix transform W2-11 pushes to
-            // the object instance path never re-tessellates these.
+            // Selection-handle overlay, drawn on top with the legacy world-space
+            // pipeline (LoadOp::Load preserves the object pass). Screen-fixed world
+            // quads; the instance-matrix preview never re-tessellates these.
             if handle_vertex_count > 0 {
                 let color_attachments = [Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -130,10 +120,9 @@ impl ShapeWebGpuRenderer {
                 pass.set_vertex_buffer(0, self.handle_vertex_buffer.slice(..));
                 pass.draw(0..handle_vertex_count as u32, 0..1);
             }
-            // RA2a (#7): the drag marquee must surface in object mode too. The object
-            // pass replaces the legacy 2D pass, which is the only place the marquee
-            // overlay was drawn — so without this the rubber-band never renders over
-            // an object scene. Same world-space pipeline, LoadOp::Load on top.
+            // The drag marquee in object mode: the object pass replaces the legacy 2D
+            // pass that drew it, so draw it here too. Same world-space pipeline,
+            // LoadOp::Load on top.
             if overlay_vertex_count > 0 {
                 let color_attachments = [Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -188,8 +177,8 @@ impl ShapeWebGpuRenderer {
                     pass.draw(range.start..range.end, 0..1);
                 }
             }
-            // Draw the drag marquee on top of the scene using the same world-space
-            // pipeline and bind group, from a separate dynamic vertex buffer.
+            // Draw the drag marquee on top using the same pipeline + bind group, from
+            // a separate dynamic vertex buffer.
             if overlay_vertex_count > 0 {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
@@ -291,29 +280,26 @@ impl ShapeWebGpuRenderer {
 #[cfg(feature = "wgpu-probe")]
 #[cfg(target_arch = "wasm32")]
 impl ShapeWebGpuRenderer {
-    /// W2-04: write the selection-handle overlay (8 resize handles + rotate zone)
-    /// for the current object-scene selection into the dedicated handle buffer,
-    /// returning the vertex count to draw. Zero when no object is selected (or the
-    /// selection has no finite world bounds). World-space quads sized
-    /// `HANDLE_SIZE_PX / zoom` so the legacy pipeline draws them at a fixed screen
-    /// size; the shared `selection_handles` layout keeps render == hit-test.
+    /// Write the selection-handle overlay (8 resize handles + rotate zone) for the
+    /// current selection into the handle buffer, returning the vertex count. Zero
+    /// when nothing is selected (or no finite world bounds). World-space quads sized
+    /// `HANDLE_SIZE_PX / zoom`; the shared `selection_handles` layout keeps render ==
+    /// hit-test.
     fn write_handle_overlay(&mut self) -> usize {
         let selection = self
             .object_scene
             .as_ref()
             .and_then(|scene| scene.selection.clone());
-        // RA1: while a transform drag is in flight the renderer holds the dragged
-        // object's live preview transform; feed it so the handles track the previewed
-        // bbox every frame instead of snapping only on commit (zero-rebake read).
+        // Feed the live preview transform so the handles track the previewed bbox
+        // every frame instead of snapping only on commit (zero-rebake read).
         let preview = selection.as_deref().and_then(|id| {
             self.object_renderer
                 .as_ref()
                 .and_then(|renderer| renderer.preview_transform(id))
         });
-        // v3 §2b: an open-class selection renders TWO endpoint handles instead of
-        // the bbox 8-handle + rotate overlay (`selection_handles` returns None for
-        // it). During a live endpoint drag the dragged handle rides the pointer
-        // (the geometry patch carries the silhouette; the regions stay canonical).
+        // An open-class selection renders TWO endpoint handles instead of the bbox
+        // overlay (`selection_handles` returns None for it); the dragged handle rides
+        // the pointer during a live endpoint drag.
         if let Some(handles) = endpoint_handles(
             &self.object_regions,
             &self.camera,
@@ -352,21 +338,18 @@ impl ShapeWebGpuRenderer {
         vertices.len()
     }
 
-    /// W3-G7/#1 + W3-G9/#2: write the per-object outline ring into its dedicated
-    /// buffer, returning the vertex count to draw. Rings every multi-select member,
-    /// or (when the multi-select is empty) the single selected object/group — so a
-    /// grouped selection shows a continuous border, not just its 8 resize handles.
-    /// Zero when nothing is selected.
+    /// Write the per-object outline ring into its buffer, returning the vertex count.
+    /// Rings every multi-select member, or (when empty) the single selected object/
+    /// group so a grouped selection shows a continuous border. Zero when nothing is
+    /// selected.
     fn write_multi_select_overlay(&mut self) -> usize {
         let ids = self
             .object_scene
             .as_ref()
             .map(|scene| outline_overlay_ids(scene, &self.object_regions))
             .unwrap_or_default();
-        // W3-G10/#2: feed each id's LIVE preview transform so the outline ring tracks
-        // the drag every frame like the resize handles, not just on commit. The G9
-        // multi-member SameDelta preview writes every member's instance matrix, so a
-        // group/multi drag rings every member live (zero-rebake read).
+        // Feed each id's LIVE preview transform so the ring tracks the drag every
+        // frame like the resize handles (zero-rebake read).
         let object_renderer = self.object_renderer.as_ref();
         let vertices = build_multi_select_overlay_vertices(
             &self.object_regions,
@@ -385,9 +368,8 @@ impl ShapeWebGpuRenderer {
         vertices.len()
     }
 
-    /// Write the marquee overlay quads for the active drag (if any) into the
-    /// dedicated overlay vertex buffer, returning the vertex count to draw. Zero
-    /// when no marquee is in flight.
+    /// Write the marquee overlay quads for the active drag (if any), returning the
+    /// vertex count. Zero when no marquee is in flight.
     fn write_marquee_overlay(&mut self) -> usize {
         let vertices = marquee_overlay_for_drag(self.input_drag.as_ref(), self.camera.zoom);
         if vertices.is_empty() {

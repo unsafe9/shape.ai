@@ -1,27 +1,11 @@
-// Transport-backed object scene data layer (OB4.3).
+// The single client data path: the shell loads and mutates the canvas through the WS transport,
+// composing `WsTransport` (the wire), `SyncEngine` (optimistic op-apply + durable outbox + coalescing
+// + reconnect reconcile), and an `OutboxStore` into one handle.
 //
-// The single client data path: the shell loads and mutates the canvas through
-// the WS transport. It composes `WsTransport` (the wire), `SyncEngine`
-// (optimistic object op-apply + durable outbox + coalescing + reconnect
-// reconcile), and an `OutboxStore` into one handle the shell drives.
-//
-// Routing rules:
-//
-//   - Object ops (`ObjectOp`) flow through `engine.author()`: optimistic local
-//     apply via the scene-core wasm core (the ONE op-apply, P1), persisted to the
-//     outbox as a `WireOp`, sent as an `ops` envelope, dropped on the server ack.
-//
-//   - Selection-only changes do NOT bump the document revision: a selection move
-//     is presence, not a document op. `saveSelection` broadcasts it as a
-//     best-effort presence frame; it never enters the outbox or produces an
-//     `ops` frame.
-//
-//   - Feature traffic (comment upsert, template apply, export, canvas switch)
-//     rides the single WS `feature` request/response RPC channel (OB4.5); there
-//     is no bespoke domain REST.
-//
-//   - LWW / stale-snapshot guards live in `SyncEngine.reconcileSnapshot`, which
-//     rebases on the freshest `welcome` and replays the unacked outbox on top.
+// Routing: object ops flow through `engine.author()` (optimistic apply, outbox, `ops` envelope, dropped
+// on ack). Selection-only changes are presence, NOT document ops — `saveSelection` broadcasts a best-
+// effort presence frame, never entering the outbox or bumping the revision. Feature traffic rides the
+// single WS `feature` RPC channel. Stale-snapshot guards live in `SyncEngine.reconcileSnapshot`.
 
 import type { ObjectScene, ObjectOp, ObjectSelection, FeatureRequest, FeatureResponse } from "../shared/object";
 import type { WorldPoint, WorldRect } from "../shared/geometry";
@@ -33,71 +17,48 @@ import { PeerRegistry, type PeerPresence } from "./peers";
 import type { Bbox, FeatureServerMessage, PatchMessage, Region } from "./transport";
 
 export type SceneClientOptions = {
-  /** Wire base, e.g. `ws://127.0.0.1:8787`; the transport appends `/ws`. */
+  // Wire base, e.g. `ws://127.0.0.1:8787`; the transport appends `/ws`.
   url: string;
-  /** Authoring identity stamped into every opId.clientId. */
+  // Authoring identity stamped into every opId.clientId.
   clientId: string;
-  /**
-   * Stable user identity. Sent in `hello.userId` and stamped on every presence
-   * frame so the server self-skips this client's ops/presence and peers can be
-   * surfaced by userId. Defaults to {@link SceneClientOptions.clientId}.
-   */
+  // Stable user identity, sent in `hello.userId` and stamped on every presence frame so the server
+  // self-skips this client's ops/presence and peers surface by userId. Defaults to `clientId`.
   userId?: string;
-  /** Durable outbox; defaults to an in-memory store (non-durable fallback). */
+  // Durable outbox; defaults to an in-memory store (non-durable fallback).
   outbox?: OutboxStore;
-  /** Socket factory; tests inject a mock, prod uses the browser `WebSocket`. */
   createSocket?: WebSocketFactory;
-  /** Coalescing window in ms; forwarded to the engine. */
   coalesceMs?: number;
-  /** Clock source for envelope `ts`; injected for deterministic tests. */
+  // Injected for deterministic tests.
   now?: () => string;
-  /** Timer hooks; injected so tests can drive coalescing without real time. */
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
-  /** Reconnect backoff config; forwarded to the transport (MG8.4). */
   reconnect?: ReconnectOptions;
-  /** Random source for reconnect jitter; forwarded to the transport. */
   random?: () => number;
-  /**
-   * Window margin factor (MG9.4). The viewport bbox is grown by this fraction of
-   * its width/height on each side before it becomes the subscribed region, so a
-   * small pan/zoom does not immediately re-subscribe. Omit to use the core default
-   * (`client-runtime` `DEFAULT_VIEWPORT_MARGIN`).
-   */
+  // The viewport bbox is grown by this fraction on each side before it becomes the subscribed region, so
+  // a small pan/zoom does not immediately re-subscribe. Omit for the core default.
   viewportMargin?: number;
-  /**
-   * Debounce in ms for {@link SceneClient.setViewport} re-subscribes (MG9.4).
-   * Default {@link DEFAULT_VIEWPORT_DEBOUNCE_MS}.
-   */
   viewportDebounceMs?: number;
-  /** Stale-peer cursor TTL in ms (MG6.2). Default {@link DEFAULT_PEER_TTL_MS}. */
+  // Stale-peer cursor TTL in ms.
   peerTtlMs?: number;
-  /** Wall-clock source for peer freshness/expiry; injected for tests. */
   nowMs?: () => number;
 };
 
 export type Unsubscribe = () => void;
 
-/** A camera-derived viewport in WORLD coordinates (before the window margin). */
+// A camera-derived viewport in WORLD coordinates (before the window margin).
 export type Viewport = Bbox;
 
-/** Default debounce for viewport-driven re-subscribes. */
 export const DEFAULT_VIEWPORT_DEBOUNCE_MS = 200;
 
-/** Default window after which a silent peer's cursor is expired. */
 export const DEFAULT_PEER_TTL_MS = 10_000;
 
-/**
- * A transport-backed object scene store. Open it with {@link connect}; author
- * object ops with {@link applyObjectOp}; move the selection (presence-only) with
- * {@link saveSelection}; drive feature RPCs with {@link sendFeature}.
- */
+// A transport-backed object scene store. Open with `connect`, author ops with `applyObjectOp`, move the
+// selection (presence-only) with `saveSelection`, drive feature RPCs with `sendFeature`.
 export class SceneClient {
   private readonly url: string;
   private readonly clientId: string;
-  /** Stable user identity; sent in hello + stamped on presence frames. */
   private readonly userId: string;
-  /** Re-pointed on switchCanvas so the new canvas starts with a clean outbox. */
+  // Re-pointed on switchCanvas so the new canvas starts with a clean outbox.
   private outbox: OutboxStore;
   private readonly createSocket: SceneClientOptions["createSocket"];
   private readonly coalesceMs?: number;
@@ -106,7 +67,7 @@ export class SceneClient {
   private readonly clearTimer: (handle: unknown) => void;
   private readonly reconnect?: ReconnectOptions;
   private readonly random?: () => number;
-  /** Window margin handed to the core decision state; `-1` = core default. */
+  // Window margin handed to the core decision state; `-1` = core default.
   private readonly viewportMargin: number;
   private readonly viewportDebounceMs: number;
 
@@ -115,20 +76,16 @@ export class SceneClient {
   private detachEngine: Unsubscribe | null = null;
   private canvasId: string | null = null;
 
-  /**
-   * The viewport-windowing DECISION state, owned by the core (client-runtime
-   * `WindowState`). Null before {@link connect} initializes the wasm; the shell
-   * only drives the debounce timer + transport off its decisions.
-   */
+  // The viewport-windowing DECISION state, owned by the core. Null before `connect` initializes the
+  // wasm; the shell only drives the debounce timer + transport off its decisions.
   private windowState: WasmWindow | null = null;
-  /** Debounce handle for the pending viewport-driven re-subscribe. */
   private viewportTimer: unknown = null;
 
   private readonly sceneListeners = new Set<(scene: ObjectScene) => void>();
   private readonly patchListeners = new Set<(patch: PatchMessage) => void>();
   private readonly featureListeners = new Set<(response: FeatureResponse) => void>();
   private readonly statusListeners = new Set<(status: ConnectionStatus) => void>();
-  /** Peer cursor registry (MG6.2) + its subscribers; rebuilt per connection. */
+  // Peer cursor registry + subscribers; rebuilt per connection.
   private peers: PeerRegistry;
   private readonly peerListeners = new Set<(peers: PeerPresence[]) => void>();
   private readonly peerTtlMs: number;
@@ -158,17 +115,13 @@ export class SceneClient {
     this.peers = this.newPeerRegistry();
   }
 
-  /** A fresh peer registry seeded with this client's self-skip identity. */
+  // A fresh peer registry seeded with this client's self-skip identity.
   private newPeerRegistry(): PeerRegistry {
     return new PeerRegistry({ selfUserId: this.userId, ttlMs: this.peerTtlMs, now: this.nowMs });
   }
 
-  /**
-   * Open the session: connect the transport, send `hello`, and resolve with the
-   * welcome `ObjectScene` snapshot. The engine is created from the welcome scene
-   * and attached to the socket so subsequent acks/rejects/patches/reconnect-
-   * welcomes are reconciled automatically.
-   */
+  // Open the session: connect the transport, send `hello`, resolve with the welcome `ObjectScene`. The
+  // engine is created from the welcome scene and attached so acks/rejects/patches/reconnect-welcomes reconcile automatically.
   async connect(canvasId: string, region?: Region): Promise<ObjectScene> {
     if (this.transport) throw new Error("SceneClient already connected");
     this.canvasId = canvasId;
@@ -184,13 +137,11 @@ export class SceneClient {
     });
     this.transport = transport;
 
-    // The engine's optimistic op-apply is the scene-core wasm object core (the
-    // same Rust the server runs); init it before the engine can author.
+    // The engine's optimistic op-apply is the scene-core wasm core; init it before the engine can author.
     const sceneCoreReady = ensureSceneCore();
     const welcome = await transport.connect(canvasId, this.regionFor(seed));
     await sceneCoreReady;
-    // The windowing decisions live in the core; seed its state from the connect
-    // region now that the wasm is initialized.
+    // Windowing decisions live in the core; seed its state from the connect region now the wasm is initialized.
     this.windowState = createWasmWindow({ seed, margin: this.viewportMargin });
 
     const engine = new SyncEngine(welcome.scene, {
@@ -215,20 +166,14 @@ export class SceneClient {
     return welcome.scene;
   }
 
-  /** Build a `Region` for the current canvas from an optional window bbox. */
+  // Build a `Region` for the current canvas from an optional window bbox.
   private regionFor(bbox: Bbox | undefined): Region | undefined {
     if (!this.canvasId) return undefined;
     return bbox ? { canvasId: this.canvasId, bbox } : undefined;
   }
 
-  /**
-   * Windowed replica (MG9.4): re-aim the subscription to the bbox derived from a
-   * camera viewport plus the window margin, debounced so a continuous pan/zoom
-   * does not spam re-subscribes. The margin + re-subscribe DECISION lives in the
-   * core (`WindowState`); the shell only drives the debounce timer here. The
-   * server replies with a region-filtered welcome (the resnapshot); the engine
-   * reconciles it.
-   */
+  // Re-aim the subscription to the bbox derived from a camera viewport + margin, debounced so a
+  // continuous pan/zoom does not spam re-subscribes. The margin + re-subscribe DECISION lives in the core.
   setViewport(viewport: Viewport): void {
     if (this.viewportTimer != null) this.clearTimer(this.viewportTimer);
     this.viewportTimer = this.setTimer(() => {
@@ -238,7 +183,7 @@ export class SceneClient {
     }, this.viewportDebounceMs);
   }
 
-  /** Immediately re-aim the window to `bbox` (no debounce); for tests/programmatic moves. */
+  // Immediately re-aim the window to `bbox` (no debounce); for tests/programmatic moves.
   subscribeRegion(bbox: Bbox): void {
     if (this.viewportTimer != null) {
       this.clearTimer(this.viewportTimer);
@@ -247,7 +192,7 @@ export class SceneClient {
     this.subscribeWindowDecision(this.windowState?.set_window(JSON.stringify(bbox)));
   }
 
-  /** Drop the window: re-subscribe to the whole canvas (no bbox). */
+  // Drop the window: re-subscribe to the whole canvas (no bbox).
   subscribeWholeCanvas(): void {
     if (this.viewportTimer != null) {
       this.clearTimer(this.viewportTimer);
@@ -257,11 +202,7 @@ export class SceneClient {
     if (this.canvasId) this.transport?.subscribe({ canvasId: this.canvasId });
   }
 
-  /**
-   * Act on a core windowing decision: the bbox JSON (`"null"` / undefined = no
-   * change, emit nothing) the `WindowState` returned. A non-null bbox is the new
-   * window to `subscribe` to.
-   */
+  // Act on a core windowing decision: `"null"`/undefined = no change (emit nothing); a non-null bbox is the new window to `subscribe` to.
   private subscribeWindowDecision(decisionJson: string | undefined): void {
     if (decisionJson === undefined) return;
     const bbox = JSON.parse(decisionJson) as Bbox | null;
@@ -269,51 +210,39 @@ export class SceneClient {
     if (this.canvasId) this.transport?.subscribe({ canvasId: this.canvasId, bbox });
   }
 
-  /** The window bbox currently subscribed, or null for whole-canvas. */
+  // The window bbox currently subscribed, or null for whole-canvas.
   get currentWindow(): Bbox | null {
     if (!this.windowState) return null;
     return JSON.parse(this.windowState.current_window()) as Bbox | null;
   }
 
-  /** The current optimistic object scene, or null before {@link connect}. */
+  // The current optimistic object scene, or null before `connect`.
   get scene(): ObjectScene | null {
     return this.engine?.getScene() ?? null;
   }
 
-  /**
-   * Author an object op: optimistic local apply (via the wasm core) + outbox +
-   * coalesced send. Returns the rejecting-core errors (empty on success), the
-   * minted opId, and the captured inverse op (the undo entry, D21).
-   */
+  // Author an object op (optimistic apply + outbox + coalesced send). Returns rejecting-core errors
+  // (empty on success), the minted opId, and the captured inverse op (the undo entry).
   async applyObjectOp(op: ObjectOp): Promise<AuthorResult> {
     if (!this.engine) throw new Error("applyObjectOp before connect");
     return this.engine.author(op);
   }
 
-  /**
-   * Move the selection WITHOUT a document op: broadcast it as a best-effort
-   * presence frame only. Selection is ephemeral, so it never enters the outbox,
-   * never produces an `ops` frame, and never bumps the document revision.
-   */
+  // Move the selection WITHOUT a document op: broadcast a best-effort presence frame only. Selection is
+  // ephemeral — it never enters the outbox, produces an `ops` frame, or bumps the revision.
   saveSelection(selection: ObjectSelection): void {
     if (!this.transport) throw new Error("saveSelection before connect");
     this.transport.sendPresence({ kind: "select", selection });
   }
 
-  /**
-   * Send a Feature request RPC frame on the single WS feature channel (OB4.5).
-   * Comment upsert, template apply, export request, canvas switch. The response
-   * arrives on {@link onFeature}.
-   */
+  // Send a Feature request RPC frame on the single WS feature channel (comment upsert, template apply,
+  // export, canvas switch). The response arrives on `onFeature`.
   sendFeature(request: FeatureRequest): void {
     if (!this.transport) throw new Error("sendFeature before connect");
     this.transport.sendFeature(request);
   }
 
-  /**
-   * Broadcast this client's live cursor/viewport as a presence frame (MG6.2),
-   * stamped with this client's `userId`. Ephemeral and best-effort.
-   */
+  // Broadcast this client's live cursor/viewport as a presence frame, stamped with its `userId`. Ephemeral, best-effort.
   sendCursor(cursor: WorldPoint, viewport?: WorldRect): void {
     if (!this.transport) throw new Error("sendCursor before connect");
     this.transport.sendPresence({
@@ -323,56 +252,50 @@ export class SceneClient {
     });
   }
 
-  /** Subscribe to the live peer cursor set (MG6.2); returns an unsubscribe. */
+  // Subscribe to the live peer cursor set; returns an unsubscribe.
   onPeers(cb: (peers: PeerPresence[]) => void): Unsubscribe {
     this.peerListeners.add(cb);
     return () => this.peerListeners.delete(cb);
   }
 
-  /** The live (non-expired) peer cursors. Expires stale peers lazily on read. */
+  // The live (non-expired) peer cursors. Expires stale peers lazily on read.
   get peerCursors(): PeerPresence[] {
     this.peers.expire();
     return this.peers.list();
   }
 
-  /** Subscribe to optimistic scene updates; returns an unsubscribe. */
+  // Subscribe to optimistic scene updates; returns an unsubscribe.
   onScene(cb: (scene: ObjectScene) => void): Unsubscribe {
     this.sceneListeners.add(cb);
     return () => this.sceneListeners.delete(cb);
   }
 
-  /** Subscribe to remote applied patches (already folded into the scene). */
+  // Subscribe to remote applied patches (already folded into the scene).
   onPatch(cb: (patch: PatchMessage) => void): Unsubscribe {
     this.patchListeners.add(cb);
     return () => this.patchListeners.delete(cb);
   }
 
-  /** Subscribe to Feature response RPC frames; returns an unsubscribe. */
   onFeature(cb: (response: FeatureResponse) => void): Unsubscribe {
     this.featureListeners.add(cb);
     return () => this.featureListeners.delete(cb);
   }
 
-  /** Subscribe to connectivity changes (online/offline) for the shell banner. */
+  // Subscribe to connectivity changes (online/offline) for the shell banner.
   onStatus(cb: (status: ConnectionStatus) => void): Unsubscribe {
     this.statusListeners.add(cb);
     return () => this.statusListeners.delete(cb);
   }
 
-  /** The current connectivity status (offline before connect). */
   get connectionStatus(): ConnectionStatus {
     return this.transport?.connectionStatus ?? "offline";
   }
 
-  // --- multi-canvas (MG9.2) ------------------------------------------------
-
-  /** List every canvas from the durable index (`GET /api/canvases`). */
   async listCanvases(): Promise<CanvasSummary[]> {
     const data = await httpJson<{ canvases: CanvasSummary[] }>(this.apiBase(), "/api/canvases");
     return data.canvases;
   }
 
-  /** Create a canvas and return its summary (`POST /api/canvases`). */
   async createCanvas(title?: string): Promise<CanvasSummary> {
     const data = await httpJson<{ canvas: CanvasSummary }>(this.apiBase(), "/api/canvases", {
       method: "POST",
@@ -381,18 +304,12 @@ export class SceneClient {
     return data.canvas;
   }
 
-  /** Delete a canvas (`DELETE /api/canvases/:id`). */
   async deleteCanvas(canvasId: string): Promise<void> {
     await httpJson(this.apiBase(), `/api/canvases/${encodeURIComponent(canvasId)}`, { method: "DELETE" });
   }
 
-  /**
-   * Switch to a different canvas (MG9.2): tear down the current session and
-   * reconnect to `canvasId`, re-subscribing the SAME window so the new canvas
-   * loads region-filtered. A fresh outbox is created for the new canvas to avoid
-   * replaying the previous canvas's ops against it. Resolves with the new
-   * canvas's welcome snapshot.
-   */
+  // Switch canvas: tear down the current session and reconnect to `canvasId`, re-subscribing the SAME
+  // window. A fresh outbox avoids replaying the previous canvas's ops. Resolves with the new welcome snapshot.
   async switchCanvas(canvasId: string, outbox?: OutboxStore): Promise<ObjectScene> {
     const window = this.currentWindow;
     this.teardown();
@@ -405,27 +322,24 @@ export class SceneClient {
     return this.url.replace(/^ws/, "http").replace(/\/+$/, "");
   }
 
-  /** Flush any buffered coalesced frame immediately (e.g. on gesture end). */
+  // Flush any buffered coalesced frame immediately (e.g. on gesture end).
   flush(): void {
     this.engine?.flush();
   }
 
-  /**
-   * Re-request the authoritative snapshot on the open socket. The server replies
-   * with a fresh `welcome` (honoring the current window) on the welcome stream,
-   * which the attached engine reconciles. A no-op while offline.
-   */
+  // Re-request the authoritative snapshot on the open socket; the server replies with a fresh `welcome`
+  // the attached engine reconciles. No-op while offline.
   resync(): void {
     this.transport?.resume();
   }
 
-  /** Close the socket and drop all subscriptions. */
+  // Close the socket and drop all subscriptions.
   close(): void {
     this.engine?.flush();
     this.teardown();
   }
 
-  /** Detach engine/listeners and close the socket, leaving the client reusable. */
+  // Detach engine/listeners and close the socket, leaving the client reusable.
   private teardown(): void {
     if (this.viewportTimer != null) {
       this.clearTimer(this.viewportTimer);
@@ -450,11 +364,8 @@ export class SceneClient {
     this.emitPeers();
   }
 
-  /**
-   * Ingest one inbound presence frame and re-emit the peer set if it changed.
-   * Each frame also expires stale peers, so a quiet peer drops the next time
-   * ANY peer moves — no background sweep timer is needed.
-   */
+  // Ingest one inbound presence frame and re-emit the peer set if it changed. Each frame also expires
+  // stale peers, so a quiet peer drops the next time ANY peer moves — no background sweep timer is needed.
   private ingestPresence(payload: unknown): void {
     const added = this.peers.ingest(payload);
     const expired = this.peers.expire();
@@ -483,10 +394,7 @@ export class SceneClient {
   }
 }
 
-/**
- * The canvas list-item shape mirroring the server `CanvasSummary` (camelCase
- * serde): `GET /api/canvases` returns `{ canvases: CanvasSummary[] }`.
- */
+// Mirrors the server `CanvasSummary` (camelCase serde); `GET /api/canvases` returns `{ canvases: CanvasSummary[] }`.
 export type CanvasSummary = {
   id: string;
   title: string;

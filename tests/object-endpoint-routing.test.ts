@@ -1,21 +1,3 @@
-// Anchor-semantics v3 §2b — open-class endpoint drag shell wiring.
-//
-// The renderer emits `objectEndpointDelta` ({id, nodeIndex, world x/y}) on each
-// move of an endpoint-handle drag. This pins the engine glue end-to-end through
-// the REAL engine against a fake renderer (the object-double-click-routing
-// pattern): each move must (a) run the release-snap probe through the SAME
-// outline query as drag-create (`nearestOutlinePoint`) with the DRAGGED id
-// excluded (its own outline sits under the cursor and would self-snap at ~0),
-// (b) push the live chord deform via `setObjectEndpointPreview` at the snapped
-// point, and (c) emit `object-endpoint-preview`; the pointer-up emits ONE
-// `object-endpoint-commit` carrying the last sample. The commit payload is then
-// fed into the REAL scene-core `endpointReleaseOps` — the exact call the
-// App.svelte onEndpointCommit handler makes — pinning the ops contract
-// (chord-deform edit-geometry + set-anchor rebind/unbind).
-//
-// Falsifiable: dropping the delta read, the exclude list, the Alt snap bypass,
-// or the commit emission each fails a dedicated assertion below.
-
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { ShapeCanvasEngine, type EngineEvent } from "../platforms/web/renderer/engine";
@@ -33,7 +15,7 @@ import type { CameraState } from "../platforms/web/renderer/scene";
 const CAMERA: CameraState = { x: 0, y: 0, zoom: 1 };
 const LINE_ID = "line-1";
 const TARGET_ID = "rect-1";
-// The mock outline: the horizontal segment y=200, x in [100, 300] (rect-1's edge).
+// Mock outline: horizontal segment y=200, x in [100, 300] (rect-1's edge).
 const OUTLINE_Y = 200;
 const OUTLINE_X0 = 100;
 const OUTLINE_X1 = 300;
@@ -46,11 +28,10 @@ beforeAll(async () => {
 
 type PreviewCall = { id: string; nodeIndex: number; x: number; y: number };
 
-// A fake renderer that emits an `objectEndpointDelta` for each pointer-move (the
-// supplied world sample), carries the W2-06 outline-snap contract, and records
-// the engine's endpoint preview pushes. The exclude-ids contract mirrors
-// create-snap.test.ts: the snap target is the DRAGGED LINE itself (a phantom
-// self-snap) unless the engine excludes it — then the REAL rect id comes back.
+// Fake renderer: emits an objectEndpointDelta per pointer-move, carries the
+// outline-snap contract, and records the engine's endpoint preview pushes. The snap
+// target is the dragged LINE itself (a phantom self-snap) unless the engine excludes
+// it — then the real rect id comes back.
 function endpointRenderer(samples: Array<{ nodeIndex: number; x: number; y: number }>) {
   const previews: PreviewCall[] = [];
   const cleared: string[] = [];
@@ -125,7 +106,6 @@ function recordingCanvas(): { canvas: HTMLCanvasElement; fire: (type: string, ev
   };
 }
 
-// Drive a pen pointer down -> move(s) -> up/cancel through the real engine.
 function driveEndpointDrag(
   samples: Array<{ nodeIndex: number; x: number; y: number }>,
   options: { altHeld?: boolean; end?: "up" | "cancel" } = {}
@@ -153,25 +133,24 @@ function driveEndpointDrag(
   return { events, commits, previewsEmitted, previewCalls: previews, cleared };
 }
 
-describe("engine endpoint-drag routing (v3 §2b)", () => {
+describe("engine endpoint-drag routing", () => {
   it("routes a snapped endpoint drag: live preview at the snapped point + ONE commit with the real target", () => {
-    // The endpoint sample lands 4px under rect-1's edge: within the 8px tolerance.
+    // Sample lands 4px under rect-1's edge, within the 8px tolerance.
     const { commits, previewsEmitted, previewCalls } = driveEndpointDrag([{ nodeIndex: 1, x: 200, y: 204 }]);
 
-    // (b) the live chord deform was pushed at the SNAPPED point, not the raw sample.
+    // Pushed at the SNAPPED point, not the raw sample.
     expect(previewCalls).toEqual([{ id: LINE_ID, nodeIndex: 1, x: 200, y: OUTLINE_Y }]);
-    // (c) the preview event carried the snap probe for the shell's anchor ring.
     expect(previewsEmitted).toEqual([
       { type: "object-endpoint-preview", id: LINE_ID, nodeIndex: 1, world: { x: 200, y: OUTLINE_Y }, snapped: true, targetId: TARGET_ID }
     ]);
-    // (a)+(d): one commit, carrying the REAL target (the dragged id was excluded
-    // from the snap query — a self-snap would surface LINE_ID here and fail).
+    // One commit, carrying the REAL target — the dragged id was excluded from the
+    // snap query, so a self-snap would surface LINE_ID here and fail.
     expect(commits).toEqual([
       { type: "object-endpoint-commit", id: LINE_ID, nodeIndex: 1, world: { x: 200, y: OUTLINE_Y }, snapped: true, targetId: TARGET_ID }
     ]);
   });
 
-  it("bypasses the release snap while Alt is held (C2 no-snap-alt)", () => {
+  it("bypasses the release snap while Alt is held", () => {
     const { commits, previewCalls } = driveEndpointDrag([{ nodeIndex: 1, x: 200, y: 204 }], { altHeld: true });
     expect(previewCalls).toEqual([{ id: LINE_ID, nodeIndex: 1, x: 200, y: 204 }]);
     expect(commits).toEqual([
@@ -192,18 +171,12 @@ describe("engine endpoint-drag routing (v3 §2b)", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// The commit payload -> ops contract: the REAL core call the App.svelte
-// onEndpointCommit handler makes (endpointReleaseOps), against a real scene.
-// ---------------------------------------------------------------------------
-
 function obj(partial: Partial<SceneObject> & { id: string; geometry: SceneObject["geometry"] }): SceneObject {
   return { order: "a0", ...partial } as SceneObject;
 }
 
-// rect-1: a 100x100 rect at world (100, 100) — world (200, 200) sits on its
-// bottom-right corner; line-1: a 200px horizontal line at the world origin,
-// endpoint pair indices 0 and 1.
+// rect-1: 100x100 rect at world (100,100); line-1: 200px horizontal line at the
+// world origin, endpoint indices 0 and 1.
 function releaseScene(lineAnchors?: SceneObject["anchors"]): ObjectScene {
   return {
     ...emptyObjectScene(),
@@ -229,12 +202,11 @@ describe("endpointReleaseOps commit contract (the App onEndpointCommit call)", (
     expect(ops.map((o) => o.kind)).toEqual(["edit-geometry", "set-anchor"]);
     const [geo, anchor] = ops;
     if (geo.kind !== "edit-geometry" || anchor.kind !== "set-anchor") throw new Error("unexpected op kinds");
-    // Endpoint 1 moved from world (200,0) to (200,200): the chord deform rewrites
-    // the whole d (quantized units, 8/px).
+    // Endpoint 1 moved (200,0)->(200,200); chord deform rewrites d in quantized units (8/px).
     expect(geo.id).toBe(LINE_ID);
     expect(geo.geometry.d).toBe("M 0 0 L 1600 1600");
-    // The rebind: node 1 anchored to rect-1 at the target-local quantized point
-    // (world (200,200) - rect translate (100,100) = local 100px = 800 units).
+    // node 1 anchored at target-local quantized point: world (200,200) - rect (100,100)
+    // = local 100px = 800 units.
     expect(anchor.id).toBe(LINE_ID);
     expect(anchor.anchors).toEqual([{ nodeIndex: 1, target: TARGET_ID, at: { x: 800, y: 800 } }]);
   });
@@ -253,12 +225,9 @@ describe("endpointReleaseOps commit contract (the App onEndpointCommit call)", (
   });
 });
 
-// The onEndpointCommit / onEndpointPreview wiring, exercised through the extracted
-// controller functions the shell now composes (no .svelte source pin).
 describe("controller endpoint wiring", () => {
   it("onEndpointCommit authors the release through the core endpointReleaseOps, snap canonicalized", () => {
-    // A snapped release onto rect-1 -> the chord-deform edit-geometry + the rebind,
-    // collapsed to ONE batch op (the shape App.svelte authors).
+    // A snapped release onto rect-1 -> chord-deform edit-geometry + rebind, in ONE batch.
     const target = endpointSnapTarget(releaseScene(), LINE_ID, true, TARGET_ID);
     expect(target).toBe(TARGET_ID);
     const op = endpointReleaseOp(core, releaseScene(), LINE_ID, 1, { x: 200, y: 200 }, target);
@@ -269,19 +238,14 @@ describe("controller endpoint wiring", () => {
   });
 
   it("onEndpointCommit returns null (no op) on a no-op release so the shell reverts the deform", () => {
-    // A closed-class id has no endpoint surface -> endpointReleaseOps returns [].
     expect(endpointReleaseOp(core, releaseScene(), TARGET_ID, 0, { x: 0, y: 0 }, null)).toBeNull();
   });
 
   it("the preview snap probe honors a real OTHER object and rejects a self-snap (drives the ring)", () => {
     const scene = releaseScene();
-    // A snap onto a real, OTHER object surfaces as the hover-ring target.
     expect(endpointSnapTarget(scene, LINE_ID, true, TARGET_ID)).toBe(TARGET_ID);
-    // A self-snap onto the dragged line is rejected (no phantom ring).
     expect(endpointSnapTarget(scene, LINE_ID, true, LINE_ID)).toBeNull();
-    // An unsnapped move never targets.
     expect(endpointSnapTarget(scene, LINE_ID, false, TARGET_ID)).toBeNull();
-    // A snap onto a non-existent id is rejected.
     expect(endpointSnapTarget(scene, LINE_ID, true, "ghost")).toBeNull();
   });
 });

@@ -1,22 +1,17 @@
-// Framework-neutral session/identity/status helpers lifted out of App.svelte.
-//
-// These carry the ambient seams App.svelte previously reached for inline (the
-// page location, localStorage, the UUID source) as explicit parameters, so the
-// shell injects the real `window.*`/`crypto.randomUUID` and the helpers stay
-// testable and DOM-free. `isDiagnosticsOnlyStatus` is already pure.
+// Session/identity/status helpers. Ambient seams (page location, localStorage, the UUID source)
+// are passed as explicit parameters so the helpers stay testable and DOM-free.
 
-/** True when a status string is one of the renderer-diagnostics-only notices. */
 export function isDiagnosticsOnlyStatus(message: string): boolean {
   return message.startsWith("WebGPU renderer unavailable:") || message.startsWith("WebGPU render failed");
 }
 
-/** The ws/wss base URL derived from the page location (scheme upgraded for https). */
+// The ws/wss base URL derived from the page location (scheme upgraded for https).
 export function wsBaseUrl(location: { protocol: string; host: string }): string {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${location.host}`;
 }
 
-/** A fresh per-session client id (ephemeral, not persisted). */
+// A fresh per-session client id (ephemeral, not persisted).
 export function clientIdentity(randomUuid: () => string): string {
   return `shell-${randomUuid().slice(0, 8)}`;
 }

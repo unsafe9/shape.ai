@@ -1,23 +1,12 @@
-//! Fully-working on-disk file adapter.
+//! On-disk file adapter. The store's source of truth IS the portable bundle
+//! directory — there is no full in-memory mirror, so every op touches only what
+//! it needs and the adapter stays memory-bounded:
 //!
-//! The store's source of truth is the portable bundle directory on disk — a
-//! file store *is* a portable bundle. There is **no full in-memory mirror**:
-//! every operation touches only what it needs, so the adapter stays
-//! memory-bounded even for very large stores.
-//!
-//! Memory discipline:
-//!
-//! * [`records`](StorageAdapter::records) streams the bundle shard-by-shard,
-//!   frame-by-frame, off disk — peak is one record.
-//! * `load` / `list` stream the relevant shard(s) and stop early — peak is one
-//!   record.
-//! * `save` / `delete` rewrite only the single shard a record hashes to — peak
-//!   is `O(one shard)`, never the whole store.
-//! * `import` does a bounded streaming merge of the incoming bundle with what is
-//!   already on disk and re-shards it via the streaming exporter — peak is
-//!   `O(shard chunk * parallelism)`, never `O(total)`.
-//! * `snapshot` / `restore` exist for the small/in-memory convenience API and
-//!   are **not** on the export/import streaming path.
+//! * `records`/`load`/`list` stream shard-by-shard, peak one record.
+//! * `save`/`delete` rewrite only the single shard a record hashes to.
+//! * `import` streams a bounded merge of incoming + on-disk records, re-sharded
+//!   via the exporter — peak `O(shard chunk * parallelism)`, never `O(total)`.
+//! * `snapshot`/`restore` are the small/in-memory path, **not** streaming.
 
 use crate::adapter::{AdapterKind, RecordCursor, StorageAdapter};
 use crate::error::{Result, StorageError};
@@ -36,9 +25,9 @@ pub struct FileAdapter {
 }
 
 impl FileAdapter {
-    /// Open (or create) a file store at `root`. If a bundle already exists there
-    /// it is adopted as-is (its shard count is kept); otherwise an empty bundle
-    /// is written with the default shard count.
+    /// Open (or create) a file store at `root`. An existing bundle is adopted
+    /// as-is (its shard count kept); otherwise an empty bundle is written with
+    /// the default shard count.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         if root.join(MANIFEST_NAME).exists() {
@@ -52,14 +41,13 @@ impl FileAdapter {
                 root,
                 shard_count: DEFAULT_SHARD_COUNT,
             };
-            // Materialize an empty bundle on disk.
             store.write_empty()?;
             Ok(store)
         }
     }
 
-    /// Override the shard fan-out and re-shard the on-disk bundle to match.
-    /// On a reshard failure the on-disk bundle and shard count are left intact.
+    /// Override the shard fan-out and re-shard the bundle to match. On a reshard
+    /// failure the on-disk bundle and shard count are left intact.
     pub fn with_shard_count(mut self, shard_count: u32) -> Self {
         let target = shard_count.max(1);
         if target != self.shard_count && self.reshard(target).is_ok() {
@@ -80,7 +68,6 @@ impl FileAdapter {
             .unwrap_or(0)
     }
 
-    /// Whether the store is empty (manifest-only check).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -90,11 +77,10 @@ impl FileAdapter {
         Ok(())
     }
 
-    /// Stream the current on-disk records into a fresh layout with `shard_count`
-    /// shards. Bounded: the streaming exporter never holds the whole store.
+    /// Stream the on-disk records into a fresh `shard_count`-shard layout via a
+    /// sibling temp bundle swapped in place. Bounded: never holds the whole store.
     fn reshard(&mut self, shard_count: u32) -> Result<()> {
         let cursor = crate::format::stream_bundle(&self.root)?;
-        // Write to a sibling temp bundle, then swap in place.
         let tmp = sibling_tmp(&self.root);
         write_then_swap(&self.root, &tmp, |dst| {
             export_stream(cursor, dst, shard_count).map(|_| ())
@@ -108,7 +94,6 @@ impl StorageAdapter for FileAdapter {
     }
 
     fn save(&mut self, record: Record) -> Result<()> {
-        // Rewrite only the single shard this record hashes to.
         let index = shard_index_of(&record.id, self.shard_count);
         rewrite_shard(&self.root, self.shard_count, index, |records| {
             upsert_sorted(records, record);
@@ -137,7 +122,6 @@ impl StorageAdapter for FileAdapter {
     }
 
     fn list(&self) -> Result<Vec<String>> {
-        // Streams shard-by-shard; only the id strings are retained.
         let mut ids = Vec::new();
         crate::format::import_stream(&self.root, |record| {
             ids.push(record.id);
@@ -148,12 +132,10 @@ impl StorageAdapter for FileAdapter {
     }
 
     fn records(&self) -> Result<RecordCursor<'_>> {
-        // Lazy, id-sorted, shard-by-shard off disk.
         Ok(Box::new(crate::format::stream_bundle(&self.root)?))
     }
 
     fn snapshot(&self) -> Result<StoreSnapshot> {
-        // Convenience API: collects the streamed records. Not on the export path.
         let mut snap = StoreSnapshot::new();
         crate::format::import_stream(&self.root, |record| {
             snap.insert(record);
@@ -163,20 +145,16 @@ impl StorageAdapter for FileAdapter {
     }
 
     fn restore(&mut self, snapshot: StoreSnapshot) -> Result<()> {
-        // Replace the on-disk bundle from a snapshot (small/in-memory path).
         export_stream(snapshot.records().cloned().map(Ok), &self.root, self.shard_count)?;
         Ok(())
     }
 
     fn import(&mut self, root: &Path) -> Result<()> {
-        // Bounded streaming merge: 2-way merge of the on-disk records and the
-        // incoming bundle (both id-sorted), incoming winning on equal id, then
-        // re-shard via the streaming exporter. Peak is O(shard chunk * threads),
-        // never O(total) — no full snapshot is built on either side.
+        // Bounded 2-way merge of on-disk + incoming (both id-sorted, incoming
+        // wins on equal id), re-sharded via the exporter — never O(total).
         let existing = crate::format::stream_bundle(&self.root)?;
         let incoming = crate::format::stream_bundle(root)?;
         let merged = MergeById::new(Box::new(existing), Box::new(incoming));
-
         let tmp = sibling_tmp(&self.root);
         write_then_swap(&self.root, &tmp, |dst| {
             export_stream(merged, dst, self.shard_count).map(|_| ())
@@ -192,8 +170,8 @@ fn upsert_sorted(records: &mut Vec<Record>, record: Record) {
     }
 }
 
-/// A bounded 2-way merge of two id-sorted record streams. On equal id the
-/// `right` (incoming) record wins. Peak resident: one record per side.
+/// A bounded 2-way merge of two id-sorted record streams; `right` (incoming)
+/// wins on equal id. Peak resident: one record per side.
 struct MergeById {
     left: std::iter::Peekable<RecordIter>,
     right: std::iter::Peekable<RecordIter>,
@@ -262,10 +240,9 @@ fn sibling_tmp(root: &Path) -> PathBuf {
     }
 }
 
-/// Write a fresh bundle into the sibling temp path `tmp` via `write`, then swap
-/// it into place at `dst`. The swap-in-place keeps the live bundle byte-intact
-/// until the new one is fully written. On any failure the partial temp bundle is
-/// removed so a failed run never leaks an orphan bundle beside the live store.
+/// Write a fresh bundle into `tmp`, then swap it into `dst`. The live bundle
+/// stays byte-intact until the new one is fully written; on failure the partial
+/// temp bundle is removed so a failed run leaks no orphan beside the live store.
 fn write_then_swap<F>(dst: &Path, tmp: &Path, write: F) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
@@ -293,7 +270,6 @@ mod tests {
     use super::*;
     use std::env;
 
-    /// A unique temp dir under the OS temp root, cleaned up on drop.
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(tag: &str) -> Self {
@@ -327,7 +303,6 @@ mod tests {
                 .save(Record::new("y", "edge", b"yo".to_vec()))
                 .unwrap();
         }
-        // Reopen from disk in a fresh adapter instance.
         let store = FileAdapter::open(&root).unwrap();
         assert_eq!(store.len(), 2);
         assert_eq!(store.load("x").unwrap().payload, b"hi");

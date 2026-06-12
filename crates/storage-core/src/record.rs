@@ -1,27 +1,18 @@
-//! Store-neutral data model.
-//!
-//! The storage core does not know about canvas scenes, cards, or edges. It
-//! moves opaque [`Record`]s: each one is an addressable, versioned blob tagged
-//! with a `kind` so a caller can partition its domain (e.g. "card", "edge",
-//! "group") without this crate depending on the renderer model.
+//! Store-neutral data model: opaque, versioned byte-payload [`Record`]s the
+//! storage core moves without knowing about scenes, cards, or edges.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// One opaque, addressable, versioned unit of stored data.
-///
-/// `payload` is arbitrary bytes — JSON, msgpack, or anything the caller likes.
-/// Keeping it byte-oriented is what lets a single portable format carry every
-/// adapter's contents losslessly.
+/// One opaque, addressable, versioned unit of stored data. The byte-oriented
+/// `payload` is what lets one portable format carry every adapter losslessly.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    /// Unique id within the store.
     pub id: String,
     /// Caller-defined category for the record.
     pub kind: String,
     /// Monotonic revision; callers may use it for optimistic concurrency.
     pub version: u64,
-    /// Opaque payload bytes.
     #[serde(with = "bytes_as_base64")]
     pub payload: Vec<u8>,
 }
@@ -42,12 +33,9 @@ impl Record {
     }
 }
 
-/// The full logical contents of a store at one instant.
-///
-/// This is the in-memory shape every adapter can produce ([`snapshot`]) and
-/// consume ([`restore`]). Records are keyed by id and kept in a `BTreeMap` so
-/// iteration order is deterministic — which is what makes the exported format
-/// byte-stable for the same logical contents.
+/// The full logical contents of a store at one instant: the in-memory shape
+/// every adapter can [`snapshot`] and [`restore`]. The `BTreeMap` keying gives
+/// deterministic id order, which makes the exported format byte-stable.
 ///
 /// [`snapshot`]: crate::StorageAdapter::snapshot
 /// [`restore`]: crate::StorageAdapter::restore
@@ -57,17 +45,14 @@ pub struct StoreSnapshot {
 }
 
 impl StoreSnapshot {
-    /// An empty snapshot.
     pub fn new() -> Self {
         StoreSnapshot::default()
     }
 
-    /// Number of records held.
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
-    /// Whether the snapshot holds no records.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
@@ -82,12 +67,10 @@ impl StoreSnapshot {
         self.records.remove(id)
     }
 
-    /// Borrow a record by id.
     pub fn get(&self, id: &str) -> Option<&Record> {
         self.records.get(id)
     }
 
-    /// Whether a record with `id` exists.
     pub fn contains(&self, id: &str) -> bool {
         self.records.contains_key(id)
     }
@@ -97,13 +80,11 @@ impl StoreSnapshot {
         self.records.keys()
     }
 
-    /// Records in deterministic (id-sorted) order. The format relies on this
-    /// ordering for byte stability.
+    /// Records in id-sorted order. The format relies on this for byte stability.
     pub fn records(&self) -> impl Iterator<Item = &Record> {
         self.records.values()
     }
 
-    /// Consume the snapshot into a sorted vec of records.
     pub fn into_records(self) -> Vec<Record> {
         self.records.into_values().collect()
     }
@@ -118,9 +99,8 @@ impl StoreSnapshot {
     }
 }
 
-/// Serialize `Vec<u8>` payloads as base64 strings so the manifest/JSON paths
-/// stay text-clean and stable. Used only for the JSON representation; the
-/// binary shard format frames the raw bytes directly.
+/// Payloads serialize as base64 in the JSON representation only; the binary
+/// shard format frames the raw bytes directly.
 mod bytes_as_base64 {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -160,7 +140,6 @@ mod bytes_as_base64 {
         out
     }
 
-    /// Matching standard base64 decoder.
     #[allow(clippy::cast_possible_truncation, reason = "base64 decode extracts bytes from a packed u32")]
     pub fn decode(input: &str) -> Result<Vec<u8>, String> {
         fn val(c: u8) -> Result<u32, String> {
@@ -219,7 +198,6 @@ mod tests {
             Record::new("a", "card", b"1-new".to_vec()),
         ]);
         assert_eq!(snap.len(), 2);
-        // BTreeMap order => sorted by id.
         let ids: Vec<&String> = snap.ids().collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert_eq!(snap.get("a").unwrap().payload, b"1-new");

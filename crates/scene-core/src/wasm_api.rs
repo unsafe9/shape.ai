@@ -1,18 +1,11 @@
-//! wasm-bindgen JS bridge (MG0.3/MG0.4) — gated behind `cfg(feature = "wasm")`.
-//!
-//! Every export here is a THIN bridge: parse a JSON string into the pure
-//! scene-core input type, call the corresponding pure function, and serialize the
-//! result back to a JSON String. No canvas logic lives here — the goal is that the
-//! web client runs the *same* op-apply as the server, so this file only adapts
-//! types across the FFI boundary.
+//! wasm-bindgen JS bridge, gated behind `cfg(feature = "wasm")`. Every export is a
+//! THIN bridge: parse JSON into the pure input type, call the pure function,
+//! serialize the result back. No canvas logic lives here.
 //!
 //! Error policy: these functions never panic across the FFI boundary. A
-//! deserialize/serialize failure is returned as a JSON object
-//! `{"error": "<message>"}` (a normal `String` return, not a thrown JS
-//! exception), so the TS loader can branch on the `error` field instead of
-//! wrapping every call in try/catch. Domain-level failures (an unknown id, a
-//! bad patch) are NOT errors here: they flow through normally as the `errors`
-//! array inside the returned payload, exactly as the pure functions report them.
+//! deserialize/serialize failure returns a JSON `{"error": "<message>"}` (a normal
+//! `String`, not a thrown exception). Domain failures (unknown id, bad patch) are
+//! NOT errors here — they flow through as the `errors` array in the payload.
 
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -23,9 +16,8 @@ fn ok_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|e| error_json(&format!("serialize failed: {e}")))
 }
 
-/// Build an `{"error": "<msg>"}` JSON string. `serde_json::to_string` of a
-/// single string field cannot fail, but fall back to a hand-built literal to
-/// keep this infallible regardless.
+/// Build an `{"error": "<msg>"}` JSON string. Falls back to a hand-built literal
+/// to stay infallible.
 fn error_json(message: &str) -> String {
     #[derive(Serialize)]
     struct ErrorPayload<'a> {
@@ -41,12 +33,7 @@ fn parse<T: serde::de::DeserializeOwned>(label: &str, json: &str) -> Result<T, S
     serde_json::from_str(json).map_err(|e| error_json(&format!("invalid {label} JSON: {e}")))
 }
 
-// ---------------------------------------------------------------------------
-// Object-model bridges (OB-3/OB-4). The single set of bridges after the OB4.4
-// legacy removal: the web client runs the SAME object op-apply / region /
-// templates as the server (P1: one core, the shell carries no domain logic).
-// ---------------------------------------------------------------------------
-
+// The web client runs the SAME object op-apply / region / templates as the server.
 use crate::object::anchor_follow::{
     geometry_follow_ops as geometry_follow_ops_pure,
     synthesize_create_anchors as synthesize_create_anchors_pure,
@@ -87,11 +74,8 @@ struct ObjectApplyResult<'a> {
     errors: &'a [String],
 }
 
-/// `apply_object_op(scene_json, op_json) -> {scene, inverse, errors}`.
-///
-/// Runs the canonical object op-apply (the SAME path the server runs). On a
-/// domain failure the scene is returned unchanged with the message in `errors`
-/// and `inverse: null`, mirroring the render-patch bridge's error policy.
+/// Runs the canonical object op-apply. On a domain failure the scene is returned
+/// unchanged with the message in `errors` and `inverse: null`.
 #[wasm_bindgen]
 pub fn apply_object_op(scene_json: &str, op_json: &str) -> String {
     let mut scene: ObjectScene = match parse("scene", scene_json) {
@@ -119,7 +103,6 @@ pub fn apply_object_op(scene_json: &str, op_json: &str) -> String {
     }
 }
 
-/// `derive_region(geometry_json, flatness) -> Region | {error}`.
 /// Reference (stub) outline derivation — fill area / hit-test / selection bound.
 #[wasm_bindgen]
 pub fn derive_region(geometry_json: &str, flatness: i32) -> String {
@@ -136,21 +119,18 @@ pub fn derive_region(geometry_json: &str, flatness: i32) -> String {
     }
 }
 
-/// `object_command_catalog() -> ObjectCommand[]` (label/category/shortcut/op).
 #[wasm_bindgen]
 pub fn object_command_catalog() -> String {
     object_command_catalog_json()
 }
 
-/// `object_gesture_catalog() -> ObjectGesture[]` (id/label/category/hold-trigger).
 #[wasm_bindgen]
 pub fn object_gesture_catalog() -> String {
     object_gesture_catalog_json()
 }
 
-/// `build_object_template(template_id, anchor_x, anchor_y, id_prefix) -> Object[]`.
-/// Builds a template recipe of inline-styled objects; the shell sends these as a
-/// `FeatureRequest::TemplateApply` recipe (server lowers them to insert-object ops).
+/// A template recipe of inline-styled objects; the shell sends these as a
+/// `FeatureRequest::TemplateApply` recipe.
 #[wasm_bindgen]
 pub fn build_object_template(
     template_id: &str,
@@ -165,13 +145,11 @@ pub fn build_object_template(
         n += 1;
         id
     };
-    // Deterministic ascending fractional order keys (no rng): chain from the
-    // previous key so siblings stay ordered.
+    // Ascending fractional order keys chained from the previous key.
     let mut prev: Option<String> = None;
     let mut order_alloc = move || {
         let key = generate_key_between(prev.as_deref(), None)
-            // `generate_key_between(Some, None)` does not fail for valid keys;
-            // the fallback appends `~` (sorts after alphanumerics) to stay ascending.
+            // Fallback appends `~` (sorts after alphanumerics) to stay ascending.
             .unwrap_or_else(|_| match &prev {
                 Some(p) => format!("{p}~"),
                 None => "a0".to_string(),
@@ -183,17 +161,10 @@ pub fn build_object_template(
     ok_json(&objects)
 }
 
-/// `freehand_to_object(points_json, color, width_px, id, order, mode) -> Object | {error}`.
-///
-/// Commit a single freehand stroke (FC-11 / anchor-semantics v3 §4):
-/// `points_json` is a JSON array of `[x, y]` world-px samples. The pen-up
-/// stroke is RECOGNIZED per `mode` — `"basic"` force-snaps to a basic
-/// primitive (line / ellipse / rect / triangle, threshold-free), `"free"`
-/// runs the full pipeline (line / ellipse / rect / polygon / normalized
-/// silhouette, open or closed) — one stroke = one object. The geometry is
-/// object-local with the origin (the stroke's bbox min) riding the transform
-/// translate (P4 zero-rebake). Returns `{error}` for fewer than 2 points (a
-/// tap has no extent), an unknown mode, or a malformed input.
+/// Commit a single freehand stroke: `points_json` is a JSON array of `[x, y]`
+/// world-px samples, recognized per `mode` (`"basic"` force-snaps to a basic
+/// primitive; `"free"` runs the full pipeline) into one object. `{error}` for
+/// fewer than 2 points, an unknown mode, or malformed input.
 #[wasm_bindgen]
 pub fn freehand_to_object(
     points_json: &str,
@@ -226,17 +197,10 @@ pub fn freehand_to_object(
     ok_json(&object)
 }
 
-/// `merge_open_stroke_ops(scene_json, points_json, mode, tolerance_px)
-/// -> ObjectOp[] | null | {error}`.
-///
-/// Multi-stroke endpoint merge (anchor-semantics v3 §4 follow-up): the ops
-/// merging a released freehand stroke (`points_json`, a JSON array of `[x, y]`
-/// world-px samples) into the open-class object(s) whose endpoint(s) its ends
-/// landed within `tolerance_px` (WORLD px — the shell converts its screen-px
-/// constant through the zoom) — one `edit-geometry` on the survivor plus the
-/// anchor release / absorbed-object delete, batch-ready. `null` = no merge
-/// (no endpoint hit, or the stroke recognizes closed by itself): the shell
-/// keeps its existing insert + release-anchoring path.
+/// Multi-stroke endpoint merge: ops merging a released stroke (`points_json`,
+/// world-px samples) into the open-class object(s) its ends landed within
+/// `tolerance_px` (WORLD px). `null` = no merge (no endpoint hit, or the stroke
+/// recognizes closed by itself).
 #[wasm_bindgen]
 pub fn merge_open_stroke_ops(
     scene_json: &str,
@@ -261,15 +225,11 @@ pub fn merge_open_stroke_ops(
     ok_json(&merge_open_stroke_ops_pure(&scene, &pts, mode, tolerance_px))
 }
 
-/// `split_subpath_at(geometry_json, x, y, radius) -> Geometry | {error}`.
-///
-/// Partial erase (W2-08/D4): cut a stroke's geometry at a touched point. `x`/`y`/
-/// `radius` are object-local quantized coords (the shell converts the world touch
-/// into the object's local space). The node nearest the touch within `radius` is
-/// removed, splitting its subpath into two open subpaths; degenerate (<2-node)
-/// flanks drop. Returns the new geometry, or `{error}` when the touch missed
-/// every node (nothing to cut) or the input was malformed — the shell then leaves
-/// the stroke unchanged. This is a SIMPLE split, NOT a geometric boolean.
+/// Partial erase: cut a stroke's geometry at a touched point. `x`/`y`/`radius` are
+/// object-local quantized coords. The nearest node within `radius` is removed,
+/// splitting its subpath into two open subpaths (degenerate <2-node flanks drop).
+/// `{error}` when the touch missed every node or the input was malformed. A simple
+/// split, NOT a geometric boolean.
 #[wasm_bindgen]
 pub fn split_subpath_at(geometry_json: &str, x: i32, y: i32, radius: i32) -> String {
     let mut geometry: Geometry = match parse("geometry", geometry_json) {
@@ -285,13 +245,9 @@ pub fn split_subpath_at(geometry_json: &str, x: i32, y: i32, radius: i32) -> Str
     }
 }
 
-/// `partial_erase_ops(scene_json, id, x, y, radius) -> ObjectOp[] | {error}`.
-///
-/// The object-local quantized touch cuts the stroke and the core returns the WHOLE
-/// op batch: `[]` on a miss, `[delete]` when the cut empties the object, else
-/// `[edit-geometry, ...follower-reprojection]`. Op orchestration lives in the core,
-/// not the shell — the shell authors the result and only owns the UI follow-up
-/// (clearing a stale selection).
+/// The object-local quantized touch cuts the stroke; returns the whole op batch:
+/// `[]` on a miss, `[delete]` when the cut empties the object, else
+/// `[edit-geometry, ...follower-reprojection]`.
 #[wasm_bindgen]
 pub fn partial_erase_ops(scene_json: &str, id: &str, x: i32, y: i32, radius: i32) -> String {
     let scene: ObjectScene = match parse("scene", scene_json) {
@@ -306,7 +262,7 @@ pub fn partial_erase_ops(scene_json: &str, id: &str, x: i32, y: i32, radius: i32
         return error_json(&format!("geometry parse failed: {e}"));
     }
     let Some(cut) = split_subpath_at_pure(&geometry, x, y, radius) else {
-        return ok_json(&Vec::<ObjectOp>::new()); // touch missed: leave the stroke whole
+        return ok_json(&Vec::<ObjectOp>::new()); // touch missed
     };
     if cut.path_string.trim().is_empty() {
         return ok_json(&vec![ObjectOp::Delete { id: id.into() }]);
@@ -317,13 +273,8 @@ pub fn partial_erase_ops(scene_json: &str, id: &str, x: i32, y: i32, radius: i32
     ok_json(&ops)
 }
 
-/// `build_primitive(kind, anchor_x, anchor_y, color, id, order) -> Object | {error}`.
-///
-/// Tier-3: build a basic primitive (rectangle/ellipse/line/text/frame) centered on
-/// a world anchor, in the toolbar `color` (an empty string means the kind default).
-/// `color` may be the theme-default sentinel (resolves to a text token) or a hex.
-/// The geometry is object-local; the world position rides a translate (P4). The
-/// shell sends the returned object as an `insert-object` op. `{error}` for an
+/// A basic primitive centered on a world anchor, in the toolbar `color` (empty =
+/// kind default; may be the theme-default sentinel or a hex). `{error}` for an
 /// unknown `kind`.
 #[wasm_bindgen]
 pub fn build_primitive(kind: &str, anchor_x: f64, anchor_y: f64, color: &str, id: &str, order: &str) -> String {
@@ -335,11 +286,9 @@ pub fn build_primitive(kind: &str, anchor_x: f64, anchor_y: f64, color: &str, id
     ok_json(&object)
 }
 
-/// `build_primitive_from_drag(kind, start_x, start_y, end_x, end_y, color, id, order) -> Object | {error}`.
-///
-/// Tier-3: build a primitive sized to a drag span — closed kinds to the normalized
-/// bbox, the line corner-to-corner. Same color/anchor rules as [`build_primitive`].
-/// `{error}` for an unknown `kind`.
+/// A primitive sized to a drag span — closed kinds to the normalized bbox, the
+/// line corner-to-corner. Same color rules as [`build_primitive`]. `{error}` for
+/// an unknown `kind`.
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments)]
 pub fn build_primitive_from_drag(
@@ -361,12 +310,9 @@ pub fn build_primitive_from_drag(
     ok_json(&object)
 }
 
-/// `build_set_style_op(object_json, color) -> ObjectOp | {error}`.
-///
-/// Tier-3: author a `set-style` op recoloring `object` to `color` (a hex or the
-/// theme-default sentinel). Recolor touches only existing style fields; a borderless
-/// object gains a fill so the recolor is visible. The shell authors the op through
-/// the same op-apply path (D21 undo via the captured inverse).
+/// A `set-style` op recoloring `object` to `color` (hex or the theme-default
+/// sentinel). Touches only existing style fields; a borderless object gains a fill
+/// so the recolor is visible.
 #[wasm_bindgen]
 pub fn build_set_style_op(object_json: &str, color: &str) -> String {
     let object: Object = match parse("object", object_json) {
@@ -376,17 +322,11 @@ pub fn build_set_style_op(object_json: &str, color: &str) -> String {
     ok_json(&build_set_style_op_pure(&object, color))
 }
 
-/// `anchor_follow_ops(scene_json, ops_json) -> ObjectOp[] | {error}`.
-///
-/// Tier-1/#14 + #2/#3 commit-time anchor follow. `ops_json` is the committed batch:
-/// `set-transform` ops MOVE a target (the transform reproject) and `edit-geometry`
-/// ops RESHAPE a target (the anchor `at` re-projects onto its NEW outline). The
-/// result is the chord-deform `edit-geometry` ops that make every anchored follower
-/// track its target — chained, so a follower of a follower follows too (#3). The
-/// bridges that author a geometry edit (`endpoint_release_ops`, `partial_erase_ops`)
-/// and `move_ops` fold the same follow into their own batches; this export is the
-/// standalone entry the shell/tests use to compute it for an arbitrary committed
-/// batch. Returns `[]` when nothing follows.
+/// Commit-time anchor follow. `ops_json` is the committed batch: `set-transform`
+/// MOVES a target, `edit-geometry` RESHAPES one. The result is the chord-deform
+/// `edit-geometry` ops that make every anchored follower track its target, chained.
+/// The standalone entry; `move_ops`/`endpoint_release_ops`/`partial_erase_ops` fold
+/// the same follow into their batches. `[]` when nothing follows.
 #[wasm_bindgen]
 pub fn anchor_follow_ops(scene_json: &str, ops_json: &str) -> String {
     let scene: ObjectScene = match parse("scene", scene_json) {
@@ -419,14 +359,10 @@ impl From<MoveRootsWire> for MoveRoots {
     }
 }
 
-/// `move_ops(scene_json, roots_json, delta_json) -> ObjectOp[] | {error}`.
-///
-/// Tier-2 combined commit entry: the parent-drag / multi-select transform CASCADE
-/// ops FOLLOWED BY the anchor-follow `edit-geometry` ops those moves trigger, as
-/// ONE batch-ready Vec (cascade BEFORE follow — a contract). `roots_json` is the
-/// [`MoveRootsWire`] shape (`{kind:"single",id} | {kind:"multi",ids}`); `delta_json`
-/// is the world-space gesture matrix (a row-major 3x3). Collapses the shell commit
-/// to a single core call.
+/// The parent-drag / multi-select transform CASCADE ops FOLLOWED BY the
+/// anchor-follow `edit-geometry` ops those moves trigger (cascade before follow is
+/// a contract). `roots_json` is the [`MoveRootsWire`] shape; `delta_json` is the
+/// world-space gesture matrix.
 #[wasm_bindgen]
 pub fn move_ops(scene_json: &str, roots_json: &str, delta_json: &str) -> String {
     let scene: ObjectScene = match parse("scene", scene_json) {
@@ -444,14 +380,9 @@ pub fn move_ops(scene_json: &str, roots_json: &str, delta_json: &str) -> String 
     ok_json(&move_ops_pure(&scene, &roots.into(), &delta))
 }
 
-/// `synthesize_create_anchors(created_json, target_json, endpoint_x, endpoint_y)
-/// -> Anchor[] | null | {error}`.
-///
-/// AP5 drag-create anchoring. Binds `created`'s node nearest the snapped world
+/// Drag-create anchoring: binds `created`'s node nearest the snapped world
 /// endpoint to `target`; `at` is the snap world point in the target's LOCAL
-/// quantized space. Returns `null` when no anchor should be authored (the target
-/// is the created object, or the created geometry has no node), which the shell
-/// treats as "no anchor" (the Alt-create / no-snap case).
+/// quantized space. `null` when no anchor should be authored.
 #[wasm_bindgen]
 pub fn synthesize_create_anchors(
     created_json: &str,
@@ -471,12 +402,8 @@ pub fn synthesize_create_anchors(
     ok_json(&anchors)
 }
 
-/// `is_open_class_d(d) -> bool`.
-///
-/// Anchor-semantics v3 §1: the open/closed data-level dichotomy for a path
-/// string — true iff it parses to exactly one subpath and that subpath is open.
-/// Class-dependent shell branches (Alt-detach, fill-vs-stroke routing) consult
-/// THE core classifier instead of re-parsing geometry in TS.
+/// True iff `d` parses to exactly one open subpath. The core classifier
+/// class-dependent shell branches consult instead of re-parsing geometry in TS.
 #[wasm_bindgen]
 pub fn is_open_class_d(d: &str) -> String {
     ok_json(&is_open_class_d_pure(d))
@@ -490,16 +417,12 @@ struct PointWire {
     y: f64,
 }
 
-/// `endpoint_release_ops(scene_json, id, node_index, new_x_px, new_y_px,
-/// snap_target_id, snap_at_json) -> ObjectOp[] | {error}`.
-///
-/// Anchor-semantics v3 §2b: the commit of an endpoint-drag release — ONE
-/// chord-deform `edit-geometry` moving the dragged endpoint to the world-px
-/// release point, plus the `set-anchor` whole-vector rewrite (rebind when the
-/// release snapped, unbind when it landed in empty space). `snap_target_id`
-/// empty = no snap; `snap_at_json` is the snapped world point `{x,y}` (empty =
-/// the release point itself). Returns `[]` when the op does not apply (unknown
-/// id, closed-class, interior node). The shell batches the returned ops.
+/// The commit of an endpoint-drag release: ONE chord-deform `edit-geometry`
+/// moving the dragged endpoint to the release point, plus a `set-anchor`
+/// whole-vector rewrite (rebind on snap, unbind in empty space). `snap_target_id`
+/// empty = no snap; `snap_at_json` is the snapped world point `{x,y}` (empty = the
+/// release point). `[]` when the op does not apply (unknown id, closed-class,
+/// interior node).
 #[wasm_bindgen]
 pub fn endpoint_release_ops(
     scene_json: &str,
@@ -531,10 +454,8 @@ pub fn endpoint_release_ops(
     ok_json(&fold_follower_reprojection(&scene, ops))
 }
 
-/// Append the follower-reprojection ops for any `EditGeometry` an op batch carries,
-/// so a single shell `author()` applies the reshape AND moves its anchored followers
-/// (commit-path geometry-edit follow). Op orchestration stays in the core — the shell
-/// only authors what these bridges return.
+/// Append the follower-reprojection ops for any `EditGeometry` in the batch, so one
+/// `author()` applies the reshape AND moves its anchored followers.
 fn fold_follower_reprojection(scene: &ObjectScene, ops: Vec<ObjectOp>) -> Vec<ObjectOp> {
     let edits: Vec<ObjectOp> =
         ops.iter().filter(|op| matches!(op, ObjectOp::EditGeometry { .. })).cloned().collect();
@@ -546,20 +467,9 @@ fn fold_follower_reprojection(scene: &ObjectScene, ops: Vec<ObjectOp>) -> Vec<Ob
     all
 }
 
-// ---------------------------------------------------------------------------
-// Grouping bridges (Tier-4) — group-hierarchy containment op-generation + forest
-// queries. The shell's context-menu pop-out, the ungroup-enabled menu gate, and
-// the double-click container-vs-leaf decision now run THE core query; the shell
-// keeps only the dispatch (author the op / set active-container / inline edit).
-// ---------------------------------------------------------------------------
-
-/// `pop_out_op(scene_json, id) -> ObjectOp | null | {error}`.
-///
-/// Author the `reparent` op that pops `id` out one level (to its grandparent, or
-/// to the canvas root when the parent sits at the root), preserving its order key.
-/// Returns `null` when `id` is unknown or already at the root (nothing to pop out
-/// of). The shell authors the returned op through the same op-apply path (whose
-/// `reparent` arm carries the cycle check).
+/// The `reparent` op that pops `id` out one level (to its grandparent, or the
+/// canvas root), preserving its order key. `null` when `id` is unknown or already
+/// at the root.
 #[wasm_bindgen]
 pub fn pop_out_op(scene_json: &str, id: &str) -> String {
     let scene: ObjectScene = match parse("scene", scene_json) {
@@ -569,7 +479,6 @@ pub fn pop_out_op(scene_json: &str, id: &str) -> String {
     ok_json(&pop_out_op_pure(&scene, id))
 }
 
-/// `has_children(scene_json, id) -> bool | {error}`.
 /// Whether `id` is a container (has at least one child) in the object forest.
 #[wasm_bindgen]
 pub fn has_children(scene_json: &str, id: &str) -> String {
@@ -580,12 +489,8 @@ pub fn has_children(scene_json: &str, id: &str) -> String {
     ok_json(&has_children_pure(&scene, id))
 }
 
-/// `ungroup_enabled(scene_json, selected_id) -> bool | {error}`.
-///
-/// Whether ungroup is enabled for the single selected object: true only when a
-/// non-null `selected_id` is a container (has children). An empty `selected_id`
-/// string is treated as no selection (the canvas / multi-select case the shell
-/// gates out before calling).
+/// Whether ungroup is enabled: true only when `selected_id` is a container. An
+/// empty `selected_id` is treated as no selection.
 #[wasm_bindgen]
 pub fn ungroup_enabled(scene_json: &str, selected_id: &str) -> String {
     let scene: ObjectScene = match parse("scene", scene_json) {
@@ -596,12 +501,8 @@ pub fn ungroup_enabled(scene_json: &str, selected_id: &str) -> String {
     ok_json(&ungroup_enabled_pure(&scene, selected))
 }
 
-/// `double_click_action(scene_json, id) -> DoubleClickAction | {error}`.
-///
-/// The container-vs-leaf decision for a double-click on object `id`:
-/// `{"kind":"drill-in-container"}` when it has children, else
-/// `{"kind":"edit-leaf"}`. The shell drives this off the renderer's double-click
-/// signal id and dispatches the action (set active-container vs inline text edit).
+/// The container-vs-leaf decision for a double-click on `id`:
+/// `{"kind":"drill-in-container"}` when it has children, else `{"kind":"edit-leaf"}`.
 #[wasm_bindgen]
 pub fn double_click_action(scene_json: &str, id: &str) -> String {
     let scene: ObjectScene = match parse("scene", scene_json) {
@@ -611,19 +512,11 @@ pub fn double_click_action(scene_json: &str, id: &str) -> String {
     ok_json(&double_click_action_pure(&scene, id))
 }
 
-// ---------------------------------------------------------------------------
-// Undo/redo bridge (FC-15). The per-actor `UndoStack` (D21) now lives in the
-// core; the shell drives it through this stateful wrapper instead of a TS
-// reimplementation. The wrapper mirrors the crate's semantics exactly: undo/redo
-// hand out an op JSON for the host to re-author through the SAME op-apply path,
-// then the host reports the re-inverse back via `note_undo_applied` /
-// `note_redo_applied`. All op payloads cross the FFI as ObjectOp JSON.
-//
-// Like the rest of this file the wrapper never panics across the boundary: the
-// `note_*` methods are guarded by an internally-mirrored `pending` flag, so an
-// out-of-order call (no handshake in flight) returns `false` instead of hitting
-// the core's `panic!`. Malformed op JSON returns `false` as well.
-// ---------------------------------------------------------------------------
+// Stateful wrapper over the core `UndoStack`: undo/redo hand out an op JSON for
+// the host to re-author through the SAME op-apply path, then the host reports the
+// re-inverse via `note_*_applied`. The `note_*` methods are guarded by a mirrored
+// `pending` flag so an out-of-order call returns `false` instead of hitting the
+// core's `panic!`; malformed op JSON returns `false` as well.
 
 /// Which handshake the wrapper is awaiting, mirroring the core's private
 /// `Pending` so the `note_*` calls can be guarded against an FFI panic.
@@ -641,17 +534,14 @@ pub struct WasmUndoStack {
 
 #[wasm_bindgen]
 impl WasmUndoStack {
-    /// Create a per-actor undo stack. `actor_id` is informational (the crate
-    /// stores it); the shell passes its authoring identity.
+    /// `actor_id` is informational (the crate stores it).
     #[wasm_bindgen(constructor)]
     pub fn new(actor_id: &str) -> WasmUndoStack {
         WasmUndoStack { inner: UndoStack::new(actor_id.to_string()), pending: None }
     }
 
-    /// Record an applied edit: `forward` is what was applied, `inverse` is what
-    /// `apply_object_op` returned for it. Clears redo (a fresh edit forks
-    /// history); folds into the live entry during a coalescing window. Returns
-    /// `true` on success, `false` if either op JSON is malformed.
+    /// Clears redo (a fresh edit forks history); folds into the live entry during
+    /// a coalescing window. `false` if either op JSON is malformed.
     pub fn record(&mut self, forward_json: &str, inverse_json: &str) -> bool {
         let forward: ObjectOp = match serde_json::from_str(forward_json) {
             Ok(v) => v,
@@ -768,8 +658,7 @@ mod tests {
         );
         let object: Object = serde_json::from_str(&json).expect("freehand returns a valid Object");
         assert_eq!(object.id, "draw-1");
-        // v3 §4: pen-up recognition — a straight stroke commits as the
-        // canonical 2-node line (object-local, origin on the transform).
+        // A straight stroke commits as the canonical 2-node line.
         assert_eq!(object.geometry.path_string, "M 0 0 L 80 0");
         assert!(object.stroke.is_some(), "freehand commit carries a stroke");
     }
@@ -814,10 +703,8 @@ mod tests {
 
     #[test]
     fn partial_erase_ops_returns_the_whole_op_batch() {
-        // A 5-node open polyline; a touch near the middle node cuts the stroke
-        // (edit-geometry); a far touch misses (no ops); an unknown id is a no-op.
-        // The shell authors whatever this returns — it assembles no ops itself (op
-        // orchestration stays in the core).
+        // A touch near the middle node cuts the stroke; a far touch misses; an
+        // unknown id is a no-op.
         let scene = r#"{"sceneVersion":1,"objects":[{"id":"seg","order":"a0","geometry":{"d":"M 0 0 L 80 0 L 160 0 L 240 0 L 320 0"}}],"tags":[],"selection":{"kind":"canvas"},"updatedAt":""}"#;
         let cut = partial_erase_ops(scene, "seg", 161, 1, 16);
         let ops: Vec<ObjectOp> = serde_json::from_str(&cut).expect("erase returns ops");
@@ -849,10 +736,9 @@ mod tests {
         assert!(out.contains("\"error\""), "a missed touch is an error");
     }
 
-    // --- move_ops bridge (Tier-2) ---
+    // --- move_ops bridge ---
 
-    /// A two-node line object at translate `(tx, ty)`, optionally parented, in the
-    /// camelCase wire shape the shell sends.
+    /// A two-node line object, optionally parented, in the camelCase wire shape.
     fn line_object_json(id: &str, parent: Option<&str>, tx: f64, ty: f64) -> String {
         let parent_field = parent.map(|p| format!(r#""parent":"{p}","#)).unwrap_or_default();
         format!(
@@ -913,10 +799,9 @@ mod tests {
         assert!(out.contains("\"error\""), "malformed roots is a bridge error");
     }
 
-    // --- grouping bridges (Tier-4) ---
+    // --- grouping bridges ---
 
-    /// A scene with `root -> mid -> deep` plus a root-level `leaf`, in the
-    /// camelCase wire shape the shell sends.
+    /// A scene with `root -> mid -> deep` plus a root-level `leaf`.
     fn grouping_scene_json() -> String {
         scene_json(&[
             line_object_json("root", None, 0.0, 0.0),
@@ -966,18 +851,16 @@ mod tests {
         assert_eq!(edit["kind"], "edit-leaf");
     }
 
-    // --- WasmUndoStack bridge (FC-15) ---
+    // --- WasmUndoStack bridge ---
 
-    /// A `set-transform` op JSON to `(tx, ty)`, matching the camelCase wire shape
-    /// the shell sends. Used to drive the JSON handshake end to end.
+    /// A `set-transform` op JSON to `(tx, ty)` in the camelCase wire shape.
     fn set_transform_json(tx: f64, ty: f64) -> String {
         format!(
             r#"{{"kind":"set-transform","id":"r","transform":[[1,0,{tx}],[0,1,{ty}],[0,0,1]]}}"#
         )
     }
 
-    /// A one-rect scene whose only object is at the identity transform, applied
-    /// through the SAME wasm bridge the shell calls. Returns the scene JSON.
+    /// A one-rect scene at the identity transform, applied through the wasm bridge.
     fn scene_with_rect_json() -> String {
         let insert = r#"{"kind":"insert-object","object":{"id":"r","order":"a0","geometry":{"d":"M 0 0 L 80 0 L 80 40 L 0 40 Z"}}}"#;
         let result: serde_json::Value =

@@ -1,53 +1,29 @@
-//! Derived outline / region for the object render model (OB3.R4, D6).
+//! Derived outline / region for the object render model. Derives a fillable /
+//! hittable / selectable "region" from an object's geometry path-string:
 //!
-//! Every object on the canvas is a single geometry path-string (D2). For fill,
-//! text layout, hit-test, selection, and anchor borders the renderer needs a
-//! *shape* — a "region" — derived from that geometry once and cached:
+//! * A closed contour's region is its flattened boundary polygon + AABB.
+//! * An open contour's region is the concave hull of its stroke points.
 //!
-//! * A **closed** contour already encloses an interior, so its region is just
-//!   its flattened boundary polygon plus an axis-aligned bounding box (AABB).
-//! * An **open** contour (a scribble, a polyline, an absorbed edge) does not
-//!   enclose anything, yet a fillable / hittable / selectable shape is still
-//!   wanted (D6). Its region is the **concave hull** of the stroke points — a
-//!   single polygon that wraps the drawn marks more tightly than a bounding box.
+//! Pure CPU geometry: host-neutral, no GPU, no time/IO/threads.
 //!
-//! This module is the renderer-local consumer interface for OB1.3's derived
-//! region contract. It is **pure CPU geometry**: host-neutral, no `JsValue`, no
-//! GPU device, no business fields, no time/IO/threads. The GPU draw path wires
-//! it in at the OB-4 cutover; until then the cache is groundwork.
+//! Coordinates: object geometry is stored as object-local quantized integers at 8
+//! units/px; [`parse_path_string`] decodes to `f32` pixel nodes (`/8.0`) and
+//! flattens cubics so every downstream stage works in one pixel space.
+//! `derive_region` itself takes already-flattened subpaths.
 //!
-//! ## Coordinates
-//!
-//! Object geometry is stored as object-local *quantized integers* at 8 units per
-//! pixel (D2). [`parse_path_string`] decodes that integer path into `f32` pixel
-//! nodes (`/8.0`) and flattens cubics so every downstream stage — region, fill,
-//! hit-test — works in a single pixel space. `derive_region` itself takes
-//! already-flattened subpaths, so callers that flatten elsewhere can feed it
-//! directly.
-//!
-//! ## Concave hull (documented simplification)
-//!
-//! The open-contour hull is computed as: Andrew's monotone-chain **convex hull**,
-//! then an iterative **dig-in** pass that, for each hull edge longer than a
-//! threshold, pulls in the nearest interior point that tightens the boundary
-//! without self-intersecting nearby edges. This is a real concave hull but a
-//! deliberately simple one; a principled **alpha-shape** refinement (parameter
-//! `alpha` tied to point spacing, holes, multi-component shapes) is a follow-up.
-//! When dig-in finds nothing to pull in, the result degrades cleanly to the
-//! convex hull, which still satisfies the contract (a polygon whose AABB bounds
-//! every input point).
+//! Concave hull: Andrew's monotone-chain convex hull, then an iterative dig-in pass
+//! pulling in nearby interior points along long edges (a deliberately simple
+//! concave hull; a principled alpha-shape is a follow-up). Degrades cleanly to the
+//! convex hull when nothing can be pulled in.
 
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 
-/// A derived "shape" for one object's geometry, in pixel coordinates.
-///
-/// `outline` is a single boundary polygon (CCW or CW, not guaranteed) with no
-/// repeated closing vertex. `closed` records whether the source contour was a
-/// closed fill (`true`) or an open stroke whose region is a hull (`false`); the
-/// fill / hit-test / anchor consumers treat both as a filled polygon but may
-/// style them differently. The AABB fields bound every outline vertex.
+/// A derived "shape" for one object's geometry, in pixel coordinates. `outline` is
+/// a single boundary polygon (winding not guaranteed) with no repeated closing
+/// vertex. `closed` records whether the source was a closed fill or an open stroke
+/// hull. The AABB fields bound every outline vertex.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Region {
     pub outline: Vec<(f32, f32)>,
@@ -68,23 +44,12 @@ impl Region {
     }
 }
 
-/// Derive a [`Region`] from a set of flattened subpaths.
+/// Derive a [`Region`] from flattened `(closed, points)` subpaths. `flatness` is the
+/// merge tolerance (px) for collapsing near-duplicate / near-collinear vertices.
 ///
-/// Each subpath is `(closed, points)` in pixel coordinates, where `points` is an
-/// already-flattened polyline (cubics resolved upstream by [`parse_path_string`]
-/// or the caller). `flatness` is the merge tolerance in pixels for collapsing
-/// near-duplicate / near-collinear vertices before building the outline; it is
-/// the same screen tolerance the LOD re-flatten path uses, so a coarse far-zoom
-/// region carries fewer points.
-///
-/// Selection rule (D6): the region follows the contour that *defines the shape*.
-/// If any subpath is closed, the region is the boundary of the **largest-area**
-/// closed subpath (the outer fill boundary; inner subpaths are even-odd holes,
-/// not the silhouette). With no closed subpath, all open points are pooled and
-/// wrapped in a concave hull.
-///
-/// Returns `None` when there is no geometry to bound (no subpaths, or fewer than
-/// the vertices needed to form a polygon after cleanup).
+/// Selection rule: if any subpath is closed, the region is the largest-area closed
+/// subpath's boundary (inner subpaths are even-odd holes); else all open points are
+/// pooled into a concave hull. `None` when there is too little geometry to bound.
 pub fn derive_region(subpaths: &[(bool, Vec<(f32, f32)>)], flatness: f32) -> Option<Region> {
     let tol = flatness.max(0.0);
 
@@ -107,11 +72,9 @@ pub fn derive_region(subpaths: &[(bool, Vec<(f32, f32)>)], flatness: f32) -> Opt
         return Some(bound(outline, true));
     }
 
-    // Open contour(s): pool every *open* stroke's points and wrap a concave hull
-    // around them. Closed subpaths are excluded here: a closed contour either
-    // already produced a region above (>= 3 points) or is degenerate (< 3 points),
-    // and a degenerate closed contour encloses no area, so it must not be
-    // repurposed as an open stroke (it yields no region at all).
+    // Open contour(s): pool every open stroke's points into a concave hull. Closed
+    // subpaths are excluded — a degenerate closed contour encloses no area and must
+    // not be repurposed as an open stroke.
     let mut pool: Vec<(f32, f32)> = Vec::new();
     for (closed, pts) in subpaths {
         if !*closed {
@@ -123,8 +86,8 @@ pub fn derive_region(subpaths: &[(bool, Vec<(f32, f32)>)], flatness: f32) -> Opt
         return None;
     }
     if pool.len() == 2 {
-        // A degenerate two-point stroke has no area; its "shape" is the segment
-        // itself, returned as a 2-vertex outline so AABB/hit still work.
+        // A degenerate two-point stroke: return the segment as a 2-vertex outline
+        // so AABB/hit still work.
         return Some(bound(pool, false));
     }
 
@@ -157,9 +120,7 @@ fn bound(outline: Vec<(f32, f32)>, closed: bool) -> Region {
     }
 }
 
-/// Signed area of a polygon via the shoelace formula. Sign tells winding; the
-/// magnitude is the enclosed area. Used only to pick the outer (largest) closed
-/// subpath as the silhouette.
+/// Signed area via the shoelace formula (sign = winding, magnitude = enclosed area).
 fn signed_area(points: &[(f32, f32)]) -> f32 {
     if points.len() < 3 {
         return 0.0;
@@ -173,10 +134,8 @@ fn signed_area(points: &[(f32, f32)]) -> f32 {
     sum * 0.5
 }
 
-/// Drop consecutive vertices closer than `tol` and a redundant closing vertex,
-/// then drop near-collinear interior vertices (within `tol` of the chord). Keeps
-/// the boundary faithful while shedding flattening noise so the outline polygon
-/// stays small.
+/// Drop consecutive vertices closer than `tol`, a redundant closing vertex, then
+/// near-collinear interior vertices (within `tol` of the chord).
 fn cleanup_polygon(points: &[(f32, f32)], tol: f32) -> Vec<(f32, f32)> {
     let mut out = dedup_points(points, tol);
     // A closed polygon may repeat its first vertex at the end; drop it.
@@ -186,8 +145,6 @@ fn cleanup_polygon(points: &[(f32, f32)], tol: f32) -> Vec<(f32, f32)> {
     if out.len() < 3 || tol <= 0.0 {
         return out;
     }
-    // Collinear cull: remove a vertex when it sits within `tol` of the segment
-    // joining its neighbors.
     let mut culled: Vec<(f32, f32)> = Vec::with_capacity(out.len());
     let n = out.len();
     for i in 0..n {
@@ -255,51 +212,38 @@ fn convex_hull(points: &[(f32, f32)]) -> Vec<(f32, f32)> {
     hull
 }
 
-/// Concave hull of `points`: convex hull, then a dig-in refinement that pulls the
-/// boundary toward nearby interior points along edges that are long relative to
-/// the point cloud. A documented simplification of an alpha-shape (see module
-/// docs). Always returns a valid simple polygon; degrades to the convex hull when
-/// no point can be pulled in.
+/// Concave hull: convex hull, then a dig-in refinement pulling the boundary toward
+/// nearby interior points along long edges. Degrades to the convex hull when no
+/// point can be pulled in.
 fn concave_hull(points: &[(f32, f32)], tol: f32) -> Vec<(f32, f32)> {
     let mut hull = convex_hull(points);
     if hull.len() < 3 {
         return hull;
     }
 
-    // Dig-in length threshold: edges longer than `dig_threshold` are candidates
-    // for inserting a nearby interior point. Tie it to the characteristic point
-    // spacing (mean nearest-neighbor distance) so the concavity scale tracks the
-    // cloud's own resolution rather than a fixed magic number.
+    // Threshold tied to mean nearest-neighbor spacing so the concavity scale tracks
+    // the cloud's own resolution rather than a fixed magic number.
     let spacing = mean_nearest_neighbor(points).max(tol).max(f32::EPSILON);
     let dig_threshold = spacing * DIG_THRESHOLD_FACTOR;
 
-    // Iteratively refine: in each pass, find the hull edge with the largest
-    // "decay" (edge length relative to the nearest interior point's distance to
-    // it) and split it on that point if it tightens the boundary safely. Bound
-    // the passes so a pathological cloud cannot loop unboundedly.
+    // Bound the passes so a pathological cloud cannot loop unboundedly.
     let max_passes = points.len().saturating_mul(2);
     for _ in 0..max_passes {
         let Some((edge_idx, insert_pt)) = best_dig_candidate(&hull, points, dig_threshold) else {
             break;
         };
-        // Insert after `edge_idx` (between hull[edge_idx] and the next vertex).
         hull.insert(edge_idx + 1, insert_pt);
     }
     hull
 }
 
-/// Factor on mean point spacing above which a hull edge is long enough to dig
-/// into. Larger = smoother (closer to convex); smaller = more concave. A
-/// tuning lever for the future alpha-shape pass.
+/// Factor on mean point spacing above which a hull edge is long enough to dig into.
+/// Larger = smoother (nearer convex); smaller = more concave.
 const DIG_THRESHOLD_FACTOR: f32 = 2.5;
 
-/// Find the hull edge most worth digging into and the interior point to insert.
-///
-/// For every hull edge longer than `dig_threshold`, consider interior points (not
-/// already on the hull) that are closer to the edge than to its endpoints' other
-/// edges, and pick the one whose insertion shortens the longest edge the most
-/// while keeping the new vertex strictly inside the old edge's span (avoiding a
-/// spike that re-crosses the boundary). Returns `(edge_index, point)` or `None`.
+/// Find the hull edge most worth digging into and the interior point to insert: an
+/// off-hull point projecting onto the edge interior whose insertion shortens the
+/// longest edge the most. Returns `(edge_index, point)` or `None`.
 fn best_dig_candidate(
     hull: &[(f32, f32)],
     points: &[(f32, f32)],
@@ -319,19 +263,17 @@ fn best_dig_candidate(
             if on_hull(p) {
                 continue;
             }
-            // The point must project onto the edge interior, not past an end.
+            // Must project onto the edge interior, not past an end.
             let t = project_t(p, a, b);
             if !(0.05..=0.95).contains(&t) {
                 continue;
             }
             let d = point_segment_distance(p, a, b);
-            // Require the point to be meaningfully closer to this edge than the
-            // edge is long (a real concavity), and not a tiny wiggle.
+            // A real concavity: closer to the edge than the edge is long.
             if d >= edge_len {
                 continue;
             }
-            // Score: prefer the deepest dent on the longest edge. Larger is
-            // better.
+            // Prefer the deepest dent on the longest edge.
             let score = edge_len - d;
             if best.map(|(_, _, s)| score > s).unwrap_or(true) {
                 best = Some((i, p, score));
@@ -341,9 +283,8 @@ fn best_dig_candidate(
     best.map(|(i, p, _)| (i, p))
 }
 
-/// Mean distance from each point to its nearest other point. O(n^2); fine for the
-/// per-object point counts here (post-RDP scribbles), and only run once per
-/// region derive (cached). Returns 0 for fewer than two points.
+/// Mean distance from each point to its nearest other point (O(n^2), run once per
+/// derive). Returns 0 for fewer than two points.
 fn mean_nearest_neighbor(points: &[(f32, f32)]) -> f32 {
     let n = points.len();
     if n < 2 {
@@ -363,21 +304,11 @@ fn mean_nearest_neighbor(points: &[(f32, f32)]) -> f32 {
     total / n as f32
 }
 
-/// Parse a quantized-integer SVG-subset path-string into flattened pixel
-/// subpaths suitable for [`derive_region`].
-///
-/// Grammar (mirrors the object geometry encoding, D2): a sequence of commands
-/// `M`/`L`/`C`/`Z` with **absolute integer** coordinates in object-local quantized
-/// units (8 units/px). `C` carries absolute control points (`cp1x cp1y cp2x cp2y
-/// x y`); handles are stored relative to nodes upstream but the path-string emits
-/// absolute control points. Numbers are whitespace/comma separated. A `Z` closes
-/// the current subpath. A new `M` starts a new subpath (multi-subpath in one
-/// string).
-///
-/// Cubics are flattened to line segments with at most `flatness` pixels of chord
-/// error via recursive subdivision. Coordinates are converted to pixels by
-/// `/ QUANT_UNITS_PER_PX`. Returns `(closed, points)` per subpath. Returns `None`
-/// on a malformed string (unknown command, missing operand).
+/// Parse a quantized-integer SVG-subset path-string (`M`/`L`/`C`/`Z`, absolute
+/// integer coords at 8 units/px) into flattened pixel subpaths for [`derive_region`].
+/// `C` carries absolute control points. Cubics are flattened to within `flatness` px
+/// of chord error; coords are converted to pixels by `/ QUANT_UNITS_PER_PX`. Returns
+/// `(closed, points)` per subpath, or `None` on a malformed string.
 pub fn parse_path_string(path: &str, flatness: f32) -> Option<Vec<(bool, Vec<(f32, f32)>)>> {
     let mut tokens = PathLexer::new(path);
     let mut subpaths: Vec<(bool, Vec<(f32, f32)>)> = Vec::new();
@@ -463,17 +394,14 @@ pub fn parse_path_string(path: &str, flatness: f32) -> Option<Vec<(bool, Vec<(f3
     Some(subpaths)
 }
 
-/// Quantization: object-local geometry stores 8 integer units per pixel (D2).
+/// Object-local geometry stores 8 integer units per pixel.
 pub const QUANT_UNITS_PER_PX: f32 = 8.0;
 
-/// Floor on flattening tolerance so a zero/negative `flatness` still terminates
-/// cubic subdivision.
+/// Floor on flattening tolerance so a zero/negative `flatness` still terminates.
 const MIN_FLATNESS: f32 = 0.05;
 
-/// A minimal tokenizer for the M/L/C/Z path grammar over quantized integers.
-/// Commands are single ASCII bytes; coordinates are signed integers separated by
-/// whitespace or commas. Coordinates are divided by [`QUANT_UNITS_PER_PX`] to
-/// pixels as they are read.
+/// Tokenizer for the M/L/C/Z path grammar over quantized integers; coords are
+/// divided by [`QUANT_UNITS_PER_PX`] to pixels as read.
 struct PathLexer<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -500,8 +428,7 @@ impl<'a> PathLexer<'a> {
         }
     }
 
-    /// Advance to the next command byte (M/L/C/Z, case-insensitive). Returns the
-    /// uppercased command, or `None` at end of input.
+    /// Advance to the next command byte (M/L/C/Z, case-insensitive, uppercased).
     fn next_command(&mut self) -> Option<u8> {
         self.skip_separators();
         if self.pos >= self.bytes.len() {
@@ -518,7 +445,7 @@ impl<'a> PathLexer<'a> {
         }
     }
 
-    /// Read one signed integer coordinate, converting to pixels.
+    /// Read one signed integer coordinate, converted to pixels.
     fn next_coord(&mut self) -> Option<f32> {
         self.skip_separators();
         let start = self.pos;
@@ -539,9 +466,8 @@ impl<'a> PathLexer<'a> {
     }
 }
 
-/// Recursively subdivide a cubic Bézier until the control polygon is within `tol`
-/// of the chord, pushing flattened endpoints (excluding the start, which the
-/// caller already holds as the cursor) onto `out`.
+/// Flatten a cubic Bézier to within `tol` of the chord, pushing endpoints
+/// (excluding the start, already held as the cursor) onto `out`.
 fn flatten_cubic(
     p0: (f32, f32),
     p1: (f32, f32),
@@ -625,16 +551,11 @@ pub fn point_segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f3
     dist(p, proj)
 }
 
-/// Nearest point on a polyline outline to `(px, py)`, returning the projected
-/// point and its SQUARED distance (W2-06, anchor snapping).
-///
-/// `outline` is an ordered vertex list (no repeated closing vertex). Each
-/// consecutive pair `[i, i+1]` is a segment; when `closed` is `true` the implicit
-/// closing edge `[last, 0]` is included too — so rect/ellipse silhouettes snap to
-/// their full boundary, while an open line/freehand polyline never snaps to an
-/// edge it does not draw. Reuses [`project_t`] for the clamped per-segment
-/// projection. Allocation-free; O(outline.len()). A single-vertex outline returns
-/// that vertex; an empty outline returns `None`.
+/// Nearest point on a polyline outline to `(px, py)`, returning the projected point
+/// and its SQUARED distance (anchor snapping). When `closed` is true the implicit
+/// closing edge `[last, 0]` is included, so a closed silhouette snaps to its full
+/// boundary while an open polyline never snaps to an edge it does not draw. A
+/// single-vertex outline returns that vertex; an empty outline returns `None`.
 pub fn nearest_point_on_polyline(
     outline: &[(f32, f32)],
     closed: bool,
@@ -666,16 +587,9 @@ pub fn nearest_point_on_polyline(
     Some((best_pt, best_d2))
 }
 
-/// A small revision-keyed LRU of derived regions, mirroring
-/// [`crate::render_cache::RenderDataCache`]'s residency policy: keyed by object
-/// id, tagged with the geometry revision it was derived at. An object whose
-/// geometry revision is unchanged is a cache hit and skips re-derivation
-/// (D6: "geometry 편집 시 1회 계산+캐시"). Bounded by an entry cap with LRU
-/// eviction so the resident set is the visible + prefetch objects, not the whole
-/// scene.
-///
-/// This is groundwork; the GPU draw path wires it in downstream, so it is
-/// `allow(dead_code)` until then via the module attribute.
+/// A revision-keyed LRU of derived regions (mirrors [`crate::render_cache::RenderDataCache`]):
+/// an object whose geometry revision is unchanged is a hit and skips re-derivation;
+/// bounded by an entry cap with LRU eviction.
 #[derive(Clone, Debug)]
 pub struct RegionCache {
     entries: HashMap<String, RegionEntry>,
@@ -693,8 +607,7 @@ struct RegionEntry {
     region: Region,
 }
 
-/// Default cap on cached regions, seeded to match the render-data cache so the
-/// two residency budgets line up; tunable later against memory/latency evidence.
+/// Default cap on cached regions (matches the render-data cache budget).
 pub const REGION_CACHE_LIMIT: usize = 8192;
 
 impl RegionCache {
@@ -713,7 +626,7 @@ impl RegionCache {
         }
     }
 
-    /// Advance the logical frame clock for LRU recency. Returns the new frame.
+    /// Advance the logical frame clock for LRU recency.
     pub fn begin_frame(&mut self) -> u64 {
         self.frame += 1;
         self.frame
@@ -727,11 +640,8 @@ impl RegionCache {
         self.entries.is_empty()
     }
 
-    /// Look up the region for `id` at `revision`, deriving it on a miss or a stale
-    /// revision. `derive` runs only when re-derivation is actually needed, so an
-    /// object whose geometry is unchanged never re-derives its region. Returns
-    /// `None` (without caching) when `derive` yields no region (degenerate
-    /// geometry).
+    /// Look up the region for `id` at `revision`, invoking `derive` only on a miss
+    /// or stale revision. `None` (uncached) when `derive` yields no region.
     pub fn get_or_derive<F>(&mut self, id: &str, revision: u64, derive: F) -> Option<&Region>
     where
         F: FnOnce() -> Option<Region>,
@@ -838,8 +748,7 @@ mod tests {
 
     #[test]
     fn closed_region_picks_largest_subpath_as_silhouette() {
-        // A big outer square and a small inner square (a hole). The silhouette is
-        // the outer one; its AABB must be the big square's, not the hole's.
+        // Outer square + inner hole: the silhouette's AABB is the outer one's.
         let big = vec![(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)];
         let hole = vec![(8.0, 8.0), (12.0, 8.0), (12.0, 12.0), (8.0, 12.0)];
         let subpaths = vec![(true, hole), (true, big)];
@@ -850,8 +759,6 @@ mod tests {
 
     #[test]
     fn open_polyline_of_five_points_yields_hull_bounding_all() {
-        // An open scribble of 5 points; its region is a hull (not closed) whose
-        // AABB bounds every input point.
         let pts = vec![
             (0.0, 0.0),
             (4.0, 8.0),
@@ -872,7 +779,6 @@ mod tests {
             aabb_contains(&region, &pts),
             "hull AABB must bound every input point: {region:?}"
         );
-        // The hull AABB is exactly the point cloud's extent.
         assert_eq!((region.min_x, region.max_x), (0.0, 16.0));
         assert_eq!((region.min_y, region.max_y), (0.0, 9.0));
     }
@@ -893,9 +799,8 @@ mod tests {
 
     #[test]
     fn concave_hull_digs_into_a_deep_dent() {
-        // A "U"/notched cloud: a wide rectangle of points with a deep gap in the
-        // top edge. The convex hull is the bounding rect (4 pts); the concave hull
-        // should pull at least one boundary vertex into the dent.
+        // A notched cloud (rectangle with a dent in the top edge): the concave hull
+        // should pull a boundary vertex into the dent where the convex hull cannot.
         let mut pts = Vec::new();
         // bottom edge
         for i in 0..=10 {
@@ -920,7 +825,6 @@ mod tests {
             concave.len(),
             convex.len()
         );
-        // Still bounds every point.
         let region = bound(concave, false);
         assert!(aabb_contains(&region, &pts));
     }
@@ -947,7 +851,6 @@ mod tests {
         let subpaths = parse_path_string(path, 0.5).expect("valid path");
         assert_eq!(subpaths.len(), 1);
         assert!(subpaths[0].0, "Z closes the subpath");
-        // First node converted to pixels.
         assert_eq!(subpaths[0].1[0], (0.0, 0.0));
         assert_eq!(subpaths[0].1[1], (10.0, 0.0));
         assert_eq!(subpaths[0].1[2], (10.0, 6.0));
@@ -959,9 +862,6 @@ mod tests {
 
     #[test]
     fn parse_path_string_flattens_cubic_within_tolerance() {
-        // A single cubic from (0,0) to (80,0) bowing up; control pts at y=80 (10px).
-        // Flattened polyline must stay within tolerance of the true curve, and the
-        // endpoints must be exact.
         let path = "M 0 0 C 0 80 80 80 80 0";
         let subpaths = parse_path_string(path, 0.1).expect("valid cubic path");
         let pts = &subpaths[0].1;
@@ -1049,14 +949,12 @@ mod tests {
 
     #[test]
     fn nearest_point_on_polyline_closing_edge_only_when_closed() {
-        // An open square-ish polyline: 3 sides of a unit square, missing the
-        // closing edge from (0,1) back to (0,0). A query just left of that missing
-        // edge's midpoint (-0.1, 0.5) is nearest the implicit closing edge.
+        // 3 sides of a unit square; the query (-0.1, 0.5) sits left of the missing
+        // closing edge's midpoint.
         let outline = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
         let q = (-0.1_f32, 0.5_f32);
 
-        // Open: the closing edge does not exist, so the nearest point is an
-        // endpoint of the drawn polyline ((0,0) or (0,1)), not (0, 0.5).
+        // Open: no closing edge, so the nearest point is a drawn endpoint, not (0, 0.5).
         let (open_pt, _open_d2) =
             nearest_point_on_polyline(&outline, false, q.0, q.1).expect("open nearest");
         assert!(
@@ -1065,8 +963,7 @@ mod tests {
             "open polyline snaps to a drawn endpoint, got {open_pt:?}"
         );
 
-        // Closed: the implicit edge [last, 0] is included, so the nearest point is
-        // its projection (0, 0.5).
+        // Closed: the implicit edge [last, 0] is included; nearest is (0, 0.5).
         let (closed_pt, closed_d2) =
             nearest_point_on_polyline(&outline, true, q.0, q.1).expect("closed nearest");
         assert!(

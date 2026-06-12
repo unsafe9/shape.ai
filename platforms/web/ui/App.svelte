@@ -87,126 +87,71 @@
   import TemplatePopup, { type TemplatePopupItem } from "./TemplatePopup.svelte";
   import PeerCursors from "./PeerCursors.svelte";
 
-  // ----- canonical object scene (D1) -----
+  // Canonical object scene.
   let scene = $state<ObjectScene>(emptyObjectScene());
 
-  // ----- selection: single ObjectSelection + transient multi -----
   let selection = $state<ObjectSelection>({ kind: "canvas" });
 
-  // ----- AP3 (#9): active container (drill-in). A double-click on a container
-  //       object (one with children, per RA2b's drill-in signal) drills into it; the
-  //       shell holds the active container id so subsequent edits scope to it. Null =
-  //       the canvas root is active. -----
+  // Active drill-in container; null = the canvas root is active.
   let activeContainer = $state<string | null>(null);
 
-  // ----- W2-11: non-destructive live object transform preview, now GPU-side. The
-  //       canonical `scene` is never mutated mid-drag; the dragged object's instance
-  //       model matrix is pushed straight to the GPU (engine.setObjectPreviewTransform)
-  //       with zero re-tessellation (P4). The commit op on pointer-up still captures
-  //       the correct inverse (original transform), keeping undo correct (D21). -----
-
-  // FC-16: in the connected path authorOp's scene update is async (it arrives via
-  // commitClientScene), so the GPU instance matrix is the ONLY thing holding the
-  // object at its previewed position during the commit window. Remember the
-  // committed {id, transform}; the next canonical scene that reflects it triggers the
-  // single rebake (via the feedScene->loadObjectScene $effect), which drops the
-  // stale preview matrix with no snap-back.
+  // In the connected path authorOp's scene update is async, so the GPU instance matrix is the ONLY thing
+  // holding the object at its previewed position during the commit window. The next canonical scene that
+  // reflects this {id, transform} triggers the single rebake, dropping the stale preview with no snap-back.
   let pendingCommit: { id: string; transform: SceneObject["transform"] } | null = null;
 
-  // ----- FC-11: freehand pen. While the draw tool is active, the in-progress
-  //       stroke's world points accumulate here; `feedScene` appends a transient
-  //       preview object so the stroke is visible before it commits. On pointer-up
-  //       the points lower to a committed `Object` via the wasm core. -----
+  // The in-progress freehand stroke's world points; `feedScene` appends a transient preview. On pointer-up the points lower to a committed `Object` via the wasm core.
   let drawPoints = $state<{ x: number; y: number }[] | null>(null);
-  // v3 §4 freehand anchoring: the stroke's snap bookkeeping, mirroring createDrag's
-  // startSnap/lastSnap — `start` is the snap the stroke BEGAN on (the press's own
-  // snap, or the hover ring the user aimed at), `last` the most recent in-flight
-  // snap (sticky, for the near-miss release reuse). Both feed the release's
-  // endpoint-anchor authoring when the recognized result is OPEN.
+  // The stroke's snap bookkeeping: `start` is the snap the stroke BEGAN on, `last` the most recent
+  // in-flight snap (sticky, for near-miss release reuse). Both feed the release's endpoint-anchor authoring when the result is OPEN.
   let drawSnap = $state<{ start: CreateSnap | null; last: CreateSnap | null } | null>(null);
-  // W2-08: pen brush settings are now reactive state the draw-mode sub-toolbar
-  // drives (color + width). The freehand commit + the live preview both read the
-  // current brush; simplification thresholds live in scene-core recognition.
   let penWidthPx = $state(2);
-  // Pen recognition mode: Basic by default (every stroke snaps to a canonical
-  // basic shape). Hold Shift while drawing for Free recognition (polygon/curve
-  // fallbacks): mirrored from every key event, consumed only at pen-up — so it
-  // never collides with Shift's rotate/select roles (mutually exclusive contexts).
-  // Press-and-hold to draw free-form, release snaps back to Basic.
+  // Free recognition (polygon/curve fallbacks) while Shift is held; mirrored from every key event,
+  // consumed only at pen-up so it never collides with Shift's rotate/select roles.
   let freeRecognitionHeld = $state(false);
-  // D1/#5: the toolbar's always-visible selected color. It is the default fill/
-  // stroke for the next NEW shape; recoloring a selected object authors a SetStyle
-  // op (applySelectedColor). The native picker passes a CSS hex through verbatim.
+  // The toolbar's always-visible color: the default fill/stroke for the next NEW shape; recoloring a
+  // selected object authors a SetStyle op. The native picker passes a CSS hex through verbatim.
   let selectedColor = $state(THEME_DEFAULT_COLOR);
-  // W2-08: draw-mode palette + brush sizes the sub-toolbar offers. S2 (#5): the
-  // first entry is the theme-default token sentinel, then the fixed hex swatches.
+  // First entry is the theme-default token sentinel, then the fixed hex swatches.
   const PEN_PALETTE = [THEME_DEFAULT_COLOR, "#1f2933", "#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#ffffff"];
   const PEN_WIDTHS = [1, 2, 4, 8];
-  // W2-08: partial-erase cut radius in object-local quantized units (~12 logical
-  // px). A node within this radius of the touch is removed when the stroke is cut.
+  // Partial-erase cut radius in object-local quantized units (~12 logical px).
   const ERASE_RADIUS_QUANTIZED = 12 * GEOMETRY_QUANTUM_PER_PX;
 
-  // ----- W2-07: shape drag-create. Arming a shape tool sets `createKind`; the
-  //       pointer down-drag-up rubber-bands a bbox accumulated in `createDrag`
-  //       (start corner + current corner + whether the current corner is snapped
-  //       to an outline anchor). `feedScene` appends a transient preview object so
-  //       the rubber-band shows before it commits; on pointer-up the span lowers to
-  //       a sized primitive via an insert-object op, then the object is selected. -----
+  // Shape drag-create: arming a shape tool sets `createKind`; the pointer down-drag-up rubber-bands a
+  // bbox in `createDrag`. `target` is the snapped object id; `lastSnap` is the most recent successful
+  // outline snap (sticky across moves off the edge), so a release that misses the 8px snap can reuse it.
   let createKind = $state<DragCreateShape | null>(null);
-  // AP5 (#14): `target` is the id of the object whose outline the dragged corner
-  // snapped to (null when not snapped); it is captured per phase so the commit can
-  // synthesize a persistent anchor binding the created endpoint to that target.
-  // AP5/#4: `lastSnap` is the most recent successful outline snap seen DURING this
-  // drag (sticky — kept across moves that fall off the edge), so a release that
-  // itself misses the 8px snap can still reuse it to author the anchor.
   let createDrag = $state<{ span: DragSpan; snapped: boolean; target: string | null; startSnap: CreateSnap | null; lastSnap: CreateSnap | null } | null>(null);
-  // W3-G9 (#3): the pre-drag hover snap. While the create tool is armed and no
-  // button is down, a bare hover over an existing object's edge sets this to the
-  // snapped world point + target id; `feedScene` renders a PERSISTENT anchor ring
-  // from it (only while `createDrag` is null, so a drag's own ring takes over). Null
-  // when the cursor is off any edge, or once a drag starts / the tool disarms.
+  // The pre-drag hover snap: a bare hover over an object's edge sets the snapped world point + target id;
+  // `feedScene` renders a PERSISTENT anchor ring from it (only while `createDrag` is null). Null off any edge.
   let createHoverSnap = $state<{ at: { x: number; y: number }; target: string | null } | null>(null);
 
-  // ----- W2-10: inline text editing. `textEdit` holds the id of the object being
-  //       edited and its in-progress value; a contenteditable overlay is positioned
-  //       over the object's screen bbox (worldToScreen) while it is non-null. Blur or
-  //       Enter commits a set-text op; Esc cancels. The platform contenteditable
-  //       handles IME. Creating a text object enters edit immediately; pressing Enter
-  //       on a selected object enters edit. -----
+  // Inline text editing: `textEdit` holds the edited object id + in-progress value; a contenteditable
+  // overlay (which handles IME) is positioned over its screen bbox. Blur/Enter commits a set-text op; Esc cancels.
   let textEdit = $state<{ id: string; value: string } | null>(null);
 
-  // ----- ephemeral camera / chrome -----
   let camera = $state<CameraState>({ x: 140, y: 120, zoom: 0.6 });
   let status = $state("Ready");
-  // AP6 (#19): the transient toast channel. Persistent hints stay in `status`
-  // (no timer); transient ACTION notices ("Inserted rectangle", "Comment added",
-  // "Export ready") flow through `showToast`, render below `.canvas-status`, and
-  // auto-dismiss after ~2.5s with a CSS fade. The pure ToastChannel owns the
-  // lifecycle; the real setTimeout/clearTimeout are injected here so scene-core
-  // stays time-free and the state machine is unit-testable.
+  // The transient toast channel: persistent hints stay in `status`; transient ACTION notices flow
+  // through `showToast` and auto-dismiss. The real setTimeout/clearTimeout are injected so scene-core stays time-free.
   let toast = $state<string | null>(null);
   const toastChannel = new ToastChannel(
     { set: (cb, ms) => setTimeout(cb, ms), clear: (h) => clearTimeout(h as ReturnType<typeof setTimeout>) },
     (message) => (toast = message)
   );
-  // A transient action notice (auto-dismisses). Persistent text keeps using
-  // `status = ...`; AP1 etc. should reuse THIS for one-shot confirmations.
+  // A transient action notice (auto-dismisses); persistent text keeps using `status = ...`.
   function showToast(message: string): void {
     toastChannel.show(message);
   }
   let busy = $state(false);
   let diagnosticsOpen = $state(false);
   let settingsOpen = $state(false);
-  // AP4 (#12c): light/dark theme. Initialized from localStorage; the $effect below
-  // persists + flips the root `data-theme` attribute (dark-mode CSS) AND drives
-  // RB1's renderer theme-bit (`setObjectTheme`) so canvas + chrome flip together.
   let theme = $state<Theme>(readStoredTheme(window.localStorage));
   function toggleTheme(): void {
     theme = theme === "dark" ? "light" : "dark";
   }
-  // Single applier: on init and on every toggle, flip the root `data-theme`
-  // attribute (dark-mode CSS), persist the choice, and drive RB1's renderer
-  // theme-bit so the canvas flips with the chrome.
+  // On init and every toggle: flip the root `data-theme` attribute, persist, and drive the renderer theme-bit so canvas + chrome flip together.
   $effect(() => {
     applyDocumentTheme(theme, {
       root: document.documentElement,
@@ -216,27 +161,22 @@
   });
   let templateOpen = $state(false);
   let activeTool = $state<ActiveTool>("select");
-  // W2-03: Space-hold pan + dynamic hover cursor. `spaceHeld` flips the empty
-  // cursor to grab and arms the engine pan path; `affordance` is the core's
-  // per-move hover classification, mapped to a CSS cursor on the canvas wrapper.
+  // Space-hold pan + dynamic hover cursor: `spaceHeld` flips the empty cursor to grab and arms the
+  // engine pan path; `affordance` is the core's per-move hover classification, mapped to a CSS cursor.
   let spaceHeld = $state(false);
   let affordance = $state<HoverAffordance>("empty");
 
-  // ----- context menu (U3) -----
   type ContextMenuState = { selection: ObjectSelection; x: number; y: number; world: { x: number; y: number } };
   let contextMenu = $state<ContextMenuState | null>(null);
   let pendingContextScreen: { clientX: number; clientY: number } | null = null;
 
-  // ----- realtime peers -----
   let peers = $state<PeerPresence[]>([]);
   let lastCursorSentAt = 0;
   const CURSOR_THROTTLE_MS = 40;
 
-  // ----- renderer readout -----
   let rendererStats = $state<RendererStats | null>(null);
   let rendererHealth = $state<RendererHealth | null>(null);
 
-  // ----- data layer (the single object data path) -----
   let canvasId = $state("default");
   let sceneClient: SceneClient | null = null;
   let sceneClientReady = false;
@@ -247,25 +187,17 @@
   let connectionStatus = $state<ConnectionStatus>("offline");
   let canvasBusy = $state(false);
 
-  // ----- per-actor undo/redo (D21/FC-15): the core's UndoStack owns the
-  //       bookkeeping; inverse ops are authored back through the SAME op-apply
-  //       path. Only this client's ops are undoable. Created once the wasm core
-  //       loads (bootstrapSceneCore). -----
+  // Per-actor undo/redo: the core's UndoStack owns the bookkeeping; only this client's ops are undoable. Created once the wasm core loads.
   let undoStack: UndoStack | null = null;
 
-  // ----- non-reactive refs -----
   let host: ShapeCanvasHost | null = null;
   let canvasWrap: HTMLDivElement;
 
-  // W2-03/EN1: the cursor affordance reflected onto the canvas wrapper. Space-hold
-  // shows the pan grab cursor; the crosshair tools keep their own cursor (no
-  // override); otherwise the core's per-move hover classification drives it. The
-  // mapping lives in `lib/cursor` (single source the CSS in styles.css mirrors).
+  // The cursor affordance reflected onto the canvas wrapper; the mapping lives in `cursor.ts` (the single source styles.css mirrors).
   const cursorAffordance = $derived(deriveCursorAffordance(spaceHeld, activeTool, affordance));
 
-  // W2-10: the on-screen rect for the inline text-edit overlay, recomputed whenever
-  // the edited object, its transform, or the camera changes (so the overlay tracks
-  // the object under pan/zoom). Null when not editing or the object/path is gone.
+  // The inline text-edit overlay rect, recomputed when the edited object, its transform, or the camera
+  // changes (so the overlay tracks the object under pan/zoom). Null when not editing or the path is gone.
   const textEditObject = $derived(textEdit ? scene.objects.find((o) => o.id === textEdit.id) ?? null : null);
   const textEditRect = $derived(textEditObject ? textOverlayScreenRect(textEditObject, camera) : null);
 
@@ -274,14 +206,9 @@
   const hasRenderableScene = $derived(scene.objects.length > 0);
   const selectedObject = $derived(selection.kind === "object" ? scene.objects.find((o) => o.id === selection.id) ?? null : null);
 
-  // FC-08: the scene actually fed to the renderer — the canonical scene during
-  // normal editing. W2-11: a live object transform NO LONGER rebuilds this scene;
-  // the dragged object's instance model matrix is pushed straight to the GPU
-  // (engine.setObjectPreviewTransform) with zero re-tessellation (P4), so `feedScene`
-  // depends only on the canonical scene + the new-object previews below.
-  // FC-11/W2-07: while a freehand stroke or shape drag-create is in progress, append
-  // a transient preview object (a NEW object has no instance to update, so it bakes
-  // once per geometry change — correct, not a P4 violation).
+  // The scene fed to the renderer: the canonical scene plus any transient NEW-object preview (a live
+  // transform of an EXISTING object no longer rebuilds this — it's pushed straight to the GPU instance
+  // matrix). A new object bakes once per geometry change since it has no instance to update.
   const feedScene = $derived(
     buildFeedSceneOf(scene, drawPoints, createKind, createDrag, createHoverSnap, nextOrderKey, selectedColor, penWidthPx)
   );
@@ -294,40 +221,26 @@
       rendererHealth = health;
       if (health.state === "ready" && isDiagnosticsOnlyStatus(status)) status = "Ready";
     },
-    // W2-03/AP2 (#10): shift/meta-click toggles the object in/out of the multi set.
-    // A plain click on an object ALREADY in the current Multi keeps the whole Multi
-    // (so the pointer-down that begins a group-drag never collapses it to a single
-    // object — the drag then moves every member together, see onTransformCommit).
-    // A plain click on anything else replaces the selection with that object.
+    // A plain click on an object ALREADY in the current Multi keeps the whole Multi (so a group-drag
+    // never collapses it to a single); shift/meta toggles the object in/out; anything else replaces it.
     onSelectObject: (id, additive) => selectObject(routeSelectObject(selection, id, additive)),
     onTransformPreview: (id, _matrix, _kind) => {
-      // W2-11: the matrix is already on the GPU instance buffer (pushed by the engine
-      // per move). This handler only invalidates a stale pendingCommit so a new drag
-      // can never freeze on a commit still waiting for its scene update.
+      // The matrix is already on the GPU instance buffer; this only invalidates a stale pendingCommit so a new drag can't freeze.
       if (pendingCommit && pendingCommit.id !== id) pendingCommit = null;
     },
     onTransformCommit: (id, matrix, kind, detach) => {
-      // The canonical scene was never mutated during the drag, so op-apply
-      // captures the correct inverse (original transform), satisfying D21 undo.
+      // The canonical scene was never mutated during the drag, so op-apply captures the correct inverse (original transform).
       const src = scene.objects.find((o) => o.id === id);
-      // W2-11: with no src the GPU preview must not linger — revert it to canonical.
+      // With no src or no scene-core the GPU preview must not linger — revert it to canonical.
       if (!src) return void host?.clearObjectPreview(id);
-      // Null-guard (mirrors Tier-1's degrade): with no scene-core the cascade cannot
-      // be authored — drop the GPU preview rather than commit shell-side matrix math.
       if (!sceneCore) return void host?.clearObjectPreview(id);
-      // Tier-2: the parent-drag cascade + multi-select union + anchor-follow + the
-      // v3 §3 Alt-detach branch collapse into commitBodyDrag, which yields the single
-      // commit op plus the full op list (for the snap-back guard below).
+      // The parent-drag cascade + multi-select union + anchor-follow + Alt-detach collapse into
+      // commitBodyDrag, yielding the single commit op plus the full op list (for the snap-back guard).
       const { op, allOps } = commitBodyDrag(sceneCore, scene, selection, id, matrix, kind, detach);
-      // FC-16: pre-connect authorOp applies synchronously (the committed scene is on
-      // return, so the rebake $effect drops the preview matrix immediately). In the
-      // connected path the scene update is async — the GPU instance matrix holds the
-      // previewed position until commitClientScene sees the committed transform land
-      // (no snap-back). If the commit op fails, revert the GPU preview to canonical.
+      // Pre-connect authorOp applies synchronously; in the connected path the scene update is async, so
+      // the GPU matrix holds the previewed position until commitClientScene sees the transform land.
       const wasConnected = sceneClientReady && sceneClient !== null;
-      // The GPU previewed only the dragged `id`; pendingCommit (snap-back guard) is
-      // keyed on it, so read ITS composed transform from the cascade — not allOps[0],
-      // which under a multi cascade may be another member (and may be a follow op).
+      // pendingCommit is keyed on the dragged `id`, so read ITS composed transform — not allOps[0], which under a multi cascade may be another member.
       const rootTransform = draggedRootTransform(allOps, id, src.transform);
       if (wasConnected && rootTransform) pendingCommit = { id, transform: rootTransform };
       authorOp(op, true, (ok) => {
@@ -337,22 +250,16 @@
         }
       });
     },
-    // v3 §2b: open-class endpoint drag. The chord deform is already live on the
-    // GPU (engine setObjectEndpointPreview); the preview event only drives the
-    // release-snap anchor ring through the SAME hover-ring mechanism as
-    // drag-create (createHoverSnap -> feedScene), honoring a snap only onto a
-    // real, OTHER canonical object (mirrors handleCreate #6).
+    // Open-class endpoint drag. The chord deform is already live on the GPU; the preview event only
+    // drives the release-snap anchor ring (createHoverSnap -> feedScene), honoring a snap only onto a real, OTHER canonical object.
     onEndpointPreview: (id, _nodeIndex, world, snapped, targetId) => {
       const target = endpointSnapTarget(scene, id, snapped, targetId);
       const next = target !== null ? { at: world, target } : null;
       // Skip the null -> null write so an unsnapped drag never re-feeds the scene.
       if (next !== null || createHoverSnap !== null) createHoverSnap = next;
     },
-    // v3 §2b: the endpoint-drag release — ONE undoable batch from the core's
-    // endpointReleaseOps (chord-deform edit-geometry + the set-anchor whole-vector
-    // rebind/unbind). Mirrors onTransformCommit's moveOps pattern: the canonical
-    // scene was never mutated during the drag, so op-apply captures the correct
-    // inverse (D21); a no-op or failed release reverts the live GPU deform.
+    // The endpoint-drag release — ONE undoable batch from endpointReleaseOps. The canonical scene was
+    // never mutated during the drag, so op-apply captures the correct inverse; a no-op/failed release reverts the GPU deform.
     onEndpointCommit: (id, nodeIndex, world, snapped, targetId) => {
       createHoverSnap = null;
       if (!sceneCore) return void host?.clearObjectEndpointPreview(id);
@@ -364,25 +271,14 @@
       });
     },
     onMarquee: (ids) => {
-      // FC-16: route the marquee result through the same validation as
-      // onSelectObject (validSelection drops stale ids and collapses the kind).
+      // Route through the same validation as onSelectObject (drops stale ids and collapses the kind).
       selectObject(routeMarquee(ids));
     },
-    // RA2b/AP3: a double-click on a container drills in (sets activeContainer); a
-    // leaf enters inline text edit through the existing path.
     onObjectDoubleClick: (payload) => handleObjectDoubleClick(payload),
-    // FC-11/v3 §4: freehand pen capture. Accumulate world points across start/move;
-    // on end, RECOGNIZE the stroke into an object via the wasm core, author its
-    // endpoint anchors when the result is open, and insert it (the tool stays
-    // sticky in "draw"); cancel discards.
     onDraw: (phase, world, snap) => handleDraw(phase, world, snap),
-    // W2-07: shape drag-create rubber-band + commit + select-after-create.
     onCreate: (phase, world, snapped, targetId) => handleCreate(phase, world, snapped, targetId),
-    // W3-G9 (#3): pre-drag hover snap probe — drives the persistent anchor ring.
     onCreateHover: (world, snapped, targetId) => handleCreateHover(world, snapped, targetId),
-    // W2-08: eraser touch — whole-stroke delete or partial subpath cut.
     onErase: (id, world, partial) => handleErase(id, world, partial),
-    // W2-03: the core's per-move hover classification drives the canvas cursor.
     onAffordance: (next) => (affordance = next)
   };
 
@@ -401,24 +297,20 @@
     }
   }
 
-  // Push the object scene into the renderer whenever it or the selection changes.
-  // W2-11: feeds `feedScene` (the canonical scene plus any transient NEW-object
-  // preview — pen stroke / shape drag-create). A live drag of an EXISTING object no
-  // longer rides this feed; its transform is pushed straight to the GPU instance
-  // matrix (engine.setObjectPreviewTransform) without mutating the canonical state.
+  // Push `feedScene` into the renderer whenever it or the selection changes. A live drag of an EXISTING object rides the GPU instance matrix instead, not this feed.
   $effect(() => {
     const current = feedScene;
     const sel = selection;
     host?.loadObjectScene(current, sel);
   });
 
-  // CC1.4: push the active tool to the renderer whenever it changes.
+  // Push the active tool to the renderer whenever it changes.
   $effect(() => {
     const tool = activeTool;
     host?.setTool(tool);
   });
 
-  // MG9.4 windowed replica: re-aim the data-layer window at the camera viewport.
+  // Windowed replica: re-aim the data-layer window at the camera viewport.
   $effect(() => {
     const cam = camera;
     if (!sceneClientReady || !sceneClient) return;
@@ -443,8 +335,7 @@
     };
   });
 
-  // U4/U5: central shortcut dispatch over the object command catalog, plus
-  // Escape priority handoff and Space-hold pan (select-mode pan, U5).
+  // Central shortcut dispatch over the object command catalog.
   const dispatchShortcut = $derived(createShortcutDispatcher({ catalog: commandCatalog, handlers: shortcutHandlers() }));
 
   $effect(() => {
@@ -458,9 +349,7 @@
         handleEscape();
         return;
       }
-      // W2-03: Space-hold arms the unified pointer's pan path (no separate Hand
-      // tool); release on keyup. The engine flips the core to hand-pan only for the
-      // duration of a Space-held drag.
+      // Space-hold arms the pointer's pan path; release on keyup. The engine flips the core to hand-pan only for the duration of a Space-held drag.
       if (event.code === "Space" && !typing && !event.repeat) {
         event.preventDefault();
         if (!spaceHeld) {
@@ -489,11 +378,9 @@
 
   onDestroy(() => {
     sceneClient?.close();
-    // AP6: cancel any in-flight toast timer so it can't fire after teardown.
+    // Cancel any in-flight toast timer so it can't fire after teardown.
     toastChannel.dismiss();
   });
-
-  // ----- connection -------------------------------------------------------
 
   async function connectSceneClient(): Promise<void> {
     const client = new SceneClient({ url: wsBaseUrl(), clientId: clientIdentity(), userId: userIdentity() });
@@ -555,9 +442,8 @@
     }
   }
 
-  // FC-14: delete a canvas, including the active one. Deleting the active canvas
-  // first switches to another remaining canvas (so the session is never left
-  // pointing at a deleted id), then deletes the old one and reloads the list.
+  // Delete a canvas. Deleting the active one first switches to another remaining canvas (so the session
+  // is never left pointing at a deleted id), then deletes the old one and reloads the list.
   async function deleteCanvas(targetCanvasId: string): Promise<void> {
     if (!sceneClient) return;
     if (targetCanvasId === canvasId) {
@@ -583,12 +469,8 @@
   function commitClientScene(next: ObjectScene): void {
     scene = next;
     selection = validSelection(next, selection);
-    // FC-16/W2-11: once the canonical scene reflects the committed drag transform,
-    // the `scene = next` above already triggered the single rebake (feedScene ->
-    // loadObjectScene $effect) at the committed transform, dropping the stale GPU
-    // preview matrix with no flash. Clear the pendingCommit (and defensively revert
-    // any residual preview) once the canonical transform lands (success) or the
-    // object is gone (concurrent delete).
+    // The `scene = next` above already rebaked at the committed transform; clear pendingCommit (and
+    // defensively revert any residual preview) once the canonical transform lands or the object is gone.
     if (pendingCommit) {
       const committed = next.objects.find((o) => o.id === pendingCommit!.id);
       if (!committed || transformsEqual(committed.transform, pendingCommit.transform)) {
@@ -616,13 +498,9 @@
     }
   }
 
-  // ----- op authoring (the ONE op-apply path, P1) -------------------------
-
-  // Author an ObjectOp: the data layer applies it optimistically through the
-  // wasm core and returns the inverse (the undo entry, D21). On success the
-  // forward+inverse are recorded into the core undo stack — which clears redo (a
-  // fresh user op forks history). An undo/redo replay is NOT undoable (the core
-  // stack drives those via its own handshake, below).
+  // Author an ObjectOp: the data layer applies it optimistically through the wasm core and returns the
+  // inverse (the undo entry). On success forward+inverse are recorded into the core undo stack, which
+  // clears redo. An undo/redo replay is NOT undoable (the core stack drives those via its own handshake).
   function authorOp(op: ObjectOp, undoable = true, onSettled?: (ok: boolean) => void): void {
     if (!sceneClientReady || !sceneClient) {
       // Pre-connect: apply optimistically through the core only, no wire.
@@ -652,16 +530,12 @@
     sceneClient.flush();
   }
 
-  // The core's undo/redo is a two-step handshake (hand out an op, apply it, then
-  // report the re-inverse). The op-apply resolves asynchronously, so back-to-back
-  // presses must not re-enter the handshake before the prior one settles. Chain
-  // every undo/redo onto this tail so they run strictly in order.
+  // The core's undo/redo is a two-step async handshake, so back-to-back presses must not re-enter it
+  // before the prior settles. Chain every undo/redo onto this tail so they run strictly in order.
   let undoChain: Promise<void> = Promise.resolve();
 
   function undo(): void {
-    // A rejection must never poison the serialization tail (else all later
-    // undo/redo silently no-op); runUndoStep self-handles errors, the catch is
-    // a belt-and-braces guard.
+    // A rejection must never poison the serialization tail (runUndoStep self-handles errors; this catch is belt-and-braces).
     undoChain = undoChain.then(() => runUndoStep("undo")).catch(() => {});
   }
 
@@ -669,17 +543,14 @@
     undoChain = undoChain.then(() => runUndoStep("redo")).catch(() => {});
   }
 
-  // Pull the next op from the core stack and re-author it through the SAME
-  // op-apply path (D21); report the resulting inverse back to complete the
-  // handshake. Awaiting the apply keeps the core stack's pending handshake from
-  // being re-entered by a queued press.
+  // Pull the next op from the core stack and re-author it through the SAME op-apply path; report the
+  // resulting inverse to complete the handshake. Awaiting the apply keeps a queued press from re-entering it.
   async function runUndoStep(dir: "undo" | "redo"): Promise<void> {
     if (!undoStack || !sceneClient) return;
     const op = dir === "undo" ? undoStack.undo() : undoStack.redo();
     if (!op) return;
-    // From here the core stack is mid-handshake (pending set). Any exit path that
-    // does NOT complete it MUST abort() it, or the stuck pending corrupts every
-    // future undo/redo (the core's debug_assert is compiled out of release wasm).
+    // The core stack is now mid-handshake; any exit that does NOT complete it MUST abort() it, or the
+    // stuck pending corrupts every future undo/redo (the core's debug_assert is compiled out of release wasm).
     try {
       const result = await sceneClient.applyObjectOp(op);
       sceneClient.flush();
@@ -696,12 +567,9 @@
     }
   }
 
-  // ----- insertion / editing ----------------------------------------------
-
   function nextOrderKey(): string {
-    // Order keys sort by plain string Ord; append a char after the current max so
-    // a new object lands on top. The wasm core owns true fractional keys; this
-    // shell-side monotonic key is only the insertion position.
+    // Order keys sort by plain string Ord; append a char after the current max so a new object lands on
+    // top. The wasm core owns true fractional keys; this shell-side monotonic key is only the insertion position.
     const maxOrder = scene.objects.reduce((max, o) => (o.order > max ? o.order : max), "a0");
     return `${maxOrder}~`;
   }
@@ -716,11 +584,8 @@
     return screenToWorld({ x: rect.width / 2, y: rect.height / 2 }, camera);
   }
 
-  // W2-07: rect/ellipse/line ARM drag-create (the button only selects the tool; the
-  // shape is sized by a pointer down-drag-up). A context-menu insert passes an
-  // explicit `anchor`, which keeps the legacy immediate fixed-size insert so the
-  // right-click "Insert rectangle" still drops a shape at the click point. Text and
-  // frame always insert immediately at an anchor (no drag-create, per the card).
+  // Rect/ellipse/line ARM drag-create (sized by a pointer down-drag-up). A context-menu insert passes an
+  // explicit `anchor` for an immediate fixed-size drop. Text and frame always insert immediately at an anchor.
   function insertPrimitive(kind: PrimitiveKindId, anchor?: { x: number; y: number }): void {
     if (anchor === undefined && isDragCreateShape(kind)) {
       armCreate(kind);
@@ -733,14 +598,12 @@
     selection = { kind: "object", id: object.id };
     persistSelection(selection);
     showToast(`Inserted ${kind}`);
-    // W2-10: a freshly-created text object enters inline edit immediately.
+    // A freshly-created text object enters inline edit immediately.
     if (kind === "text") enterTextEdit(object.id);
   }
 
-  // W2-07: arm the shape drag-create submode. Mirrors the pen arming the draw tool:
-  // the active tool flips to "create" and `createKind` holds which shape the next
-  // pointer drag will rubber-band. A second click on the same shape disarms back to
-  // select (toggle), matching the pen toggle feel.
+  // Arm the shape drag-create submode: the active tool flips to "create" and `createKind` holds which
+  // shape the next pointer drag rubber-bands. A second click on the same shape disarms back to select.
   function armCreate(kind: DragCreateShape): void {
     if (activeTool === "create" && createKind === kind) {
       createKind = null;
@@ -754,30 +617,21 @@
     status = `Drag to create ${kind}`;
   }
 
-  // W2-07: drive shape drag-create. `start` anchors the bbox; `move` extends the
-  // current corner (already snapped to the nearest outline anchor when `snapped`,
-  // unless the Alt snap-bypass modifier was held — handled in the engine); `end`
-  // commits a primitive sized to the drag span and selects it; `cancel` discards.
-  // A drag that never reaches MIN_DRAG_EXTENT_PX is treated as a click: it drops a
-  // default fixed-size shape at the start point (so a single click still creates).
+  // Drive shape drag-create. `start` anchors the bbox; `move` extends the current corner (snapped to the
+  // nearest outline anchor when `snapped`, unless Alt-bypass); `end` commits a sized primitive and selects
+  // it; `cancel` discards. A drag below MIN_DRAG_EXTENT_PX is a click: a default fixed-size shape at the start.
   function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snappedIn: boolean, targetIdIn: string | null): void {
     const kind = createKind;
     if (!kind) return;
     if (phase === "end" && !sceneCore) return;
-    // W2-07/AP5 (#6): the snap query runs against the renderer's loaded regions,
-    // which include the TRANSIENT drag-create preview (it rides the same feed). The
-    // preview corner sits under the cursor, so an over-empty-canvas move self-snaps
-    // to the preview's own outline — a phantom snap whose target is no real object.
-    // Honor a snap ONLY when its target is a real canonical object (the preview /
-    // snap-indicator ids never are), so the ring + AP5 anchor fire on a real edge
-    // and never on the preview itself.
+    // The snap query runs against the renderer's loaded regions, which include the TRANSIENT preview
+    // (rides the same feed); its corner under the cursor self-snaps. Honor a snap ONLY when its target
+    // is a real canonical object, so the ring + anchor fire on a real edge, never on the preview itself.
     const { snapped, target: targetId } = canonicalizeCreateSnap(scene, snappedIn, targetIdIn);
     if (phase === "start") {
-      // W3-G9 (#3): a drag takes over the ring (its own snap-indicator rides the
-      // preview), so drop the pre-drag hover snap to avoid a doubled ring — but FIRST
-      // capture it: AP5/#4, a create STARTED on an edge (the user pressed where the
-      // hover ring showed) should anchor its START corner, so seed startSnap from the
-      // press's own snap OR, failing that, the hover ring the user aimed at.
+      // A drag takes over the ring, so drop the pre-drag hover snap to avoid a doubled ring — but FIRST
+      // capture it: a create STARTED on an edge anchors its START corner, so seed startSnap from the
+      // press's own snap OR the hover ring the user aimed at.
       const hover = createHoverSnap;
       createHoverSnap = null;
       const hoverTarget =
@@ -801,16 +655,12 @@
     }
     if (!createDrag) return;
     if (phase === "move") {
-      // Keep the last successful snap sticky: a move that falls off the edge does NOT
-      // clear it, so a release just past the 8px tolerance can still reuse it. The
-      // start-corner snap is fixed for the gesture and carried unchanged.
+      // Keep the last successful snap sticky: a move off the edge does NOT clear it, so a release just past the 8px tolerance can still reuse it.
       const moveSnap: CreateSnap | null = snapped && targetId ? { at: world, target: targetId } : createDrag.lastSnap;
       createDrag = { span: { start: createDrag.span.start, end: world }, snapped, target: targetId, startSnap: createDrag.startSnap, lastSnap: moveSnap };
       return;
     }
-    // phase === "end": commit a sized primitive (or a default at a click). AP5/#4: a
-    // release that missed the snap reuses the gesture's last snap when it landed near
-    // it, so a near-miss pointer-up still authors the anchor (endpoint pulled to edge).
+    // Commit a sized primitive (or a default at a click). A release that missed the snap reuses the gesture's last snap when it landed near it.
     const resolved = resolveCreateRelease(
       { end: world, snapped, target: targetId },
       createDrag.lastSnap,
@@ -826,14 +676,10 @@
     const object = tooSmall
       ? sceneCore.buildPrimitive(kind, span.start, freshId(kind), nextOrderKey(), selectedColor)
       : sceneCore.buildPrimitiveFromDrag(kind, span, freshId(kind), nextOrderKey(), selectedColor);
-    // AP5 (#14)/#4: a snapped drag-create binds the snapped CORNER(s) to the target's
-    // outline with a persistent D5 anchor. BOTH ends count: the START corner (drawn
-    // FROM an edge — the user pressed on the hover ring) and the END corner (drawn TO
-    // an edge), each binding the object node nearest that world point. The bound node
-    // then reprojects through the target's transform, so the new object moves WITH the
-    // target. (Alt-create bypasses snap upstream, so both targets are null = no anchor.)
-    // The corner loop is the same synthesizeReleaseAnchors the freehand pen commits
-    // through (v3 §4) — one release-anchor source for both tools.
+    // A snapped drag-create binds the snapped CORNER(s) to the target's outline with a persistent anchor.
+    // BOTH ends count (start drawn FROM an edge, end drawn TO one), each binding the nearest node, which
+    // then reprojects through the target's transform so the object moves WITH the target. (Alt-create = no
+    // anchor.) Same synthesizeReleaseAnchors the freehand pen uses — one release-anchor source for both tools.
     if (!tooSmall && sceneCore) {
       const anchors = synthesizeReleaseAnchors(sceneCore, scene.objects, object, [
         startSnap ? { target: startSnap.target, at: span.start } : null,
@@ -842,33 +688,24 @@
       if (anchors.length) object.anchors = anchors;
     }
     authorOp({ kind: "insert-object", object });
-    // Select-after-create (request 6) and return to the select tool so the new
-    // object can be moved/resized immediately.
+    // Select the new object and return to the select tool so it can be moved/resized immediately.
     selectObject({ kind: "object", id: object.id });
     createKind = null;
     setActiveTool("select");
     showToast(`Inserted ${kind}`);
   }
 
-  // W3-G9 (#3): drive the PERSISTENT pre-drag anchor ring. A bare create-tool hover
-  // over an object's edge sets `createHoverSnap` (the snapped world point + target);
-  // a hover off any edge (or onto the transient preview, never a real object)
-  // clears it. The canonicalization mirrors handleCreate (#6): honor a snap ONLY
-  // when its target is a REAL canonical object, so the ring never shows over the
-  // preview's own outline. The ring renders from feedScene while createDrag is null.
-  // v3 §4: the DRAW tool rides the same probe — a stroke started on the ring
-  // anchors its start, so the pen shows the ring before pen-down too.
+  // Drive the PERSISTENT pre-drag anchor ring. A bare hover over an object's edge sets `createHoverSnap`;
+  // off any edge clears it. Honors a snap ONLY onto a real canonical object so the ring never shows over
+  // the preview's own outline. The DRAW tool rides the same probe so the pen shows the ring before pen-down.
   function handleCreateHover(world: { x: number; y: number }, snappedIn: boolean, targetIdIn: string | null): void {
     if (!createKind && activeTool !== "draw") return void (createHoverSnap = null);
     createHoverSnap = canonicalizeHoverSnap(scene, snappedIn, targetIdIn, world);
   }
 
-  // FC-11/v3 §4: drive the freehand pen. Accumulate world points across start/move;
-  // on end, RECOGNIZE the stroke into its canonical object through the wasm core
-  // (pen-up shape recognition — one stroke = one object) and author an
-  // insert-object op. The tool stays sticky in "draw". A cancel discards the
-  // in-progress stroke. Anchoring mirrors handleCreate: the snap probe rides every
-  // phase; a snap is honored only onto a real canonical object (#6).
+  // Drive the freehand pen. Accumulate world points across start/move; on end, RECOGNIZE the stroke into
+  // one canonical object through the wasm core and author an insert-object op (the tool stays sticky in
+  // "draw"); cancel discards. Anchoring mirrors handleCreate: a snap is honored only onto a real canonical object.
   function handleDraw(
     phase: "start" | "move" | "end" | "cancel",
     world: { x: number; y: number },
@@ -877,9 +714,8 @@
     const canon: CreateSnap | null =
       snap && scene.objects.some((o) => o.id === snap.targetId) ? { at: snap.at, target: snap.targetId } : null;
     if (phase === "start") {
-      // A stroke STARTED on an edge anchors its start (G13 start-corner pattern):
-      // seed from the press's own snap OR the hover ring the user aimed at, and
-      // pull the first sample onto the edge so node 0 sits ON the outline.
+      // A stroke STARTED on an edge anchors its start: seed from the press's own snap OR the hover ring,
+      // and pull the first sample onto the edge so node 0 sits ON the outline.
       const hover = createHoverSnap;
       createHoverSnap = null;
       const hoverSnap: CreateSnap | null =
@@ -900,19 +736,14 @@
     if (!drawPoints) return;
     if (phase === "move") {
       drawPoints = [...drawPoints, world];
-      // Keep the last successful snap sticky (AP5/#4) and ride the SAME hover-ring
-      // state as create so the ring shows where the stroke's END would anchor.
-      // Mid-stroke samples themselves stay raw — recognition normalizes the
-      // silhouette; only the start/release endpoints pull onto an edge.
+      // Keep the last snap sticky and ride the same hover-ring state as create. Mid-stroke samples stay
+      // raw (recognition normalizes the silhouette); only the start/release endpoints pull onto an edge.
       if (canon) drawSnap = { start: drawSnap?.start ?? null, last: canon };
       if (canon !== null || createHoverSnap !== null) createHoverSnap = canon;
       return;
     }
-    // phase === "end": resolve the release against the gesture's last snap (a
-    // near-miss pointer-up still anchors, endpoint pulled onto the edge), then
-    // commit the recognized stroke (>=2 points have extent).
+    // Resolve the release against the gesture's last snap (near-miss still anchors), then commit the recognized stroke (>=2 points have extent).
     const startSnap = drawSnap?.start ?? null;
-    // Hold-to-Free: a held Shift selects Free recognition, else Basic.
     const recognizeMode = freeRecognitionHeld ? "free" : "basic";
     const resolved = resolveCreateRelease(
       { end: canon ? canon.at : world, snapped: canon !== null, target: canon?.target ?? null },
@@ -924,12 +755,9 @@
     const points = [...drawPoints, resolved.end];
     drawPoints = null;
     if (points.length < 2 || !sceneCore) return;
-    // v3 §4 multi-stroke merge — PRIORITY over insert + release anchoring: a
-    // stroke end landing on an existing open-class object's endpoint chains the
-    // stroke into that object (edit-geometry batch on the survivor, no insert,
-    // anchor authoring skipped). Every judgment (recognition, candidate match,
-    // chaining, re-recognition) lives in the core; the shell only branches on
-    // the returned ops. Null = no merge, the existing path below runs unchanged.
+    // Multi-stroke merge, PRIORITY over insert + anchoring: a stroke end landing on an open-class
+    // object's endpoint chains the stroke into it (edit-geometry on the survivor, no insert). Every
+    // judgment lives in the core; the shell only branches on the returned ops. Null = no merge.
     const mergeOps = sceneCore.mergeOpenStrokeOps(
       scene,
       points,
@@ -942,16 +770,12 @@
       if (survivor && survivor.kind === "edit-geometry") selectObject({ kind: "object", id: survivor.id });
       return;
     }
-    // S2 (#5): freehandToObject is a hex API, so the theme-default sentinel can't be
-    // passed through it — lower with a placeholder hex, then swap the stroke paint to
-    // the "text" token so the stroke flips with the theme like every other authored color.
-    // The pen draws with the single toolbar color (selectedColor); there is no separate pen color.
+    // freehandToObject is a hex API, so the theme-default sentinel can't pass through — lower with a
+    // placeholder hex, then swap the stroke paint to the "text" token so the stroke flips with the theme.
     const strokeHex = selectedColor === THEME_DEFAULT_COLOR ? "#000000" : selectedColor;
     const object = sceneCore.freehandToObject(points, strokeHex, penWidthPx, freshId("draw"), nextOrderKey(), recognizeMode);
     if (selectedColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = previewPaint(selectedColor);
-    // v3 §4 freehand anchoring: an OPEN recognition authors endpoint anchors through
-    // the same release path as drag-create (both corners); a CLOSED recognition
-    // never anchors (DU7=(b): anchors live only on open-class endpoints).
+    // An OPEN recognition authors endpoint anchors through the same release path as drag-create; a CLOSED recognition never anchors.
     if (sceneCore.isOpenClassD(object.geometry.d)) {
       const anchors = synthesizeReleaseAnchors(sceneCore, scene.objects, object, [
         startSnap ? { target: startSnap.target, at: startSnap.at } : null,
@@ -960,17 +784,13 @@
       if (anchors.length) object.anchors = anchors;
     }
     authorOp({ kind: "insert-object", object });
-    // Request 6: select the freshly-drawn stroke after creating it. The pen tool
-    // stays sticky in "draw" so the next stroke draws immediately.
+    // Select the freshly-drawn stroke; the pen tool stays sticky in "draw".
     selectObject({ kind: "object", id: object.id });
   }
 
-  // W2-08: erase the stroke under the cursor. Default = whole-stroke delete (a
-  // `delete` op). The partial modifier cuts the stroke's subpath at the touched
-  // region via the scene-core split: convert the world touch into the object's
-  // local quantized space, split the geometry, then author an `edit-geometry` op
-  // (or delete the object when the cut leaves it empty). Both ride the single
-  // op-apply path, so undo (D21) captures the inverse. A drag erases continuously.
+  // Erase the stroke under the cursor. Default = whole-stroke delete. The partial modifier cuts the
+  // stroke's subpath at the touch via the scene-core split (world touch → object-local quantized space,
+  // split, then `edit-geometry`, or delete when the cut empties it). A drag erases continuously.
   function handleErase(id: string, world: { x: number; y: number }, partial: boolean): void {
     const target = scene.objects.find((o) => o.id === id);
     if (!target) return;
@@ -984,10 +804,8 @@
       authorOp({ kind: "delete", id });
       return;
     }
-    // The core cuts the stroke and returns the WHOLE op batch: [] on a miss,
-    // [delete] when the cut empties the object, else [edit-geometry, ...followers]
-    // (a reshape reprojects anchored followers, commit-path). The shell just
-    // authors the result and owns the UI follow-up (clearing a stale selection).
+    // The core returns the WHOLE op batch: [] on a miss, [delete] when the cut empties the object, else
+    // [edit-geometry, ...followers]. The shell authors the result and owns the UI follow-up (clearing a stale selection).
     const ops = sceneCore.partialEraseOps(scene, id, local.x, local.y, ERASE_RADIUS_QUANTIZED);
     if (ops.length === 0) return; // touch missed: stroke left whole
     authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops });
@@ -1026,15 +844,11 @@
     showToast("Duplicated selection");
   }
 
-  // Group: reparent the selected objects under a fresh frame object (D3). FC-14:
-  // the frame geometry encloses the children — a rect sized to the union world-AABB
-  // of the selected objects, positioned by a pure-translation transform at the
-  // AABB's top-left. Children transforms are world-absolute, so they are reparented
-  // unchanged.
+  // Reparent the selected objects under a fresh frame object: a rect sized to their union world-AABB,
+  // positioned at the AABB's top-left. Children transforms are world-absolute, so they reparent unchanged.
   function groupSelection(): void {
     const ids = currentSelectionIds();
-    // AP3 (#9): group works on 1+ objects — a single object grouped under a fresh
-    // neutral parent container is a valid one-child frame.
+    // Group works on 1+ objects — a single object under a fresh container is a valid one-child frame.
     if (ids.length < 1) return;
     const objects = ids.map((id) => scene.objects.find((o) => o.id === id)).filter((o): o is SceneObject => Boolean(o));
     const bounds = unionWorldAabb(objects);
@@ -1045,8 +859,7 @@
     showToast("Grouped selection");
   }
 
-  // FC-14: ungroup reparents children out of the frame, then deletes the now-empty
-  // frame in the SAME batch op.
+  // Ungroup reparents children out of the frame, then deletes the now-empty frame in the SAME batch op.
   function ungroupSelection(): void {
     if (selection.kind !== "object") return;
     const id = selection.id;
@@ -1060,9 +873,7 @@
     showToast("Ungrouped selection");
   }
 
-  // AP3 (#18): pop the right-clicked child out one level — reparent it to its
-  // parent's parent (or canvas root when the parent sits at the root). The op is
-  // authored by the core `popOutOp` query; a non-child picked target yields null.
+  // Pop the right-clicked child out one level — reparent to its grandparent (or canvas root). Authored by `popOutOp`; a non-child target yields null.
   function popOutSelection(picked: ObjectSelection): void {
     if (picked.kind !== "object" || !sceneCore) return;
     const op = sceneCore.popOutOp(scene, picked.id);
@@ -1091,10 +902,8 @@
     authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops });
   }
 
-  // FC-14: true single-step reorder. Sort objects by order string; for "forward"
-  // swap the selected object's order with its next-higher neighbor, for "backward"
-  // swap with the next-lower neighbor. Applies to the single selected object only
-  // (a step reorder over a multi-set has no well-defined neighbor).
+  // True single-step reorder: swap the selected object's order with its next-higher ("forward") or
+  // next-lower ("backward") neighbor. Single selection only (a multi-set has no well-defined neighbor).
   function reorderStep(direction: "forward" | "backward"): void {
     const ids = currentSelectionIds();
     if (ids.length !== 1) {
@@ -1121,8 +930,7 @@
 
   function backOrderKey(): string {
     const minOrder = scene.objects.reduce((min, o) => (o.order < min ? o.order : min), "z");
-    // A key that sorts before the current min: trim/prefix is non-trivial; use a
-    // short ascii key below "a" so it lands at the back.
+    // A short ascii key below "a" so it sorts before the current min (lands at the back).
     return minOrder > "0" ? "0" : `0${minOrder}`;
   }
 
@@ -1139,10 +947,7 @@
     authorOp({ kind: "set-text", id: selection.id, text: { runs: [{ text }] } });
   }
 
-  // AP1 (#5): adopt the toolbar's selected color, then recolor the current
-  // selection. Always hold the latest pick (it becomes the default for the next
-  // NEW shape); when a single object is selected, author a `set-style` op so the
-  // pick recolors it live through the existing op-apply path (D21 undo).
+  // Adopt the toolbar's color (the default for the next NEW shape), then recolor a single selection via a `set-style` op.
   function applySelectedColor(color: string): void {
     selectedColor = color;
     if (!sceneCore) return;
@@ -1150,13 +955,8 @@
     if (op) authorOp(op);
   }
 
-  // ----- AP3 (#9): double-click drill-in -----
-
-  // RA2b surfaces a double-click on an object as { id, hasChildren } on the
-  // inputBatch result. The core `doubleClickAction` query branches it (D6): a
-  // container drills in — the shell sets the active container; a leaf enters inline
-  // text edit (the existing path). A null signal (double-click missed every
-  // object) is a no-op; the container-vs-leaf decision lives in the core.
+  // A double-click on a container drills in (sets the active container); a leaf enters inline text edit.
+  // A null signal (missed every object) is a no-op; the container-vs-leaf decision lives in the core.
   function handleObjectDoubleClick(signal: { id: string; hasChildren: boolean } | null): void {
     if (!signal || !sceneCore) return;
     const action = resolveDoubleClick(sceneCore, scene, signal);
@@ -1169,13 +969,8 @@
     if (action.kind === "edit-leaf") enterTextEdit(action.id);
   }
 
-  // ----- W2-10: inline text editing -----
-
-  // Enter inline edit for an object: seed the overlay value from the object's first
-  // text run, then mount the contenteditable (the mount action focuses it). When the
-  // object has not landed in `scene` yet (the connected create path applies the
-  // insert-object asynchronously), seed empty — a fresh object carries no text, and
-  // `textEditRect` derives reactively, so the overlay appears once the object arrives.
+  // Enter inline edit: seed the overlay value from the object's first text run (empty when the object
+  // hasn't landed in `scene` yet — `textEditRect` derives reactively, so the overlay appears on arrival).
   function enterTextEdit(id: string): void {
     const object = scene.objects.find((o) => o.id === id);
     textEdit = { id, value: object?.text?.runs?.[0]?.text ?? "" };
@@ -1199,8 +994,7 @@
     textEdit = null;
   }
 
-  // W2-10: Svelte action — seed the contenteditable with the object's current text
-  // and focus it (placing the caret at the end) when the overlay mounts.
+  // Svelte action — seed the contenteditable with the object's text and focus it (caret at the end) on mount.
   function mountTextEdit(node: HTMLDivElement, value: string) {
     node.textContent = value;
     node.focus();
@@ -1214,9 +1008,7 @@
     }
   }
 
-  // ----- templates (buildObjectTemplate -> FeatureRequest.templateApply) ---
-
-  // W2-09: the templates the scroll-popup offers. Ids map to buildObjectTemplate.
+  // The templates the scroll-popup offers; ids map to buildObjectTemplate.
   const TEMPLATES: TemplatePopupItem[] = [
     { id: "todo_board", title: "Todo board", desc: "Grouped To do / In progress / Done columns" },
     { id: "decision_map", title: "Decision map", desc: "Options and outcomes wired with connectors" },
@@ -1227,9 +1019,7 @@
     templateOpen = !templateOpen;
   }
 
-  // Apply the default template (object-native): lower it to a recipe of inline-
-  // styled objects via the wasm core, then send a single templateApply feature
-  // frame (the server lowers the recipe to insert-object ops, OB3.S5/OB4.5).
+  // Lower the template to a recipe of inline-styled objects via the wasm core, then send a single templateApply feature frame (the server lowers it to insert-object ops).
   function applyTemplate(templateId: string): void {
     if (!sceneCore || !sceneClient) return;
     const anchor = templateAnchor();
@@ -1319,15 +1109,13 @@
   }
 
   function handleEscape(): void {
-    // W2-10: a pending Escape first cancels an in-progress inline text edit.
+    // Escape cancels, in priority order: inline text edit, pen stroke, shape drag-create, then disarms the tool.
     if (textEdit) return void cancelTextEdit();
-    // FC-11: a pending Escape first cancels an in-progress pen stroke.
     if (drawPoints) {
       drawPoints = null;
       drawSnap = null;
       return;
     }
-    // W2-07: cancel an in-progress shape drag-create, then disarm the tool.
     if (createDrag) return void (createDrag = null);
     if (createKind) {
       createKind = null;
@@ -1341,17 +1129,14 @@
   }
 
   function setActiveTool(tool: ActiveTool): void {
-    // W2-07: leaving the create tool (e.g. picking Select/Pen) disarms the shape.
+    // Leaving the create tool disarms the shape and drops the persistent hover ring.
     if (tool !== "create") {
       createKind = null;
       createDrag = null;
-      // W3-G9 (#3): leaving create drops the persistent hover ring so it never lingers.
       createHoverSnap = null;
     }
     activeTool = tool;
   }
-
-  // ----- shortcut handlers (object command catalog ids, U4) ----------------
 
   function shortcutHandlers() {
     return {
@@ -1377,8 +1162,7 @@
       "send-backward": () => reorderStep("backward"),
       undo: () => undo(),
       redo: () => redo(),
-      // W2-10: Enter on a selected object enters inline edit (contenteditable
-      // overlay) instead of a blocking prompt.
+      // Enter on a selected object enters inline edit instead of a blocking prompt.
       "edit-text": () => {
         if (selection.kind === "object") enterTextEdit(selection.id);
       },
@@ -1392,9 +1176,7 @@
     };
   }
 
-  // ----- context menu (U3, from the command catalog) ----------------------
-
-  // FC-13: hit-test the object under the cursor and open a menu that acts on it.
+  // Hit-test the object under the cursor and open a menu that acts on it.
   function handleContextMenuRequest(point: { x: number; y: number }): void {
     if (!canvasWrap) return;
     pendingContextScreen = { clientX: point.x, clientY: point.y };
@@ -1407,8 +1189,7 @@
     handleContextPick(target);
   }
 
-  // FC-13: build the context-menu target from a picked id. If the pick is part of
-  // the current multi-select, keep the whole multi so the menu acts on the set.
+  // Build the context-menu target from a picked id; if the pick is part of the current multi-select, keep the whole multi.
   function contextTargetFromPick(id: string | null): ObjectSelection {
     if (!id) return { kind: "canvas" };
     if (selection.kind === "multi" && selection.ids.includes(id)) return selection;
@@ -1431,9 +1212,7 @@
     return () => window.removeEventListener("pointerdown", dismiss);
   });
 
-  // FC-13: the right-click menu layout (OBJECT_MENU / CANVAS_MENU) + the resolver
-  // live in controller/interactions; here we only decorate the icon tag with the
-  // shell's lucide component and gate `enabled` on the core children/parent queries.
+  // The menu layout + resolver live in controller/interactions; here we only decorate the icon tag with the lucide component and gate `enabled` on core queries.
   const MENU_ICONS: Record<string, typeof Copy> = {
     copy: Copy,
     group: GroupIcon,
@@ -1443,10 +1222,7 @@
     trash: Trash2
   };
 
-  // AP3: an entry's `enabled` predicate, bound to the live scene + core. ungroup
-  // needs a container (has children), pop-out needs a parent; both stay disabled
-  // until the core loads (the queries are core-only). Every other entry is enabled
-  // by default. Returns true = the entry is interactive.
+  // An entry's `enabled` predicate: ungroup needs a container, pop-out needs a parent (both core-only queries, disabled until the core loads); everything else is enabled.
   function contextEntryEnabled(entry: Extract<ContextMenuEntry<string>, { id: string }>, picked: ObjectSelection): boolean {
     if (entry.id === "ungroup") return !!sceneCore && ungroupPickEnabledOf(sceneCore, scene, picked);
     if (entry.id === "pop-out") return !!sceneCore && popOutPickEnabledOf(sceneCore, scene, picked);
@@ -1482,8 +1258,7 @@
       duplicate: base.duplicate,
       group: base.group,
       ungroup: base.ungroup,
-      // AP3 (#18): pop the right-clicked child out one level (to its grandparent, or
-      // canvas root). Operates on the picked object id, not the active selection.
+      // Operates on the picked object id, not the active selection.
       "pop-out": () => popOutSelection(menu.selection),
       "bring-to-front": base["bring-to-front"],
       "send-to-back": base["send-to-back"],
@@ -1542,9 +1317,7 @@
     sceneClient.sendCursor(cursor, { x: topLeft.x, y: topLeft.y, width: bottomRight.x - topLeft.x, height: bottomRight.y - topLeft.y });
   }
 
-  // ----- session / identity (composition-root binding) --------------------
-  // Bind the ambient page seams (window.location, localStorage, crypto.randomUUID)
-  // once and delegate to the framework-neutral controller/session helpers.
+  // Bind the ambient page seams (window.location, localStorage, crypto.randomUUID) once and delegate to the controller/session helpers.
 
   function wsBaseUrl(): string {
     return wsBaseUrlOf(window.location);
@@ -1684,8 +1457,7 @@
         </div>
       {/if}
 
-      <!-- AP6 (#19): transient action toast. Keyed by message so each new notice
-           remounts and replays the fade-in/out; auto-dismissed by toastChannel. -->
+      <!-- Keyed by message so each new notice remounts and replays the fade-in/out. -->
       {#if toast}
         {#key toast}
           <div class="canvas-toast" role="status" aria-live="polite">{toast}</div>

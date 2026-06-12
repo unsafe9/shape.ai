@@ -1,10 +1,7 @@
-//! Portable pure-CPU layer of the WebGPU renderer (W2-13/S8).
-//!
-//! No wgpu device, no `web_sys`: vertex/geometry build, style resolution,
-//! hit-test math, marquee, object-region derive/hit, overlay geometry, camera
-//! math, the render consts and the WGSL fallback shader, plus the unit tests.
-//! This is the layer the host test gate exercises; the `ShapeWebGpuRenderer`
-//! struct and its impls live in the parent module and the web-surface submodules.
+//! Portable pure-CPU layer of the WebGPU renderer (no wgpu device, no `web_sys`):
+//! geometry/style/hit-test/marquee/overlay/camera math, the render consts, the WGSL
+//! fallback shader, and the unit tests. This is the layer the host test gate
+//! exercises; `ShapeWebGpuRenderer` lives in the parent + web-surface submodules.
 
 use std::f32::consts::PI;
 
@@ -1636,9 +1633,8 @@ pub(crate) fn marquee_rect(start: WorldPoint, current: WorldPoint) -> WorldRect 
     }
 }
 
-/// Build the marquee overlay quads (translucent fill + 1.5px-equivalent stroke)
-/// in world space for `rect`. `zoom` keeps the stroke a constant screen width.
-/// Returns up to MARQUEE_OVERLAY_VERTEX_CAPACITY vertices.
+/// Build the marquee overlay quads (translucent fill + 1.5px stroke) in world space;
+/// `zoom` keeps the stroke a constant screen width.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn build_marquee_overlay_vertices(rect: &WorldRect, zoom: f64) -> Vec<GpuVertex> {
     let mut vertices = Vec::with_capacity(MARQUEE_OVERLAY_VERTEX_CAPACITY);
@@ -1667,10 +1663,9 @@ pub(crate) fn build_marquee_overlay_vertices(rect: &WorldRect, zoom: f64) -> Vec
     vertices
 }
 
-/// RA2a (#7): the overlay quads for an in-flight marquee drag (empty for any other
-/// drag / no drag). The single source both render passes (object + legacy) draw
-/// from, so the rubber-band surfaces identically over an object scene and a 2D
-/// scene. Kept pure (no GPU device) so the in-flight overlay can be unit-tested.
+/// The overlay quads for an in-flight marquee drag (empty otherwise). The single
+/// source both render passes (object + legacy) draw from, so the rubber-band
+/// surfaces identically; pure so it is unit-testable.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn marquee_overlay_for_drag(
     input_drag: Option<&InputDragState>,
@@ -1683,14 +1678,10 @@ pub(crate) fn marquee_overlay_for_drag(
     build_marquee_overlay_vertices(&rect, zoom)
 }
 
-/// W2-04: build the selection-handle overlay (8 resize handles + 1 rotate zone) in
-/// WORLD space for the selected object's `world_bbox`. Each handle is a square of
-/// `HANDLE_SIZE_PX / zoom` world units so the legacy shader's `* zoom` renders it at
-/// a CONSTANT [`HANDLE_SIZE_PX`] screen size at any zoom. Centers mirror
-/// [`SelectionHandles::from_screen_bbox`] (corners + edge midpoints; rotate zone
-/// `ROTATE_ZONE_OFFSET_PX` above the top-edge midpoint) so what is drawn matches
-/// what hover and pointer-down hit-test. Returns up to
-/// [`HANDLE_OVERLAY_VERTEX_CAPACITY`] vertices.
+/// Build the selection-handle overlay (8 resize handles + 1 rotate zone) in WORLD
+/// space for `world_bbox`. Each handle is `HANDLE_SIZE_PX / zoom` world units so the
+/// shader's `* zoom` renders it at a CONSTANT screen size. Centers mirror
+/// [`SelectionHandles::from_screen_bbox`] so what is drawn matches hover/hit-test.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn build_handle_overlay_vertices(world_bbox: &WorldRect, zoom: f64) -> Vec<GpuVertex> {
     use shape_renderer_core::hit_test_object::{HANDLE_SIZE_PX, ROTATE_ZONE_OFFSET_PX};
@@ -1729,14 +1720,10 @@ pub(crate) fn build_handle_overlay_vertices(world_bbox: &WorldRect, zoom: f64) -
     vertices
 }
 
-/// W3-G9/#2: the id set that gets a continuous bbox outline ring. When a
-/// multi-select is active, every member rings (single selection then keeps its
-/// 8-handle overlay too, but those are drawn separately). When the multi-select is
-/// empty, a lone selected object/group still gets ONE ring so a grouped selection
-/// shows a visible border, not just the 8 resize dots — UNLESS the selection is
-/// open-class (feedback #1): its whole selection surface is the two endpoint dots
-/// (Figma-style), so no bbox ring. The multi-select union keeps ringing open
-/// members. Returns member-input order; empty when nothing is selected.
+/// The id set that gets a continuous bbox outline ring: every multi-select member,
+/// or (when empty) the lone selected object/group so a grouped selection shows a
+/// border — UNLESS open-class, whose surface is the two endpoint dots, not a ring.
+/// Returns member-input order; empty when nothing is selected.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn outline_overlay_ids(
     scene: &RenderObjectScene,
@@ -1758,24 +1745,12 @@ pub(crate) fn outline_overlay_ids(
     vec![id.clone()]
 }
 
-/// W3-G7/#1: per-object outline highlight for the multi-select set. For each id
-/// present in `regions`, draw the object's world-space bbox as a 4-edge rectangle
-/// outline (constant ~2px screen width via `2.0 / zoom`) in the selection blue, so
-/// a marquee/shortcut multi-select shows a visible ring on every member (single
-/// selection keeps its 8-handle overlay). Stops once the buffer capacity is hit.
-/// Empty when `ids` is empty. World-space so the legacy overlay pipeline draws it.
-///
-/// W3-G10/#2: `preview` supplies each id's LIVE drag transform (`None` when not
-/// dragging); the ring is built at the PREVIEWED bbox so it tracks the drag every
-/// frame like the resize handles, instead of snapping only on commit. Transform-
-/// only — `region_world_bounds` recomputes the bbox from the preview matrix, no
-/// re-tessellation.
-///
-/// Feedback (v3 §2b carry-over): an OPEN-CLASS member draws its two endpoint dots
-/// (the same filled fans as the single-selection overlay, via
-/// [`push_endpoint_dot_vertices`]) instead of a bbox ring — VISUAL only, the
-/// multi-drag/union semantics are untouched. The dots ride the same preview
-/// transform the boxes do, mirroring [`endpoint_handles`]'s world mapping.
+/// Per-object outline highlight for the multi-select set: each id's world bbox as a
+/// 4-edge rectangle (constant ~2px screen width via `2.0 / zoom`) in selection blue,
+/// stopping at buffer capacity. `preview` supplies each id's LIVE drag transform so
+/// the ring tracks the drag at the PREVIEWED bbox (transform-only, no
+/// re-tessellation). An OPEN-CLASS member draws its two endpoint dots
+/// ([`push_endpoint_dot_vertices`]) instead of a ring — visual only.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn build_multi_select_overlay_vertices(
     regions: &[ObjectRegion],
@@ -1828,9 +1803,8 @@ pub(crate) fn build_multi_select_overlay_vertices(
     vertices
 }
 
-/// Node ids AND group ids whose world bounds intersect the marquee rect (AABB).
-/// Cards come first (selection-anchor friendly), then groups; both deduped by the
-/// scene's natural order.
+/// Node ids AND group ids whose world bounds intersect the marquee rect. Cards come
+/// first (selection-anchor friendly), then groups.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn marquee_intersecting_ids(scene: &SceneSnapshot, rect: &WorldRect) -> Vec<String> {
     let mut ids = Vec::new();
@@ -2018,8 +1992,8 @@ pub(crate) fn fit_camera_to_scene(
     fit_camera_to_bounds(&bounds, viewport_width, viewport_height)
 }
 
-/// FC-09: frame a world-space AABB into the viewport, mirroring the legacy fit math
-/// (center + zoom-to-fit with the same padding/zoom clamp as [`fit_camera_to_scene`]).
+/// Frame a world-space AABB into the viewport (same padding/zoom clamp as
+/// [`fit_camera_to_scene`]).
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn fit_camera_to_bounds(
     bounds: &WorldRect,
@@ -2037,13 +2011,11 @@ pub(crate) fn fit_camera_to_bounds(
     }
 }
 
-/// FC-04: derive each object's local-space region outline (D6) for hit-test /
-/// marquee. Parses the geometry path-string into flattened subpaths, derives the
-/// region, and keeps the boundary polygon in OBJECT-LOCAL px. Objects whose
-/// geometry yields no region (degenerate) are skipped — they cannot be hit.
+/// Derive each object's local-space region outline for hit-test / marquee: parse the
+/// geometry path-string into flattened subpaths, derive the region, keep the boundary
+/// polygon in OBJECT-LOCAL px. Degenerate objects are skipped (they cannot be hit).
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn derive_object_regions(scene: &RenderObjectScene) -> Vec<ObjectRegion> {
-    // Same flattening tolerance the region cache groundwork uses for at-rest geometry.
     const REGION_FLATNESS: f32 = 0.5;
     let mut regions = Vec::with_capacity(scene.objects.len());
     for obj in &scene.objects {
@@ -2064,11 +2036,9 @@ pub(crate) fn derive_object_regions(scene: &RenderObjectScene) -> Vec<ObjectRegi
     regions
 }
 
-/// v3 §2b: classify `d` through scene-core (`is_open_class_d`) and read its
-/// endpoint pair through the SAME pair-space parser anchors address
-/// (`local_nodes`), de-quantized to object-local px. `None` for closed-class /
-/// legacy multi-subpath / degenerate (< 2 pairs) geometry — those keep the
-/// closed-class selection surface (rule 5, no regression).
+/// Classify `d` (`is_open_class_d`) and read its endpoint pair through the same
+/// pair-space parser anchors address (`local_nodes`), de-quantized to object-local
+/// px. `None` for closed-class / multi-subpath / degenerate (< 2 pairs) geometry.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn derive_open_endpoints(d: &str) -> Option<OpenEndpoints> {
     use shape_renderer_core::hit_test_object::UNITS_PER_PX;
@@ -2090,19 +2060,16 @@ pub(crate) fn derive_open_endpoints(d: &str) -> Option<OpenEndpoints> {
     })
 }
 
-/// Object-local pad (px) for the RA3 body bbox fallback so a zero-size /
-/// collapsed stroke or text object still presents a finite grab target. Only
-/// applied to objects with no closed fill (filled bodies keep the exact fill
-/// hit), so it never makes empty canvas read as a hit on a filled shape.
+/// Object-local pad (px) for the body bbox fallback so a zero-size / collapsed
+/// stroke or text object still presents a finite grab target. Only applied to
+/// objects with no closed fill, so empty canvas never reads as a hit.
 #[cfg(feature = "wgpu-probe")]
 const BODY_BBOX_GRAB_PAD_PX: f32 = 4.0;
 
-/// FC-07: pick the top-most object whose region contains the screen point. Regions
-/// are iterated in reverse (top-down, since later objects draw on top); the query
-/// point is mapped to world then inverse-transformed into each object's local space
-/// (D8). RA3: a closed fill keeps the even-odd polygon hit; a stroke / text / open /
-/// zero-size object (no closed fill) falls back to its object-local bbox so it is
-/// still grabbable, while empty canvas still misses.
+/// Pick the top-most object whose region contains the screen point (regions iterated
+/// in reverse since later objects draw on top; the query point is inverse-transformed
+/// into each object's local space). A closed fill keeps the even-odd polygon hit; a
+/// stroke/text/open/zero-size object falls back to its object-local bbox.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn hit_object_in_regions(
     regions: &[ObjectRegion],
@@ -2126,16 +2093,11 @@ pub(crate) fn hit_object_in_regions(
         .map(|region| region.id.clone())
 }
 
-/// RA3 swept-erase: ids of EVERY object the pointer crossed between two samples.
-/// `prev`/`curr` are SCREEN points (consecutive eraser-drag samples); both are
-/// mapped to world and the world segment between them is swept against each
-/// object via [`swept_segment_hits_object`] (filled => outline crossing; stroke /
-/// text / open / zero-size => padded local-bbox crossing). Top-down order (later
-/// objects first), so a fast drag that skips between samples still erases every
-/// object the segment passes through, not just the endpoints' top-most hit.
-///
-/// A zero-length segment (`prev == curr`) degenerates to a point sweep, matching
-/// [`hit_object_in_regions`] but returning ALL overlapping ids rather than one.
+/// Ids of EVERY object the pointer crossed between two consecutive SCREEN samples:
+/// both are mapped to world and the segment is swept against each object via
+/// [`swept_segment_hits_object`] (filled => outline crossing; otherwise padded
+/// local-bbox), top-down. A zero-length segment degenerates to a point sweep but
+/// still returns ALL overlapping ids.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn swept_erase_in_regions(
     regions: &[ObjectRegion],
@@ -2164,24 +2126,11 @@ pub(crate) fn swept_erase_in_regions(
         .collect()
 }
 
-/// W2-02: compute the hover affordance under `screen` for the shell's cursor.
-/// Runs only on a no-button move (the caller gates this on "no active drag").
-///
-/// Priority, top-down: when an object is selected, its resize/rotate handles
-/// (laid out by the SHARED [`SelectionHandles`] helper, in screen space, so the
-/// hover test matches exactly what W2-04 renders and pointer-down hit-tests) win
-/// over everything; then a body hit against any object's region; otherwise empty.
-/// W2-04: the SHARED selection-handle layout for the selected object, returning
-/// the screen-space [`SelectionHandles`] plus the WORLD bbox they were laid out
-/// from. This is the single bridge that keeps hover (W2-02), the pointer-down
-/// hit-test, and the GPU handle render (W2-04) on one source of truth: all three
-/// read the same screen-space handles built from the same world bbox. `None` when
-/// nothing is selected or the selected region has no finite world bounds.
-///
-/// RA1: `preview` is the selected object's live drag transform (`delta * base`) when
-/// a transform gesture is in flight; the handles then lay out from the PREVIEWED
-/// bbox so they track the dragged object frame-by-frame instead of snapping only on
-/// commit. `None` lays them out from the canonical region transform.
+/// The SHARED selection-handle layout for the selected object: the screen-space
+/// [`SelectionHandles`] plus the WORLD bbox they were laid out from. The single
+/// source hover, pointer-down hit-test, and GPU handle render share. `preview`
+/// substitutes the live drag transform so the handles track the PREVIEWED bbox.
+/// `None` when nothing is selected or the region has no finite world bounds.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn selection_handles(
     regions: &[ObjectRegion],
@@ -2191,9 +2140,8 @@ pub(crate) fn selection_handles(
 ) -> Option<(SelectionHandles, WorldRect)> {
     let id = selection?;
     let region = regions.iter().find(|region| region.id == id)?;
-    // v3 §2b: an open-class selection has NO bbox transform surface — its two
-    // endpoint handles ([`endpoint_handles`]) are the whole manipulation surface,
-    // so neither the 8 resize handles nor the rotate zone exist for it.
+    // An open-class selection has NO bbox transform surface — its two endpoint
+    // handles are the whole manipulation surface.
     if region.open_endpoints.is_some() {
         return None;
     }
@@ -2208,16 +2156,10 @@ pub(crate) fn selection_handles(
     Some((handles, world_bbox))
 }
 
-/// v3 §2b: the endpoint-handle layout for an OPEN-CLASS selection — the SINGLE
-/// source hover (cursor), pointer-down (grab) and the GPU handle render share,
-/// mirroring how [`SelectionHandles`] single-sources the closed-class surface.
-/// `world` holds the two endpoint WORLD positions (node 0, then the last node);
-/// `screen` the matching [`HANDLE_SIZE_PX`]-square hit zones; `last_index` the
-/// end node's geometry PAIR index (the `node_index` an endpoint drag reports).
-/// `None` when the selection is absent or not open-class.
-///
-/// RA1 carry-over: `preview` substitutes the live drag transform (`delta * base`)
-/// so the handles track a translate preview frame-by-frame.
+/// The endpoint-handle layout for an OPEN-CLASS selection, the single source hover,
+/// grab, and GPU render share. `world` holds the two endpoint WORLD positions (node
+/// 0, then the last node); `screen` the matching [`HANDLE_SIZE_PX`]-square hit zones;
+/// `last_index` the end node's geometry PAIR index.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) struct EndpointHandles {
     pub(crate) world: [WorldPoint; 2],
@@ -2273,13 +2215,11 @@ pub(crate) fn endpoint_handles(
     })
 }
 
-/// v3 §2b + feedback #1: build the endpoint-handle overlay — two FILLED CIRCLES
-/// (Figma-style dots) at the open-class selection's endpoint WORLD positions.
-/// Same zoom-invariant sizing as [`build_handle_overlay_vertices`] (screen
-/// DIAMETER pins to `HANDLE_SIZE_PX` at any zoom); each dot is a
-/// [`ENDPOINT_HANDLE_SEGMENTS`]-triangle fan, the pair filling its shared buffer
-/// ([`HANDLE_OVERLAY_VERTEX_CAPACITY`]). Visual only: the grab/hover HIT zones
-/// stay the `HANDLE_SIZE_PX` screen squares in [`endpoint_handles`].
+/// Build the endpoint-handle overlay: two FILLED CIRCLES at the open-class
+/// selection's endpoint WORLD positions, zoom-invariant like
+/// [`build_handle_overlay_vertices`] (screen DIAMETER pins to `HANDLE_SIZE_PX`).
+/// Each dot is a [`ENDPOINT_HANDLE_SEGMENTS`]-triangle fan. Visual only: the
+/// grab/hover HIT zones stay the screen squares in [`endpoint_handles`].
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn build_endpoint_handle_overlay_vertices(
     world: &[WorldPoint; 2],
@@ -2295,11 +2235,10 @@ pub(crate) fn build_endpoint_handle_overlay_vertices(
     vertices
 }
 
-/// One endpoint dot: a filled [`ENDPOINT_HANDLE_SEGMENTS`]-triangle fan centered
-/// at `center` with the given WORLD radius, in [`ENDPOINT_HANDLE_FILL_COLOR`].
-/// The SINGLE fan emitter shared by the single-selection endpoint overlay
-/// ([`build_endpoint_handle_overlay_vertices`]) and the multi-select open-member
-/// dots ([`build_multi_select_overlay_vertices`]), so the two visuals can't drift.
+/// One endpoint dot: a filled [`ENDPOINT_HANDLE_SEGMENTS`]-triangle fan at `center`
+/// with the given WORLD radius, in [`ENDPOINT_HANDLE_FILL_COLOR`]. The single fan
+/// emitter shared by the single-selection overlay and the multi-select open-member
+/// dots, so the two visuals can't drift.
 #[cfg(feature = "wgpu-probe")]
 fn push_endpoint_dot_vertices(vertices: &mut Vec<GpuVertex>, center: &WorldPoint, radius: f32) {
     let cx = center.x as f32;
@@ -2326,8 +2265,8 @@ pub(crate) fn hover_affordance_at(
     selection: Option<&str>,
     screen: WorldPoint,
 ) -> HoverAffordance {
-    // v3 §2b: an open-class selection's surface is its two endpoint handles; the
-    // bbox handles below return None for it (`selection_handles` guard).
+    // An open-class selection's surface is its two endpoint handles; the bbox
+    // handles below return None for it.
     if let Some(handles) = endpoint_handles(regions, camera, selection, None) {
         if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
             return affordance;
@@ -2345,20 +2284,18 @@ pub(crate) fn hover_affordance_at(
     }
 }
 
-/// FC-07: the pure object pointer-input state machine. Operates only on the
-/// pieces of renderer state it touches (camera, drag, the region list) so it is
-/// unit-testable without a GPU device. Mutates `camera`/`input_drag` and writes
-/// any selection / transform-delta / marquee result into `object_out`.
+/// The pure object pointer-input state machine: mutates `camera`/`input_drag` and
+/// writes selection / transform-delta / marquee results into `object_out`,
+/// unit-testable without a device.
 ///
-/// Behavior (Select tool unless noted):
-/// - PointerDown, Hand tool: start a Pan drag (panning works in object mode).
+/// Behavior (Select unless noted):
+/// - PointerDown, Hand: start a Pan drag.
 /// - PointerDown, hit an object: set `selection`, start an Object drag anchored at
 ///   the pointer-down WORLD point.
-/// - PointerDown, empty: start a world-space Marquee drag.
+/// - PointerDown, empty: start a Marquee drag.
 /// - PointerMove on Pan: update `camera`. On Object: emit a CUMULATIVE delta from
 ///   the fixed anchor. On Marquee: extend the rect.
-/// - PointerUp on Marquee: AABB-test object world regions against the rect into
-///   `marquee_ids`. Any drag clears on up/cancel.
+/// - PointerUp on Marquee: AABB-test regions into `marquee_ids`; any drag clears.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn step_object_pointer(
     event: &CanvasInputEvent,
@@ -2382,11 +2319,9 @@ pub(crate) fn step_object_pointer(
                 });
                 return;
             }
-            // v3 §2b: grabbing an endpoint handle of an OPEN-CLASS selection starts
-            // an Endpoint drag (no selection change) — the open-class analogue of
-            // the resize/rotate grab below, sharing the same layout hover/render
-            // read. Anchored endpoints are grabbable too: release-time rebind/
-            // unbind is the shell's commit (`endpoint_release_ops`).
+            // Grabbing an endpoint handle starts an Endpoint drag (no selection
+            // change); anchored endpoints are grabbable too (rebind/unbind is the
+            // shell's release commit).
             if let Some(handles) = endpoint_handles(regions, camera, selection, None) {
                 if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
                     let object_id = selection.expect("endpoint_handles requires a selection");
@@ -2403,10 +2338,9 @@ pub(crate) fn step_object_pointer(
                     return;
                 }
             }
-            // W2-04: grabbing a resize handle / the rotate zone of the CURRENT
-            // selection starts a transform gesture (no selection change). Uses the
-            // SHARED handle layout so what is grabbed == what hover reports == what
-            // is drawn. Priority matches hover: handles > body > empty.
+            // Grabbing a resize handle / rotate zone starts a transform gesture (no
+            // selection change), via the SHARED layout so grab == hover == render.
+            // Priority: handles > body > empty.
             if let Some((handles, world_bbox)) = selection_handles(regions, camera, selection, None) {
                 if let Some(affordance) = handles.affordance_at(screen.x, screen.y) {
                     let object_id = selection.expect("selection_handles requires a selection");
@@ -2459,9 +2393,8 @@ pub(crate) fn step_object_pointer(
         CanvasInputEvent::PointerMove { pointer_id, screen } => {
             let pointer_id = *pointer_id;
             let screen = *screen;
-            // No active drag => no button is held: this is a hover move, so report
-            // the affordance the shell uses to pick a cursor (W2-02). Computed
-            // per-move with no hover state of its own.
+            // No active drag => a hover move, so report the affordance the shell uses
+            // to pick a cursor. No hover state of its own.
             let Some(drag) = input_drag.clone() else {
                 object_out.hover_affordance =
                     Some(hover_affordance_at(regions, camera, selection, screen));
@@ -2484,7 +2417,6 @@ pub(crate) fn step_object_pointer(
                     object_id,
                     start,
                 } if drag_pointer_id == pointer_id => {
-                    // Cumulative translation from the FIXED pointer-down world point.
                     let world_now = screen_to_world(screen, camera);
                     object_out.transform_delta = Some(ObjectTransformDelta {
                         id: object_id,
@@ -2499,7 +2431,7 @@ pub(crate) fn step_object_pointer(
                     start,
                     world_bbox,
                 } if drag_pointer_id == pointer_id => {
-                    // Cumulative scale about the OPPOSITE anchor of the grabbed handle.
+                    // Scale about the OPPOSITE anchor of the grabbed handle.
                     let world_now = screen_to_world(screen, camera);
                     object_out.transform_delta = Some(ObjectTransformDelta {
                         id: object_id,
@@ -2517,9 +2449,8 @@ pub(crate) fn step_object_pointer(
                     object_id,
                     node_index,
                 } if drag_pointer_id == pointer_id => {
-                    // v3 §2b: the dragged endpoint's cumulative WORLD position. The
-                    // shell live-previews the chord deform per sample and commits
-                    // once on release — same contract shape as `transform_delta`.
+                    // The dragged endpoint's cumulative WORLD position; the shell
+                    // previews the chord deform and commits once on release.
                     let world_now = screen_to_world(screen, camera);
                     object_out.endpoint_delta = Some(ObjectEndpointDelta {
                         id: object_id,
@@ -2534,7 +2465,7 @@ pub(crate) fn step_object_pointer(
                     start,
                     center,
                 } if drag_pointer_id == pointer_id => {
-                    // Cumulative rotation about the bbox center from the anchor angle.
+                    // Rotation about the bbox center from the anchor angle.
                     let world_now = screen_to_world(screen, camera);
                     object_out.transform_delta = Some(ObjectTransformDelta {
                         id: object_id,
@@ -2576,9 +2507,8 @@ pub(crate) fn step_object_pointer(
                     object_out.marquee_ids = Some(object_regions_in_marquee(regions, &rect));
                 }
             }
-            // Object drag commits on the shell side (one undoable op); clear only
-            // when THIS pointer owns the active drag, so a second finger lifting
-            // (different pointerId) can't cancel an in-progress drag mid-gesture.
+            // Object drag commits on the shell side; clear only when THIS pointer owns
+            // the active drag, so a second finger lifting can't cancel it mid-gesture.
             if drag_pointer_id(input_drag.as_ref()) == Some(pointer_id) {
                 *input_drag = None;
             }
@@ -2592,11 +2522,9 @@ pub(crate) fn step_object_pointer(
     }
 }
 
-/// RA2b (D6): branch a double-click that hit an object into the discriminated
-/// signal the shell consumes. Hit-tests `screen` against the live regions; on a
-/// hit, reports `{ id, has_children }` where `has_children` is true iff any object
-/// in `objects` has `parent == hit id` (a container => drill-in; a leaf => text
-/// edit). Returns `None` when the double-click landed on empty canvas.
+/// Branch a double-click that hit an object: `{ id, has_children }`, where
+/// `has_children` is true iff any object has `parent == hit id` (container =>
+/// drill-in; leaf => text edit). `None` on empty canvas.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn object_double_click(
     regions: &[ObjectRegion],
@@ -2611,9 +2539,7 @@ pub(crate) fn object_double_click(
     Some(ObjectDoubleClick { id, has_children })
 }
 
-/// FC-07: object ids whose WORLD-space region AABB intersects the marquee rect.
-/// Each local outline vertex is transformed to world via the object transform; the
-/// min/max over those gives the world AABB tested against `rect`.
+/// Object ids whose WORLD-space region AABB intersects the marquee rect.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn object_regions_in_marquee(regions: &[ObjectRegion], rect: &WorldRect) -> Vec<String> {
     regions
@@ -2625,8 +2551,8 @@ pub(crate) fn object_regions_in_marquee(regions: &[ObjectRegion], rect: &WorldRe
         .collect()
 }
 
-/// FC-09: world-space AABB over every object region (each local outline vertex
-/// transformed to world). `None` when there are no regions / no finite vertices.
+/// World-space AABB over every object region. `None` when there are no regions / no
+/// finite vertices.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn object_regions_world_bounds(regions: &[ObjectRegion]) -> Option<WorldRect> {
     let mut acc: Option<WorldRect> = None;
@@ -2642,14 +2568,10 @@ pub(crate) fn object_regions_world_bounds(regions: &[ObjectRegion]) -> Option<Wo
     acc
 }
 
-/// World-space AABB of one object's region: transform each local outline vertex
-/// through the object's projective matrix (D7/D8) and take the extent. `None` when
-/// the outline is empty or every vertex maps to a non-finite world point.
-///
-/// RA1: when `preview` is `Some`, the supplied live drag transform (`delta * base`)
-/// substitutes for the canonical `region.transform`, so the bounds (and the
-/// selection handles laid out from them) track the dragged bbox during an in-flight
-/// transform without a region rebuild — the outline is read unchanged.
+/// World-space AABB of one object's region (each local outline vertex through the
+/// projective matrix). `None` when the outline is empty or maps non-finite.
+/// `preview` substitutes the live drag transform so the bounds (and handles laid out
+/// from them) track the dragged bbox without a region rebuild.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn region_world_bounds(
     region: &ObjectRegion,
@@ -2683,28 +2605,16 @@ pub(crate) fn region_world_bounds(
     }
 }
 
-/// W2-06: nearest point on ANY object outline to a WORLD query point, within
-/// `tol_world`. Returns `(id, world_x, world_y)` of the global minimum, or `None`
-/// when no outline is within tolerance. Used by shape drag-create anchor snapping
-/// (W2-07).
+/// Nearest point on ANY object outline to a WORLD query point, within `tol_world`.
+/// Returns `(id, world_x, world_y)` of the global minimum, or `None`. Used by
+/// drag-create anchor snapping.
 ///
-/// Design (per the task's reuse mandate + simplicity-first): the renderer holds no
-/// ellipse metadata — ellipses arrive as 4 cubic Béziers already flattened into
-/// `Region.outline` at load (REGION_FLATNESS = 0.5px chord error, the same
-/// tolerance that governs hit-test). So nearest-point is a uniform min over all
-/// outline segments via [`nearest_point_on_polyline`]: straight segments and the
-/// ellipse's dense segment set are the same kind of query, and snap precision is
-/// bounded by the flatten tolerance the user already clicks against. No Newton /
-/// ellipse-equation path (it would be infeasible AND contradict the reuse rule).
-///
-/// Performance (P0, runs live during drag): AABB broad-phase first
-/// ([`region_world_bounds`] expanded by `tol_world`, cheap point-in-rect reject)
-/// before any per-outline work; the query point is inverse-transformed into each
-/// surviving region's LOCAL space ONCE (D8) instead of transforming outlines, so
-/// the inner loop is allocation-free. Distances are compared in WORLD space
-/// (`tol_world` is a world quantity): the local nearest candidate is mapped back
-/// to world via the projective transform, because local distances are wrong under
-/// scale/shear/perspective.
+/// Ellipses arrive pre-flattened into `Region.outline`, so this is a uniform min
+/// over all outline segments via [`nearest_point_on_polyline`] (no Newton path).
+/// Runs live during drag: an AABB broad-phase rejects first, the query point is
+/// inverse-transformed into each surviving region's LOCAL space ONCE (allocation-
+/// free inner loop), but distances are compared in WORLD space (the local candidate
+/// is mapped back, since local distances are wrong under scale/shear/perspective).
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn nearest_outline_point(
     regions: &[ObjectRegion],
@@ -2718,14 +2628,12 @@ pub(crate) fn nearest_outline_point(
     let tol2 = tol_world * tol_world;
     let mut best: Option<(&str, f64, f64, f64)> = None; // (id, world_x, world_y, d2)
     for region in regions {
-        // W3-G6 (#6): skip transient preview regions (create-preview / snap-indicator
-        // fed via buildFeedScene) so a create-drag snaps to a REAL object's edge
-        // instead of self-snapping to the preview's own corner under the cursor.
+        // Skip transient preview regions so a create-drag snaps to a REAL edge
+        // instead of self-snapping under the cursor.
         if exclude.contains(&region.id.as_str()) {
             continue;
         }
-        // Broad-phase: skip when the query point is outside the region's world AABB
-        // expanded by the tolerance.
+        // Broad-phase: skip when the query is outside the world AABB + tolerance.
         let Some(bounds) = region_world_bounds(region, None) else {
             continue;
         };
@@ -2736,7 +2644,7 @@ pub(crate) fn nearest_outline_point(
         {
             continue;
         }
-        // Query in object-LOCAL space (D8): inverse-transform the world point once.
+        // Query in object-LOCAL space: inverse-transform the world point once.
         let Some((lx, ly)) = world_to_local(&region.transform, world.x, world.y) else {
             continue;
         };
@@ -2745,7 +2653,7 @@ pub(crate) fn nearest_outline_point(
         else {
             continue;
         };
-        // Map the local nearest candidate back to WORLD and measure there.
+        // Map the local candidate back to WORLD and measure there.
         let (wx, wy) = apply_3x3(&region.transform, local_pt.0 as f64, local_pt.1 as f64);
         if !wx.is_finite() || !wy.is_finite() {
             continue;
@@ -3273,42 +3181,32 @@ pub(crate) const EDGE_VERTEX_SLOT: usize = 768;
 pub(crate) const CARD_VERTEX_SLOT: usize = 1536;
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const VIEWPORT_CULL_PADDING: f64 = 400.0;
-// Marquee overlay = 1 fill quad (6 verts) + 4 stroke edge quads (24 verts) = 30.
+// 1 fill quad (6) + 4 stroke edge quads (24).
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const MARQUEE_OVERLAY_VERTEX_CAPACITY: usize = 30;
-// Marquee fill/stroke colors (accent blue, translucent). Drawn in world space so
-// the existing camera-transform pipeline renders them in place.
+// Accent blue, translucent. World-space so the camera-transform pipeline renders it.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const MARQUEE_FILL_COLOR: [f32; 4] = [0.231, 0.510, 0.965, 0.12];
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const MARQUEE_STROKE_COLOR: [f32; 4] = [0.231, 0.510, 0.965, 0.9];
 
-// W2-04: selection-handle overlay buffer covers BOTH selection surfaces:
-// closed-class = 8 resize handles + 1 rotate zone, each a fill quad (6 verts)
-// = 54; open-class (v3 §2b) = two endpoint dots, each a triangle fan
-// (3 verts/segment) = 2 * 16 * 3 = 96.
+// Sized for the larger surface: open-class = two endpoint dot fans (2 * 16 * 3 =
+// 96), vs closed-class = 8 resize handles + rotate zone (54).
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const HANDLE_OVERLAY_VERTEX_CAPACITY: usize = 2 * ENDPOINT_HANDLE_SEGMENTS * 3;
-// Solid focus-blue handle fill (#2f7ee6).
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const HANDLE_FILL_COLOR: [f32; 4] = [0.184, 0.494, 0.902, 1.0];
-// Feedback #1: open-class endpoint dots — fan segments per circle, filled with
-// the selection blue (#007aff).
+// Fan segments per endpoint dot circle.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const ENDPOINT_HANDLE_SEGMENTS: usize = 16;
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const ENDPOINT_HANDLE_FILL_COLOR: [f32; 4] = [0.0, 0.478, 1.0, 1.0];
 
-// W3-G7/#1: multi-select overlay = up to ~96 members. A closed member is a 4-edge
-// rectangle outline (4 line quads * 6 verts = 24); an open-class member is two
-// endpoint dot fans instead (2 * ENDPOINT_HANDLE_SEGMENTS * 3 = 96, 4x a box), so
-// the cap sizes the ALL-OPEN worst case. One-time allocation at device init —
-// not a per-frame cost.
+// Sized for the ALL-OPEN worst case (~96 members, each two dot fans = 4x a box's 24
+// outline verts). One-time allocation at device init, not a per-frame cost.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const MULTI_SELECT_OVERLAY_VERTEX_CAPACITY: usize =
     96 * 2 * ENDPOINT_HANDLE_SEGMENTS * 3;
-// Selection-ring blue (#007aff), opaque. Same sRGB-normalized convention as the
-// marquee/handle color consts above.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) const MULTI_SELECT_OUTLINE_COLOR: [f32; 4] = [0.0, 0.478, 1.0, 1.0];
 
@@ -4040,7 +3938,7 @@ mod tests {
         assert!(vertices.len() <= MARQUEE_OVERLAY_VERTEX_CAPACITY);
     }
 
-    // ----- FC-04..FC-07 object live-path helpers -----------------------------
+    // ----- object live-path helpers -----------------------------
 
     use shape_renderer_core::render_object::RenderObject;
 
@@ -4049,7 +3947,7 @@ mod tests {
     }
 
     /// An object at world `(tx, ty)` whose local geometry is an `s`px×`s`px rect
-    /// (`s` px = `s*8` quantized units, D2). Later-in-the-list objects draw on top.
+    /// (`s` px = `s*8` quantized units). Later-in-the-list objects draw on top.
     fn rect_object(id: &str, tx: f64, ty: f64, s: i32) -> RenderObject {
         let u = s * 8; // px -> quantized units
         RenderObject {
@@ -4067,8 +3965,8 @@ mod tests {
     }
 
     /// An object at world `(tx, ty)` whose local geometry is a `w`px×`h`px ellipse
-    /// (4 cubic arcs, the same kappa string the shell's `ellipsePath` emits, D2 8
-    /// units/px). Used to exercise the curve nearest-point path.
+    /// (4 cubic arcs, the same kappa string the shell's `ellipsePath` emits).
+    /// Exercises the curve nearest-point path.
     fn ellipse_object(id: &str, tx: f64, ty: f64, w: i32, h: i32) -> RenderObject {
         let q = |px: i32| px * 8; // px -> quantized units
         let qw = q(w);
@@ -4173,7 +4071,7 @@ mod tests {
 
     #[test]
     fn hit_object_grabs_zero_fill_stroke_via_bbox_fallback() {
-        // RA3 (1): an OPEN line (no closed fill) at world (0,0), local (0,0)->(40,0).
+        // An OPEN line (no closed fill) at world (0,0), local (0,0)->(40,0).
         // A point ON the stroke body must grab it via the bbox fallback (the even-odd
         // fill test would miss an open contour); empty canvas off the stroke misses.
         let scene = object_scene(vec![line_object("l", 0.0, 0.0, 40)]);
@@ -4190,7 +4088,7 @@ mod tests {
 
     #[test]
     fn swept_erase_crosses_all_objects_between_two_samples() {
-        // RA3 (2): three 10px rects spaced along x at world x = 0, 30, 60 (all y=0).
+        // Three 10px rects spaced along x at world x = 0, 30, 60 (all y=0).
         // A FAST eraser drag samples only the endpoints (-5, 5) and (75, 5): the
         // segment crosses all three between samples though no single sample point sits
         // inside more than one. The swept test must accumulate EVERY crossed object.
@@ -4301,16 +4199,12 @@ mod tests {
         assert!(beyond.is_none(), "{beyond:?}");
     }
 
-    // W3-G6 (#6): the live create-drag feeds a transient "create-preview" region
-    // whose dragged corner sits UNDER the cursor — so an unexcluded snap query
-    // self-snaps to that preview (distance ~0) and the canonical filter then drops
-    // it, leaving no anchor. Excluding the preview id must surface the nearest REAL
-    // object's edge instead, which the shell keeps (firing the ring + AP5 anchor).
+    // Excluding the transient create-preview region (whose dragged corner sits under
+    // the cursor) must surface the nearest REAL object's edge instead of self-snapping.
     #[test]
     fn nearest_outline_excludes_transient_create_preview() {
-        // Real rect "r" at world (0,0), right edge x=20. Plus a transient preview
-        // rect "create-preview" at world (2,-10) whose bottom-right corner lands at
-        // world (22,10) — exactly the query point under the cursor.
+        // Real rect "r" right edge x=20; preview rect whose corner lands at the query
+        // point (22,10).
         let scene = object_scene(vec![
             rect_object("r", 0.0, 0.0, 20),
             rect_object("create-preview", 2.0, -10.0, 20),
@@ -4454,7 +4348,7 @@ mod tests {
 
     #[test]
     fn object_marquee_reversed_drag_through_move_reaches_marquee_ids() {
-        // RA2a (#7): a full down -> move -> up sequence dragged bottom-right -> top-left
+        // A full down -> move -> up sequence dragged bottom-right -> top-left
         // (reversed corners) must still round-trip to the same ids the rect intersects.
         let scene = object_scene(vec![
             rect_object("near", 0.0, 0.0, 10),
@@ -4486,20 +4380,16 @@ mod tests {
 
     #[test]
     fn object_marquee_over_two_filled_rects_yields_multi_ids() {
-        // BUG A (W3-G6/#1): a drag that STARTS on empty canvas in the gap between two
-        // FILLED rects must (a) start a Marquee — RA3's bbox fallback must NOT re-grab
-        // a filled body's empty bbox and turn the gesture into an Object move — and
-        // (b) on pointer-up collect BOTH ids so the shell forms a >=2 Multi selection.
-        // Two 20px filled rects: "a" at world (0,0) [0..20], "b" at world (30,0)
-        // [30..50]. The down anchor (-5,-5) sits on empty canvas top-left of both; the
-        // marquee rect is span(down-anchor, up-point) — the in-flight move is irrelevant
-        // to the final rect, so the anchor + up corner must straddle BOTH bodies.
+        // A drag starting on empty canvas between two FILLED rects must start a Marquee
+        // (the bbox fallback must NOT re-grab a filled body's empty bbox) and collect
+        // BOTH ids on up. The final rect is span(down-anchor, up-point), so the anchor
+        // (-5,-5) + up corner must straddle both 20px bodies (a [0..20], b [30..50]).
         let scene = object_scene(vec![
             rect_object("a", 0.0, 0.0, 20),
             rect_object("b", 30.0, 0.0, 20),
         ]);
         let regions = derive_object_regions(&scene);
-        // Both regions are closed fills (so RA3 uses the polygon test, not the bbox).
+        // Both regions are closed fills (so hit-testing uses the polygon test, not the bbox).
         assert!(regions.iter().all(|r| r.closed), "filled rects derive closed regions");
         let mut camera = identity_camera();
         let mut drag: Option<InputDragState> = None;
@@ -4532,12 +4422,9 @@ mod tests {
 
     #[test]
     fn object_pointer_down_in_concave_fill_notch_starts_marquee() {
-        // BUG A (W3-G6/#1) — RA3 guard: a point inside a FILLED concave object's
-        // bounding box but OUTSIDE its polygon (the notch) must MISS the body, so a
-        // drag there starts a Marquee. An L lying on its back: local px outline
-        // (0,0)(20,0)(20,20)(10,20)(10,10)(0,10) (units = px*8). Filled region = the
-        // full bottom strip y in 0..10 plus the right column x in 10..20, y in 10..20.
-        // Its AABB is 0..20 square, but the upper-LEFT quadrant (5,15) is empty notch.
+        // A point inside a FILLED concave object's bbox but OUTSIDE its polygon (the
+        // notch) must MISS the body, so a drag there starts a Marquee. An L on its
+        // back: AABB 0..20 square, but the upper-LEFT quadrant (5,15) is empty notch.
         let l_shape = RenderObject {
             id: "l".to_string(),
             parent: None,
@@ -4582,7 +4469,7 @@ mod tests {
 
     #[test]
     fn object_mode_marquee_drag_yields_overlay_geometry_from_shared_source() {
-        // RA2a (#7): the in-flight object-mode marquee drag must produce drawable
+        // The in-flight object-mode marquee drag must produce drawable
         // overlay geometry from the shared `marquee_overlay_for_drag` source the
         // object render pass draws — without it the rubber-band never surfaces over an
         // object scene. A non-Marquee / no drag yields no overlay.
@@ -4718,7 +4605,7 @@ mod tests {
 
     #[test]
     fn double_click_branches_parent_vs_leaf_by_children() {
-        // RA2b (D6): double-click an object WITH children => drill-in branch
+        // Double-click an object WITH children => drill-in branch
         // (has_children true); double-click a LEAF => text-edit branch (false).
         // "o1" at world (0,0) has a child "c1" (parent=o1, off to the side so it
         // does not overlap the click); "leaf" at world (50,0) has no children.
@@ -4818,7 +4705,7 @@ mod tests {
 
     #[test]
     fn multi_select_overlay_ring_follows_live_preview_transform() {
-        // W3-G10/#2: a 20px rect at world origin; canonical ring spans [0,20]². A live
+        // A 20px rect at world origin; canonical ring spans [0,20]². A live
         // drag pushes a preview WORLD transform translating +100,+50. The outline ring
         // MUST be built at the PREVIEWED bbox [100,120]×[50,70], tracking the drag like
         // the resize handles — not snapping only on commit. Fails if the ring ignores
@@ -4889,7 +4776,7 @@ mod tests {
         ]);
         let regions = derive_object_regions(&scene);
 
-        // W3-G9/#2: a lone selected object/group rings (so a grouped selection shows
+        // A lone selected object/group rings (so a grouped selection shows
         // a border, not just resize dots) even though multi_select is empty.
         scene.selection = Some("a".to_string());
         scene.multi_select = Vec::new();
@@ -4996,7 +4883,7 @@ mod tests {
 
     #[test]
     fn multi_select_open_member_dots_follow_live_preview_transform() {
-        // W3-G10/#2 pattern: an open member's dots must be built at the PREVIEWED
+        // An open member's dots must be built at the PREVIEWED
         // endpoint positions during a live drag, tracking the pointer every frame
         // like the closed-member rings — transform-only, no re-tessellation.
         let scene = object_scene(vec![line_object("l", 0.0, 0.0, 40)]);
@@ -5119,11 +5006,10 @@ mod tests {
         assert!(out2.selection.is_none());
     }
 
-    // ----- anchor-semantics v3 §2b: open-class endpoint handles ---------------
+    // ----- open-class endpoint handles ---------------
 
-    /// An object whose local geometry is the canonical bezier open curve from the
-    /// scene-core deform fixture: 3 nodes, 5 coordinate PAIRS (control points
-    /// included), endpoints local px (0,0) and (8,0).
+    /// An open bezier curve: 3 nodes, 5 coordinate PAIRS (control points included),
+    /// endpoints local px (0,0) and (8,0).
     fn curve_object(id: &str) -> RenderObject {
         RenderObject {
             id: id.to_string(),
@@ -5216,7 +5102,7 @@ mod tests {
         let regions = derive_object_regions(&scene);
         let camera = identity_camera();
 
-        // RA1 carry-over: a live preview transform substitutes for the canonical
+        // A live preview transform substitutes for the canonical
         // region transform, so the handles track a translate drag frame-by-frame.
         let preview = [[1.0, 0.0, 100.0], [0.0, 1.0, 50.0], [0.0, 0.0, 1.0]];
         let handles = endpoint_handles(&regions, &camera, Some("l"), Some(&preview))
@@ -5262,7 +5148,7 @@ mod tests {
     #[test]
     fn pointer_down_on_endpoint_starts_endpoint_drag_and_emits_world_signal() {
         // An ANCHORED open line: the handle is grabbable regardless of the anchor
-        // (release-time rebind/unbind is the shell's commit, v3 §2b).
+        // (release-time rebind/unbind is the shell's commit).
         let mut line = line_object("l", 0.0, 0.0, 40);
         line.anchors = vec![shape_renderer_core::render_object::RAnchor {
             node_index: 1,
@@ -5348,7 +5234,7 @@ mod tests {
 
     #[test]
     fn selection_handles_follow_live_preview_transform() {
-        // RA1 (#1): a 20px rect at world origin, identity camera (screen == world).
+        // A 20px rect at world origin, identity camera (screen == world).
         // Canonical bbox is [0,20]², so the SE resize handle centers at world (20,20).
         let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
         let regions = derive_object_regions(&scene);
@@ -5447,10 +5333,8 @@ mod tests {
 
     #[test]
     fn object_matrix_uniform_camera_packing_matches_update_camera() {
-        // FC-06: update_camera packs the camera uniform identically to from_scene.
-        // No GPU device here, so assert the shared packing logic directly (the byte
-        // layout update_camera writes). ObjectRenderer::update_camera is exercised on
-        // a real device at the cutover.
+        // No device here, so assert the shared packing logic update_camera writes
+        // directly.
         use crate::object_pipeline::ObjectMatrixUniform;
         let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
         let from_scene = ObjectMatrixUniform::from_scene(&scene, 1280.0, 720.0);
@@ -5468,12 +5352,9 @@ mod tests {
         assert_eq!(live.camera, [12.0, -7.0, 2.5, 0.0]);
     }
 
-    // W2-01: the object camera uniform must be fed LOGICAL pixels, the same space
-    // the pointer path (screen->world) and the shaders work in. At DPR>1 the
-    // physical viewport (logical*DPR) drifts objects toward the upper-right
-    // because the larger denominator shrinks NDC. This pins the round-trip:
-    // a logical screen point -> world (pointer math) -> NDC (shader math) lands
-    // back at the same NDC the screen point maps to directly.
+    // The camera uniform must be fed LOGICAL pixels (the pointer + shader space).
+    // The physical viewport (logical*DPR) would shrink NDC and drift objects, so this
+    // pins the round-trip: logical screen -> world -> NDC lands back at the direct NDC.
     #[test]
     fn object_camera_logical_viewport_round_trips_at_dpr2() {
         use crate::object_pipeline::ObjectMatrixUniform;

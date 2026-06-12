@@ -1,32 +1,17 @@
-//! OB3.S5 — templates are recipes of inline-styled [`Object`]s.
+//! Templates are recipes of inline-styled [`Object`]s: a pure function that, given
+//! an anchor and id/order allocators, returns a `Vec<Object>` of fully-formed
+//! objects. Every object carries its colors inline as [`Fill`]/[`Stroke`] and its
+//! label as [`Text`]; the semantic palette is [`semantic_preset_style`].
 //!
-//! A template is a *recipe*: a pure function that, given an anchor point and a
-//! pair of id/order allocators, returns a `Vec<Object>` of fully-formed canvas
-//! objects (rects, text labels, connectors). There is no legacy
-//! group/card/edge recipe and no `styleKey`/palette indirection (OB3.R10):
-//! every produced object carries its colors **inline** as [`Fill`]/[`Stroke`]
-//! and its label as [`Text`]. The semantic palette (the 12 presets that used to
-//! live behind `defaultStyles`/`shapeStyleToken` in `renderScene.ts`) is ported
-//! here as [`semantic_preset_style`], read directly into inline object styles.
+//! The UI reads [`object_template_catalog`]; picking one sends a
+//! `FeatureRequest::TemplateApply { recipe, .. }` whose `recipe` is
+//! [`build_template`]'s output, lowered to ops by [`template_to_ops`].
 //!
-//! How the pieces fit (OB1.2/OB3.S7):
-//! * The UI reads [`object_template_catalog`] for the picker (id/label/category).
-//! * Picking one sends a `FeatureRequest::TemplateApply { recipe, anchor_x,
-//!   anchor_y, .. }` whose `recipe` is the output of [`build_template`].
-//! * The server/client lowers that recipe to ops via [`template_to_ops`], which
-//!   wraps each object in an `ObjectOp::InsertObject` and applies them through
-//!   the one op-apply path (P1).
-//!
-//! Purity (CLAUDE.md): no time/rng/IO. Object ids and fractional `order` keys
-//! are produced by injected allocators (`id_alloc`/`order_alloc`), so the same
-//! call with the same allocators yields byte-identical objects.
-//!
-//! Geometry convention: each object's geometry is **object-local** quantized i32
-//! at [`GEOMETRY_QUANTUM_PER_PX`] (8 units/px), authored from (0,0). The object's
-//! world placement is its `transform` (`anchor + local px offset`), so no
-//! `f64 -> i32` narrowing of coordinates ever happens — local box dimensions are
-//! integer pixel constants quantized exactly, and the only `f64` values live in
-//! the (`f64`) `Transform3x3`.
+//! Pure: no time/rng/IO. Ids and fractional `order` keys come from injected
+//! allocators, so the same call yields byte-identical objects. Geometry is
+//! object-local quantized i32 at [`GEOMETRY_QUANTUM_PER_PX`], authored from (0,0);
+//! the world placement is the `transform`, so no coordinate `f64 -> i32` narrowing
+//! happens (the only `f64` values live in `Transform3x3`).
 
 use crate::object::model::{
     Anchor, Fill, FillRule, Geometry, LineCap, LineJoin, LocalPoint, Object, Paint, PathNode,
@@ -35,12 +20,7 @@ use crate::object::model::{
 use crate::object::op::ObjectOp;
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Catalog metadata (the UI picker reads this).
-// ---------------------------------------------------------------------------
-
-/// Coarse grouping for the template picker (mirrors the legacy
-/// `TemplateCategory`, minus the legacy `Presentation` recipe shape).
+/// Coarse grouping for the template picker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TemplateCategory {
@@ -51,9 +31,8 @@ pub enum TemplateCategory {
     General,
 }
 
-/// Theme token names the templates paint with (C1 contract, see `object::theme`).
-/// Templates style their frames/cards with semantic tokens so they track the
-/// active light/dark theme instead of baking a fixed hex.
+/// Semantic token names so templates track the active light/dark theme instead of
+/// baking a fixed hex (see `object::theme`).
 const TOKEN_SURFACE: &str = "surface";
 const TOKEN_SURFACE_MUTED: &str = "surface-muted";
 const TOKEN_DEFAULT_STROKE: &str = "default-stroke";
@@ -71,8 +50,6 @@ pub struct ObjectTemplateMeta {
 }
 
 /// A registered template: metadata plus the builder that produces its objects.
-/// `build` has the same signature as [`build_template`] minus the id (it is
-/// already bound to this entry).
 pub struct ObjectTemplate {
     pub id: &'static str,
     pub label: &'static str,
@@ -189,23 +166,16 @@ pub fn build_template(
     }
 }
 
-/// Lower a built recipe into ops: one [`ObjectOp::InsertObject`] per object, in
-/// recipe order (shapes before the connectors that anchor to them). The
-/// server/client applies these through the single op-apply path when handling a
-/// `FeatureRequest::TemplateApply` (OB1.2/OB3.S7).
+/// One [`ObjectOp::InsertObject`] per object, in recipe order (shapes before the
+/// connectors that anchor to them).
 pub fn template_to_ops(objs: Vec<Object>) -> Vec<ObjectOp> {
     objs.into_iter()
         .map(|object| ObjectOp::InsertObject { object })
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Semantic presets (OB3.R10) — the 12 inline styles ported from renderScene.ts.
-// ---------------------------------------------------------------------------
-
-/// The 12 semantic preset keys, ported from `renderScene.ts` `defaultStyles`.
-/// These are not stored on objects (palette/styleKey is gone, OB3.R10); they are
-/// only a source of *inline* colors that [`build_template`] bakes into objects.
+/// The 12 semantic preset keys — a source of inline colors that [`build_template`]
+/// bakes into objects, never stored on them.
 pub fn semantic_presets() -> Vec<&'static str> {
     vec![
         "default",
@@ -223,13 +193,9 @@ pub fn semantic_presets() -> Vec<&'static str> {
     ]
 }
 
-/// Inline style for a semantic preset: `(fill, stroke, text-color)`, ported
-/// 1:1 from `renderScene.ts` `shapeStyleToken(id, fill, stroke, text, ..)`.
-/// `fill` is the surface color, `stroke` the border accent, and the third
-/// element the text color string (used to color a [`TextRun`]). Stroke width is
-/// 1px expressed in quantized units. An unknown preset falls back to `default`.
+/// Inline style for a semantic preset: `(fill surface, stroke accent, text color)`.
+/// Stroke width is 1px in quantized units. An unknown preset falls back to default.
 pub fn semantic_preset_style(preset: &str) -> (Option<Fill>, Option<Stroke>, Option<String>) {
-    // (fill, stroke, text) hex triples copied from renderScene.ts defaultStyles.
     let (fill_hex, stroke_hex, text_hex) = match preset {
         "decision" | "decision_point" => ("#f7fbff", "#2f7ee6", "#102033"),
         "risk" => ("#fff8f1", "#c67914", "#2a1b0b"),
@@ -266,12 +232,12 @@ const fn px(p: i32) -> i32 {
     p * GEOMETRY_QUANTUM_PER_PX
 }
 
-/// A solid fill painted with a theme token (C1) — resolves light/dark at draw.
+/// A solid fill painted with a theme token (resolves light/dark at draw).
 fn token_fill(token: &str) -> Fill {
     Fill { paint: Paint::Token { name: token.to_string() }, opacity: 1.0 }
 }
 
-/// A 1px-wide stroke painted with a theme token (C1).
+/// A 1px-wide stroke painted with a theme token.
 fn token_stroke(token: &str) -> Stroke {
     Stroke {
         paint: Paint::Token { name: token.to_string() },
@@ -301,9 +267,8 @@ fn rect_geometry(w_px: i32, h_px: i32) -> Geometry {
     )
 }
 
-/// An open 2-node segment in object-local quantized units (the connector body,
-/// D5). The world endpoints are resolved from the anchors, not this geometry; a
-/// short stub keeps the object non-degenerate before resolution.
+/// An open 2-node connector body. The world endpoints come from the anchors, not
+/// this geometry; the short stub keeps the object non-degenerate before resolution.
 fn segment_geometry(dx_px: i32, dy_px: i32) -> Geometry {
     Geometry::from_subpaths(
         vec![SubPath {
@@ -349,10 +314,8 @@ fn heading(text: &str, size_px: i32, bold: bool) -> Text {
 }
 
 /// A token-styled rect placed at `anchor + (ox, oy)` px, optionally parented and
-/// optionally titled. `fill_token`/`stroke_token` are theme tokens (C1). The
-/// title (when present) sits top-left via [`heading`]; a frame with no title is
-/// a plain container. Returns the built object so the caller can wire children
-/// to its id.
+/// titled (the title sits top-left). Returns the object so the caller can wire
+/// children to its id.
 #[allow(clippy::too_many_arguments)]
 fn framed(
     fill_token: &str,
@@ -402,9 +365,8 @@ fn card(
     obj
 }
 
-/// Like [`card`] but parented to `parent` (D3 grouping). The transform is still
-/// world-absolute (children carry absolute transforms, AP2); `parent` only wires
-/// containment so a parent drag cascades to the card.
+/// Like [`card`] but parented. The transform stays world-absolute (children carry
+/// absolute transforms); `parent` only wires containment so a parent drag cascades.
 #[allow(clippy::too_many_arguments)]
 fn card_in(
     preset: &str,
@@ -424,9 +386,8 @@ fn card_in(
     obj
 }
 
-/// Build a connector: an open 2-node object whose endpoints anchor to `from`
-/// and `to` (D5). Node 0 attaches to `from`, node 1 to `to`; the `at` local
-/// point is the target's center, re-projected when the target's geometry edits.
+/// An open 2-node object whose endpoints anchor to `from` (node 0) and `to`
+/// (node 1); each `at` is the target's center, re-projected when its geometry edits.
 fn connector(
     from: &Object,
     to: &Object,
@@ -436,8 +397,7 @@ fn connector(
     order_alloc: &mut dyn FnMut() -> String,
 ) -> Object {
     let mut obj = Object::new(id_alloc(), order_alloc(), segment_geometry(40, 0));
-    // The connector body lives in world space; placement is identity and the
-    // endpoints are governed by the anchors (resolved against target outlines).
+    // Placement is identity; the endpoints are governed by the anchors.
     obj.stroke = Some(Stroke {
         paint: Paint::Solid { color: "#7b8794".to_string() },
         width: px(2),
@@ -462,11 +422,8 @@ fn center_of(w_px: i32, h_px: i32) -> LocalPoint {
 // Real templates (fully fleshed).
 // ---------------------------------------------------------------------------
 
-/// Decision Map: a decision point branching to two competing options, each
-/// leading to its own outcome, wired with four anchored connectors. Each card
-/// uses its matching semantic preset; the columns are tuned so no two cards
-/// overlap. This is the anchors showcase — every edge re-projects when a card
-/// moves (AP5).
+/// Decision Map: a decision point branching to two options, each leading to its
+/// outcome, wired with four anchored connectors that re-project when a card moves.
 fn build_decision_map(
     ax: f64,
     ay: f64,
@@ -499,11 +456,9 @@ fn build_decision_map(
     vec![decision, option_a, option_b, outcome_a, outcome_b, e1, e2, e3, e4]
 }
 
-/// To-do Board: three grouped columns (To do / In progress / Done). Each column
-/// is a `surface-muted` frame (a real parent object) holding `task`-preset cards
-/// as children (D3 grouping). Children carry world-absolute transforms and a
-/// `parent` link to their column, so dragging a column cascades its cards (AP2).
-/// Emitted parents-first so the recipe stays well-formed when applied in order.
+/// To-do Board: three `surface-muted` column frames each parenting `task`-preset
+/// cards, so dragging a column cascades its cards. Emitted parents-first so the
+/// recipe stays well-formed when applied in order.
 fn build_todo_board(
     ax: f64,
     ay: f64,
@@ -598,10 +553,8 @@ fn build_wiki_note(
     vec![title, body]
 }
 
-/// Presentation: a deck frame grouping four slide frames (a title slide and
-/// three content slides) laid out in a 2x2 grid. The deck is a `surface-muted`
-/// parent; each slide is a `surface` child frame with a top-left heading (D3
-/// grouping). Dragging the deck cascades all slides (AP2). Parents-first order.
+/// Presentation: a `surface-muted` deck frame parenting four `surface` slide
+/// frames in a 2x2 grid, so dragging the deck cascades all slides. Parents-first.
 fn build_presentation(
     ax: f64,
     ay: f64,
@@ -663,12 +616,7 @@ fn build_presentation(
     objs
 }
 
-// ---------------------------------------------------------------------------
-// Stub templates — a single titled card each (documented placeholders).
-// ---------------------------------------------------------------------------
-
-/// One titled card with the given preset — the shared body for stub templates
-/// that are not yet fully fleshed.
+/// One titled card with the given preset — the shared body for stub templates.
 fn titled_rect(
     preset: &str,
     title: &str,
@@ -680,7 +628,7 @@ fn titled_rect(
     vec![card(preset, title, 260, 120, ax, ay, 0.0, 0.0, id_alloc, order_alloc)]
 }
 
-/// Stub: ADR (architecture decision record). Fleshing out is OB-future.
+/// Stub: ADR (architecture decision record).
 fn build_adr_stub(
     ax: f64,
     ay: f64,
@@ -690,7 +638,7 @@ fn build_adr_stub(
     titled_rect("decision", "ADR", ax, ay, id_alloc, order_alloc)
 }
 
-/// Stub: investigation map. Fleshing out is OB-future.
+/// Stub: investigation map.
 fn build_investigation_map_stub(
     ax: f64,
     ay: f64,
@@ -700,7 +648,7 @@ fn build_investigation_map_stub(
     titled_rect("evidence", "Investigation Map", ax, ay, id_alloc, order_alloc)
 }
 
-/// Stub: dependency diagram. Fleshing out is OB-future.
+/// Stub: dependency diagram.
 fn build_dependency_diagram_stub(
     ax: f64,
     ay: f64,
@@ -710,7 +658,7 @@ fn build_dependency_diagram_stub(
     titled_rect("artifact", "Dependency Diagram", ax, ay, id_alloc, order_alloc)
 }
 
-/// Stub: server architecture. Fleshing out is OB-future.
+/// Stub: server architecture.
 fn build_server_architecture_stub(
     ax: f64,
     ay: f64,
@@ -720,17 +668,12 @@ fn build_server_architecture_stub(
     titled_rect("artifact", "Server Architecture", ax, ay, id_alloc, order_alloc)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Bind two sequential `id-{n}` / `o{n}` allocators into the caller's scope —
-    /// deterministic, no rng. A macro (not a function) because `impl FnMut`
-    /// cannot be returned nested inside a tuple.
+    /// Two sequential `id-{n}` / `o{n}` allocators (deterministic, no rng). A macro
+    /// because `impl FnMut` cannot be returned nested inside a tuple.
     macro_rules! allocators {
         ($id:ident, $order:ident) => {
             let mut id_n = 0;
@@ -798,12 +741,7 @@ mod tests {
         assert_eq!(first.transform.m[1][2], 50.0 + 180.0);
     }
 
-    // -- TP1: groups + anchors + tuned positions on the lowered templates -----
-
-    /// Object-local pixel bounds of a `framed`/`card` rect, in world px. Cards are
-    /// authored as a (0,0)-(w,h) rect translated by the transform, so the world
-    /// box is `[tx, tx + w] x [ty, ty + h]`. Connectors (open geometry) are
-    /// excluded by the caller. Returns `None` if the geometry is not a closed box.
+    /// World-px bounds of a closed `framed`/`card` rect. `None` for open geometry.
     fn world_box(o: &Object) -> Option<(f64, f64, f64, f64)> {
         let sp = o.geometry.subpaths.first()?;
         if !sp.closed {
@@ -853,7 +791,7 @@ mod tests {
             objs[..first_child].iter().all(|o| o.parent.is_none()),
             "parents must precede children",
         );
-        // Columns carry a theme-token fill (C1), not a baked hex.
+        // Columns carry a theme-token fill, not a baked hex.
         assert!(parents.iter().all(|o| matches!(
             o.fill.as_ref().map(|f| &f.paint),
             Some(Paint::Token { .. })

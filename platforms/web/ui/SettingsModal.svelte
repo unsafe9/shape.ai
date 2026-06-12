@@ -4,13 +4,8 @@
   import { formatGestureTrigger } from "../controller/gestures";
   import type { ObjectCommand, ObjectGesture } from "../bridge/sceneCoreWasm";
 
-  // CC5.1 / U4 — settings overlay (Cmd+,). Shows the READ-ONLY shortcut list from
-  // the object command catalog (the wasm core's `object_command_catalog()`, P1 —
-  // no TS mirror). Each row pairs a command (id/label) with its binding
-  // (defaultShortcut); editing is out of scope.
-  //
-  // SM1 (#2): a second section lists the hold-key gesture catalog (the wasm core's
-  // `object_gesture_catalog()`, C2) — registering a gesture once self-documents it.
+  // Settings overlay (Cmd+,): the READ-ONLY shortcut list from the wasm core's command catalog plus a
+  // second section for the hold-key gesture catalog. Registering a feature in its catalog self-documents it here.
   type Props = {
     catalog: ObjectCommand[];
     gestures: ObjectGesture[];

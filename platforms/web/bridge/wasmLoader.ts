@@ -6,13 +6,6 @@ export type RustCoreStatus = {
   detail: string;
   probeWebGpu: RustWebGpuProbe | null;
   createWebGpuRenderer: RustCreateWebGpuRenderer | null;
-  /**
-   * OB-4 object render entry: builds CPU object fill/stroke geometry from a
-   * `RenderObjectScene` JSON via the crate's `ObjectPipeline::build_scene_geometry`.
-   * Present once the renderer wasm exports it. The live GPU object PASS (uploading
-   * this geometry through the frame loop) is a deferred renderer-crate step — this
-   * exercises the build path so the object scene round-trips through the renderer.
-   */
   buildObjectSceneGeometry: ((sceneJson: string) => unknown) | null;
 };
 
@@ -56,15 +49,11 @@ export type RustWebGpuFrameStats = {
   groupCompactionCount: number;
   groupSlotCount: number;
   groupSlotFreeCount: number;
-  // FC-09: object draw-path diagnostics. Nullable so a wasm build (or test mock)
-  // predating these fields still typechecks; read defensively as "no objects".
+  // Nullable so a wasm build (or test mock) predating these fields still typechecks.
   objectCount?: number | null;
   objectFillIndexCount?: number | null;
   objectStrokeVertexCount?: number | null;
   objectDrawCount?: number | null;
-  // FramePlan IR feed accounting: targeted patches applied across canonical
-  // re-feeds vs. feeds that fell back to a full rebuild. Nullable for the same
-  // forward-compat reason as the object-draw diagnostics above.
   objectPatchCount?: number | null;
   objectRebuildCount?: number | null;
   backend: string;
@@ -80,32 +69,25 @@ export type RustCanvasInputEvent =
   | { kind: "fit-scene" }
   | { kind: "focus-bounds"; bounds: WorldRect; screen?: WorldPoint; zoom?: number; padding?: WorldPoint; minZoom?: number; maxZoom?: number }
   | { kind: "set-camera"; camera: CameraState }
-  // CC1.4: active tool toggle (Select/Hand). tool is camelCase ActiveTool.
   | { kind: "set-tool"; tool: "select" | "hand" }
-  // Transient multi-select highlight set (marquee / shift-click). Empty clears it;
-  // the persisted single-anchor selection is untouched.
+  // Empty clears the transient multi-select highlight; the persisted single-anchor selection is untouched.
   | { kind: "set-multi-select"; ids: string[] }
-  // CC4.1: right-click pick — populates result.hit without mutating selection.
+  // Right-click pick — populates result.hit without mutating selection.
   | { kind: "context-pick"; screen: WorldPoint };
 
 
-// W2-04: a cumulative object transform delta. `matrix` is a ROW-MAJOR world-space
-// delta to PRE-MULTIPLY onto the object's existing transform (newWorld = matrix *
-// objTransform); it is cumulative from the fixed pointer-down anchor (not per-move).
-// `kind` names the gesture. The shell composes it non-destructively for preview and
-// authors one undoable op on pointer-up (W2-05); W2-11 pushes the composed matrix as
-// the per-object instance matrix.
+// Cumulative object transform delta. `matrix` is a ROW-MAJOR world-space delta to
+// PRE-MULTIPLY onto the object's existing transform (newWorld = matrix * objTransform);
+// cumulative from the fixed pointer-down anchor, not per-move.
 export type RustObjectTransformDelta = {
   id: string;
   matrix: RenderTransform3x3;
   kind: "translate" | "resize" | "rotate";
 };
 
-// v3 §2b: a live endpoint-drag sample for an OPEN-CLASS selection. `nodeIndex` is
-// the dragged endpoint in geometry PAIR space (0 | last — the same space anchors
-// and scene-core `endpoint_release_ops` address); (x, y) is the cumulative pointer
-// WORLD position. The shell live-previews via `setObjectEndpointPreview` and
-// commits one undoable batch on release (`endpoint_release_ops`, rebind/unbind).
+// Live endpoint-drag sample for an OPEN-CLASS selection. `nodeIndex` is the dragged
+// endpoint in geometry PAIR space (0 | last, the space anchors and scene-core
+// `endpoint_release_ops` address); (x, y) is the cumulative pointer WORLD position.
 export type RustObjectEndpointDelta = {
   id: string;
   nodeIndex: number;
@@ -115,25 +97,18 @@ export type RustObjectEndpointDelta = {
 
 export type RustInputBatchResult = {
   camera: CameraState;
-  // FC-07: object-path input results, optional/non-null only when an object scene
-  // is loaded and the matching event occurred.
+  // Object-path results: non-null only when an object scene is loaded and the matching event occurred.
   objectSelection?: string | null;
   objectTransformDelta?: RustObjectTransformDelta | null;
-  // v3 §2b: non-null only on a move during an endpoint drag (open-class
-  // selection). Optional so a wasm build predating it still typechecks.
   objectEndpointDelta?: RustObjectEndpointDelta | null;
   objectMarqueeIds?: string[] | null;
-  // RA2b: a double-click that landed on an object. null (or absent) when the
-  // double-click missed every object; `hasChildren` lets the shell drill into a
-  // container vs. edit a leaf. Optional so a wasm build predating it still typechecks.
+  // Double-click that landed on an object; null/absent on a miss. `hasChildren` lets the shell drill in vs edit a leaf.
   objectDoubleClick?: { id: string; hasChildren: boolean } | null;
-  // W2-02: hover affordance the shell maps to a cursor. Optional so a wasm build /
-  // test mock predating the field still typechecks; defaults to "empty".
+  // Hover affordance the shell maps to a cursor; defaults to "empty".
   hoverAffordance?: HoverAffordance;
 };
 
-// W2-02: stable hover-affordance wire strings (mirror the Rust enum). The shell
-// maps each to a cursor (W2-03).
+// Stable hover-affordance wire strings (mirror the Rust enum).
 export type HoverAffordance =
   | "empty"
   | "body"
@@ -180,49 +155,33 @@ export type RustCreateWebGpuRenderer = (
 export type RustWebGpuRenderer = {
   resize(width: number, height: number, devicePixelRatio: number): void;
   renderFrame(): RustWebGpuFrameStats;
-  // OB-4 object draw path. `loadObjectScene` builds + uploads the object geometry
-  // for a `RenderObjectScene` JSON and returns `{ objects, fillIndices,
-  // strokeVertices }`; `drawObjects` records the live object GPU pass. Optional so
-  // a wasm build (or test mock) predating these methods still satisfies the type;
-  // the host feature-detects before calling.
+  // Object draw path: `loadObjectScene` builds + uploads geometry for a `RenderObjectScene`
+  // JSON; `drawObjects` records the live GPU pass. Methods are optional + feature-detected
+  // here and below so a wasm build (or test mock) predating an export still satisfies the type.
   loadObjectScene?(sceneJson: string): { objects: number; fillIndices: number; strokeVertices: number };
   drawObjects?(): void;
-  // W2-11: drag zero-rebake. `setObjectPreviewTransform` pushes ONLY the dragged
-  // object's instance model matrix (a row-major [[f64;3];3] cumulative world DELTA,
-  // JSON) to the GPU with no re-tessellation; `clearObjectPreview` reverts it to the
-  // canonical baked transform. Optional so a wasm build predating these stays valid;
-  // the host feature-detects before calling.
+  // Drag zero-rebake: `setObjectPreviewTransform` pushes ONLY the dragged object's instance
+  // matrix (row-major [[f64;3];3] cumulative world DELTA, JSON) with no re-tessellation;
+  // `clearObjectPreview` reverts to the canonical baked transform.
   setObjectPreviewTransform?(id: string, matrixJson: string): void;
   clearObjectPreview?(id: string): void;
-  // v3 §2b endpoint drag: `setObjectEndpointPreview` chord-deforms ONE open-class
-  // object's geometry so its dragged endpoint (`nodeIndex`, pair space: 0 | last)
-  // lands on the live pointer WORLD position — the G14 single-object
-  // reexpand+patch path, scene-core `deform_open_path` math (same as the release
-  // commit). `clearObjectEndpointPreview` restores the canonical baked geometry.
-  // Optional so a wasm build predating these stays valid.
+  // Endpoint drag: chord-deforms ONE open-class object so its dragged endpoint (`nodeIndex`,
+  // pair space 0 | last) lands on the live pointer WORLD position (scene-core `deform_open_path`
+  // math, same as the release commit). `clearObjectEndpointPreview` restores the baked geometry.
   setObjectEndpointPreview?(id: string, nodeIndex: number, worldX: number, worldY: number): void;
   clearObjectEndpointPreview?(id: string): void;
   inputBatch(eventsJson: string): RustInputBatchResult;
-  // CC1.4: optional so a wasm build (or test mock) predating it still satisfies the
-  // type; the engine feature-detects before calling. setTool sets the active pointer
-  // tool ("select" | "hand"; unknown ignored).
+  // Sets the active pointer tool ("select" | "hand"; unknown ignored).
   setTool?(tool: string): void;
-  // FC-08: pure object pick for the right-click context menu — returns the id of
-  // the top-most object under the screen point (no mutation). Optional so a wasm
-  // build predating it is treated as "no object" by the engine.
+  // Pure object pick for the right-click context menu — top-most object id under the screen point, no mutation.
   hitTestObject?(screenX: number, screenY: number): string | null;
-  // RA3/EN1: pure swept erase pick — every object crossed by the eraser between two
-  // consecutive SCREEN samples (prev -> curr), top-down order, so a fast drag erases
-  // the whole swept path. No selection/camera/drag mutation. Optional so a wasm build
-  // predating it falls back to the single-sample `hitTestObject` in the engine.
+  // Pure swept erase pick — every object crossed between two consecutive SCREEN samples (prev -> curr),
+  // top-down, so a fast drag erases the whole swept path; falls back to single-sample `hitTestObject` when absent.
   sweptEraseAt?(prevX: number, prevY: number, currX: number, currY: number): string[];
-  // W2-06: nearest point on any object outline to a WORLD query point, for shape
-  // drag-create anchor snapping (W2-07 consumes this). `tolPx` is a screen-pixel
-  // radius converted to world via `zoom` internally; the inputs are WORLD coords
-  // (not screen). `excludeIdsJson` is a JSON array of region ids to skip (W3-G6 #6:
-  // the transient create-preview / snap-indicator, which ride the feed and would
-  // otherwise self-snap under the cursor). Optional + feature-detected, same pattern
-  // as hitTestObject.
+  // Nearest point on any object outline to a WORLD query point, for drag-create anchor snapping.
+  // `tolPx` is a screen-pixel radius converted to world via `zoom` internally; inputs are WORLD coords.
+  // `excludeIdsJson` is a JSON array of region ids to skip (the transient create-preview/snap-indicator,
+  // which ride the feed and would otherwise self-snap under the cursor).
   nearestOutlinePoint?(
     worldX: number,
     worldY: number,
@@ -230,12 +189,9 @@ export type RustWebGpuRenderer = {
     zoom: number,
     excludeIdsJson: string
   ): { snapped: boolean; x: number; y: number; targetId: string | null };
-  // Replace the transient multi-select highlight set (JSON array of ids). Optional
-  // so a wasm build predating it is treated as a no-op by the engine.
+  // Replace the transient multi-select highlight set (JSON array of ids).
   setMultiSelect?(idsJson: string): void;
-  // AP4/RB1 theme-bit: flip the renderer to dark/light. Re-resolves token-backed
-  // instance colors and writes ONLY the color slot (zero rebake). Optional so a
-  // wasm build predating the export stays valid; the shell feature-detects.
+  // Theme-bit: flip the renderer dark/light. Re-resolves token-backed instance colors and writes ONLY the color slot (zero rebake).
   setObjectTheme?(dark: boolean): void;
 };
 

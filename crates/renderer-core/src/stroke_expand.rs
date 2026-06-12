@@ -1,48 +1,32 @@
-//! CPU stroke expansion reference (OB3.R2, D2/D4/D10).
+//! CPU stroke expansion reference: turns a polyline into a filled triangle ribbon
+//! of a given width. The GPU vertex-shader expansion is the fast path; this is the
+//! CPU reference/fallback the test gate checks.
 //!
-//! Turns a polyline into a filled triangle ribbon of a given width so a stroked
-//! contour can be drawn as ordinary geometry. The GPU vertex-shader expansion
-//! (a separate WGSL deliverable) is the fast path; this module is the CPU
-//! reference / fallback that the renderer uses for complex joins/caps and that
-//! the test gate checks for correctness.
-//!
-//! This is a pure-CPU, host-neutral module: it reads only points and style and
-//! returns plain data (no `JsValue`, no device, no I/O). It is pointer-width
-//! agnostic — no `usize` appears in any returned data field; indices are `u32`
-//! to match the live pipeline's index type.
-//!
-//! Conventions mirror the rest of the renderer core:
-//! - Coordinates are CSS pixels as `f32`. Quantized object-local `i32` geometry
-//!   is converted to px by `/ 8.0` before reaching this module (D2).
-//! - `width` is the full stroke width; the ribbon extends `± width / 2` from the
-//!   centerline. Per-node width (D2/D4) overrides the global width at that node
-//!   when supplied.
+//! Coordinates are CSS pixels as `f32` (quantized object-local i32 is `/ 8.0` before
+//! reaching this module). `width` is the full stroke width; the ribbon extends
+//! `± width / 2` from the centerline, with per-node width overriding when supplied.
+//! Pointer-width-agnostic: indices are `u32`.
 
-/// Line-cap style for the open ends of a stroke (D4). Ignored on closed paths,
-/// which have no free ends.
+/// Line-cap style for the open ends of a stroke; ignored on closed paths.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cap {
-    /// End is flush with the last node; no extension.
     Butt,
-    /// End is extended by `width / 2` past the last node, squared off.
+    /// Extended by `width / 2` past the last node, squared off.
     Square,
-    /// End is rounded with a semicircular fan of [`ROUND_CAP_SEGMENTS`] segments.
+    /// Rounded with a semicircular fan of [`ROUND_CAP_SEGMENTS`] segments.
     Round,
 }
 
-/// Line-join style between two segments at an interior node (D4).
+/// Line-join style between two segments at an interior node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Join {
-    /// Extend the two outer edges until they meet at a point. Falls back to a
-    /// bevel when the join is sharper than [`MITER_LIMIT`] (the spike would run
-    /// away to infinity at a cusp).
+    /// Extend the outer edges until they meet; falls back to a bevel when sharper
+    /// than [`MITER_LIMIT`] (the spike runs away to infinity at a cusp).
     Miter,
-    /// Cut the corner with a single straight edge across the two offset points.
     Bevel,
 }
 
-/// A triangle mesh: a flat vertex list and a triangle-list index buffer, the
-/// same shape the live pipeline feeds the GPU.
+/// A triangle mesh, the same shape the live pipeline feeds the GPU.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Mesh {
     pub vertices: Vec<[f32; 2]>,
@@ -57,9 +41,8 @@ impl Mesh {
         }
     }
 
-    /// Push a vertex, returning its index. The index fits in `u32` for any mesh
-    /// the renderer realistically builds; we convert through `u32::try_from` so
-    /// a pathological overflow panics here rather than silently wrapping.
+    /// Push a vertex via `u32::try_from` so a pathological overflow panics here
+    /// rather than silently wrapping.
     fn push_vertex(&mut self, v: [f32; 2]) -> u32 {
         let idx = u32::try_from(self.vertices.len())
             .expect("stroke mesh vertex count exceeds u32");
@@ -67,48 +50,35 @@ impl Mesh {
         idx
     }
 
-    /// Push a triangle by three existing vertex indices (CCW order is not
-    /// enforced; the live pipeline does not cull stroke geometry).
+    /// Winding order is not enforced; the live pipeline does not cull stroke geometry.
     fn push_tri(&mut self, a: u32, b: u32, c: u32) {
         self.indices.push(a);
         self.indices.push(b);
         self.indices.push(c);
     }
 
-    /// Push a quad as two triangles from four existing vertex indices, wound
-    /// `a, b, c` then `a, c, d` (a fan around `a`).
+    /// Two triangles wound `a, b, c` then `a, c, d` (a fan around `a`).
     fn push_quad(&mut self, a: u32, b: u32, c: u32, d: u32) {
         self.push_tri(a, b, c);
         self.push_tri(a, c, d);
     }
 }
 
-/// Segments in the semicircular fan used to approximate a round cap. Eight
-/// segments over the half-circle keeps the cap visibly round at typical zoom
-/// while staying cheap; the GPU path can pick a zoom-driven count later.
+/// Segments in the semicircular fan approximating a round cap.
 pub const ROUND_CAP_SEGMENTS: u32 = 8;
 
-/// Miter ratio ceiling (miter length / stroke width). Above this the miter
+/// Miter ratio ceiling (miter length / stroke width); above this the miter
 /// degenerates to a bevel. `4.0` matches the SVG/Canvas default `stroke-miterlimit`.
 pub const MITER_LIMIT: f32 = 4.0;
 
-/// Below this segment length (in px) a segment is treated as degenerate and its
-/// direction is undefined, so it is skipped when building the centerline.
+/// Below this segment length (px) direction is undefined, so the segment is skipped.
 const MIN_SEGMENT_LEN: f32 = 1.0e-6;
 
-/// Expand a polyline `points` into a filled triangle ribbon of the given
-/// `width`, honoring per-node width, joins, and caps (D2/D4).
-///
-/// `closed` joins the last node back to the first and suppresses end caps.
-/// `per_node_width`, when `Some`, overrides `width` at each node and must have
-/// the same length as `points`; the half-width used along a segment is the mean
-/// of its two endpoints' half-widths so width varies smoothly (D2 width slot,
-/// future pen pressure).
-///
-/// The ribbon is built segment-by-segment as offset quads, with join geometry
-/// (miter/bevel) filling the wedge at interior nodes and cap geometry
-/// (butt/square/round) closing the open ends. Degenerate inputs (fewer than two
-/// distinct points, non-positive width) yield an empty mesh.
+/// Expand `points` into a filled triangle ribbon of `width`, honoring per-node
+/// width, joins, and caps. `closed` wraps the last node to the first and suppresses
+/// end caps. `per_node_width`, when `Some`, must match `points` length; the
+/// half-width along a segment is the mean of its endpoints' half-widths. Degenerate
+/// inputs (< 2 distinct points, non-positive width) yield an empty mesh.
 pub fn expand_stroke(
     points: &[(f32, f32)],
     closed: bool,
@@ -138,7 +108,6 @@ pub fn expand_stroke(
         }
     };
 
-    // Per-segment unit direction and unit left-normal. With N nodes there are
     // N-1 open segments, or N closed segments (the wrap-around included).
     let seg_count = if closed { pts.len() } else { pts.len() - 1 };
     let mut dirs: Vec<[f32; 2]> = Vec::with_capacity(seg_count);
@@ -154,7 +123,6 @@ pub fn expand_stroke(
         normals.push([-uy, ux]);
     }
 
-    // Ribbon quad for each segment, offset by the half-width at each endpoint.
     for s in 0..seg_count {
         let i0 = s;
         let i1 = (s + 1) % pts.len();
@@ -168,19 +136,16 @@ pub fn expand_stroke(
         let a_right = mesh.push_vertex([ax - n[0] * h0, ay - n[1] * h0]);
         let b_left = mesh.push_vertex([bx + n[0] * h1, by + n[1] * h1]);
         let b_right = mesh.push_vertex([bx - n[0] * h1, by - n[1] * h1]);
-        // Wind around the quad: a_left -> b_left -> b_right -> a_right.
         mesh.push_quad(a_left, b_left, b_right, a_right);
     }
 
-    // Joins at interior nodes. For a closed path every node is interior
-    // (including the wrap node 0). For an open path nodes 1..=N-2 are interior.
+    // Closed: every node is interior (including wrap node 0). Open: nodes 1..=N-2.
     let join_nodes: Vec<usize> = if closed {
         (0..pts.len()).collect()
     } else {
         (1..pts.len() - 1).collect()
     };
     for &node in &join_nodes {
-        // Segment arriving at `node` and segment leaving `node`.
         let incoming = (node + seg_count - 1) % seg_count;
         let outgoing = node % seg_count;
         let (px, py) = pts[node].point;
@@ -225,15 +190,14 @@ pub fn expand_stroke(
     mesh
 }
 
-/// A surviving point after coincident-run collapse, carrying its index in the
+/// A surviving point after coincident-run collapse; `orig` is its index in the
 /// caller's original `points` so per-node width still maps correctly.
 struct DedupPoint {
     point: (f32, f32),
     orig: usize,
 }
 
-/// Drop points that coincide with their predecessor (within [`MIN_SEGMENT_LEN`]),
-/// since a zero-length segment has no defined direction.
+/// Drop points coinciding with their predecessor (within [`MIN_SEGMENT_LEN`]).
 fn dedup_points(points: &[(f32, f32)]) -> Vec<DedupPoint> {
     let mut out: Vec<DedupPoint> = Vec::with_capacity(points.len());
     for (orig, &(x, y)) in points.iter().enumerate() {
@@ -263,20 +227,16 @@ fn add_join(
     d_out: [f32; 2],
     join: Join,
 ) {
-    // Cross product of incoming and outgoing direction: sign tells turn handedness.
+    // Cross of incoming/outgoing direction: sign tells turn handedness.
     let cross = d_in[0] * d_out[1] - d_in[1] * d_out[0];
     if cross.abs() < MIN_SEGMENT_LEN {
-        // Collinear (straight or 180° reversal): the offset quads already abut,
-        // nothing to fill.
+        // Collinear: the offset quads already abut, nothing to fill.
         return;
     }
     let (cx, cy) = center;
-    // The outer side is opposite the turn. For a left turn (cross > 0) the
-    // outer corner is on the right (negative normal direction); for a right
-    // turn it is on the left (positive normal direction).
+    // Outer side is opposite the turn (left turn -> right outer corner).
     let side = if cross > 0.0 { -1.0 } else { 1.0 };
 
-    // Outer offset points: end of incoming segment and start of outgoing segment.
     let p_in = [cx + n_in[0] * half * side, cy + n_in[1] * half * side];
     let p_out = [cx + n_out[0] * half * side, cy + n_out[1] * half * side];
 
@@ -289,43 +249,38 @@ fn add_join(
             mesh.push_tri(c, a, b);
         }
         Join::Miter => {
-            // Miter apex: intersection of the two outer offset edges. The apex
-            // lies along the bisector of the two outer normals at distance
-            // half / cos(theta/2). Compute via the normalized normal sum.
+            // Miter apex lies along the bisector of the outer normals at distance
+            // half / cos(theta/2).
             let mut bisx = n_in[0] * side + n_out[0] * side;
             let mut bisy = n_in[1] * side + n_out[1] * side;
             let bis_len = (bisx * bisx + bisy * bisy).sqrt();
             if bis_len < MIN_SEGMENT_LEN {
-                // Normals oppose (≈180° turn) — no finite miter; bevel it.
+                // Normals oppose (≈180° turn): no finite miter; bevel it.
                 mesh.push_tri(c, a, b);
                 return;
             }
             bisx /= bis_len;
             bisy /= bis_len;
-            // cos(theta/2) = dot(outer_normal, bisector). Guard against zero.
+            // cos(theta/2) = dot(outer_normal, bisector); guard against zero.
             let cos_half = n_in[0] * side * bisx + n_in[1] * side * bisy;
             if cos_half.abs() < MIN_SEGMENT_LEN {
                 mesh.push_tri(c, a, b);
                 return;
             }
             let miter_len = half / cos_half;
-            // Miter ratio is miter length over stroke width (= 2 * half).
             if (miter_len / (half * 2.0)).abs() > MITER_LIMIT {
                 // Spike too long: clip to a bevel.
                 mesh.push_tri(c, a, b);
                 return;
             }
             let apex = mesh.push_vertex([cx + bisx * miter_len, cy + bisy * miter_len]);
-            // Two triangles: center-in-apex and center-apex-out.
             mesh.push_tri(c, a, apex);
             mesh.push_tri(c, apex, b);
         }
     }
 }
 
-/// Close a free end with a cap. `center` is the end node, `normal` the
-/// left-normal of the end segment, `out_dir` the outward direction past the end
-/// (away from the body of the stroke).
+/// Close a free end with a cap. `out_dir` is the outward direction past the end.
 fn add_cap(
     mesh: &mut Mesh,
     center: (f32, f32),
@@ -341,7 +296,6 @@ fn add_cap(
     match cap {
         Cap::Butt => {} // Flush end; the ribbon already ends here.
         Cap::Square => {
-            // Extend both edge points outward by `half`, forming a square cap.
             let ext_left = [left[0] + out_dir[0] * half, left[1] + out_dir[1] * half];
             let ext_right = [right[0] + out_dir[0] * half, right[1] + out_dir[1] * half];
             let l = mesh.push_vertex(left);
@@ -351,14 +305,10 @@ fn add_cap(
             mesh.push_quad(l, el, er, r);
         }
         Cap::Round => {
-            // Semicircular fan from the center spanning `left` -> `right` the
-            // long way around (through the outward direction).
             let c = mesh.push_vertex([cx, cy]);
             let start = (normal[1].atan2(normal[0])) as f64;
-            // Sweep 180° so the fan's midpoint points along `out_dir` (outward).
-            // `normal` and `out_dir` are perpendicular; rotating `normal` toward
-            // `out_dir` is CCW (+) when their cross product is positive, CW (-)
-            // otherwise, which fixes the half-circle's sense.
+            // Sweep 180° so the fan's midpoint points along `out_dir`. The cross sign
+            // fixes the half-circle's sense (CCW when positive).
             let cross = normal[0] * out_dir[1] - normal[1] * out_dir[0];
             let sweep = if cross >= 0.0 {
                 std::f64::consts::PI
@@ -382,15 +332,9 @@ fn add_cap(
     }
 }
 
-/// Split a polyline into the "on" subpaths of a dash pattern (D4). `dash`
-/// lengths are in px and alternate on, off, on, off…; the pattern repeats. An
-/// empty pattern (or all-zero) yields a single subpath equal to the whole
-/// polyline (solid stroke).
-///
-/// Each returned subpath is a polyline of two or more points, sampled along the
-/// original line so a dash that starts or ends mid-segment lands at the exact
-/// fractional position. Zero-length input or fewer than two points yields no
-/// subpaths.
+/// Split a polyline into the "on" subpaths of a dash pattern. `dash` lengths are in
+/// px and alternate on/off, repeating; an empty/all-zero pattern yields one subpath
+/// (the whole polyline). Dashes are sampled so mid-segment boundaries land exactly.
 pub fn dash_segments(points: &[(f32, f32)], dash: &[f32]) -> Vec<Vec<(f32, f32)>> {
     if points.len() < 2 {
         return Vec::new();
@@ -404,8 +348,6 @@ pub fn dash_segments(points: &[(f32, f32)], dash: &[f32]) -> Vec<Vec<(f32, f32)>
     let mut out: Vec<Vec<(f32, f32)>> = Vec::new();
     let mut current: Vec<(f32, f32)> = Vec::new();
 
-    // Dash phase state: index into the pattern, remaining length in the current
-    // on/off span, and whether that span is "on".
     let mut dash_idx = 0usize;
     let mut remaining = dash[0];
     // Advance past any leading zero-length spans so `remaining > 0`.
@@ -431,14 +373,12 @@ pub fn dash_segments(points: &[(f32, f32)], dash: &[f32]) -> Vec<Vec<(f32, f32)>
         let mut walked = 0.0f32; // distance consumed within this segment
 
         while seg_len - walked > remaining {
-            // A dash boundary falls inside this segment.
             walked += remaining;
             let bx_ = ax + ux * walked;
             let by_ = ay + uy * walked;
 
-            // Advance to the next non-zero-length span. Zero-length spans flip
-            // the on/off state without consuming distance, so collapse the run
-            // and compute the *net* drawing state at the boundary.
+            // Collapse zero-length spans (they flip on/off without consuming
+            // distance) and take the net drawing state at the boundary.
             let was_drawing = drawing;
             loop {
                 drawing = !drawing;
@@ -450,34 +390,28 @@ pub fn dash_segments(points: &[(f32, f32)], dash: &[f32]) -> Vec<Vec<(f32, f32)>
             }
 
             if drawing == was_drawing {
-                // A zero-length span flipped us straight back to the same
-                // state; the run continues unbroken, so emit no boundary.
+                // Flipped back to the same state: the run continues unbroken.
                 continue;
             }
             if was_drawing {
-                // End of an on-span: close the current subpath at the boundary.
                 current.push((bx_, by_));
                 out.push(std::mem::take(&mut current));
             } else {
-                // Start of an on-span: begin a new subpath at the boundary.
                 current.push((bx_, by_));
             }
         }
 
-        // Consume the rest of the segment without crossing a boundary.
         remaining -= seg_len - walked;
         if drawing {
             current.push((bx, by));
         }
     }
 
-    // Flush a trailing on-span that ran to the polyline's end.
     if drawing && current.len() >= 2 {
         out.push(current);
     }
 
-    // A boundary landing exactly on the final point can leave a 1-point stub;
-    // drop any subpath that is not a real polyline.
+    // A boundary on the final point can leave a 1-point stub; drop non-polylines.
     out.retain(|sub| sub.len() >= 2);
     out
 }
@@ -501,8 +435,6 @@ mod tests {
 
     #[test]
     fn horizontal_segment_is_a_quad() {
-        // The required acceptance case: a single horizontal segment of width 2
-        // expands to one quad — 4 vertices, 6 indices — spanning ±1 in y.
         let mesh = expand_stroke(
             &[(0.0, 0.0), (10.0, 0.0)],
             false,
@@ -514,7 +446,6 @@ mod tests {
         assert_eq!(mesh.vertices.len(), 4, "one ribbon quad = 4 verts");
         assert_eq!(mesh.indices.len(), 6, "one quad = two triangles");
 
-        // y extents are ±1 (half of width 2); x extents are the segment ends.
         let ys: Vec<f32> = mesh.vertices.iter().map(|v| v[1]).collect();
         let xs: Vec<f32> = mesh.vertices.iter().map(|v| v[0]).collect();
         let max_y = ys.iter().cloned().fold(f32::MIN, f32::max);
@@ -527,11 +458,9 @@ mod tests {
 
     #[test]
     fn dash_4_4_over_length_16_yields_two_on_segments() {
-        // The required acceptance case: dash [4,4] over a length-16 line gives
-        // on-spans [0,4] and [8,12] — two subpaths.
+        // dash [4,4] over length 16: on-spans [0,4] and [8,12].
         let subs = dash_segments(&[(0.0, 0.0), (16.0, 0.0)], &[4.0, 4.0]);
         assert_eq!(subs.len(), 2, "two on-dashes over length 16");
-        // First on-span [0,4], second [8,12].
         assert!(approx(subs[0][0].0, 0.0) && approx(subs[0].last().unwrap().0, 4.0));
         assert!(approx(subs[1][0].0, 8.0) && approx(subs[1].last().unwrap().0, 12.0));
     }
@@ -546,26 +475,20 @@ mod tests {
 
     #[test]
     fn dash_crosses_vertex_correctly() {
-        // L-shaped polyline, total length 8 (two legs of 4), dash [2,2].
-        // On-spans: [0,2] within first leg, [4,6] straddling the corner,
-        // [8,...] would start exactly at the end so there is none.
+        // L-shape (two legs of 4), dash [2,2]: on-spans [0,2] and [4,6] (corner-straddling).
         let line = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)];
         let subs = dash_segments(&line, &[2.0, 2.0]);
         assert_eq!(subs.len(), 2, "on at [0,2] and [4,6]");
-        // Second span straddles the corner (4,0): it must include the corner.
         let second = &subs[1];
         assert!(
             second.iter().any(|p| approx(p.0, 4.0) && approx(p.1, 0.0)),
             "on-span crossing the corner includes the vertex {second:?}"
         );
-        // Its total length is the dash length 2.
         assert!(approx(polyline_length(second), 2.0));
     }
 
     #[test]
     fn dash_starts_on_at_origin() {
-        // Pattern [on=3, off=3] over length 12: on[0,3], off[3,6], on[6,9],
-        // off[9,12]. First span is on, anchored at the origin.
         let subs = dash_segments(&[(0.0, 0.0), (12.0, 0.0)], &[3.0, 3.0]);
         assert_eq!(subs.len(), 2);
         assert!(approx(subs[0][0].0, 0.0) && approx(subs[0].last().unwrap().0, 3.0));
@@ -574,11 +497,8 @@ mod tests {
 
     #[test]
     fn dash_skips_zero_length_spans() {
-        // A zero-length span must not emit a boundary that splits a continuous
-        // run. Pattern [4, 0, 4]: the middle 0-length gap collapses the first
-        // two on-spans into one continuous dash, so [0,4]+[4,8] merge to [0,8].
-        // (Odd-length patterns alternate roles each period; here the rest of the
-        // line lands "off", matching SVG dash semantics.)
+        // Pattern [4, 0, 4]: the middle 0-length gap merges [0,4]+[4,8] into [0,8],
+        // matching SVG dash semantics.
         let subs = dash_segments(&[(0.0, 0.0), (16.0, 0.0)], &[4.0, 0.0, 4.0]);
         assert_eq!(subs.len(), 1, "the zero gap merges two dashes into one");
         assert!(
@@ -610,7 +530,6 @@ mod tests {
 
     #[test]
     fn coincident_points_are_collapsed() {
-        // Duplicate start should not produce a zero-length first segment.
         let mesh = expand_stroke(
             &[(0.0, 0.0), (0.0, 0.0), (10.0, 0.0)],
             false,
@@ -619,7 +538,7 @@ mod tests {
             Cap::Butt,
             Join::Miter,
         );
-        // Still just one real segment -> one quad.
+        // One real segment -> one quad.
         assert_eq!(mesh.vertices.len(), 4);
     }
 
@@ -644,7 +563,6 @@ mod tests {
         // Two extra cap quads (4 verts + 6 idx each) over the butt ribbon.
         assert_eq!(square.vertices.len(), butt.vertices.len() + 8);
         assert_eq!(square.indices.len(), butt.indices.len() + 12);
-        // The square cap pushes geometry past the segment ends to ∓1 / +11.
         let xs: Vec<f32> = square.vertices.iter().map(|v| v[0]).collect();
         let max_x = xs.iter().cloned().fold(f32::MIN, f32::max);
         let min_x = xs.iter().cloned().fold(f32::MAX, f32::min);
@@ -686,7 +604,6 @@ mod tests {
 
     #[test]
     fn miter_join_adds_apex_on_right_angle() {
-        // 90° corner: a miter should add an apex vertex past the corner.
         let bevel = expand_stroke(
             &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)],
             false,
@@ -714,8 +631,6 @@ mod tests {
 
     #[test]
     fn miter_falls_back_to_bevel_on_sharp_cusp() {
-        // A near-spike (very acute angle) exceeds the miter limit and must
-        // produce bevel geometry (no apex vertex), matching a bevel join.
         let spike = [(0.0, 0.0), (10.0, 0.0), (0.0, 0.2)];
         let miter = expand_stroke(&spike, false, 2.0, None, Cap::Butt, Join::Miter);
         let bevel = expand_stroke(&spike, false, 2.0, None, Cap::Butt, Join::Bevel);
@@ -729,7 +644,6 @@ mod tests {
 
     #[test]
     fn closed_path_joins_every_node() {
-        // A triangle (closed) has 3 nodes, 3 segments, 3 joins, no caps.
         let tri = [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)];
         let mesh = expand_stroke(&tri, true, 2.0, None, Cap::Butt, Join::Bevel);
         // 3 ribbon quads (12 verts, 18 idx) + 3 bevel joins (3 verts, 3 idx each).
@@ -739,7 +653,7 @@ mod tests {
 
     #[test]
     fn per_node_width_overrides_global() {
-        // Two-node line: node 0 width 4 (half 2), node 1 width 2 (half 1).
+        // node 0 width 4 (half 2), node 1 width 2 (half 1).
         let mesh = expand_stroke(
             &[(0.0, 0.0), (10.0, 0.0)],
             false,
@@ -748,7 +662,6 @@ mod tests {
             Cap::Butt,
             Join::Miter,
         );
-        // Start half-width 2 -> y at ±2; end half-width 1 -> y at ±1.
         let start_ys: Vec<f32> = mesh
             .vertices
             .iter()
@@ -769,8 +682,7 @@ mod tests {
 
     #[test]
     fn dash_pattern_repeats_across_long_line() {
-        // dash [2,2] over length 20: on-spans at [0,2],[4,6],[8,10],[12,14],
-        // [16,18] = 5 dashes.
+        // dash [2,2] over length 20: 5 on-spans.
         let subs = dash_segments(&[(0.0, 0.0), (20.0, 0.0)], &[2.0, 2.0]);
         assert_eq!(subs.len(), 5);
         for (i, sub) in subs.iter().enumerate() {

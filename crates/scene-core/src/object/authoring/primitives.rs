@@ -1,23 +1,13 @@
-//! Tier-3 — primitive geometry construction + recolor (ported from the shell).
+//! Primitive geometry construction + recolor: a path-string `d` + inline style +
+//! a pure-translation transform placing the object at a world anchor.
 //!
-//! The shell composes a basic primitive (rectangle/ellipse/line/text/frame) into
-//! an [`Object`] the core validates and applies via an `insert-object`
-//! [`ObjectOp`]. This module owns that geometry-vocabulary construction (a
-//! path-string `d` + inline style + a pure-translation transform placing the
-//! object at a world anchor) — the SAME logic that used to live in the shell's
-//! `objectPrimitives.ts`, moved into the core so the web client builds primitives
-//! with the same Rust the server links (P1). It mirrors the structure of
-//! [`crate::object::templates`]: a per-kind default spec, a builder that places the spec
-//! at an anchor (or sizes it to a drag span), and caller-supplied id/order.
+//! Geometry is object-local quantized i32 at [`GEOMETRY_QUANTUM_PER_PX`]
+//! (8 units/px), authored from (0,0); the world placement rides the `transform`
+//! translate so a later move is matrix-only.
 //!
-//! Geometry convention (D2): each object's geometry is object-local quantized i32
-//! at [`GEOMETRY_QUANTUM_PER_PX`] (8 units/px), authored from (0,0); the world
-//! placement rides the `transform` translate so a later move is matrix-only (P4).
-//!
-//! Byte-preservation: the emitted path-string `d` must match the shell's previous
-//! output exactly (locked by tests), so the cutover changes nothing visually and
-//! no golden vector embedding a primitive needs re-locking. The quantization uses
-//! JS `Math.round` semantics (`floor(x + 0.5)`) to match the TS it replaces.
+//! Byte-preservation: the emitted path-string must match the prior TS output
+//! exactly (locked by tests). Quantization uses JS `Math.round` semantics
+//! (`floor(x + 0.5)`) to match that TS.
 
 use core::fmt::Write as _;
 
@@ -27,7 +17,6 @@ use crate::object::model::{
 };
 use crate::object::op::{FieldEdit, ObjectOp};
 
-/// The primitive kinds the toolbar can author (mirrors the shell `PrimitiveKindId`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrimitiveKind {
     Rectangle,
@@ -38,7 +27,6 @@ pub enum PrimitiveKind {
 }
 
 impl PrimitiveKind {
-    /// Parse the shell's lowercase kind string, or `None` if unknown.
     pub fn from_str(s: &str) -> Option<PrimitiveKind> {
         match s {
             "rectangle" => Some(PrimitiveKind::Rectangle),
@@ -51,12 +39,9 @@ impl PrimitiveKind {
     }
 }
 
-/// The sentinel a user color carries when "Theme default" is picked. It is NOT a
-/// CSS hex — [`paint_for_color`] maps it to a [`Paint::Token`] `{ name: "text" }`
-/// so the authored object follows the theme (the renderer re-resolves the "text"
-/// token per theme, dark-ish in light / light-ish in dark). Every other color
-/// stays a solid hex. This is the single source of truth for the sentinel; the
-/// shell re-exports it so there is no second copy.
+/// The "Theme default" sentinel (not a CSS hex): [`paint_for_color`] maps it to a
+/// [`Paint::Token`] `{ name: "text" }` so the object follows the theme. The single
+/// source of truth; the shell re-exports it.
 pub const THEME_DEFAULT_COLOR: &str = "token:text";
 
 /// Map a toolbar color to its [`Paint`]: the theme-default sentinel resolves to a
@@ -70,9 +55,7 @@ pub fn paint_for_color(color: &str) -> Paint {
 }
 
 /// Quantize logical px to object-local integer units with JS `Math.round`
-/// semantics (round half toward +∞), matching the TS this replaces exactly.
-/// `floor(x + 0.5)` reproduces `Math.round` for every finite value, including the
-/// negative half-integers a diagonal line drag can produce.
+/// semantics (`floor(x + 0.5)`, round half toward +∞) to match the TS exactly.
 fn q(px: f64) -> i32 {
     if px.is_nan() {
         return 0;
@@ -87,18 +70,14 @@ fn q(px: f64) -> i32 {
     q
 }
 
-// ---------------------------------------------------------------------------
-// Path-string builders (object-local, quantized) — byte-match the prior TS.
-// ---------------------------------------------------------------------------
-
 /// A closed rectangle path-string of `w`×`h` logical px (object-local).
 fn rect_path(w: f64, h: f64) -> String {
     format!("M 0 0 L {} 0 L {} {} L 0 {} Z", q(w), q(w), q(h), q(h))
 }
 
 /// A closed ellipse path-string of `w`×`h` logical px via four cubic arcs (kappa
-/// 0.5523), matching the TS `ellipsePath` rounding (each value quantized then the
-/// kappa control offset rounded from the quantized radius).
+/// 0.5523). Each value quantized, then the kappa offset rounded from the quantized
+/// radius (matches the TS rounding).
 fn ellipse_path(w: f64, h: f64) -> String {
     let cx = q(w / 2.0);
     let cy = q(h / 2.0);
@@ -138,13 +117,8 @@ fn js_round(x: f64) -> i32 {
     v
 }
 
-// ---------------------------------------------------------------------------
-// Per-kind default spec.
-// ---------------------------------------------------------------------------
-
 /// The default geometry/style for a primitive kind: an object-local path-string,
-/// optional fill/stroke, and the logical-px size used to center the object on an
-/// anchor. Mirrors the TS `PrimitiveSpec` + `primitiveSpec` defaults.
+/// optional fill/stroke, and the logical-px size used to center on an anchor.
 struct PrimitiveSpec {
     d: String,
     fill: Option<Fill>,
@@ -158,8 +132,7 @@ fn solid_fill(hex: &str) -> Fill {
     Fill { paint: Paint::Solid { color: hex.to_string() }, opacity: 1.0 }
 }
 
-/// A solid stroke of `width_px` logical px (quantized), default round-less caps —
-/// the TS specs carried only paint + width, so cap/join/dash stay at their defaults.
+/// A solid stroke of `width_px` logical px (quantized); cap/join/dash stay default.
 fn solid_stroke(hex: &str, width_px: f64) -> Stroke {
     Stroke {
         paint: Paint::Solid { color: hex.to_string() },
@@ -194,9 +167,8 @@ fn primitive_spec(kind: PrimitiveKind) -> PrimitiveSpec {
             width: 200.0,
             height: 0.0,
         },
-        // The text primitive is a borderless, style-less rect — no border, no
-        // fill, no default text. Every object can hold text; the text "shape" is
-        // one with no border that enters inline edit immediately on create.
+        // The text primitive is a borderless, style-less rect that enters inline
+        // edit immediately on create.
         PrimitiveKind::Text => PrimitiveSpec {
             d: rect_path(180.0, 80.0),
             fill: None,
@@ -215,8 +187,7 @@ fn primitive_spec(kind: PrimitiveKind) -> PrimitiveSpec {
 }
 
 /// Override a spec's existing fill/stroke paint with the toolbar color (only the
-/// paint changes; width/opacity stay). An absent field stays absent (a line has
-/// no fill, the text primitive neither). `None` leaves the hardcoded defaults.
+/// paint changes). An absent field stays absent; `None` leaves the defaults.
 fn recolor_spec(mut spec: PrimitiveSpec, color: Option<&str>) -> PrimitiveSpec {
     if let Some(color) = color {
         let paint = paint_for_color(color);
@@ -230,14 +201,12 @@ fn recolor_spec(mut spec: PrimitiveSpec, color: Option<&str>) -> PrimitiveSpec {
     spec
 }
 
-/// Build an [`Object`] from a spec's `d`/style at `transform`, with `id`/`order`.
-/// `clip` is set for the frame primitive (D18). The geometry carries the spec's
-/// path-string (parsed so the object's runtime contours are populated) and the
-/// `nonZero` fill rule the shell authored.
+/// Build an [`Object`] from a spec's `d`/style at `transform`. `clip` is set for
+/// the frame primitive.
 fn object_from_spec(spec: PrimitiveSpec, id: &str, order: &str, transform: Transform3x3, clip: bool) -> Object {
     let mut geometry = Geometry { path_string: spec.d, fill_rule: FillRule::NonZero, subpaths: Vec::new() };
-    // Hydrate the runtime contours from the canonical path-string; the wire form
-    // (`d`) is untouched, so byte-output is exactly the authored string.
+    // Hydrate the runtime contours; the wire form (`d`) is untouched, so the
+    // byte-output is exactly the authored string.
     let _ = geometry.parse();
     let mut obj = Object::new(id.to_string(), order.to_string(), geometry);
     obj.transform = transform;
@@ -249,14 +218,9 @@ fn object_from_spec(spec: PrimitiveSpec, id: &str, order: &str, transform: Trans
     obj
 }
 
-// ---------------------------------------------------------------------------
-// Public builders.
-// ---------------------------------------------------------------------------
-
-/// Build the [`Object`] for a primitive `kind`, centered on the world anchor
-/// `(anchor_x, anchor_y)`, recolored to `color` (or the kind default when `color`
-/// is `None`). The geometry is object-local; the world position rides a
-/// pure-translation transform (D7) so a later move is matrix-only (P4).
+/// Build the [`Object`] for a primitive `kind`, centered on the world anchor,
+/// recolored to `color` (kind default when `None`). The world position rides a
+/// pure-translation transform.
 pub fn build_primitive(
     kind: PrimitiveKind,
     anchor_x: f64,
@@ -280,10 +244,9 @@ pub struct DragSpan {
     pub end_y: f64,
 }
 
-/// Build the [`Object`] for a primitive `kind` sized to a drag `span`, recolored
-/// to `color` (or the kind default when `None`). Closed primitives size to the
-/// normalized bbox; the open line runs corner-to-corner so a diagonal drag draws
-/// a diagonal. Geometry object-local; world position on a translate (P4).
+/// Build the [`Object`] for a primitive `kind` sized to a drag `span`. Closed
+/// primitives size to the normalized bbox; the open line runs corner-to-corner so
+/// a diagonal drag draws a diagonal.
 pub fn build_primitive_from_drag(
     kind: PrimitiveKind,
     span: DragSpan,
@@ -297,10 +260,9 @@ pub fn build_primitive_from_drag(
     object_from_spec(spec, id, order, Transform3x3::translate(tx, ty), kind == PrimitiveKind::Frame)
 }
 
-/// Object-local geometry + the world translation for a primitive sized to a drag.
-/// The line rides corner-to-corner (object-local from (0,0) to the end delta,
-/// translated at the start point); closed kinds size to the normalized bbox and
-/// translate to its min corner.
+/// Object-local geometry + world translation for a drag-sized primitive. The line
+/// rides corner-to-corner from the start point; closed kinds size to the
+/// normalized bbox and translate to its min corner.
 fn drag_geometry(kind: PrimitiveKind, span: DragSpan) -> (String, f64, f64) {
     if kind == PrimitiveKind::Line {
         let dx = span.end_x - span.start_x;
@@ -315,17 +277,11 @@ fn drag_geometry(kind: PrimitiveKind, span: DragSpan) -> (String, f64, f64) {
     (d, min_x, min_y)
 }
 
-/// Author a `set-style` op recoloring `object` to `color`. Recolor only the
-/// style fields the object already carries — a filled shape keeps its stroke, a
-/// stroke-only line keeps being stroke-only — so a recolor never adds a paint the
-/// object did not have. An object with NEITHER fill nor stroke (the borderless
-/// text primitive) gets a fill so the recolor is still visible. The inverse (the
-/// old style) comes from the core apply path, keeping undo correct (D21).
-///
-/// Anchor-semantics v3 §1: an OPEN-CLASS object (one open subpath) carries no
-/// fill, so the color routes to its STROKE — recoloring it, or authoring the
-/// line-default stroke when missing — and a legacy fill is left untouched (the
-/// renderer skips open-class fills; the shell stays class-ignorant).
+/// Author a `set-style` op recoloring `object` to `color`. Recolors only the style
+/// fields the object already carries, so a recolor never adds a paint it lacked; an
+/// object with neither fill nor stroke gets a fill so the recolor is visible. An
+/// open-class object (no fill) routes the color to its STROKE, leaving any legacy
+/// fill untouched.
 pub fn build_set_style_op(object: &Object, color: &str) -> ObjectOp {
     let paint = paint_for_color(color);
     if is_open_class(&object.geometry) {
@@ -368,14 +324,13 @@ mod tests {
     #[test]
     fn rectangle_default_d_byte_matches_prior_ts() {
         let o = build_primitive(PrimitiveKind::Rectangle, 0.0, 0.0, None, "r", "a0");
-        // q(160)=1280, q(100)=800.
         assert_eq!(d_of(&o), "M 0 0 L 1280 0 L 1280 800 L 0 800 Z");
     }
 
     #[test]
     fn ellipse_default_d_byte_matches_prior_ts() {
         let o = build_primitive(PrimitiveKind::Ellipse, 0.0, 0.0, None, "e", "a0");
-        // cx=cy=rx=ry=q(70)=560; kx=ky=round(560*0.5523)=round(309.288)=309.
+        // cx=cy=rx=ry=q(70)=560; kx=ky=round(560*0.5523)=309.
         assert_eq!(
             d_of(&o),
             "M 0 560 C 0 251 251 0 560 0 C 869 0 1120 251 1120 560 C 1120 869 869 1120 560 1120 C 251 1120 0 869 0 560 Z"
@@ -509,7 +464,7 @@ mod tests {
 
     #[test]
     fn set_style_recolors_both_fill_and_stroke_of_a_filled_shape() {
-        // Closed d: a fill-bearing shape is closed-class by definition (v3 §1).
+        // Closed d: a fill-bearing shape is closed-class.
         let o = obj_with(
             "M 0 0 L 8 0 L 8 8 Z",
             Some(solid_fill("#000000")),
@@ -540,8 +495,7 @@ mod tests {
 
     #[test]
     fn set_style_gives_a_styleless_object_a_fill() {
-        // Closed d: the borderless text primitive is a closed rect (v3 §1 keeps
-        // the fill fallback for closed-class only).
+        // Closed d: the fill fallback applies to closed-class only.
         let o = obj_with("M 0 0 L 8 0 L 8 8 Z", None, None);
         let op = build_set_style_op(&o, "#abcdef");
         let ObjectOp::SetStyle { fill, stroke, .. } = op else { panic!("set-style") };
@@ -551,7 +505,7 @@ mod tests {
         assert_eq!(f.opacity, 1.0);
     }
 
-    // -- v3 §1: open-class color routes to the stroke, never the fill ---------
+    // -- open-class color routes to the stroke, never the fill ---------
 
     #[test]
     fn set_style_routes_open_class_color_to_stroke_never_fill() {
@@ -577,7 +531,6 @@ mod tests {
         assert!(fill.is_none(), "open-class never gains a fill");
         let FieldEdit::Set { value: s } = stroke.unwrap() else { panic!("stroke set") };
         assert_eq!(s.paint, Paint::Solid { color: "#abcdef".into() });
-        // The line-default stroke width (q(2px)) so the recolor is visible.
         assert_eq!(s.width, q(2.0));
     }
 
@@ -590,15 +543,13 @@ mod tests {
         assert_eq!(s.paint, Paint::Token { name: "text".into() });
     }
 
-    // -- live-preview parity: the committed core object equals what a shell-side
-    //    preview would draw at the same span (same d for the same span). --------
+    // -- live-preview parity: same d for the same span, regardless of id/color ---
 
     #[test]
     fn committed_drag_object_d_matches_a_repeat_build_at_the_same_span() {
         let span = DragSpan { start_x: 3.0, start_y: 7.0, end_x: 91.0, end_y: 44.0 };
         let preview = build_primitive_from_drag(PrimitiveKind::Rectangle, span, None, "preview", "a0");
         let committed = build_primitive_from_drag(PrimitiveKind::Rectangle, span, Some("#abcdef"), "real", "a1");
-        // Geometry (the visual shape) is identical regardless of id/order/color.
         assert_eq!(d_of(&preview), d_of(&committed));
         assert_eq!(preview.transform, committed.transform);
     }

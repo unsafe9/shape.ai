@@ -1,21 +1,13 @@
-//! shape.ai native server (`shape_server`).
+//! shape.ai native server (`shape_server`): the platform seam in front of the
+//! pure scene core, orchestrating transport, persistence, and fan-out only.
+//! Canvas logic (op-apply, layout, hit testing) stays in `shape_scene_core` and
+//! is never reimplemented here.
 //!
-//! The web/native platform seam in front of the pure scene core: this crate
-//! orchestrates transport (axum/tokio), persistence (`shape_storage_core`), and
-//! fan-out only. Canvas logic — op-apply, layout, hit testing — stays in
-//! `shape_scene_core` and is never reimplemented here.
+//! Native-only (tokio/axum); siblings are depended on by path without adding deps
+//! to them, so the wasm builds of scene-core/storage-core stay intact.
 //!
-//! It is **native-only** (tokio/axum) and depends on the sibling crates by path
-//! without adding deps to them, so the wasm builds of scene-core/storage-core
-//! stay intact.
-//!
-//! Identity is `userId`-only with **no auth** (C13).
+//! Identity is `userId`-only with no auth.
 //! TODO(auth): real authn/authz attaches here when identity moves past userId.
-//!
-//! OB4.1 — the object model is the LIVE server path: the per-canvas actor holds an
-//! [`ObjectScene`](shape_scene_core::object::ObjectScene) driven through
-//! [`ObjectStore`], the WS transport is object-native, and the MCP endpoint serves
-//! the object toolset. The legacy Group/Card/Edge server path is removed.
 
 pub mod app;
 pub mod canvas_actor;
@@ -43,9 +35,6 @@ pub use sync::{DedupTable, OpAck, OpEnvelope, OpId, CHECKPOINT_INTERVAL};
 pub use ws::{ws_handler, WsClientMessage, WsServerMessage};
 
 /// Bind to the configured address and serve until the process is terminated.
-///
-/// The shared application state — the canvas actor registry — is constructed here,
-/// before the router, and threaded into [`build_router_with_mcp`].
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let data_dir = std::env::var("SHAPE_AI_DATA_DIR")
         .map(std::path::PathBuf::from)
@@ -57,8 +46,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let addr = config.socket_addr()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "shape_server listening");
-    // Graceful shutdown: on ctrl_c, stop accepting connections, then drain the
-    // registry (flush + checkpoint every actor, release every lease).
+    // On ctrl_c, stop accepting, then drain the registry (flush + checkpoint
+    // every actor, release every lease).
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

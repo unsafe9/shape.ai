@@ -2,17 +2,12 @@
   color-scheme: light;
   --bg: #eef2f5;
   --canvas: #f7f9fb;
-  /* AP4 (#12c): the themeable SURFACE base RGB triplet. Every translucent
-   * chrome/popup/panel surface is `rgb(var(--surface-rgb) / a)`, so flipping this
-   * one triplet in the dark block inverts every floating surface at once (no
-   * per-rule dark override). Light = white; dark = near-black. */
+  /* The themeable SURFACE base RGB triplet. Every translucent chrome/popup/panel surface is
+   * `rgb(var(--surface-rgb) / a)`, so flipping this one triplet in the dark block inverts every surface at once. */
   --surface-rgb: 255 255 255;
-  /* The light TINT triplets the panels layer over the surface (faint blue/teal
-   * washes). Re-pointed to the surface base in dark mode so they don't reintroduce
-   * a bright wash on a dark panel. */
+  /* The light TINT panels layer over the surface; re-pointed to the surface base in dark mode so they don't reintroduce a bright wash. */
   --surface-tint-rgb: 236 245 255;
-  /* The solid color tag chips / mixes blend toward (white in light, near-black in
-   * dark) and the ink they read against. Themed so a tinted chip stays legible. */
+  /* Themed so a tinted chip stays legible against the surface. */
   --surface-mix: #ffffff;
   --tag-ink: #1d252c;
   --surface: rgb(var(--surface-rgb) / 0.82);
@@ -34,17 +29,13 @@
   --glass-blur: blur(22px) saturate(1.25);
 }
 
-/* AP4 (#12c): dark mode. The `data-theme="dark"` attribute is set on the root by
- * the shell's theme toggle (scene.ts `applyDocumentTheme`), which also flips RB1's
- * renderer theme-bit so the canvas flips with this chrome. The canvas/surface/text
- * values mirror the C1 dark token RGBA so shell chrome and rendered objects agree. */
+/* Dark mode. `data-theme="dark"` is set on the root by the shell's theme toggle, which also flips the
+ * renderer theme-bit. The canvas/surface/text values mirror the core dark token RGBA so chrome and rendered objects agree. */
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #161618;
   --canvas: #1e1e20;
-  /* Flip the surface base to near-black: every `rgb(var(--surface-rgb) / a)`
-   * chrome/popup/panel surface inverts in one move, and the faint tint washes
-   * collapse onto the same dark base instead of staying bright. */
+  /* Flip the surface base to near-black: every `rgb(var(--surface-rgb) / a)` surface inverts in one move. */
   --surface-rgb: 28 28 30;
   --surface-tint-rgb: 44 44 46;
   --surface-mix: #1e1e20;
@@ -62,10 +53,8 @@
   --shadow-deep: 0 28px 70px rgb(0 0 0 / 0.6), 0 8px 18px rgb(0 0 0 / 0.5);
 }
 
-/* AP4 (#12c): the few surfaces that layer a literal LIGHT triplet (faint blue /
- * teal washes, near-white gradients) rather than `--surface-rgb` — flip them as a
- * group in dark mode so no bright panel survives the toggle. Each mirrors its
- * light rule but swaps the light triplet for the dark surface base / tint. */
+/* The few surfaces that layer a literal LIGHT triplet rather than `--surface-rgb` — flipped as a group
+ * in dark mode so no bright panel survives the toggle. */
 :root[data-theme="dark"] body {
   background:
     radial-gradient(circle at 20% 12%, rgb(var(--surface-rgb) / 0.5), transparent 32rem),
@@ -260,19 +249,15 @@ p {
   touch-action: none;
 }
 
-/* W2-03/W2-07/W2-08 tool cursors: draw + shape drag-create + erase use a
- * crosshair, the unified Move pointer's cursor is driven by the hover affordance
- * below. */
+/* Tool cursors: draw/create/erase use a crosshair; the Move pointer's cursor is driven by the hover affordance below. */
 .renderer-scene-surface[data-tool="draw"],
 .renderer-scene-surface[data-tool="create"],
 .renderer-scene-surface[data-tool="erase"] {
   cursor: crosshair;
 }
 
-/* W2-03 affordance cursors for the unified Move pointer: the core's per-move hover
- * classification maps to the matching resize/rotate/move cursor; Space-hold ("pan")
- * shows the grab/grabbing pan cursor. data-affordance always wins over data-tool
- * (more specific). */
+/* Affordance cursors for the Move pointer: the core's per-move hover classification maps to the
+ * matching resize/rotate/move cursor; Space-hold ("pan") shows grab/grabbing. data-affordance wins over data-tool. */
 .renderer-scene-surface[data-affordance="pan"] {
   cursor: grab;
 }
@@ -329,11 +314,8 @@ p {
   pointer-events: none;
 }
 
-/* EN1 (#4): the input canvas is the topmost pointer-capturing surface (z-index 2,
- * above the affordance-cursor wrapper). It must INHERIT the cursor so the hover
- * affordance set on `.renderer-scene-surface[data-affordance=...]` shows through;
- * a hardcoded `cursor: grab` here (the pre-W2-03 pan surface) was overriding every
- * resize/rotate/move affordance with grab. */
+/* The input canvas is the topmost pointer-capturing surface, so it must INHERIT the cursor for the
+ * `[data-affordance=...]` hover cursor to show through — a hardcoded cursor here overrides every affordance. */
 .renderer-input-canvas {
   z-index: 2;
   cursor: inherit;
@@ -359,7 +341,7 @@ p {
   background: var(--renderer-edit-selection-bg);
 }
 
-/* W2-10: inline text-edit overlay positioned over a text object's screen bbox. */
+/* Inline text-edit overlay positioned over a text object's screen bbox. */
 .text-edit-overlay {
   position: absolute;
   z-index: 7;
@@ -523,7 +505,7 @@ p {
   border-radius: 11px;
 }
 
-/* MG9.2 canvas switch chrome: pinned top-centre, above the canvas surface. */
+/* Canvas switch chrome: pinned top-centre, above the canvas surface. */
 .canvas-switcher-chrome {
   position: absolute;
   top: 24px;
@@ -532,7 +514,7 @@ p {
   z-index: 12;
 }
 
-/* AP4 (#12c): theme toggle — pinned top-right, above the canvas surface. */
+/* Theme toggle — pinned top-right, above the canvas surface. */
 .theme-toggle {
   position: absolute;
   top: 28px;
@@ -1530,9 +1512,7 @@ p {
   transform: translateX(-50%);
 }
 
-/* AP6 (#19): transient action toast. Sits just above the persistent status row,
- * shares its glass chrome, and fades in then out across its ~2.5s lifetime; the
- * shell's toastChannel removes the node when the timer fires. */
+/* Transient action toast: sits just above the persistent status row and fades in then out across its ~2.5s lifetime. */
 .canvas-toast {
   left: 50%;
   bottom: 148px;
@@ -1603,9 +1583,7 @@ p {
     animation-iteration-count: 1 !important;
   }
 
-  /* AP6: the collapsed animation would land the toast on its faded-out end frame
-   * (invisible). Drop the fade entirely so it shows steadily; the shell's timer
-   * still dismisses it after ~2.5s. */
+  /* The collapsed animation would land the toast on its faded-out end frame (invisible); drop the fade so it shows steadily (the timer still dismisses it). */
   .canvas-toast {
     animation: none !important;
     opacity: 1;
@@ -1724,7 +1702,7 @@ p {
 }
 
 /* ---------------------------------------------------------------------------
- * FC-12 toolbar — Figma-style bottom-center remote, labeled groups
+ * Toolbar — Figma-style bottom-center remote, labeled groups
  * --------------------------------------------------------------------------- */
 
 .toolbar-remote {
@@ -1772,7 +1750,7 @@ p {
   margin: 0 4px;
 }
 
-/* W2-08 — draw-mode sub-toolbar (brush size + color), floats above the remote. */
+/* Draw-mode sub-toolbar (brush size + color), floats above the remote. */
 .toolbar-draw {
   position: absolute;
   left: 50%;
@@ -1804,9 +1782,8 @@ p {
   border: 1px solid rgb(0 0 0 / 0.18);
 }
 
-/* D1/#5: the native color-picker swatch — the <input type="color"> fills the
-   label as a transparent overlay so a click opens the OS picker; the visible
-   chip is the swatch-fill underneath showing the current selected color. */
+/* The native color-picker swatch — the <input type="color"> fills the label as a transparent overlay
+   so a click opens the OS picker; the visible chip is the swatch-fill underneath. */
 .icon-button.swatch.color-picker {
   position: relative;
   overflow: hidden;
@@ -1825,8 +1802,7 @@ p {
   cursor: pointer;
 }
 
-/* TB1 (#3): the single color-trigger button — a rainbow conic-gradient ring with
-   the current selected color as the inner dot. Clicking it toggles the popup. */
+/* The color-trigger button — a rainbow conic-gradient ring with the selected color as the inner dot; clicking toggles the popup. */
 .icon-button.color-trigger {
   position: relative;
 }
@@ -1860,8 +1836,7 @@ p {
   box-shadow: 0 0 0 1px rgb(0 0 0 / 0.22);
 }
 
-/* TB1 (#3): the color popup — fixed PEN_PALETTE swatches + a native picker, opened
-   above the toolbar Color group. */
+/* The color popup — fixed swatches + a native picker, opened above the toolbar Color group. */
 .color-popup {
   position: absolute;
   bottom: 100%;
@@ -1920,7 +1895,7 @@ p {
 }
 
 /* ---------------------------------------------------------------------------
- * CC3.3 TemplateLibrary — popover above the toolbar remote
+ * TemplateLibrary — popover above the toolbar remote
  * --------------------------------------------------------------------------- */
 
 .template-library {
@@ -2033,8 +2008,7 @@ p {
   font-size: 13px;
 }
 
-/* W2-09 — Debug/diagnostics readout, floats above the toolbar remote like the
-   draw sub-toolbar and the template popover. */
+/* Debug/diagnostics readout, floats above the toolbar remote. */
 .diagnostics-panel {
   position: absolute;
   right: 28px;
@@ -2055,7 +2029,7 @@ p {
 }
 
 /* ---------------------------------------------------------------------------
- * CC5.1 SettingsModal — read-only shortcut reference
+ * SettingsModal — read-only shortcut reference
  * --------------------------------------------------------------------------- */
 
 .settings-overlay {
@@ -2151,8 +2125,7 @@ p {
   color: var(--muted);
 }
 
-/* SM1 (#2): the gesture catalog row carries a third (description) line, so it
-   spans both grid columns and stacks label/binding/description. */
+/* The gesture catalog row carries a third (description) line, so it spans both grid columns. */
 .settings-gestures {
   grid-column: 1 / -1;
 }

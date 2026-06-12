@@ -1,19 +1,17 @@
-//! Morton (Z-order) keys for region windowing (D16/OB1.4/OB3.T2).
+//! Morton (Z-order) keys for region windowing.
 //!
-//! A KV store has no SQL `WHERE bbox && window`. Instead we interleave the bits
-//! of a quantized 2D point into a single `u64` Morton code; storing records keyed
-//! by `canvas_id` prefix + big-endian Morton code makes byte order equal Z-order,
-//! so a region window becomes a **single ordered range scan** plus an exact
-//! bbox-overlap refilter (the over-coverage the Z-curve introduces).
+//! A KV store has no SQL `WHERE bbox && window`. Interleaving a quantized 2D
+//! point's bits into a `u64` and keying by `canvas_id` prefix + big-endian
+//! Morton code makes byte order equal Z-order, so a region window becomes a
+//! **single ordered range scan** plus an exact bbox-overlap refilter.
 //!
-//! Pure + pointer-width-agnostic: codes are `u64`, axis inputs `u32`, never
-//! `usize`. World `f64` coordinates map to `u32` via a fixed offset so negative
-//! coordinates encode correctly and the index stays stable across runs.
+//! Pointer-width-agnostic: codes are `u64`, axis inputs `u32`, never `usize`.
+//! World `f64` maps to `u32` via a fixed offset so negative coordinates encode
+//! correctly and the index stays stable across runs.
 
-/// World-coordinate origin offset. World `f64` rounded to the nearest integer is
-/// shifted by `2^31` into `u32` space, so the representable world range is
-/// roughly `[-2^31, 2^31)` logical units around the origin — far beyond any real
-/// canvas — and negative coordinates keep their Z-order.
+/// World-coordinate origin offset. World `f64` (rounded) is shifted by `2^31`
+/// into `u32` space, giving a representable range of roughly `[-2^31, 2^31)`
+/// around the origin while keeping negative coordinates in Z-order.
 const WORLD_OFFSET: i64 = 1 << 31;
 
 /// Map a world `f64` coordinate to a `u32` axis value (round-to-nearest, clamped
@@ -83,13 +81,11 @@ pub fn morton_range(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> (u64, u64
     (lo.min(hi), lo.max(hi))
 }
 
-/// The big-endian keyspace row for a record: `canvas_id` bytes, a `0x00`
-/// separator, the 8 big-endian Morton bytes, then the `object_id` bytes. Byte
-/// order == (canvas, Morton, object_id) order, so an ordered KV range scan over a
-/// Morton window yields exactly the Z-order window; the `object_id` tail makes the
-/// key UNIQUE per object, so two records whose bbox centers quantize to the same
-/// Morton cell get distinct rows instead of overwriting each other. Returned as
-/// bytes so any ordered KV (redb table, IndexedDB) can key on it directly.
+/// The big-endian keyspace row for a record: `canvas_id` + `0x00` separator +
+/// 8 Morton bytes + `object_id`. Byte order == (canvas, Morton, object_id)
+/// order, so an ordered range scan yields exactly the Z-order window; the
+/// `object_id` tail keeps the key UNIQUE so two records in the same Morton cell
+/// get distinct rows instead of clobbering each other.
 pub fn region_row_key(canvas_id: &str, morton: u64, object_id: &str) -> Vec<u8> {
     let mut key = region_scan_start(canvas_id, morton);
     key.extend_from_slice(object_id.as_bytes());
@@ -107,11 +103,10 @@ pub fn region_scan_start(canvas_id: &str, morton: u64) -> Vec<u8> {
     key
 }
 
-/// The EXCLUSIVE upper bound that ends a region scan after every row in the
-/// Morton cell `hi_morton` (any `object_id` tail): the first key of the next cell,
-/// `canvas\0 + (hi_morton + 1)`. When `hi_morton == u64::MAX` there is no next
-/// cell, so bump the `0x00` canvas separator to `0x01` — the first key past the
-/// whole canvas's Morton space — which stays pointer-width-agnostic (no `usize`).
+/// The EXCLUSIVE upper bound ending a region scan after every row in cell
+/// `hi_morton`: the first key of the next cell, `canvas\0 + (hi_morton + 1)`.
+/// At `u64::MAX` there is no next cell, so bump the `0x00` separator to `0x01` —
+/// the first key past the whole canvas's Morton space.
 pub fn region_scan_end_excl(canvas_id: &str, hi_morton: u64) -> Vec<u8> {
     match hi_morton.checked_add(1) {
         Some(next) => region_scan_start(canvas_id, next),
@@ -138,7 +133,6 @@ mod tests {
 
     #[test]
     fn world_axis_preserves_order_across_origin() {
-        // Negative < origin < positive after the offset.
         assert!(world_to_axis(-100.0) < world_to_axis(0.0));
         assert!(world_to_axis(0.0) < world_to_axis(100.0));
     }
@@ -154,7 +148,6 @@ mod tests {
         let (lo, hi) = morton_range(-10.0, -10.0, 10.0, 10.0);
         assert!(lo <= hi);
         let center = morton_of_world(0.0, 0.0);
-        // The center's code lies within the corner range for a box around origin.
         assert!(lo <= center && center <= hi);
     }
 
@@ -166,8 +159,6 @@ mod tests {
         assert!(a < b, "same canvas orders by morton");
         assert!(b < c, "canvas prefix dominates");
 
-        // Two objects in the SAME Morton cell get distinct, id-ordered rows, and a
-        // scan over that cell brackets both (start inclusive, next-cell exclusive).
         let o1 = region_row_key("canvas-a", 5, "id-1");
         let o2 = region_row_key("canvas-a", 5, "id-2");
         assert_ne!(o1, o2, "same cell, distinct ids -> distinct rows");
@@ -176,7 +167,6 @@ mod tests {
         let end = region_scan_end_excl("canvas-a", 5);
         assert!(start <= o1 && o1 < end && o2 < end, "scan brackets the cell");
 
-        // u64::MAX cell still gets a valid exclusive end past the whole canvas.
         let max_row = region_row_key("canvas-a", u64::MAX, "z");
         let max_end = region_scan_end_excl("canvas-a", u64::MAX);
         assert!(max_row < max_end, "u64::MAX cell has a valid exclusive end");

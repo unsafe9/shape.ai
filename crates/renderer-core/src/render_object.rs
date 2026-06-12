@@ -1,47 +1,30 @@
-//! OB-3 object render model (OB3.R10): the renderer-core view of the single
-//! `object` primitive (D1/D2/D4/D7) plus structural style defaults and the
-//! selection/hover/focus visual resolution that used to live in the shell's
-//! `renderScene.ts` (`defaultStyles`/`shapeStyleToken`).
+//! Object render model: the renderer-core view of the single `object` primitive
+//! plus structural style defaults and selection/hover/focus visual resolution.
 //!
-//! This is ADDITIVE: it does not touch the live `RenderGroup/RenderCard/RenderEdge`
-//! pipeline in `model.rs`/`webgpu.rs`. The object pipeline is wired into the GPU
-//! draw path at the OB-4 cutover, not here. All logic here is pure CPU and unit
-//! tested in-file.
-//!
-//! Geometry coordinates are object-local quantized integers at 8 units/px (D2);
-//! convert to f64 pixels with [`QUANT_PER_PX`] before any matrix math. The
-//! transform is a 3x3 projective matrix in f64 (D7). The crate stays
-//! pointer-width-agnostic: data fields use `i32` coords and `f64` matrices, never
-//! `usize`.
+//! Geometry coordinates are object-local quantized integers at 8 units/px; convert
+//! to f64 pixels with [`QUANT_PER_PX`] before any matrix math. The transform is a
+//! 3x3 projective matrix in f64. Pointer-width-agnostic: `i32` coords and `f64`
+//! matrices, never `usize`.
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::CameraState;
 
-/// Quantization units per logical pixel for object-local geometry coordinates
-/// (D2: agent-discretion default = 1/8 px). Divide an `i32` coord by this to get
-/// f64 pixels for matrix math.
+/// Quantization units per logical pixel for object-local geometry coords (1/8 px).
 pub const QUANT_PER_PX: f64 = 8.0;
 
-// ---------------------------------------------------------------------------
-// Object render model (D1/D2/D4/D7)
-// ---------------------------------------------------------------------------
-
-/// A single canvas object as the renderer sees it (D1). Geometry is carried as a
-/// path-string (`geometry_d`, D2) and parsed on demand via [`parse_path_d`];
-/// style is inline (D4), there is no `styleKey`/palette lookup.
+/// A single canvas object as the renderer sees it. Geometry is a path-string
+/// (`geometry_d`) parsed on demand; style is inline, no `styleKey`/palette lookup.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderObject {
     pub id: String,
     #[serde(default)]
     pub parent: Option<String>,
-    /// Fractional ordering key (string), see D1.
     pub order: String,
-    /// 3x3 projective transform, row-major (D7). `screen = camera · M · local`.
+    /// 3x3 projective transform, row-major. `screen = camera · M · local`.
     pub transform: [[f64; 3]; 3],
-    /// SVG-subset path-string (M/L/C/Z, multi-subpath); object-local quantized
-    /// `i32` coords at [`QUANT_PER_PX`] units/px (D2).
+    /// SVG-subset path-string (M/L/C/Z); object-local quantized i32 coords.
     #[serde(rename = "geometryD")]
     pub geometry_d: String,
     #[serde(default)]
@@ -50,20 +33,18 @@ pub struct RenderObject {
     pub stroke: Option<RStroke>,
     #[serde(default)]
     pub text: Option<RText>,
-    /// Per-node attachments (D5): each binds one of this object's geometry nodes to
-    /// a `target` object. W3-G9/#5: the bindings graph inverts these into Reproject
-    /// edges (target -> this follower) so a moved target reprojects its followers.
+    /// Per-node attachments binding this object's geometry nodes to a target. The
+    /// bindings graph inverts these into Reproject edges so a moved target
+    /// reprojects its followers.
     #[serde(default)]
     pub anchors: Vec<RAnchor>,
-    /// Figma-style clip flag (D18). When true, children render clipped to this
-    /// object's region/bounds.
+    /// Figma-style clip flag: children render clipped to this object's region/bounds.
     #[serde(default)]
     pub clip: bool,
 }
 
-/// A per-node attachment (D5): node `node_index` of the owning object is bound to
-/// `target` at the target-local point `at`. Mirrors the shell `Anchor` wire shape
-/// (`{ nodeIndex, target, at: { x, y } }`).
+/// Per-node attachment binding node `node_index` to `target` at target-local `at`.
+/// Wire: `{ nodeIndex, target, at: { x, y } }`.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RAnchor {
@@ -72,7 +53,7 @@ pub struct RAnchor {
     pub at: RLocalPoint,
 }
 
-/// A target-local attachment point in object-local pixels (D5).
+/// A target-local attachment point in object-local pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RLocalPoint {
@@ -80,17 +61,17 @@ pub struct RLocalPoint {
     pub y: f64,
 }
 
-/// Fill paint applied to the derived region, below stroke (D4).
+/// Fill paint applied to the derived region, below stroke.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RFill {
     pub paint: RPaint,
-    /// Fill opacity in 0..=1. Defaults to fully opaque.
+    /// Fill opacity in 0..=1; defaults to fully opaque.
     #[serde(default = "default_opacity")]
     pub opacity: f64,
 }
 
-/// Stroke for the outline / drawn line (D4): paint + width + opacity + dash/cap/join.
+/// Stroke for the outline / drawn line: paint + width + opacity + dash/cap/join.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RStroke {
@@ -126,17 +107,15 @@ pub enum RStrokeJoin {
     Bevel,
 }
 
-/// Paint source for fill or stroke (D4). Colors are inline; there is no palette
-/// or `styleKey` indirection.
+/// Paint source for fill or stroke; colors inline, no palette indirection.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum RPaint {
     Solid {
         color: String,
     },
-    /// Semantic theme token (C1/D1): a kebab-case token name resolved to RGBA at
-    /// draw time via the renderer's light/dark theme tables (see
-    /// [`crate::object_theme`]). Wire form: `{"kind":"token","name":"<kebab>"}`.
+    /// Kebab-case theme token resolved to RGBA at draw time (see
+    /// [`crate::object_theme`]). Wire: `{"kind":"token","name":"<kebab>"}`.
     Token {
         name: String,
     },
@@ -159,7 +138,7 @@ pub struct RGradientStop {
     pub color: String,
 }
 
-/// Text content positioned relative to the derived region (D4): runs + align.
+/// Text content positioned relative to the derived region: runs + align.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RText {
@@ -207,32 +186,23 @@ pub enum RTextValign {
     Bottom,
 }
 
-/// The renderer-core scene view of the object substrate: scene id, camera (reused
-/// from `model.rs`), the object list, the persisted single-anchor selection, and
-/// the transient multi-select set.
+/// The renderer-core scene view of the object substrate.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderObjectScene {
     pub scene_id: String,
     pub camera: CameraState,
     pub objects: Vec<RenderObject>,
-    /// Persisted single-anchor selection: the id of the selected object, if any.
     #[serde(default)]
     pub selection: Option<String>,
-    /// Transient multi-select set. Shell-owned and never round-tripped to disk, but
-    /// the shell DOES send it on the live wire (`multiSelect`), so it must
-    /// deserialize — the draw path (outline overlay, preview closure) reads it.
+    /// Transient, shell-owned, never persisted — but the shell sends it on the live
+    /// wire (`multiSelect`), so it must deserialize; the draw path reads it.
     #[serde(default, rename = "multiSelect")]
     pub multi_select: Vec<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Geometry path-string parse (D2)
-// ---------------------------------------------------------------------------
-
 /// A geometry node in object-local quantized i32 coords. Handles are stored
-/// relative to the node (D2: `inHandle`/`outHandle`), so a node with no handles
-/// is a straight (polyline) corner.
+/// relative to the node, so a node with no handles is a straight (polyline) corner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RNode {
@@ -254,8 +224,8 @@ pub struct RHandle {
     pub dy: i32,
 }
 
-/// One subpath (contour) of a parsed geometry: a node list plus a closed flag.
-/// A multi-subpath path-string yields multiple `RSubPath`s (even-odd holes, D2).
+/// One subpath (contour): a node list plus a closed flag. Multiple subpaths form
+/// even-odd holes.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RSubPath {
@@ -263,18 +233,10 @@ pub struct RSubPath {
     pub nodes: Vec<RNode>,
 }
 
-/// Parse an SVG-subset path-string into subpaths (D2). Supported commands:
-///
-/// - `M x y`  — moveto, starts a new subpath at absolute (x, y).
-/// - `L x y`  — lineto to absolute (x, y) (straight node).
-/// - `C x1 y1 x2 y2 x y` — cubic to absolute (x, y); the absolute control points
-///   `(x1,y1)`/`(x2,y2)` become the previous node's `out_handle` and this node's
-///   `in_handle`, stored relative to their respective nodes.
-/// - `Z`      — close the current subpath.
-///
-/// Coordinates are absolute integers (object-local quantized i32 at
-/// [`QUANT_PER_PX`] units/px). Only the absolute (uppercase) forms are accepted,
-/// mirroring the at-rest encoding. Whitespace and commas separate tokens.
+/// Parse an SVG-subset path-string (`M`/`L`/`C`/`Z`) into subpaths. For `C`, the
+/// absolute control points become the previous node's `out_handle` and this node's
+/// `in_handle`, stored relative. Coords are absolute quantized i32; only the
+/// uppercase (absolute) forms are accepted.
 pub fn parse_path_d(d: &str) -> Result<Vec<RSubPath>, String> {
     let mut tokens = Tokenizer::new(d);
     let mut subpaths: Vec<RSubPath> = Vec::new();
@@ -321,7 +283,6 @@ pub fn parse_path_d(d: &str) -> Result<Vec<RSubPath>, String> {
                 let y2 = tokens.next_int()?;
                 let x = tokens.next_int()?;
                 let y = tokens.next_int()?;
-                // Absolute control points -> relative handles (D2).
                 let prev = sub
                     .nodes
                     .last_mut()
@@ -376,23 +337,20 @@ impl<'a> Tokenizer<'a> {
             .trim_start_matches(|c: char| c.is_whitespace() || c == ',');
     }
 
-    /// Read the next command letter, or `None` at end of input.
     fn next_command(&mut self) -> Result<Option<char>, String> {
         self.skip_separators();
         match self.rest.chars().next() {
             None => Ok(None),
             Some(c) if c.is_ascii_alphabetic() => {
                 self.rest = &self.rest[c.len_utf8()..];
-                // Pass the letter through verbatim: only absolute (uppercase)
-                // M/L/C/Z are accepted, so relative (lowercase) forms fall through
-                // to the caller's unsupported-command error (D2 at-rest encoding).
+                // Verbatim: lowercase (relative) forms fall through to the caller's
+                // unsupported-command error.
                 Ok(Some(c))
             }
             Some(c) => Err(format!("expected command, found '{c}'")),
         }
     }
 
-    /// Read the next signed integer coordinate.
     fn next_int(&mut self) -> Result<i32, String> {
         self.skip_separators();
         let end = self
@@ -409,12 +367,7 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Style defaults + visual state resolution (OB3.R10)
-// ---------------------------------------------------------------------------
-
-/// Structural default fill applied when an object omits `fill` (OB3.R10). Mirrors
-/// the shell's neutral surface; color is inline, no palette lookup.
+/// Structural default fill applied when an object omits `fill`.
 pub fn default_fill() -> RFill {
     RFill {
         paint: RPaint::Solid {
@@ -424,7 +377,7 @@ pub fn default_fill() -> RFill {
     }
 }
 
-/// Structural default stroke applied when an object omits `stroke` (OB3.R10).
+/// Structural default stroke applied when an object omits `stroke`.
 pub fn default_stroke() -> RStroke {
     RStroke {
         paint: RPaint::Solid {
@@ -438,14 +391,11 @@ pub fn default_stroke() -> RStroke {
     }
 }
 
-/// Focus-ring color used when an object is selected/focused (OB3.R10), from the
-/// shell's `focus` token (`#2f7ee6`).
 pub const FOCUS_RING_COLOR: &str = "#2f7ee6";
-/// Focus-ring width in logical pixels, from the shell's `strokeWidths.focusRing`.
+/// Focus-ring width in logical pixels.
 pub const FOCUS_RING_WIDTH: f64 = 4.0;
 
-/// Visual interaction state for an object (OB3.R10). The renderer owns this
-/// instead of the shell.
+/// Visual interaction state for an object; renderer-owned.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VisualState {
     pub selected: bool,
@@ -460,8 +410,8 @@ pub struct FocusRing {
     pub width: f64,
 }
 
-/// The fully resolved draw style for an object: inline style over structural
-/// defaults, plus any selection/focus ring (OB3.R10).
+/// The fully resolved draw style: inline style over structural defaults, plus any
+/// focus ring.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedStyle {
     pub fill: RFill,
@@ -469,10 +419,8 @@ pub struct ResolvedStyle {
     pub focus_ring: Option<FocusRing>,
 }
 
-/// Resolve an object's draw style (OB3.R10): apply the object's inline `fill`/
-/// `stroke` over the structural defaults, then add a focus ring when the visual
-/// state is selected or focused. Hover currently carries no style change; it is
-/// part of the owned state so the GPU path can react later without re-plumbing.
+/// Resolve an object's draw style: inline `fill`/`stroke` over structural defaults,
+/// plus a focus ring when selected or focused. Hover carries no style change yet.
 pub fn resolve_visual(obj: &RenderObject, state: VisualState) -> ResolvedStyle {
     let fill = obj.fill.clone().unwrap_or_else(default_fill);
     let stroke = obj.stroke.clone().unwrap_or_else(default_stroke);
@@ -499,17 +447,12 @@ fn default_text_color() -> String {
     "#111111".to_string()
 }
 
-/// Default font size in WIRE-quantized units (D2: 8 units/px), so a run that
-/// omits `size` defaults to 16px AFTER the layout de-quant (`/QUANT_PER_PX`) — the
-/// same quantized space `size` carries on the wire. Returning raw px here would
-/// de-quant to 2px for a defaulted run.
+/// Default font size in WIRE-quantized units (8 units/px), so a defaulted run is
+/// 16px after the layout de-quant (`/QUANT_PER_PX`). Returning raw px would de-quant
+/// to 2px.
 fn default_text_size() -> f64 {
     16.0 * QUANT_PER_PX
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -526,7 +469,6 @@ mod tests {
 
     #[test]
     fn parse_rect_path() {
-        // A closed unit-ish rect: M 0 0 L 80 0 L 80 40 L 0 40 Z
         let subs = parse_path_d("M 0 0 L 80 0 L 80 40 L 0 40 Z").expect("rect parses");
         assert_eq!(subs.len(), 1);
         let sub = &subs[0];
@@ -544,10 +486,7 @@ mod tests {
 
     #[test]
     fn parse_cubic_path_absolute_controls_to_relative_handles() {
-        // M 0 0 C 10 -20 90 -20 100 0
-        // start node at (0,0), end node at (100,0).
-        // abs control1 (10,-20) -> start.out_handle = (10, -20)
-        // abs control2 (90,-20) -> end.in_handle    = (90-100, -20-0) = (-10, -20)
+        // abs control2 (90,-20) -> end.in_handle = (90-100, -20-0) = (-10, -20)
         let subs = parse_path_d("M 0 0 C 10 -20 90 -20 100 0").expect("cubic parses");
         assert_eq!(subs.len(), 1);
         let sub = &subs[0];
@@ -567,7 +506,6 @@ mod tests {
 
     #[test]
     fn parse_multi_subpath_with_commas() {
-        // Two subpaths in one string, comma-separated coords (even-odd hole, D2).
         let subs =
             parse_path_d("M0,0 L40,0 L40,40 Z M10,10 L20,10 L20,20 Z").expect("multi parses");
         assert_eq!(subs.len(), 2);
@@ -697,9 +635,7 @@ mod tests {
 
     #[test]
     fn deserializes_minimal_model_text_and_stroke() {
-        // The model is the source of truth: the shell sends a minimal text shape
-        // (runs without color/size, align as the model's `start` variant) and a
-        // stroke. The renderer feed must tolerate it (FC-01).
+        // Minimal text shape (runs without color/size) + stroke; the feed must tolerate it.
         let json = r##"{
             "sceneId": "s1",
             "camera": { "x": 0, "y": 0, "zoom": 1 },
@@ -720,15 +656,13 @@ mod tests {
         assert_eq!(text.valign, RTextValign::Top);
         let run = &text.runs[0];
         assert_eq!(run.color, "#111111");
-        // `size` is WIRE-quantized (8 u/px); a defaulted run holds 16px * 8 = 128,
-        // which de-quantizes to 16px at the layout boundary (RB2 commit C).
+        // `size` is wire-quantized (8 u/px): 16px * 8 = 128, de-quantizing to 16px.
         assert_eq!(run.size, 16.0 * QUANT_PER_PX);
         assert_eq!(obj.stroke.as_ref().expect("stroke present").width, 8.0);
     }
 
     #[test]
     fn quantized_coords_to_pixels() {
-        // 80 quantized units at 8 units/px = 10 px.
         assert_eq!(80.0 / QUANT_PER_PX, 10.0);
     }
 
@@ -738,8 +672,6 @@ mod tests {
 
     #[test]
     fn multi_select_deserializes_from_the_wire() {
-        // W3-G9/#2: the shell sends `multiSelect` on the live wire; before the fix it
-        // was `skip`ped so this always parsed empty (no outline, no group preview).
         let json = r##"{
             "sceneId": "s1",
             "camera": { "x": 0, "y": 0, "zoom": 1 },

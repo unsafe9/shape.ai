@@ -1,22 +1,10 @@
-// OB-3 object fill shader (OB3.R3 + D7 projective transform + OB3.R8 analytic AA).
+// Object fill shader: projective transform + inline solid fill + analytic AA.
 //
-// Pipeline contract (compiled by wgpu at the OB-4 cutover; structurally
-// validated only here — there is no device in the CPU test environment):
-//
-//   - Camera lives in @group(0) and mirrors the legacy affine convention used by
-//     the live pipeline: `camera = vec4(translate.x, translate.y, zoom, _)` and
-//     `viewport = vec4(px_w, px_h, _, _)`. World pixels map to clip space the
-//     same way the legacy `fs_main` path does, so the two pipelines share a
-//     coordinate frame during the cutover.
-//   - Per-object transform (D1/D4) is a 3x3 *projective* matrix carried as three
-//     instance-step vec3 columns. Object-local vertex positions are in CSS px
-//     (the i32 geometry, quantized at 8 units/px, is converted to px by /8 on the
-//     CPU before upload). world = M * vec3(pos, 1); the .z carries the projective
-//     term, so a perspective divide (world.xy / world.z) is required — this is
-//     why we cannot fold M into the affine camera.
-//   - Fill color (D7) is inline per-instance (solid paint). Gradient/image fills
-//     resolve to this same color slot on the CPU for the first cutover; richer
-//     paints get their own bind group later without touching this VS.
+// Per-object transform is a 3x3 projective matrix carried as three instance-step
+// vec3 columns; the .z carries the projective term, so a perspective divide is
+// required — which is why M cannot be folded into the affine camera. Object-local
+// positions are CSS px (i32 geometry at 8 units/px, converted /8 on the CPU).
+// Fill color is inline per-instance; gradient/image fills resolve to this slot.
 
 struct View {
   camera: vec4<f32>,
@@ -26,18 +14,14 @@ struct View {
 @group(0) @binding(0)
 var<uniform> view: View;
 
-// Per-vertex: object-local position (CSS px) and a silhouette coverage helper.
-// `edge` is a per-vertex scalar that is 1 at a boundary (silhouette) vertex and 0
-// at interior vertices; interpolated, it rises from 0 across the interior toward 1
-// at the shape boundary, giving us a cheap analytic coverage term without a full
-// SDF. The CPU build fills this from the mesh topology (`Mesh::boundary_flags`);
-// interior fans get edge = 0.
+// `edge` is 1 at a boundary vertex and 0 at interior vertices; interpolated, it
+// gives a cheap analytic coverage term without a full SDF. The CPU fills it from
+// the mesh topology; interior fans get edge = 0.
 struct VertexIn {
   @location(0) position: vec2<f32>,
   @location(1) edge: f32,
-  // Instance-step: three columns of the per-object 3x3 projective matrix and the
-  // inline fill color. mat3x3 as a vertex attribute is awkward across backends,
-  // so we pass three vec3 columns and rebuild the matrix in the VS.
+  // Instance-step matrix columns (mat3x3 attributes are awkward across backends,
+  // so pass three vec3 columns and rebuild in the VS) + inline fill color.
   @location(2) m0: vec3<f32>,
   @location(3) m1: vec3<f32>,
   @location(4) m2: vec3<f32>,
@@ -47,17 +31,14 @@ struct VertexIn {
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) fill: vec4<f32>,
-  // Signed edge coverage helper carried to the FS for analytic AA.
   @location(1) edge: f32,
 };
 
 fn world_from_local(local: vec2<f32>, m0: vec3<f32>, m1: vec3<f32>, m2: vec3<f32>) -> vec2<f32> {
-  // Column-major reconstruction: M = [m0 | m1 | m2].
   let m = mat3x3<f32>(m0, m1, m2);
   let h = m * vec3<f32>(local, 1.0);
-  // D4 projective divide. Guard the degenerate w ~= 0 so a malformed matrix
-  // produces a finite (off-screen) point rather than a NaN that poisons the
-  // whole primitive.
+  // Projective divide. Guard the degenerate w ~= 0 so a malformed matrix yields a
+  // finite off-screen point rather than a NaN that poisons the primitive.
   let w = select(h.z, 1.0, abs(h.z) < 1e-6);
   return h.xy / w;
 }
@@ -82,19 +63,10 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-  // OB3.R8 analytic anti-aliasing. `edge` rises from 0 in the interior to 1 at the
-  // silhouette boundary; fwidth gives the per-pixel screen-space rate of change so
-  // the soft band is exactly one pixel wide at any zoom (the projective divide
-  // already varies edge non-linearly across the primitive, which fwidth tracks for
-  // free). Coverage stays 1 across the opaque interior and fades only in the last
-  // pixel before `edge` reaches 1 — so an all-zero-edge mesh (no boundary data)
-  // degrades gracefully to a fully opaque fill.
-  //
-  // MSAA is the simpler alternative: enabling a multisampled color target and
-  // dropping this coverage term would hand antialiasing to fixed-function
-  // hardware. We keep the analytic path so object edges stay crisp without
-  // paying for a multisampled attachment, and so dashed strokes/text can share
-  // the same distance-based treatment.
+  // Analytic AA: `edge` rises 0 (interior) -> 1 (boundary); fwidth gives the
+  // screen-space rate so the soft band is one pixel wide at any zoom. An all-zero-
+  // edge mesh degrades to a fully opaque fill. We keep this over MSAA so edges stay
+  // crisp without a multisampled attachment and strokes/text share the treatment.
   let aa = fwidth(input.edge);
   let coverage = 1.0 - smoothstep(1.0 - aa, 1.0, input.edge);
   return vec4<f32>(input.fill.rgb, input.fill.a * coverage);

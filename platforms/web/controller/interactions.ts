@@ -1,11 +1,6 @@
-// Framework-neutral interaction logic lifted out of App.svelte's god-controller.
-//
-// Each function takes every input explicitly (scene, selection, the scene-core
-// handle, id/order factories...) — no Svelte reactivity, no DOM, no ambient
-// state — so App.svelte composes them through thin reactive wrappers and the unit
-// gate pins them by exercising the real behavior (op shapes, routing decisions,
-// menu items) without a mount. Op construction itself still lives in the Rust core
-// (sceneCore); these compose the core's results into the shapes the shell authors.
+// Interaction logic: each function takes every input explicitly (scene, selection, the scene-core
+// handle, id/order factories) with no Svelte reactivity, DOM, or ambient state. Op construction
+// lives in the Rust core (sceneCore); these compose the core's results into the shapes the shell authors.
 
 import {
   GEOMETRY_QUANTUM_PER_PX,
@@ -22,37 +17,31 @@ import type { MoveRoots, ObjectCommand, SceneCore } from "../bridge/sceneCoreWas
 import { THEME_DEFAULT_COLOR, altDetachOps, type DragSpan } from "./objectPrimitives";
 import type { DragCreateShape, PrimitiveKindId } from "./toolbar";
 
-// ----- selection routing (onSelectObject / onMarquee) -----
-
-// W3-G5 (#10): a plain pick on a member of the current Multi keeps the Multi (so a
-// group-drag never collapses to a single object); additive toggles the id in/out;
-// everything else replaces the selection with that object.
+// A plain pick on a member of the current Multi keeps the Multi (so a group-drag never collapses to
+// a single); additive toggles the id in/out; everything else replaces the selection with that object.
 export function routeSelectObject(current: ObjectSelection, id: string, additive: boolean): ObjectSelection {
   if (additive) return toggleObjectSelection(current, id);
   if (current.kind === "multi" && current.ids.includes(id)) return current;
   return { kind: "object", id };
 }
 
-// RA2a: a marquee of >= 2 ids is a Multi, exactly 1 is a single object, 0 clears.
+// A marquee of >= 2 ids is a Multi, exactly 1 is a single object, 0 clears.
 export function routeMarquee(ids: string[]): ObjectSelection {
   if (ids.length >= 2) return { kind: "multi", ids };
   if (ids.length === 1) return { kind: "object", id: ids[0] };
   return { kind: "canvas" };
 }
 
-// ----- body-drag commit (onTransformCommit) -----
-
-// AP2 (#10): a Multi drag anchored on the picked `id` moves EVERY member; otherwise
-// the dragged single root cascades to its own subtree (the core's moveOps).
+// A Multi drag anchored on the picked `id` moves EVERY member; otherwise the dragged single root
+// cascades to its own subtree.
 export function moveRootsFor(selection: ObjectSelection, id: string): MoveRoots {
   return selection.kind === "multi" && selection.ids.includes(id)
     ? { kind: "multi", ids: selection.ids }
     : { kind: "single", id };
 }
 
-// v3 §3 (DU4): an Alt-held BODY translate of an anchored open-class single object is
-// detachable — it moves whole and clears its anchors. The class judgment is the
-// core's (isOpenClassD); only single-root translate body drags qualify.
+// An Alt-held BODY translate of an anchored open-class single object is detachable (moves whole,
+// clears its anchors). The class judgment is the core's; only single-root translate body drags qualify.
 export function isDetachableBodyDrag(
   core: Pick<SceneCore, "isOpenClassD">,
   src: SceneObject,
@@ -69,9 +58,8 @@ export function isDetachableBodyDrag(
   );
 }
 
-// Tier-2: the commit ops for a body drag — the Alt-detach composition when
-// detachable, else the core's combined cascade + anchor-follow moveOps — collapsed
-// to a single ObjectOp (a one-op result stays bare; many ops wrap in a batch).
+// The commit ops for a body drag — the Alt-detach composition when detachable, else the core's
+// combined cascade + anchor-follow moveOps — collapsed to a single ObjectOp (one op stays bare; many batch).
 export function commitBodyDrag(
   core: Pick<SceneCore, "isOpenClassD" | "moveOps">,
   scene: ObjectScene,
@@ -91,10 +79,8 @@ export function commitBodyDrag(
   return { op, allOps };
 }
 
-// FC-16: the dragged `id`'s composed transform from the cascade — read ITS
-// set-transform op (a multi cascade may put another member first / a follow op at
-// [0]), falling back to its current transform. Drives the pendingCommit snap-back
-// guard keyed on the dragged id.
+// The dragged `id`'s composed transform from the cascade — its set-transform op (a multi cascade may
+// put another member or a follow op first), falling back to its current transform. Drives the snap-back guard.
 export function draggedRootTransform(
   allOps: ObjectOp[],
   id: string,
@@ -104,10 +90,8 @@ export function draggedRootTransform(
   return op?.kind === "set-transform" ? op.transform : fallback;
 }
 
-// ----- endpoint drag (onEndpointPreview / onEndpointCommit) -----
-
-// v3 §2b: honor an endpoint-drag snap only onto a REAL, OTHER canonical object (not
-// the dragged id, not a transient preview); returns the hover-ring snap or null.
+// Honor an endpoint-drag snap only onto a REAL, OTHER canonical object (not the dragged id, not a
+// transient preview); returns the hover-ring snap or null.
 export function endpointSnapTarget(
   scene: ObjectScene,
   id: string,
@@ -119,9 +103,8 @@ export function endpointSnapTarget(
     : null;
 }
 
-// v3 §2b: the ONE undoable batch for an endpoint-drag release — the core's
-// endpointReleaseOps (chord-deform edit-geometry + the set-anchor rebind/unbind),
-// collapsed to a single ObjectOp. Null when the release is a no-op (core returns []).
+// The ONE undoable batch for an endpoint-drag release — the core's endpointReleaseOps (chord-deform
+// edit-geometry + set-anchor rebind/unbind), collapsed to a single ObjectOp. Null on a no-op release.
 export function endpointReleaseOp(
   core: Pick<SceneCore, "endpointReleaseOps">,
   scene: ObjectScene,
@@ -135,11 +118,8 @@ export function endpointReleaseOp(
   return ops.length === 1 ? ops[0] : { kind: "batch", ops };
 }
 
-// ----- create / hover snap canonicalization -----
-
-// W3-G5 (#6): honor a snap ONLY when its target is a real canonical object (the
-// transient drag-create preview / snap-indicator ids never are), so a self-snap
-// onto the preview is dropped while a real-edge snap is kept.
+// Honor a snap ONLY when its target is a real canonical object (the transient drag-create preview /
+// snap-indicator ids never are), so a self-snap onto the preview is dropped while a real-edge snap is kept.
 export function canonicalizeCreateSnap(
   scene: ObjectScene,
   snapped: boolean,
@@ -149,8 +129,7 @@ export function canonicalizeCreateSnap(
   return { snapped: snapped && target !== null, target };
 }
 
-// W3-G9 (#3): the persistent pre-drag hover ring snap — set only when snapped onto a
-// real canonical object, else cleared (null). Mirrors create's canonicalization.
+// The persistent pre-drag hover ring snap — set only when snapped onto a real canonical object, else null.
 export function canonicalizeHoverSnap(
   scene: ObjectScene,
   snapped: boolean,
@@ -161,11 +140,7 @@ export function canonicalizeHoverSnap(
   return snapped && target !== null ? { at: world, target } : null;
 }
 
-// ----- primitive insert / recolor (insertPrimitive / applySelectedColor) -----
-
-// AP1 (#5): the immediate-insert object for `kind` at `center`, painted in
-// `selectedColor`, built by the core. The shell authors it as an insert-object op
-// and selects it.
+// The immediate-insert object for `kind` at `center`, painted in `selectedColor`, built by the core.
 export function buildInsertPrimitive(
   core: Pick<SceneCore, "buildPrimitive">,
   kind: PrimitiveKindId,
@@ -177,9 +152,8 @@ export function buildInsertPrimitive(
   return core.buildPrimitive(kind, center, id, order, selectedColor);
 }
 
-// AP1 (#5): the set-style op recoloring the single selected object to `color`, or
-// null when nothing single is selected. The shell adopts the color regardless (it
-// becomes the default for the next NEW shape); only a single selection recolors.
+// The set-style op recoloring the single selected object to `color`, or null when nothing single is
+// selected. The shell adopts the color regardless (it becomes the next-shape default); only a single selection recolors.
 export function buildColorApplyOp(
   core: Pick<SceneCore, "buildSetStyleOp">,
   scene: ObjectScene,
@@ -192,11 +166,8 @@ export function buildColorApplyOp(
   return core.buildSetStyleOp(object, color);
 }
 
-// ----- group / double-click (groupSelection / handleObjectDoubleClick) -----
-
-// FC-14: the batch grouping `ids` under a fresh frame — insert a rect frame sized to
-// the children's union world-AABB, then reparent each child under it (world-absolute
-// transforms reparent unchanged). The frame's id/order come from the shell factories;
+// The batch grouping `ids` under a fresh frame — insert a rect frame sized to the children's union
+// world-AABB, then reparent each child under it (world-absolute transforms reparent unchanged).
 // `bounds` is the union AABB (null = degenerate 1x1 at origin).
 export function buildGroupOps(
   ids: string[],
@@ -225,8 +196,7 @@ export function buildGroupOps(
   return { ops, frameId: frame.id };
 }
 
-// RA2b (#9, D6): the double-click action — the core's container-vs-leaf decision for
-// the signal's object. A null signal is a no-op.
+// The double-click action — the core's container-vs-leaf decision for the signal's object; null signal is a no-op.
 export type DoubleClickResolution =
   | { kind: "none" }
   | { kind: "drill-in"; id: string }
@@ -242,12 +212,8 @@ export function resolveDoubleClick(
   return action.kind === "drill-in-container" ? { kind: "drill-in", id: signal.id } : { kind: "edit-leaf", id: signal.id };
 }
 
-// ----- context menu assembly (OBJECT_MENU / CANVAS_MENU) -----
-
-// AP3: a context-menu entry — a separator or a command row gated optionally on the
-// picked target's shape in the forest (children/parent), beyond the coarse
-// `disabledFor` kind check. Icons are decorated by the shell (Svelte components), so
-// this layer carries only an opaque icon tag the shell maps; `enabled` is a predicate.
+// A context-menu entry — a separator or a command row gated optionally on the picked target's shape
+// (beyond the coarse `disabledFor` kind check). The icon is an opaque tag the shell maps to a component.
 export type ContextMenuEntry<Icon = unknown> =
   | "separator"
   | {
@@ -259,7 +225,7 @@ export type ContextMenuEntry<Icon = unknown> =
       enabled?: (picked: ObjectSelection) => boolean;
     };
 
-// AP3 (#13): ungroup is enabled only for a single container object (has children).
+// Ungroup is enabled only for a single container object (has children).
 export function ungroupPickEnabled(
   core: Pick<SceneCore, "ungroupEnabled">,
   scene: ObjectScene,
@@ -268,7 +234,7 @@ export function ungroupPickEnabled(
   return picked.kind === "object" && core.ungroupEnabled(scene, picked.id);
 }
 
-// AP3 (#18): pop-out is enabled only when the single picked object has a parent.
+// Pop-out is enabled only when the single picked object has a parent.
 export function popOutPickEnabled(
   core: Pick<SceneCore, "popOutOp">,
   scene: ObjectScene,
@@ -277,9 +243,7 @@ export function popOutPickEnabled(
   return picked.kind === "object" && core.popOutOp(scene, picked.id) !== null;
 }
 
-// AP3 (#13): the object/multi menu. Icons are tagged by string id and mapped to the
-// shell's lucide components at render; `pop-out` is a shell-only command (no catalog
-// entry) so it carries its own label.
+// The object/multi menu. `pop-out` is a shell-only command (no catalog entry) so it carries its own label.
 export const OBJECT_MENU: ContextMenuEntry<string>[] = [
   { id: "duplicate", icon: "copy" },
   { id: "group", icon: "group", disabledFor: "object" },
@@ -292,8 +256,7 @@ export const OBJECT_MENU: ContextMenuEntry<string>[] = [
   { id: "delete", icon: "trash", danger: true }
 ];
 
-// AP3 (#18, D7): the empty-canvas menu — quick inserts, the template library, and
-// select-all. The insert-text entry is gone (D7); text arrives via the toolbar.
+// The empty-canvas menu — quick inserts, the template library, and select-all.
 export const CANVAS_MENU: ContextMenuEntry<string>[] = [
   { id: "insert-rectangle" },
   { id: "insert-ellipse" },
@@ -302,10 +265,8 @@ export const CANVAS_MENU: ContextMenuEntry<string>[] = [
   { id: "select-all" }
 ];
 
-// FC-13: a resolved menu item — the catalog/shell label, the picked-target disabled
-// state (kind check OR the `enabled` predicate), plus the icon tag + danger flag.
-// `null` is a separator. Pure over the layout + the command catalog + a handler set:
-// an entry with no handler drops out (renders nothing).
+// A resolved menu item — label, disabled state (kind check OR the `enabled` predicate), icon tag,
+// danger flag. `null` is a separator; an entry with no handler drops out (renders nothing).
 export type ResolvedMenuItem<Icon = unknown> = {
   id: string;
   label: string;
@@ -336,21 +297,17 @@ export function resolveContextMenuItems<Icon>(
   });
 }
 
-// ----- feed scene + preview cluster (buildFeedScene) -----
-
-// W2-07/Tier-3: the renderer Paint for a transient shell preview's selected color —
-// the theme-default sentinel renders as the "text" token, every other color as
-// solid. The CANONICAL sentinel→Paint rule lives in the core (build_primitive /
-// build_set_style_op); this is the per-frame-preview mirror, kept off the FFI hot path.
+// The renderer Paint for a transient preview's selected color — the theme-default sentinel renders
+// as the "text" token, else solid. The canonical sentinel→Paint rule lives in the core; this is the
+// per-frame-preview mirror, kept off the FFI hot path.
 export function previewPaint(color: string): Paint {
   return color === THEME_DEFAULT_COLOR ? { kind: "token", name: "text" } : { kind: "solid", color };
 }
 
 const q = (px: number) => Math.round(px * GEOMETRY_QUANTUM_PER_PX);
 
-// FC-11: a transient preview object for the in-progress pen stroke — a world-px
-// polyline (identity transform, so local==world) with the pen brush. Built in TS
-// (NOT op-apply); the committed object replaces it on pointer-up.
+// A transient preview object for the in-progress pen stroke — a world-px polyline (identity
+// transform, so local==world) with the pen brush. Built in TS (NOT op-apply); the commit replaces it.
 export function drawPreviewObject(
   points: { x: number; y: number }[],
   order: string,
@@ -373,9 +330,8 @@ export function drawPreviewObject(
   };
 }
 
-// W2-07/Tier-3: the transient rubber-band for one drag-create frame. Mirrors the
-// core build_primitive_from_drag geometry (line corner-to-corner; closed kinds to
-// the normalized bbox) on a pure-translation transform, cheaply in TS so the
+// The transient rubber-band for one drag-create frame. Mirrors the core's build_primitive_from_drag
+// geometry (line corner-to-corner; closed kinds to the normalized bbox) cheaply in TS so the
 // per-frame preview never crosses the FFI boundary.
 export function createPreviewObject(
   kind: DragCreateShape,
@@ -406,8 +362,7 @@ export function createPreviewObject(
   };
 }
 
-// The four-cubic ellipse rubber-band path (kappa 0.5523), object-local quantized. A
-// shell-side preview affordance; the committed ellipse is built by the core.
+// The four-cubic ellipse rubber-band path (kappa 0.5523), object-local quantized. Preview only; the committed ellipse is built by the core.
 function previewEllipsePath(w: number, h: number): string {
   const cx = q(w / 2);
   const cy = q(h / 2);
@@ -423,9 +378,8 @@ function previewEllipsePath(w: number, h: number): string {
   ].join(" ");
 }
 
-// W2-07: a small ring drawn at a snapped corner so the user sees the snap. Geometry
-// is a world-px ellipse (identity transform, so local==world); built in TS like the
-// pen preview (NOT op-apply).
+// A small ring drawn at a snapped corner so the user sees the snap — a world-px ellipse (identity
+// transform, so local==world), built in TS (NOT op-apply).
 export function snapIndicatorObject(at: { x: number; y: number }, order: string): SceneObject {
   const r = 5;
   const k = r * 0.5523;
@@ -448,11 +402,9 @@ export function snapIndicatorObject(at: { x: number; y: number }, order: string)
   };
 }
 
-// FC-11/W2-07: the renderer feed — the canonical scene plus any transient NEW-object
-// preview (pen stroke / shape drag-create rubber-band + snap indicator, or the
-// persistent pre-drag hover ring when no drag is in progress). Neither mutates the
-// canonical scene nor runs op-apply (geometry-vocabulary construction only). The
-// order factory positions every preview on top.
+// The renderer feed — the canonical scene plus any transient NEW-object preview (pen stroke /
+// drag-create rubber-band + snap indicator, or the persistent pre-drag hover ring when no drag is
+// in progress). Never mutates the canonical scene nor runs op-apply. The order factory puts every preview on top.
 export function buildFeedScene(
   source: ObjectScene,
   pen: { x: number; y: number }[] | null,
@@ -471,8 +423,7 @@ export function buildFeedScene(
     if (createState.snapped) extra.push(snapIndicatorObject(createState.span.end, nextOrder()));
     feed = { ...feed, objects: [...feed.objects, ...extra] };
   } else if (hoverSnap) {
-    // W3-G9 (#3): no drag in progress — render the PERSISTENT pre-drag anchor ring
-    // at the hovered edge so the user sees where the next create would anchor.
+    // No drag in progress — render the persistent pre-drag anchor ring at the hovered edge.
     feed = { ...feed, objects: [...feed.objects, snapIndicatorObject(hoverSnap.at, nextOrder())] };
   }
   return feed;

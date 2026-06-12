@@ -1,9 +1,5 @@
-// FC-02 regression — the renderer feed de-quantizes stroke units.
-//
-// The model stores stroke width/dash in QUANTIZED units (GEOMETRY_QUANTUM_PER_PX
-// per px); `objectSceneToRenderObjectScene` must divide them back to logical px
-// so the renderer (which treats RStroke.width as px) does not draw 8x too thick.
-// Node-only, no GPU.
+// The model stores stroke width/dash in quantized units (GEOMETRY_QUANTUM_PER_PX per
+// px); the feed must divide back to logical px so the renderer does not draw 8x thick.
 
 import { beforeAll, describe, expect, it } from "vitest";
 import { objectSceneToRenderObjectScene } from "../platforms/web/controller/canvasHost";

@@ -1,15 +1,3 @@
-// OB4.3 client cutover tests.
-//
-// These prove the shell's data layer is the object-native stack (WS transport +
-// scene-core OBJECT op-apply via SceneClient), not the retired HTTP/TS-renderPatch
-// path. The Svelte shell (App.svelte) drives SceneClient exactly the way these
-// tests do — connect for the LOAD snapshot, applyObjectOp for the SAVE,
-// saveSelection for presence, sendFeature for the single feature channel — so
-// asserting the contract here asserts the cutover without instantiating Svelte.
-//
-// The op-apply itself is the scene-core WASM object core, exercised end-to-end in
-// object-op-apply.test.ts (the op-apply oracle); here we assert the wire shape.
-
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { SceneClient } from "../platforms/web/runtime/sceneClient";
@@ -81,9 +69,8 @@ function sceneWithA(sceneVersion = 1): ObjectScene {
 }
 
 function rect(id: string): SceneObject {
-  // fillRule is the canonical scene-core default; spell it out so the op/scene
-  // round-tripped through the Rust session (which materializes serde defaults)
-  // deep-equals this fixture.
+  // Spell out fillRule so the op/scene round-tripped through the Rust session
+  // (which materializes serde defaults) deep-equals this fixture.
   return { id, order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z", fillRule: "evenOdd" } };
 }
 
@@ -190,7 +177,7 @@ describe("cutover: selection-only does not bump the revision", () => {
   });
 });
 
-describe("cutover: feature traffic via the single WS feature channel (OB4.5)", () => {
+describe("cutover: feature traffic via the single WS feature channel", () => {
   it("a template apply rides a feature frame, not bespoke REST", async () => {
     const { client, socket } = await boot(sceneWithA(1), 1);
     client.sendFeature({

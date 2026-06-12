@@ -1,64 +1,32 @@
-//! OB3.S7 — wire Feature channel handlers (object-native, additive).
+//! Feature channel handlers: the request/response RPC that replaces the bespoke
+//! REST surface. Mutating requests lower to [`ObjectOp`]s and push through the
+//! single op-apply path (`apply_object_op` on the passed [`ObjectScene`]), so the
+//! channel never grows a second way to mutate the scene; reads reply directly.
 //!
-//! The Feature channel is the request/response RPC that replaces the bespoke
-//! REST surface (`/api/canvases|comments|templates|export`). Mutating requests
-//! are lowered to [`ObjectOp`]s and pushed through the **single** op-apply path
-//! (P1) — `apply_object_op` on the passed [`ObjectScene`] — so the Feature
-//! channel never grows a second way to mutate the scene. Read/subscribe
-//! requests reply directly without authoring an op.
-//!
-//! This module is authored alongside the legacy server (`ws.rs`/`scene_api.rs`/
-//! `mcp.rs`, all still on `shape_scene_core::{Scene, ...}`). It is wired into the
-//! router and the per-canvas actor at the OB-4 cutover; nothing here touches the
-//! legacy modules.
-//!
-//! Pure-where-possible: time, the journal seq, and id allocation are *injected*
-//! through [`FeatureCtx`] (the actor seam supplies the real clock/seq/ids), so
-//! the handler itself holds no clock/rng/IO and the same call is deterministic
-//! under a fixed `FeatureCtx`. Pointer-width-agnostic: `seq`/`revision` ride the
-//! wire as `u64`, never `usize`.
+//! Time, seq, and id allocation are injected through [`FeatureCtx`], so the
+//! handler holds no clock/rng/IO and the same call is deterministic under a fixed
+//! ctx. Pointer-width-agnostic: `seq`/`revision` ride the wire as `u64`.
 
 use shape_scene_core::object::{
     apply_object_op, ApplyError, FeatureRequest, FeatureResponse, ObjectOp, ObjectScene,
     template_to_ops,
 };
 
-/// Injected effects for a Feature handler call (P1 IO/time seam).
-///
-/// The handler is otherwise pure: it mutates only the [`ObjectScene`] it is
-/// given, through `apply_object_op`. Everything non-deterministic — the wall
-/// clock, the canvas's current journal `seq`/`revision`, and fresh id minting —
-/// arrives here so the actor owns those concerns and tests can pin them.
+/// Injected effects so the handler stays pure (mutates only the given
+/// [`ObjectScene`] through `apply_object_op`); the actor owns clock/seq/ids.
 pub struct FeatureCtx<'a> {
-    /// Wall-clock accessor (RFC-3339 string, the `ObjectScene.updated_at` shape).
-    /// Injected so the handler stays clock-free; a mutating Feature stamps
-    /// `scene.updated_at` with it after a successful apply.
+    /// RFC-3339 wall clock; a mutating Feature stamps `scene.updated_at` after apply.
     pub now: &'a dyn Fn() -> String,
-    /// The canvas's current journal sequence (post-apply seq the actor reports).
-    /// Returned verbatim in `CanvasSwitched` so a switch is a read/subscribe.
+    /// Current journal seq, echoed verbatim in `CanvasSwitched`.
     pub seq: u64,
-    /// The canvas's current scene revision (`scene_version`), echoed on switch.
+    /// Current scene revision (`scene_version`), echoed on switch.
     pub revision: u64,
 }
 
-/// Lower a [`FeatureRequest`] to [`ObjectOp`]s and apply them through the single
-/// op-apply path, returning `(applied ops, response)`.
-///
-/// The returned `Vec<ObjectOp>` is the forward ops that were *applied* (already
-/// lowered and committed to `scene`). The actor seam re-drives these through
-/// `apply_object_op` to capture the matching inverses for the undo/journal; this
-/// layer keeps the lowering pure and does not own the journal.
-///
-/// Variants:
-/// - `CommentUpsert` → one [`ObjectOp::AddComment`]; reply `CommentUpserted`.
-/// - `TemplateApply` → `template_to_ops(recipe)`, applied in order; reply
-///   `TemplateApplied` with the inserted ids.
-/// - `CanvasSwitch` → no op (read/subscribe); reply `CanvasSwitched` with the
-///   injected `seq`/`revision`.
-/// - `ExportRequest` → no op; reply `ExportReady` carrying the rendered export
-///   text in `artifact_ref` (the AI-readable digest of the scoped objects + their
-///   anchor connections, via [`crate::object_mcp::export`]), or `FeatureError`
-///   for an unsupported `export_type`.
+/// Lower a [`FeatureRequest`] to [`ObjectOp`]s, apply through the single op-apply
+/// path, and return `(applied ops, response)`. The actor seam re-drives the
+/// applied ops to capture inverses; this layer keeps lowering pure and owns no
+/// journal. Reads (`CanvasSwitch`, `ExportRequest`) yield no op.
 pub fn handle_feature(
     req: FeatureRequest,
     scene: &mut ObjectScene,
@@ -89,8 +57,7 @@ pub fn handle_feature(
         }
 
         FeatureRequest::TemplateApply { recipe, .. } => {
-            // The recipe objects already carry ids/orders (the shell's
-            // build_template allocated them); lower 1 insert-object per object.
+            // Recipe objects already carry ids/orders (the shell allocated them).
             let object_ids: Vec<String> = recipe.iter().map(|o| o.id.clone()).collect();
             let ops = template_to_ops(recipe);
             match apply_lowered(scene, ops) {
@@ -103,8 +70,6 @@ pub fn handle_feature(
         }
 
         FeatureRequest::CanvasSwitch { canvas_id } => {
-            // A read/subscribe: no op, no scene mutation. The actor's current
-            // seq/revision (injected) tell the client where the snapshot lands.
             (
                 Vec::new(),
                 FeatureResponse::CanvasSwitched {
@@ -121,9 +86,8 @@ pub fn handle_feature(
             request_id,
             ..
         } => {
-            // Read-only: render the scoped objects + their anchor connections into
-            // the AI-readable digest (P6) and return the text as the artifact.
-            // Unknown formats are a clean FeatureError carrying the request_id.
+            // Read-only: render the scoped objects + anchor connections into the
+            // digest. Unknown formats are a FeatureError carrying the request_id.
             if !is_supported_export(&export_type) {
                 return (
                     Vec::new(),
@@ -146,32 +110,25 @@ pub fn handle_feature(
     }
 }
 
-/// Apply already-lowered ops in order through the single op-apply path (P1),
-/// returning the applied ops on success. On any failure the partial mutations
-/// stay (matching `apply_object_op`'s in-place semantics for non-batch ops); the
-/// caller turns the error into a `FeatureError` and does NOT report the request
-/// as applied. The actor records the inverses (captured here) for undo/journal.
+/// Apply lowered ops in order. On failure the partial mutations stay (matching
+/// `apply_object_op`'s in-place semantics); the caller turns the error into a
+/// `FeatureError`. The inverse is discarded here — the actor seam re-derives it
+/// for journaling.
 fn apply_lowered(scene: &mut ObjectScene, ops: Vec<ObjectOp>) -> Result<Vec<ObjectOp>, ApplyError> {
     let mut applied = Vec::with_capacity(ops.len());
     for op in ops {
-        // The inverse is intentionally discarded at this layer; the actor seam
-        // re-derives/records it when it drives `apply_object_op` for journaling.
         let _inverse = apply_object_op(scene, op.clone())?;
         applied.push(op);
     }
     Ok(applied)
 }
 
-/// The export formats [`crate::object_mcp::export`] renders. Kept narrow on
-/// purpose: an unknown format is rejected rather than silently rendered.
 fn is_supported_export(export_type: &str) -> bool {
     matches!(export_type, "mermaid" | "digest")
 }
 
 fn export_content_type(export_type: &str) -> &'static str {
     match export_type {
-        // A mermaid flowchart is markdown-embeddable text; the plain digest is
-        // a node/edge listing.
         "mermaid" => "text/markdown",
         _ => "text/plain",
     }
@@ -184,20 +141,13 @@ fn feature_error(request_id: Option<String>, e: ApplyError) -> FeatureResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Wire round-trip helpers. These replace the bespoke REST endpoints
-// (/api/canvases|comments|templates|export): a Feature request/response is a
-// single JSON frame on the reliable_ordered channel, internally tagged on
-// `feature` (the FeatureRequest/FeatureResponse serde shape).
-// ---------------------------------------------------------------------------
-
-/// Decode a Feature request frame from its JSON wire text.
+/// A Feature request/response is a single internally-tagged JSON frame on the
+/// reliable_ordered channel.
 pub fn decode_feature(json: &str) -> Result<FeatureRequest, serde_json::Error> {
     serde_json::from_str(json)
 }
 
-/// Encode a Feature response to its JSON wire text. Serialization of a
-/// well-formed response is infallible (no non-string map keys, no NaN paths).
+/// Serialization of a well-formed response is infallible.
 pub fn encode_feature_response(resp: &FeatureResponse) -> String {
     serde_json::to_string(resp).expect("feature response serializes")
 }
@@ -210,7 +160,6 @@ mod tests {
         TextRun, TextVAlign,
     };
 
-    /// A labeled closed rect object at the origin, carrying a single text run.
     fn labeled_rect(id: &str, order: &str, label: &str) -> Object {
         let mut obj = Object::new(id, order, rect_geometry());
         obj.text = Some(Text {
@@ -228,7 +177,7 @@ mod tests {
         obj
     }
 
-    /// An open 2-node connector anchored from `a` (node 0) to `b` (node 1).
+    /// Open 2-node connector anchored from `a` (node 0) to `b` (node 1).
     fn connector(id: &str, order: &str, a: &str, b: &str) -> Object {
         let mut obj = Object::new(
             id,
@@ -248,7 +197,7 @@ mod tests {
         obj
     }
 
-    /// A closed unit rect at (0,0)-(80,40) in quantized units.
+    /// A closed rect at (0,0)-(80,40) in quantized units.
     fn rect_geometry() -> Geometry {
         Geometry::from_subpaths(
             vec![SubPath {
@@ -264,7 +213,6 @@ mod tests {
         )
     }
 
-    /// A no-op clock for the time seam (handlers are clock-free today).
     fn fixed_clock() -> impl Fn() -> String {
         || "1970-01-01T00:00:00Z".to_string()
     }
@@ -305,14 +253,10 @@ mod tests {
 
         let (applied, resp) = handle_feature(req, &mut scene, &mut ctx);
 
-        // The comment is appended to the object via the single apply path.
         assert_eq!(scene.get("rect-1").unwrap().comments, vec![comment]);
-        // The injected clock stamped updated_at on the successful apply.
         assert_eq!(scene.updated_at, "1970-01-01T00:00:00Z");
-        // One AddComment op was applied.
         assert_eq!(applied.len(), 1);
         assert!(matches!(applied[0], ObjectOp::AddComment { .. }));
-        // Response echoes the object + the comment id.
         assert_eq!(
             resp,
             FeatureResponse::CommentUpserted {
@@ -358,7 +302,6 @@ mod tests {
             seq: 7,
             revision: 42,
         };
-        // A 2-object recipe carrying its own ids/orders (as build_template mints).
         let recipe = vec![
             Object::new("tpl-a", "a0", rect_geometry()),
             Object::new("tpl-b", "a1", rect_geometry()),
@@ -372,11 +315,9 @@ mod tests {
 
         let (applied, resp) = handle_feature(req, &mut scene, &mut ctx);
 
-        // Both objects inserted through the single apply path.
         assert_eq!(scene.objects.len(), 2);
         assert!(scene.get("tpl-a").is_some());
         assert!(scene.get("tpl-b").is_some());
-        // Two insert-object ops applied.
         assert_eq!(applied.len(), 2);
         assert!(applied
             .iter()
@@ -405,7 +346,6 @@ mod tests {
 
         let (applied, resp) = handle_feature(req, &mut scene, &mut ctx);
 
-        // No op, no scene mutation.
         assert!(applied.is_empty());
         assert_eq!(scene, before);
         assert_eq!(
@@ -420,7 +360,6 @@ mod tests {
 
     #[test]
     fn export_request_renders_connected_scope_into_artifact() {
-        // A 2-object scene wired by a connector: src -> dst.
         let mut scene = ObjectScene::default();
         for op in [
             ObjectOp::InsertObject { object: labeled_rect("src", "a0", "Source") },
@@ -444,7 +383,6 @@ mod tests {
 
         let (applied, resp) = handle_feature(req, &mut scene, &mut ctx);
 
-        // Read-only: no op applied, scene untouched.
         assert!(applied.is_empty());
         match resp {
             FeatureResponse::ExportReady {
@@ -454,7 +392,6 @@ mod tests {
             } => {
                 assert_eq!(request_id, "req-9");
                 assert_eq!(content_type, "text/plain");
-                // Non-empty content mentioning both connected objects + the edge.
                 assert!(!artifact_ref.is_empty(), "export content is non-empty");
                 assert!(artifact_ref.contains("Source"), "mentions src label: {artifact_ref}");
                 assert!(artifact_ref.contains("Dest"), "mentions dst label: {artifact_ref}");
@@ -564,10 +501,8 @@ mod tests {
         for req in reqs {
             let json = serde_json::to_string(&req).expect("serialize request");
             let mut back = decode_feature(&json).expect("decode request");
-            // Geometry serializes only its path-string `d`; the parsed `subpaths`
-            // mirror is reconstructed by `ensure_parsed`. Hydrate the decoded
-            // recipe so the round-trip compares apples to apples (the at-rest wire
-            // form is faithful; only the runtime mirror needs rebuilding).
+            // Geometry serializes only its path-string `d`; `ensure_parsed`
+            // rebuilds the `subpaths` mirror, so hydrate before comparing.
             if let FeatureRequest::TemplateApply { recipe, .. } = &mut back {
                 for object in recipe {
                     object.geometry.ensure_parsed().expect("recipe geometry parses");

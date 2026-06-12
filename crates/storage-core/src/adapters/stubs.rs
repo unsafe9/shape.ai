@@ -1,14 +1,8 @@
-//! Adapter stubs for backends whose drivers are not available offline.
-//!
-//! postgres / s3 / remote-server are part of the [`AdapterKind`] vocabulary but
-//! require external crates or services that cannot be fetched in this
-//! environment. Each is a real `StorageAdapter` *shape* so callers can name and
-//! route to it, but the per-record I/O returns [`StorageError::Unsupported`]
-//! until a backend is wired in.
-//!
-//! Crucially, the portability surface is *not* faked: a real backend just needs
-//! to implement the streaming pair (`records`/`ingest`) plus `snapshot`/
-//! `restore`, and `export`/`import` then work unchanged via the streaming core.
+//! Adapter stubs for backends (postgres / s3 / remote-server) whose drivers are
+//! unavailable offline. Each is a real `StorageAdapter` *shape* callers can name
+//! and route to, but per-record I/O returns [`StorageError::Unsupported`] until
+//! a backend is wired in (`export`/`import` then come for free via the
+//! streaming core once `records`/`ingest`/`snapshot`/`restore` are implemented).
 
 use crate::adapter::{AdapterKind, RecordCursor, StorageAdapter};
 use crate::error::{Result, StorageError};
@@ -21,7 +15,6 @@ macro_rules! unsupported_adapter {
         pub struct $name;
 
         impl $name {
-            /// Construct the stub.
             pub fn new() -> Self {
                 $name
             }

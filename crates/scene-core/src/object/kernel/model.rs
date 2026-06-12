@@ -1,41 +1,26 @@
-//! OB1.1 keystone — the single `object` substrate (D1/P2).
+//! The single `object` substrate. Every shape, scribble, edge, group, and text
+//! node is an [`Object`] — no shape/type discriminant; one `geometry` value plus
+//! optional style/text/anchors/layout expresses all of them.
 //!
-//! Every shape, scribble, edge, group, and text node on the canvas is an
-//! [`Object`]. There is no shape/type discriminant: a single `geometry` value
-//! (a path substrate) plus optional style/text/anchors/layout expresses all of
-//! them. This module is authored alongside the legacy `model.rs` during the
-//! OB-1..OB-3 parallel run; the model cutover (OB4.1) swaps consumers over and
-//! deletes `SceneGroup/SceneNode/SceneEdge`.
+//! Conventions: serde camelCase to match the wire; platform-pure; pointer-width-
+//! agnostic (coords i32, codes i64/u64; no `usize` in serialized/addressing
+//! fields); no lossy `as` casts.
 //!
-//! Conventions (CLAUDE.md): serde camelCase to match the wire; platform-pure
-//! (no time/rng/IO); pointer-width-agnostic (no `usize` in any serialized or
-//! addressing field — coords are i32, codes i64/u64); strict workspace lints
-//! (no lossy `as` casts).
-//!
-//! **Geometry layering (D2/D9/D11):** the canonical at-rest + wire encoding is
-//! an SVG-subset path-string (`d`); the parsed contour list (`subpaths`) is the
-//! runtime form and is never serialized (`#[serde(skip)]`). Coordinates inside
-//! the string are object-local quantized integers at [`GEOMETRY_QUANTUM_PER_PX`]
-//! units per logical pixel.
+//! Geometry layering: the canonical at-rest + wire encoding is an SVG-subset
+//! path-string (`d`); the parsed contour list (`subpaths`) is the runtime form,
+//! never serialized. Coordinates are object-local quantized integers at
+//! [`GEOMETRY_QUANTUM_PER_PX`] units per logical pixel.
 
 use serde::{Deserialize, Serialize};
 
-/// Stable string id. Objects, tags, comments, and anchor targets all use string
-/// ids (matches the existing model.rs / `Record.id`); never an array index that
-/// could shift, which is why nodes are index-addressed *within* one geometry.
+/// Stable string id — never an array index that could shift, which is why nodes
+/// are index-addressed *within* one geometry.
 pub type ObjectId = String;
 
-/// Free-form metadata bag, preserved verbatim (mirrors legacy `ObjectMeta`).
 pub type ObjectMeta = serde_json::Map<String, serde_json::Value>;
 
-// ---------------------------------------------------------------------------
-// D2 — geometry: single path substrate, object-local quantized i32 @ 1/8px.
-// ---------------------------------------------------------------------------
-
-/// Quantization unit: this many quantized units == 1.0 logical px. Global const
-/// (not per-canvas) per the locked decision — keeps storage + golden vectors
-/// stable. Stored coords are i32 so the schema is pointer-width-agnostic and
-/// bit-exact across Rust/wasm/golden.
+/// Quantized units per 1.0 logical px. Global (not per-canvas) so storage +
+/// golden vectors stay stable; i32 so the schema is bit-exact across Rust/wasm.
 pub const GEOMETRY_QUANTUM_PER_PX: i32 = 8;
 
 /// Bezier handle offset, object-local quantized i32 relative to its owning node.
@@ -48,12 +33,10 @@ pub struct HandlePoint {
     pub dy: i32,
 }
 
-/// One path node, **index-addressable within its subpath** (the node index is
-/// the addressing key for edit-geometry / anchors — never a separate node id).
-/// `in_handle`/`out_handle` absent => straight segment (polyline/sketch),
-/// present => cubic bezier control points relative to the node. `width` is the
-/// per-node stroke/pressure slot (D4/D13, behavior deferred). Coords object-local
-/// quantized i32 (D2).
+/// Index-addressable within its subpath (the node index is the addressing key
+/// for edit-geometry / anchors — never a separate node id). Handles absent =>
+/// straight segment, present => cubic bezier control points relative to the node.
+/// Coords object-local quantized i32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -70,14 +53,13 @@ pub struct PathNode {
 }
 
 impl PathNode {
-    /// A corner node (straight segments on both sides).
     pub fn corner(x: i32, y: i32) -> Self {
         PathNode { x, y, in_handle: None, out_handle: None, width: None }
     }
 }
 
 /// One contour. `closed` + presence-of-handles + multi-subpath define topology;
-/// there is no shape/type discriminant (P2/D2).
+/// there is no shape/type discriminant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -97,43 +79,39 @@ pub enum FillRule {
     NonZero,
 }
 
-/// Geometry (D2/D9). The serialized form carries the SVG-subset path-string `d`
-/// and the fill rule only; `subpaths` is the parsed runtime mirror and is
-/// reconstructed by [`Geometry::ensure_parsed`] / [`Geometry::parse`]. This
-/// makes the path-string the single source of truth at rest + on the wire
-/// (no duality / divergence risk).
+/// The serialized form carries the path-string `d` + fill rule only; `subpaths`
+/// is the parsed runtime mirror, reconstructed by `ensure_parsed`/`parse`. The
+/// path-string is the single source of truth at rest + on the wire.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Geometry {
-    /// At-rest / wire SVG-subset path-string (M/L/C/Z, multi-subpath). Absolute
-    /// integer coordinates in object-local quantized units (D2).
+    /// Path-string (M/L/C/Z, multi-subpath); absolute integer coordinates in
+    /// object-local quantized units.
     #[serde(rename = "d", default, skip_serializing_if = "String::is_empty")]
     pub path_string: String,
     #[serde(default)]
     pub fill_rule: FillRule,
-    /// Parsed runtime contours — never serialized; derived from `path_string`.
     #[serde(skip)]
     pub subpaths: Vec<SubPath>,
 }
 
 impl Geometry {
-    /// Build geometry from runtime contours, encoding the canonical path-string.
     pub fn from_subpaths(subpaths: Vec<SubPath>, fill_rule: FillRule) -> Self {
         let path_string = path_string::serialize(&subpaths);
         Geometry { path_string, fill_rule, subpaths }
     }
 
-    /// Parse `path_string` into `subpaths`, replacing any current parse. Returns
-    /// an error string on malformed input (never panics).
+    /// Parse `path_string` into `subpaths`, replacing any current parse. `Err` on
+    /// malformed input; never panics.
     pub fn parse(&mut self) -> Result<(), String> {
         self.subpaths = path_string::parse(&self.path_string)?;
         Ok(())
     }
 
-    /// Populate `subpaths` from `path_string` if it is currently empty but a
-    /// path-string is present (the post-deserialize hydration step).
+    /// Post-deserialize hydration: populate `subpaths` from `path_string` when
+    /// currently empty.
     pub fn ensure_parsed(&mut self) -> Result<(), String> {
         if self.subpaths.is_empty() && !self.path_string.is_empty() {
             self.parse()?;
@@ -141,23 +119,20 @@ impl Geometry {
         Ok(())
     }
 
-    /// Re-encode `path_string` from the current `subpaths` (call after editing
-    /// the parsed form so the canonical encoding stays in sync).
+    /// Re-encode `path_string` after editing the parsed form.
     pub fn reencode(&mut self) {
         self.path_string = path_string::serialize(&self.subpaths);
     }
 }
 
-/// SVG-subset path-string codec (D2). Grammar: `M x y` (moveto, starts a
-/// subpath), `L x y` (lineto), `C x1 y1 x2 y2 x y` (absolute cubic bezier),
-/// `Z` (close). Coordinates are integers (object-local quantized units). Bezier
-/// handles are stored relative to their node; the codec converts to/from the
-/// absolute control points SVG expects.
+/// SVG-subset path-string codec. Grammar: `M x y`, `L x y`, `C x1 y1 x2 y2 x y`
+/// (absolute cubic), `Z`. Integer coordinates in object-local quantized units.
+/// Bezier handles are stored relative to their node; the codec converts to/from
+/// SVG's absolute control points.
 pub mod path_string {
     use super::{HandlePoint, PathNode, SubPath};
     use core::fmt::Write as _;
 
-    /// Encode contours into an SVG-subset path-string.
     pub fn serialize(subpaths: &[SubPath]) -> String {
         let mut out = String::new();
         for sp in subpaths {
@@ -174,8 +149,7 @@ pub mod path_string {
             }
             if sp.closed {
                 if let (Some(last), Some(first)) = (sp.nodes.last(), sp.nodes.first()) {
-                    // Closing segment back to the first node carries its curve
-                    // when the endpoints define handles.
+                    // Closing segment carries its curve when endpoints define handles.
                     if last.out_handle.is_some() || first.in_handle.is_some() {
                         emit_segment(&mut out, last, first);
                     }
@@ -201,8 +175,8 @@ pub mod path_string {
         }
     }
 
-    /// Parse an SVG-subset path-string into contours. Tolerates extra
-    /// whitespace and commas; rejects unknown commands and short arg lists.
+    /// Tolerates extra whitespace and commas; rejects unknown commands and short
+    /// arg lists.
     pub fn parse(s: &str) -> Result<Vec<SubPath>, String> {
         let mut tokens = s
             .split(|c: char| c.is_whitespace() || c == ',')
@@ -266,12 +240,8 @@ pub mod path_string {
     }
 }
 
-// ---------------------------------------------------------------------------
-// D7 — transform: 3x3 projective matrix (TRS + shear + perspective), 0-rebake.
-// ---------------------------------------------------------------------------
-
 /// Row-major 3x3 projective matrix `[[a,b,c],[d,e,f],[g,h,i]]`; affine is the
-/// case `g=h=0,i=1`. Pipeline: `screen = camera · m · warp(local)` (D7). f64 so
+/// case `g=h=0,i=1`. Pipeline: `screen = camera · m · warp(local)`. f64 so
 /// hit-test inverse + perspective divide stay numerically faithful.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -294,7 +264,6 @@ impl Transform3x3 {
         Transform3x3 { m: [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]] }
     }
 
-    /// Matrix product `self · rhs`.
     pub fn mul(&self, rhs: &Transform3x3) -> Transform3x3 {
         let a = &self.m;
         let b = &rhs.m;
@@ -307,8 +276,8 @@ impl Transform3x3 {
         Transform3x3 { m: out }
     }
 
-    /// Apply to an object-local point, returning a world point (perspective
-    /// divide included). Input/output in logical px (not quantized).
+    /// Object-local point -> world point (perspective divide included). I/O in
+    /// logical px (not quantized).
     pub fn apply_point(&self, x: f64, y: f64) -> (f64, f64) {
         let m = &self.m;
         let wx = m[0][0] * x + m[0][1] * y + m[0][2];
@@ -322,8 +291,8 @@ impl Transform3x3 {
     }
 }
 
-/// FFD warp grid slot (D7 nonlinear bend/envelope/text-on-path). Schema-present,
-/// implementation deferred — control point grid in object-local quantized units.
+/// FFD warp grid slot (nonlinear bend/envelope/text-on-path), implementation
+/// deferred — control point grid in object-local quantized units.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -334,10 +303,6 @@ pub struct Warp {
     /// `cols*rows` control points, row-major, object-local quantized i32.
     pub points: Vec<PathNode>,
 }
-
-// ---------------------------------------------------------------------------
-// D4 — style: fill / stroke / text(runs[]).
-// ---------------------------------------------------------------------------
 
 fn default_opacity() -> f64 {
     1.0
@@ -350,12 +315,10 @@ fn default_opacity() -> f64 {
 pub enum Paint {
     Solid { color: String },
     Gradient { stops: Vec<GradientStop>, angle: f64 },
-    /// content/embed channel hedge slot (external file/image). `contentRef` is a
-    /// content-addressed handle resolved out-of-band; type-per-kind deferred.
+    /// `contentRef` is a content-addressed handle resolved out-of-band.
     Image { content_ref: String },
-    /// Semantic theme token (D-token contract). `name` is a kebab-case token id
-    /// from [`crate::object::theme`]; resolution to RGBA is deferred to the renderer
-    /// (light/dark aware) — treated as an opaque color source until then.
+    /// `name` is a kebab-case token id from [`crate::object::theme`]; RGBA
+    /// resolution is deferred to the renderer (light/dark aware).
     Token { name: String },
 }
 
@@ -368,7 +331,7 @@ pub struct GradientStop {
     pub color: String,
 }
 
-/// Paint applied to the derived region (D6 render order: fill below stroke).
+/// Paint applied to the derived region (render order: fill below stroke).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -401,14 +364,13 @@ pub enum LineJoin {
     Bevel,
 }
 
-/// Stroke paints the path outline (open + closed) above fill.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Stroke {
     pub paint: Paint,
-    /// Default stroke width in quantized units (per-node `PathNode.width` wins).
+    /// Default width in quantized units (per-node `PathNode.width` wins).
     pub width: i32,
     #[serde(default = "default_opacity")]
     pub opacity: f64,
@@ -452,7 +414,7 @@ pub struct TextRun {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
-    /// Font size in quantized units.
+    /// Quantized units.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<i32>,
     #[serde(default)]
@@ -463,8 +425,7 @@ pub struct TextRun {
     pub font: Option<String>,
 }
 
-/// D4 — text is a runs array (styled segments), positioned relative to the
-/// derived region (D6). Markdown/silhouette-flow deferred; runs present.
+/// Runs array (styled segments) positioned relative to the derived region.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -476,10 +437,6 @@ pub struct Text {
     #[serde(default)]
     pub valign: TextVAlign,
 }
-
-// ---------------------------------------------------------------------------
-// D5 — anchors: per-node optional attachment; edges are absorbed into this.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
@@ -493,7 +450,6 @@ pub struct LocalPoint {
 /// Per-node attachment. `node_index` addresses a node in *this* object's
 /// geometry; `target` is another object's id; `at` is a local point on the
 /// target's derived outline (re-projected when the target's geometry edits).
-/// The pair of `target`s on two anchors defines the connection graph (D5/D6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -503,10 +459,6 @@ pub struct Anchor {
     pub target: ObjectId,
     pub at: LocalPoint,
 }
-
-// ---------------------------------------------------------------------------
-// D3 / D18 / D20 — children grouping, clip, comments, tags.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
@@ -538,8 +490,8 @@ pub enum LayoutSizing {
     Fill,
 }
 
-/// Auto-layout inputs on a children group (D3 tier-3, OB3.A1). Output positions
-/// are derived (not stored/synced); these are the inputs. Schema-present.
+/// Auto-layout inputs on a children group; output positions are derived (not
+/// stored/synced).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -561,7 +513,7 @@ pub enum CommentAnchor {
     Point { at: LocalPoint },
 }
 
-/// D20 — comment on an object, optionally anchored to a node or local point.
+/// Comment on an object, optionally anchored to a node or local point.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -576,9 +528,8 @@ pub struct Comment {
     pub resolved: bool,
 }
 
-/// content/embed channel hedge slot (external file/embed). `kind` stays an open
-/// string and `contentRef` a content-addressed handle so adding behavior later
-/// is non-breaking.
+/// `kind` stays an open string and `contentRef` a content-addressed handle so
+/// adding behavior later is non-breaking.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -588,27 +539,22 @@ pub struct ContentEmbed {
     pub content_ref: String,
 }
 
-// ---------------------------------------------------------------------------
-// D1 — the single Object. Replaces SceneGroup/SceneNode/SceneEdge entirely.
-// ---------------------------------------------------------------------------
-
-/// The one canvas primitive (D1/P2). Optional fields use `skip_serializing_if`
-/// so an empty object is minimal on the wire and at rest.
+/// The one canvas primitive. Optional fields use `skip_serializing_if` so an
+/// empty object is minimal on the wire and at rest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Object {
     pub id: ObjectId,
-    /// Parent object id (children-group containment, D3). `None` = canvas root.
+    /// `None` = canvas root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ObjectId>,
     /// Fractional z-order key (base-62, `fractional.rs`); sorts by plain str Ord.
     pub order: String,
-    // `Transform3x3` is `#[serde(transparent)]` (a bare `[[..],[..],[..]]` array on
-    // the wire); ts-rs ignores `transparent` and can't impl `TS` for it, so emit the
-    // matrix AS its inner `[[f64; 3]; 3]` — a faithful bare-array shape that ts-rs
-    // can resolve — instead of referencing the (hand-written, facade-only) type.
+    // `Transform3x3` is `#[serde(transparent)]` (a bare array on the wire); ts-rs
+    // ignores `transparent` and can't impl `TS`, so emit the matrix AS its inner
+    // `[[f64; 3]; 3]`.
     #[serde(default)]
     #[cfg_attr(feature = "ts-gen", ts(as = "[[f64; 3]; 3]"))]
     pub transform: Transform3x3,
@@ -621,27 +567,25 @@ pub struct Object {
     pub stroke: Option<Stroke>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<Text>,
-    /// Per-node attachments (D5). Edges live here, not as a separate type.
+    /// Edges live here, not as a separate type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anchors: Vec<Anchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<Layout>,
-    /// D18 — clip children to this object's region/bounds (Figma frame clip).
+    /// Clip children to this object's region/bounds (Figma frame clip).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
-    /// D20 — tag ids (name/color registry lives in `ObjectScene.tags`).
+    /// Tag ids; name/color registry lives in `ObjectScene.tags`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// Hedge: `componentOf` — id of a component this object instantiates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_of: Option<ObjectId>,
-    /// Hedge: object-level content/embed channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<ContentEmbed>,
-    // `ObjectMeta` is a `serde_json::Map` (free-form bag); type it as the matching
-    // index signature rather than dragging ts-rs's `JsonValue` into the surface.
+    // Typed as the matching index signature rather than dragging ts-rs's
+    // `JsonValue` into the surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-gen", ts(type = "Record<string, unknown>"))]
     pub meta: Option<ObjectMeta>,
@@ -671,17 +615,10 @@ impl Object {
         }
     }
 
-    /// Hydrate the parsed geometry after deserialization.
     pub fn ensure_parsed(&mut self) -> Result<(), String> {
         self.geometry.ensure_parsed()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Scene wrapper (FOLD-IN replace of model.rs Scene): drop the 3 arrays, add
-// `objects`. comments + tags are now object fields (D20); the scene keeps a
-// canvas-level tag registry (id -> name/color).
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
@@ -693,7 +630,6 @@ pub struct TagDef {
     pub color: String,
 }
 
-/// Selection union (preserves the legacy `SceneSelection` shape: `tag = "kind"`).
 /// `multi` is ephemeral shell-only; the canonical persisted selection is single.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
@@ -716,8 +652,7 @@ impl Default for ObjectSelection {
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectScene {
-    // i64 on the wire is a plain JSON number (JS `number`), not a `bigint`; ts-rs
-    // would default i64/u64 to `bigint`, so every such field overrides to `number`.
+    // i64 on the wire is a plain JSON number, not a `bigint` (ts-rs default).
     #[serde(default)]
     #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub scene_version: i64,
@@ -733,17 +668,14 @@ pub struct ObjectScene {
 }
 
 impl ObjectScene {
-    /// Find an object by id.
     pub fn get(&self, id: &str) -> Option<&Object> {
         self.objects.iter().find(|o| o.id == id)
     }
 
-    /// Mutable lookup by id.
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Object> {
         self.objects.iter_mut().find(|o| o.id == id)
     }
 
-    /// Hydrate every object's parsed geometry (post-deserialize).
     pub fn ensure_parsed(&mut self) -> Result<(), String> {
         for o in &mut self.objects {
             o.ensure_parsed()?;

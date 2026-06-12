@@ -1,8 +1,5 @@
-//! Shared fixtures for the client-runtime port tests. Mirrors the helpers in the
-//! TS spec (`tests/{sync-engine,multiuser,scene-client,windowing}.test.ts`).
-//!
-//! Each integration test binary compiles this module and uses a different subset
-//! of the helpers, so unused-helper warnings per binary are expected scaffolding.
+//! Shared fixtures for the client-runtime tests. Each test binary uses a
+//! different subset, so per-binary unused-helper warnings are expected.
 #![allow(dead_code)]
 
 use shape_client_runtime::outbox::OutboxEntry;
@@ -12,17 +9,15 @@ use shape_scene_core::object::model::{
 };
 use shape_scene_core::object::op::ObjectOp;
 
-/// `emptyObjectScene()` — a fresh scene at version 0.
 pub fn empty_scene() -> ObjectScene {
     ObjectScene::default()
 }
 
-/// `translateTransform(tx, ty)`.
 pub fn translate(tx: f64, ty: f64) -> Transform3x3 {
     Transform3x3::translate(tx, ty)
 }
 
-/// `rect(id, order)` fixture — a closed quad that validates under op-apply.
+/// A closed quad that validates under op-apply.
 pub fn rect(id: &str, order: &str) -> Object {
     Object {
         id: id.to_string(),
@@ -97,7 +92,7 @@ pub fn object_text(scene: &ObjectScene, id: &str) -> Option<String> {
         .map(|r| r.text.clone())
 }
 
-/// A mock `EngineTransport` that records flushed batches (the TS `CaptureTransport`).
+/// A mock `EngineTransport` that records flushed batches.
 #[derive(Default)]
 pub struct CaptureTransport {
     pub batches: Vec<Vec<OutboxEntry>>,
@@ -118,7 +113,7 @@ impl EngineTransport for CaptureTransport {
     }
 }
 
-/// A fixed, monotonic clock-stamp source: `t0`, `t1`, … (the TS `fixedNow`).
+/// A fixed, monotonic clock-stamp source: `t0`, `t1`, ….
 pub struct FixedNow {
     n: usize,
 }

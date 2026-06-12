@@ -1,8 +1,5 @@
-//! OB4.1: the bespoke REST domain routes (`/api/groups` seed + export + artifact
-//! download, `/api/comments`) are gone — those mutations are now Feature frames
-//! over WS (see `tests/ws.rs`). What survives on HTTP is the thin canvas CRUD the
-//! switch UI drives. These tests assert those response shapes through the
-//! assembled router via `tower::ServiceExt::oneshot`.
+//! Canvas CRUD over HTTP (domain mutations are Feature frames over WS — see
+//! `tests/ws.rs`). Asserts the response shapes through the assembled router.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -59,24 +56,20 @@ async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
 async fn canvas_create_list_delete_round_trip_over_http() {
     let app = router();
 
-    // Empty to start.
     let (status, body) = get_json(&app, "/api/canvases").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["canvases"].as_array().unwrap().len(), 0);
 
-    // Create one.
     let (status, body) = send_json(&app, "POST", "/api/canvases", json!({ "title": "Alpha" })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let id = body["canvas"]["id"].as_str().unwrap().to_string();
     assert_eq!(body["canvas"]["title"], "Alpha");
 
-    // List shows it.
     let (_status, body) = get_json(&app, "/api/canvases").await;
     let canvases = body["canvases"].as_array().unwrap();
     assert_eq!(canvases.len(), 1);
     assert_eq!(canvases[0]["title"], "Alpha");
 
-    // Delete it.
     let (status, _body) = send_json(&app, "DELETE", &format!("/api/canvases/{id}"), Value::Null).await;
     assert_eq!(status, StatusCode::OK);
 

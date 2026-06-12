@@ -1,8 +1,5 @@
-//! OB4.1 integration tests for the object-native per-canvas actor + registry +
-//! storage embed.
-//!
-//! Every test uses an in-memory redb store and drives the actor through its async
-//! handle on a `#[tokio::test]` runtime.
+//! Integration tests for the per-canvas actor + registry + storage embed, each
+//! over an in-memory redb store driving the actor through its async handle.
 
 use std::time::Duration;
 
@@ -15,7 +12,7 @@ use shape_server::canvas_actor::SharedStore;
 use shape_server::sync::{OpEnvelope, OpId};
 use shape_server::{ActorHandle, ApplyResult, CanvasActor, CanvasRegistry};
 
-/// Wrap an object op in an MG-4 op envelope with an `(clientId, localSeq)` id.
+/// Wrap an op in an envelope with an `(clientId, localSeq)` id.
 fn envelope(client_id: &str, local_seq: i64, base_revision: i64, op: ObjectOp) -> OpEnvelope {
     OpEnvelope {
         op_id: OpId {
@@ -28,7 +25,7 @@ fn envelope(client_id: &str, local_seq: i64, base_revision: i64, op: ObjectOp) -
     }
 }
 
-/// A closed unit rect at object-local (0,0)-(80,40) in quantized units.
+/// A closed rect at object-local (0,0)-(80,40) in quantized units.
 fn rect_geometry() -> Geometry {
     Geometry::from_subpaths(
         vec![SubPath {
@@ -48,14 +45,12 @@ fn rect_object(id: &str, order: &str) -> Object {
     Object::new(id, order, rect_geometry())
 }
 
-/// An insert-object op for `id`.
 fn insert(id: &str, order: &str) -> ObjectOp {
     ObjectOp::InsertObject {
         object: rect_object(id, order),
     }
 }
 
-/// A set-transform op moving `id` to (x, y).
 fn move_to(id: &str, x: f64, y: f64) -> ObjectOp {
     ObjectOp::SetTransform {
         id: id.to_string(),
@@ -63,8 +58,8 @@ fn move_to(id: &str, x: f64, y: f64) -> ObjectOp {
     }
 }
 
-/// Spawn a bare actor over a fresh in-memory store and return both its handle and
-/// the shared store (so a re-spawn on the SAME store can be tested).
+/// Returns the handle and the shared store so a re-spawn on the SAME store can be
+/// tested.
 fn spawn_actor(canvas: &str) -> (ActorHandle, SharedStore) {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
         shape_storage_core::RedbAdapter::open_in_memory().unwrap(),
@@ -99,14 +94,13 @@ async fn lifecycle_insert_two_objects_increments_seq_and_reflects_scene() {
 async fn rejected_op_does_not_bump_seq() {
     let (handle, _store) = spawn_actor("c-reject");
 
-    // set-transform against a non-existent object is rejected by scene-core.
     let r = handle.apply_op(move_to("missing", 1.0, 1.0), "user-1").await;
     match r {
         ApplyResult::Rejected { errors } => assert!(!errors.is_empty()),
         other => panic!("expected rejection, got {other:?}"),
     }
 
-    // A subsequent valid op is still seq 1 (the rejected op didn't advance).
+    // A subsequent valid op is still seq 1: the rejected op didn't advance.
     let ok = handle.apply_op(insert("o1", "a0"), "user-1").await;
     assert!(matches!(ok, ApplyResult::Applied { seq: 1, .. }), "got {ok:?}");
 }
@@ -127,7 +121,6 @@ async fn durability_write_through_survives_shutdown_and_respawn() {
     assert_eq!(after.objects.len(), 2, "objects reloaded from per-object Records");
     assert_eq!(after, before, "reloaded scene equals the persisted scene");
 
-    // The reloaded actor continues the server seq from the recovered state.
     let next = reborn.apply_op(insert("o3", "a2"), "user-1").await;
     assert!(
         matches!(next, ApplyResult::Applied { seq: 3, .. }),
@@ -189,10 +182,6 @@ async fn broadcast_delivers_applied_op_with_new_seq() {
     assert_eq!(msg.scene.objects.len(), 1, "broadcast scene reflects the apply");
 }
 
-// ---------------------------------------------------------------------------
-// MG-4: opId idempotent dedup.
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn duplicate_op_id_does_not_reapply_or_bump_seq() {
     let (handle, _store) = spawn_actor("c-dedup");
@@ -200,7 +189,6 @@ async fn duplicate_op_id_does_not_reapply_or_bump_seq() {
     let first = handle.apply_envelope(envelope("c1", 1, 0, insert("o1", "a0")), "c1").await;
     assert!(matches!(first, ApplyResult::Applied { seq: 1, .. }), "got {first:?}");
 
-    // Re-apply the SAME opId: returns the ORIGINAL ack (seq 1), no second apply.
     let dup = handle.apply_envelope(envelope("c1", 1, 0, insert("o1", "a0")), "c1").await;
     assert!(
         matches!(dup, ApplyResult::Applied { seq: 1, .. }),
@@ -217,14 +205,9 @@ async fn duplicate_op_id_does_not_reapply_or_bump_seq() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// MG-4.1: journal-tail recovery past the last write-through.
-// ---------------------------------------------------------------------------
-
-/// Simulate a crash: ops are journaled + written through (each apply awaits its
-/// durable reply) but the actor is dropped instead of `shutdown()`. On respawn the
-/// actor reloads the per-object Records and replays the journal tail, recovering
-/// all ops and rebuilding the dedup table.
+/// Crash recovery: dropping the actor (not `shutdown()`) leaves journaled + written
+/// records; respawn reloads the per-object Records, replays the journal tail, and
+/// rebuilds the dedup table.
 #[tokio::test]
 async fn crash_recovers_via_per_object_records_and_journal() {
     let store: SharedStore = std::sync::Arc::new(std::sync::Mutex::new(
@@ -251,7 +234,7 @@ async fn crash_recovers_via_per_object_records_and_journal() {
         "seq continues past the 3 recovered ops, got {next:?}"
     );
 
-    // Dedup state was rebuilt from the journal: replaying op (c1,2) is idempotent.
+    // Dedup rebuilt from the journal: replaying op (c1,2) is idempotent.
     let replayed = reborn.apply_envelope(envelope("c1", 2, 1, insert("o2", "a1")), "c1").await;
     assert!(
         matches!(replayed, ApplyResult::Applied { seq: 2, .. }),
@@ -304,26 +287,19 @@ async fn many_ops_then_crash_recovers_all_objects() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Per-property LWW convergence by server arrival seq + authored author.
-// ---------------------------------------------------------------------------
-
-/// Two users move the SAME object (transform is an LWW-tracked property); the
-/// server serializes them and assigns a monotonic seq. The later-arriving op
-/// (higher seq) wins, provided the later writer's baseRevision is current.
+/// Two users move the SAME object; the server serializes them by monotonic seq, so
+/// the later-arriving op wins.
 #[tokio::test]
 async fn concurrent_transform_edits_converge_to_higher_seq() {
     let (handle, _store) = spawn_actor("c-lww-converge");
 
-    handle.apply_op(insert("o1", "a0"), "user-A").await; // seq 1
+    handle.apply_op(insert("o1", "a0"), "user-A").await;
 
-    // user-A moves first (lower seq 2).
     let a = handle
         .apply_envelope(envelope("user-A", 1, 1, move_to("o1", 10.0, 10.0)), "user-A")
         .await;
     assert!(matches!(a, ApplyResult::Applied { seq: 2, .. }), "got {a:?}");
 
-    // user-B moves the SAME object acting on the latest revision, arrives later.
     let rev = handle.get_scene().await.scene_version;
     let b = handle
         .apply_envelope(envelope("user-B", 1, rev, move_to("o1", 99.0, 99.0)), "user-B")
@@ -335,25 +311,20 @@ async fn concurrent_transform_edits_converge_to_higher_seq() {
     assert_eq!(t, &Transform3x3::translate(99.0, 99.0), "later-arriving op wins");
 }
 
-/// A stale op (lower seq than the property's current winner) must NOT clobber it.
 /// `apply_object_op_lww` skips a write whose seq is `<=` the held winner's seq.
 #[tokio::test]
 async fn stale_seq_does_not_clobber_advanced_property() {
     let (handle, _store) = spawn_actor("c-lww-stale");
 
-    handle.apply_op(insert("o1", "a0"), "user-A").await; // seq 1
+    handle.apply_op(insert("o1", "a0"), "user-A").await;
 
-    // user-A advances the transform at seq 2.
     let winner = handle
         .apply_envelope(envelope("user-A", 1, 1, move_to("o1", 5.0, 5.0)), "user-A")
         .await;
     assert!(matches!(winner, ApplyResult::Applied { seq: 2, .. }), "got {winner:?}");
 
-    // user-B's op arrives at a higher arrival seq (3) but the store's LWW gate is
-    // keyed by arrival seq, so this is the legitimate last write. To prove a stale
-    // loss, we drive a SECOND winner then a straggler with a lower arrival seq is
-    // impossible (the actor seq is monotonic) — instead assert the converged
-    // value is the latest applied.
+    // The actor seq is monotonic, so a true stale arrival is impossible; the LWW
+    // gate is keyed by arrival seq, so this later op is the legitimate winner.
     let b = handle
         .apply_envelope(envelope("user-B", 1, 2, move_to("o1", 7.0, 7.0)), "user-B")
         .await;
@@ -364,8 +335,7 @@ async fn stale_seq_does_not_clobber_advanced_property() {
     assert_eq!(t, &Transform3x3::translate(7.0, 7.0), "latest arrival is the winner");
 }
 
-/// The actor tags each broadcast with the authoring userId so the WS layer can
-/// self-skip and a write's author is recorded.
+/// Each broadcast carries the authoring userId so the WS layer can self-skip.
 #[tokio::test]
 async fn broadcast_carries_authoring_user_id() {
     let (handle, _store) = spawn_actor("c-author");
@@ -381,15 +351,10 @@ async fn broadcast_carries_authoring_user_id() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Per-object canonical scene store (region-indexed) + recovery.
-// ---------------------------------------------------------------------------
-
 use shape_storage_core::SpatialStore;
 
-/// After several edits (incl. a delete), a clean shutdown leaves per-object
-/// Records; a fresh actor reconstructs the live scene from those Records,
-/// including pruning the deleted object.
+/// A fresh actor reconstructs the live scene from per-object Records, including
+/// pruning a deleted object.
 #[tokio::test]
 async fn recovery_from_per_object_records_reproduces_live_scene() {
     let (handle, store) = spawn_actor("c-perobject");
@@ -408,9 +373,7 @@ async fn recovery_from_per_object_records_reproduces_live_scene() {
     assert!(after.get("o1").is_some() && after.get("o3").is_some());
 }
 
-/// Edits flow into the canonical store REGION-INDEXED. After a checkpoint, the
-/// spatial index answers a whole-canvas region query, and a far window selects
-/// nothing.
+/// The spatial index answers a whole-canvas region query; a far window selects nothing.
 #[tokio::test]
 async fn checkpointed_objects_are_region_indexed_and_queryable() {
     let (handle, store) = spawn_actor("c-region");
@@ -440,22 +403,17 @@ async fn checkpointed_objects_are_region_indexed_and_queryable() {
     assert!(none.is_empty(), "far window selects no objects, got {none:?}");
 }
 
-// ---------------------------------------------------------------------------
-// Region-scoped scene snapshot (get_scene_region) via the region index.
-// ---------------------------------------------------------------------------
-
 use shape_storage_core::RegionWindow;
 
-/// A rect object placed at world (x, y).
+/// A rect placed at world (x, y).
 fn object_at(id: &str, order: &str, x: f64, y: f64) -> ObjectOp {
     let mut object = rect_object(id, order);
     object.transform = Transform3x3::translate(x, y);
     ObjectOp::InsertObject { object }
 }
 
-/// Build a canvas with two far-apart clusters: region A near the origin, region B
-/// ~100k units away. A window over A returns only A's objects; over B only B's;
-/// `None` returns the whole scene.
+/// Two far-apart clusters: a window over each returns only its own objects, `None`
+/// the whole scene.
 #[tokio::test]
 async fn get_scene_region_filters_to_window() {
     let (handle, _store) = spawn_actor("c-region-filter");
@@ -486,10 +444,6 @@ async fn get_scene_region_filters_to_window() {
     assert_eq!(all.scene_version, full.scene_version, "None == full scene revision");
     assert_eq!(a.scene_version, full.scene_version, "windowed snapshot reports the true revision");
 }
-
-// ---------------------------------------------------------------------------
-// Feature channel: comment upsert + template apply lower to ops on the actor.
-// ---------------------------------------------------------------------------
 
 use shape_scene_core::object::{Comment, FeatureRequest, FeatureResponse};
 
@@ -563,12 +517,8 @@ async fn feature_canvas_switch_reports_seq_and_revision() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bounded working set: many objects under load reload-on-demand from the store.
-// ---------------------------------------------------------------------------
-
-/// An op targeting an object that may be cold must still apply correctly and
-/// persist; a whole-scene read reconstructs every object from the store.
+/// An op targeting a possibly-cold object still applies and persists; a whole-scene
+/// read reconstructs every object from the store.
 #[tokio::test]
 async fn many_objects_persist_and_reload() {
     let (handle, _store) = spawn_actor("c-bulk");
@@ -578,7 +528,6 @@ async fn many_objects_persist_and_reload() {
         handle.apply_op(insert(&format!("n{i}"), &format!("b{i}")), "u").await;
     }
 
-    // Move the (possibly cold) anchor; the op-apply path reloads it via the store.
     let edited = handle.apply_op(move_to("anchor", 42.0, 42.0), "u").await;
     assert!(matches!(edited, ApplyResult::Applied { .. }), "got {edited:?}");
 
@@ -588,7 +537,7 @@ async fn many_objects_persist_and_reload() {
     assert_eq!(t, &Transform3x3::translate(42.0, 42.0), "edit to the anchor persisted");
 }
 
-/// Sanity: the actor scene matches a pure scene-core apply of the same op stream.
+/// The actor scene matches a pure scene-core apply of the same op stream.
 #[tokio::test]
 async fn actor_scene_matches_pure_apply() {
     let (handle, _store) = spawn_actor("c-oracle");

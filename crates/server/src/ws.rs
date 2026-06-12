@@ -1,26 +1,14 @@
-//! WebSocket transport (OB4.1, object-native): one socket, two logical channels.
+//! WebSocket transport: `GET /ws` bridges a client to the per-canvas actor. Two
+//! logical channels multiplex over the single socket (channel = message type):
 //!
-//! `GET /ws` upgrades to a WebSocket that bridges a client to the per-canvas
-//! actor. Two *logical* channels are multiplexed over the single socket; the
-//! channel is a property of the message type, not a separate stream:
+//! - reliable_ordered — `hello`/`welcome`, `ops`/`ack`/`rejected`, `patch`, and
+//!   `feature` frames, riding the actor's ordered op pipeline.
+//! - ephemeral_besteffort — `presence`. Lossy by design and never persisted.
 //!
-//! - **reliable_ordered** — `hello`/`welcome`, `ops`/`ack`/`rejected`, `patch`,
-//!   and the request/response `feature` frames. These ride the actor's ordered op
-//!   pipeline: every `ops` apply is sequenced and acked, applied ops fan out to
-//!   peers in seq order, and a Feature request is lowered to ops on the same path.
-//! - **ephemeral_besteffort** — `presence`. Lossy by design: a lagging receiver
-//!   drops the oldest frames rather than back-pressuring, and nothing is
-//!   persisted.
-//!
-//! Each `ops` entry is a [`WireOp`](shape_scene_core::wire::WireOp): its
-//! `propDelta` carries the [`ObjectOp`] delta JSON, wrapped with the op's `opId`
-//! (`clientId` + `localSeq`), `baseRevision`, `actor`, and a client `ts`. The
-//! actor dedups by `opId` (idempotent re-apply), and `ack`/`rejected` echo the
-//! `opIds` they resolved. The welcome snapshot and the patch fan-out are
-//! object-native ([`ObjectScene`] / `WireOp`).
-//!
-//! Identity is `userId`-only with no auth (C13): the op's `opId.clientId` doubles
-//! as the authoring user id passed to the actor.
+//! Each `ops` entry is a [`WireOp`](shape_scene_core::wire::WireOp) whose
+//! `propDelta` carries the [`ObjectOp`] JSON plus the `opId` (`clientId` +
+//! `localSeq`) and `baseRevision`; the actor dedups by `opId`. Identity is
+//! `userId`-only with no auth: `opId.clientId` doubles as the authoring user id.
 
 use std::sync::{Arc, Mutex};
 
@@ -40,16 +28,11 @@ use crate::object_store::object_region_key;
 use crate::registry::CanvasRegistry;
 use crate::sync::{OpEnvelope, OpId};
 
-// ---------------------------------------------------------------------------
-// WS envelope (client <-> server). Internally tagged on `type`, camelCase.
-// ---------------------------------------------------------------------------
-
-/// Upstream (client -> server) messages.
+/// Upstream (client -> server) messages. Internally tagged on `type`, camelCase.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WsClientMessage {
-    /// Open the session on a canvas. The first message a client sends; the server
-    /// replies with [`WsServerMessage::Welcome`].
+    /// The first message a client sends; the server replies with `Welcome`.
     #[serde(rename_all = "camelCase")]
     Hello {
         canvas_id: String,
@@ -60,26 +43,19 @@ pub enum WsClientMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_id: Option<String>,
     },
-    /// A batch of [`WireOp`]s to apply, in order. Each carries its own `opId`
-    /// (`clientId` + `localSeq`) for idempotent dedup, the `baseRevision` it was
-    /// authored against, and the object-op delta in `propDelta`.
     #[serde(rename_all = "camelCase")]
     Ops { ops: Vec<WireOp> },
-    /// A Feature request/response RPC frame (comment upsert, template apply,
-    /// canvas switch, export). Lowered to ops on the single op-apply path.
+    /// Lowered to ops on the single op-apply path.
     #[serde(rename_all = "camelCase")]
     Feature { request: FeatureRequest },
-    /// (Re)subscribe to a region of the canvas.
     #[serde(rename_all = "camelCase")]
     Subscribe { canvas_id: String, region: Region },
-    /// A best-effort presence frame fanned out to the canvas's other clients.
     #[serde(rename_all = "camelCase")]
     Presence {
         canvas_id: String,
         payload: serde_json::Value,
     },
-    /// Resume after a disconnect from `lastAckSeq`. Replies with a fresh `welcome`
-    /// snapshot.
+    /// Replies with a fresh `welcome` snapshot.
     #[serde(rename_all = "camelCase")]
     Resume {
         canvas_id: String,
@@ -87,18 +63,16 @@ pub enum WsClientMessage {
     },
 }
 
-/// Downstream (server -> client) messages.
+/// Downstream (server -> client) messages. Internally tagged on `type`, camelCase.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WsServerMessage {
-    /// Handshake reply: the current object scene snapshot plus seq/revision.
     #[serde(rename_all = "camelCase")]
     Welcome {
         scene: ObjectScene,
         seq: i64,
         revision: i64,
     },
-    /// One applied op: the `opIds` it acked plus the server seq/revision after it.
     /// A duplicate op re-acks its original seq/revision.
     #[serde(rename_all = "camelCase")]
     Ack {
@@ -106,28 +80,24 @@ pub enum WsServerMessage {
         seq: i64,
         revision: i64,
     },
-    /// One op rejected by scene-core; nothing was applied for it.
     #[serde(rename_all = "camelCase")]
     Rejected {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         op_ids: Vec<OpId>,
         errors: Vec<String>,
     },
-    /// A peer's applied op fanned out in seq order, as a [`WireOp`].
+    /// A peer's applied op fanned out in seq order.
     #[serde(rename_all = "camelCase")]
     Patch { ops: Vec<WireOp>, seq: i64 },
-    /// A Feature response to a `feature` request.
     #[serde(rename_all = "camelCase")]
     Feature { response: FeatureResponse },
-    /// A peer's presence frame (ephemeral/best-effort).
     #[serde(rename_all = "camelCase")]
     Presence { payload: serde_json::Value },
-    /// A transport- or protocol-level error (bad frame, premature ops, …).
     #[serde(rename_all = "camelCase")]
     Error { message: String },
 }
 
-/// A windowed subscription into a canvas. `bbox == None` is the whole canvas.
+/// A windowed subscription. `bbox == None` is the whole canvas.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Region {
@@ -136,7 +106,6 @@ pub struct Region {
     pub bbox: Option<Bounds>,
 }
 
-/// Convert a window bbox (`x,y,width,height`) into the region query window.
 fn bounds_to_window(bounds: Bounds) -> RegionWindow {
     RegionWindow {
         min_x: bounds.x,
@@ -146,9 +115,8 @@ fn bounds_to_window(bounds: Bounds) -> RegionWindow {
     }
 }
 
-/// Decode a [`WireOp`] into the actor's [`OpEnvelope`]. The `propDelta` carries
-/// the internally-tagged [`ObjectOp`] JSON. Returns an error string on a malformed
-/// delta so the caller can reject the op.
+/// `propDelta` carries the internally-tagged [`ObjectOp`] JSON; an error string
+/// lets the caller reject a malformed delta.
 fn wire_op_to_envelope(wire: &WireOp) -> Result<OpEnvelope, String> {
     let op: ObjectOp = serde_json::from_value(wire.prop_delta.clone())
         .map_err(|e| format!("invalid op delta: {e}"))?;
@@ -163,8 +131,8 @@ fn wire_op_to_envelope(wire: &WireOp) -> Result<OpEnvelope, String> {
     })
 }
 
-/// Build a [`WireOp`] for fan-out from an applied [`ObjectOp`]. `objectId`/`kind`
-/// are descriptive; `propDelta` carries the op JSON the peer re-applies.
+/// `objectId`/`kind` are descriptive; `propDelta` carries the op JSON the peer
+/// re-applies.
 fn op_to_wire(op: &ObjectOp, seq: i64, author: &str) -> WireOp {
     let object_id = op.target_ids().first().cloned().unwrap_or_default();
     WireOp {
@@ -181,10 +149,10 @@ fn op_to_wire(op: &ObjectOp, seq: i64, author: &str) -> WireOp {
     }
 }
 
-/// Whether an applied op should be delivered to a connection windowed to `bbox`.
-/// Conservative: a whole-canvas subscriber (`None`) always receives everything;
-/// for a windowed subscriber, deliver unless every target object of the op is
-/// locatable in the post-apply scene AND outside the window.
+/// Whether an applied op reaches a connection windowed to `bbox`. Conservative: a
+/// whole-canvas subscriber (`None`) gets everything; a windowed subscriber gets
+/// it unless every target is locatable in the post-apply scene AND outside the
+/// window.
 fn op_touches_region(scene: &ObjectScene, op: &ObjectOp, bbox: Option<Bounds>) -> bool {
     let Some(bbox) = bbox else { return true };
     let window = bounds_to_window(bbox);
@@ -192,7 +160,7 @@ fn op_touches_region(scene: &ObjectScene, op: &ObjectOp, bbox: Option<Bounds>) -
     if targets.is_empty() {
         return true;
     }
-    // A canvas id is only needed for the RegionKey shape; bounds are world-space.
+    // The canvas id only shapes the RegionKey; bounds are world-space.
     let canvas = CanvasId::from("w");
     let mut located_any = false;
     for id in &targets {
@@ -209,14 +177,10 @@ fn op_touches_region(scene: &ObjectScene, op: &ObjectOp, bbox: Option<Bounds>) -
             }
         }
     }
-    // If we could not locate any target with a bbox, send through (structural /
-    // unlocalizable op). If all located targets were outside the window, drop.
+    // No locatable target => structural/unlocalizable op, send through; all located
+    // targets outside the window => drop.
     !located_any
 }
-
-// ---------------------------------------------------------------------------
-// Handler.
-// ---------------------------------------------------------------------------
 
 /// `GET /ws`: upgrade to a WebSocket bridged to the per-canvas actor.
 pub async fn ws_handler(
@@ -230,7 +194,7 @@ pub async fn ws_handler(
 async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
     let (mut sink, mut stream) = socket.split();
 
-    // 1) Await the opening `hello` (anything else first is a protocol error).
+    // Await the opening `hello`; anything else first is a protocol error.
     let hello = loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsClientMessage>(&text) {
@@ -260,14 +224,13 @@ async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
     let (canvas_str, hello_region, _last_ack_seq, hello_user_id) = hello;
     let canvas_id = CanvasId::from(canvas_str.as_str());
 
-    // The connection's current windowed region. Shared with the patch fan-out task
-    // so a `subscribe` re-aims the live filter. `None` bbox is the whole canvas.
+    // Current windowed region, shared with the patch fan-out task so a `subscribe`
+    // re-aims the live filter. `None` bbox is the whole canvas.
     let region: Arc<Mutex<Option<Bounds>>> =
         Arc::new(Mutex::new(hello_region.and_then(|r| r.bbox)));
 
-    // Self-skip: the author ids this connection writes with. The patch fan-out
-    // task skips a broadcast whose `author` is in this set (the originator already
-    // applied it optimistically); peers still receive it.
+    // The author ids this connection writes with: the patch fan-out skips a
+    // broadcast whose `author` is in this set (the originator already applied it).
     let self_authors: Arc<Mutex<std::collections::HashSet<String>>> = {
         let mut set = std::collections::HashSet::new();
         if let Some(uid) = &hello_user_id {
@@ -276,8 +239,8 @@ async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
         Arc::new(Mutex::new(set))
     };
 
-    // 2) Acquire the lease + spawn the actor, subscribe to BOTH fan-outs before
-    //    sending welcome so no patch between snapshot and subscribe is missed.
+    // Subscribe to BOTH fan-outs before sending welcome so no patch between
+    // snapshot and subscribe is missed.
     let handle = match canvases.get_or_spawn(&canvas_id).await {
         Ok(handle) => handle,
         Err(e) => {
@@ -288,8 +251,7 @@ async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
     let mut patch_rx = handle.subscribe();
     let mut presence_rx = canvases.presence_subscribe(&canvas_id);
 
-    // The welcome snapshot is region-filtered: a windowed connection only receives
-    // the objects in its region.
+    // The welcome snapshot is region-filtered to the connection's window.
     let window = region
         .lock()
         .expect("region mutex poisoned")
@@ -305,8 +267,8 @@ async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
         return;
     }
 
-    // 3) A single writer task owns the sink; reader + fan-out tasks funnel
-    //    outbound frames through `out_tx` so the sink is never shared.
+    // A single writer task owns the sink; reader + fan-out tasks funnel outbound
+    // frames through `out_tx` so the sink is never shared.
     let (out_tx, mut out_rx) = mpsc::channel::<WsServerMessage>(256);
     let writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
@@ -316,8 +278,8 @@ async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
         }
     });
 
-    // 4) Op fan-out: actor broadcast -> client `patch`. SKIPS a broadcast whose
-    //    author is one of this connection's own ids; peers still receive it.
+    // Op fan-out: actor broadcast -> client `patch`, skipping this connection's
+    // own author ids.
     let patch_out = out_tx.clone();
     let patch_region = Arc::clone(&region);
     let patch_authors = Arc::clone(&self_authors);
@@ -353,7 +315,7 @@ async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
         }
     });
 
-    // 5) Presence fan-out: registry presence broadcast -> client `presence`.
+    // Presence fan-out: registry presence broadcast -> client `presence`.
     let presence_out = out_tx.clone();
     let presence_authors = Arc::clone(&self_authors);
     let presence_task = tokio::spawn(async move {
@@ -378,7 +340,7 @@ async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
         }
     });
 
-    // 6) Reader loop: client frames -> actor / presence fan-out.
+    // Reader loop: client frames -> actor / presence fan-out.
     let fallback_user_id = hello_user_id.unwrap_or_else(connection_author_id);
     while let Some(frame) = stream.next().await {
         let text = match frame {
@@ -419,15 +381,14 @@ async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
                         }
                     };
 
-                    // The authoring identity is the op's clientId; fall back to the
-                    // connection id when it is empty.
+                    // Authoring identity is the op's clientId; fall back to the
+                    // connection id when empty.
                     let author = if envelope.op_id.client_id.is_empty() {
                         fallback_user_id.clone()
                     } else {
                         envelope.op_id.client_id.clone()
                     };
 
-                    // Write gate (single-line seam, permissive C13).
                     if !authorize_write(&author, &canvas_id) {
                         let _ = out_tx
                             .send(WsServerMessage::Rejected {
@@ -534,16 +495,16 @@ async fn handle_socket(socket: WebSocket, canvases: CanvasRegistry) {
         }
     }
 
-    // Reader ended: drop the outbound sender so the writer drains and exits, and
-    // abort the fan-out tasks (their receivers are tied to this connection).
+    // Drop the outbound sender so the writer drains and exits; abort the fan-out
+    // tasks tied to this connection.
     drop(out_tx);
     patch_task.abort();
     presence_task.abort();
     let _ = writer.await;
 }
 
-/// A stable, process-unique fallback author id for a connection that did not
-/// advertise a `userId`. Deterministic within a process; no rng.
+/// Fallback author id when a connection advertises no `userId`. Deterministic
+/// within a process; no rng.
 fn connection_author_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -551,8 +512,7 @@ fn connection_author_id() -> String {
     format!("ws-conn-{}-{n}", std::process::id())
 }
 
-/// Write gate hook: decide whether `author` may write to `canvas_id`. Permissive
-/// by design (single-user / no-auth, C13).
+/// Write-gate hook, permissive by design (no-auth). TODO(auth): real authz here.
 fn authorize_write(_author: &str, _canvas_id: &CanvasId) -> bool {
     true
 }
@@ -563,7 +523,6 @@ fn error(message: &str) -> WsServerMessage {
     }
 }
 
-/// Serialize `msg` to JSON text and push it onto `sink`.
 async fn send<S>(sink: &mut S, msg: &WsServerMessage) -> Result<(), ()>
 where
     S: SinkExt<Message> + Unpin,

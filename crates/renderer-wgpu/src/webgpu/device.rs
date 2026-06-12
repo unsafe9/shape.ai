@@ -1,7 +1,7 @@
-//! Web-only WebGPU surface (W2-13/S8): the `web_sys` + wgpu device/surface/config
-//! lifecycle. Everything here is `target_arch = "wasm32"` gated (the renderer can
-//! only be constructed in the browser); `create_text_atlas` builds for the host as
-//! dead code so the pure layer keeps compiling on the test gate.
+//! Web-only WebGPU surface: the `web_sys` + wgpu device/surface/config lifecycle,
+//! `target_arch = "wasm32"` gated since the renderer is browser-only.
+//! `create_text_atlas` builds for the host as dead code so the pure layer keeps
+//! compiling on the test gate.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
@@ -346,9 +346,8 @@ impl ShapeWebGpuRenderer {
             cache: None,
         });
 
-        // W3-G8/A: build the offscreen drop-shadow blur targets at the surface size.
-        // Created here and recreated in `resize`; isolated from the fill/stroke/text
-        // path so a fault degrades to "no shadow", never a blank canvas.
+        // Offscreen drop-shadow blur targets at the surface size; recreated in
+        // `resize`. Isolated so a fault degrades to "no shadow", never a blank canvas.
         let shadow_blur = crate::shadow_blur::ShadowBlur::new(
             &device,
             &queue,
@@ -435,8 +434,8 @@ impl ShapeWebGpuRenderer {
         self.canvas.set_width(self.config.width);
         self.canvas.set_height(self.config.height);
         self.surface.configure(&self.device, &self.config);
-        // W3-G8/A: the offscreen shadow targets are surface-sized, so rebuild them to
-        // match the new physical resolution (only when the size actually changed).
+        // The shadow targets are surface-sized, so rebuild them to the new resolution
+        // only when the size changed.
         if !self.shadow_blur.matches(self.config.width, self.config.height) {
             self.shadow_blur = crate::shadow_blur::ShadowBlur::new(
                 &self.device,

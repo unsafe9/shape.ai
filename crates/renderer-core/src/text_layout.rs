@@ -1,16 +1,7 @@
-//! OB3.R9 (+ R8 MSDF) — text run layout against a derived region (D4/D6).
-//!
-//! Lays out an OB-3 object `Text { runs, align, valign }` inside a region's
-//! bounds. Pure CPU: it takes a `measure` closure returning per-char advance
-//! width and emits absolute glyph placements ready for the GPU text pass. Font
-//! metrics live in `text.rs` (`TextEngine`); this module stays decoupled from
-//! the raster path by accepting `measure` rather than calling fontdue directly,
-//! so it is trivially unit-testable with a stub and equally usable against the
-//! MSDF atlas described by [`MsdfAtlasPlan`].
-//!
-//! ADDITIVE: this is a new file wired into the GPU draw path at the OB-4
-//! cutover, not now. It does not touch the legacy `RenderGroup/Card/Edge` path,
-//! `ViewUniform`, or `webgpu.rs`.
+//! Text run layout against a derived region. Pure CPU: takes a `measure` closure
+//! returning per-char advance width and emits absolute glyph placements, decoupled
+//! from the raster path (`text.rs`) so it is unit-testable with a stub and usable
+//! against the MSDF atlas described by [`MsdfAtlasPlan`].
 
 /// Horizontal alignment of laid-out lines within the region width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,9 +21,7 @@ pub enum TextVAlign {
     Bottom,
 }
 
-/// A single styled run, mirroring the OB-3 `Text.runs[]` entry (D7). The
-/// renderer stays standalone, so this is a local mirror rather than a
-/// scene-core import.
+/// A single styled run (local mirror of the OB-3 `Text.runs[]` entry).
 #[derive(Clone, Debug)]
 pub struct TextRunInput {
     pub text: String,
@@ -43,10 +32,9 @@ pub struct TextRunInput {
     pub font: String,
 }
 
-/// One placed glyph in region-local pixel coordinates. `x`/`y` is the glyph
-/// pen origin on its baseline-aligned line box (top-left of the line cell, so
-/// the shader applies its own per-glyph bearing). `run_index` indexes back into
-/// the `runs` slice so the GPU pass can pull paint/style.
+/// One placed glyph in region-local px. `x`/`y` is the glyph pen origin (top-left
+/// of the line cell; the shader applies its own per-glyph bearing). `run_index`
+/// indexes back into `runs` for paint/style.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphPlacement {
     pub ch: char,
@@ -57,8 +45,7 @@ pub struct GlyphPlacement {
     pub run_index: usize,
 }
 
-/// An atomic flow token carrying the originating run so style follows the glyph
-/// through wrapping and alignment.
+/// An atomic flow token carrying the originating run so style follows the glyph.
 struct Token {
     ch: char,
     advance: f32,
@@ -68,28 +55,23 @@ struct Token {
     whitespace: bool,
 }
 
-/// A laid-out line: the tokens on it plus the running visible width (excluding
-/// trailing whitespace) used for alignment.
 struct Line {
     tokens: Vec<Token>,
-    /// Width of the line up to and including its last non-whitespace token.
+    /// Width up to and including the last non-whitespace token.
     visible_width: f32,
-    /// Sum of the advances of the visible (non-whitespace) tokens only. Justify
-    /// distributes `region_width - glyph_width` across the inter-word gaps, so
-    /// whitespace contributes its natural advance *plus* an even share of the
-    /// remaining slack (whitespace is treated as zero-content for slack).
+    /// Sum of visible (non-whitespace) advances. Justify distributes
+    /// `region_width - glyph_width` across the inter-word gaps.
     glyph_width: f32,
-    /// Count of inter-word whitespace tokens eligible for justify stretch
-    /// (whitespace strictly between two visible tokens).
+    /// Inter-word whitespace tokens eligible for justify stretch (strictly between
+    /// two visible tokens).
     justify_gaps: usize,
-    /// Line height: the max run size on the line (falls back to block default).
+    /// Line height: the max run size on the line (else block default).
     height: f32,
 }
 
-/// Flow `runs` into lines wrapped to the region width, then align horizontally
-/// (start/center/end/justify) and vertically (top/middle/bottom). Line height
-/// is derived from the glyph size (the tallest run on each line). `measure`
-/// returns the advance width of `ch` at the given pixel size.
+/// Flow `runs` into lines wrapped to the region width, then align horizontally and
+/// vertically. Line height is the tallest run on each line. `measure` returns the
+/// advance width of `ch` at a given pixel size.
 pub fn layout_runs(
     runs: &[TextRunInput],
     region_min: (f32, f32),
@@ -122,12 +104,9 @@ pub fn layout_runs(
             TextAlign::Center => (region_min.0 + slack * 0.5, 0.0),
             TextAlign::End => (region_min.0 + slack, 0.0),
             TextAlign::Justify => {
-                // The final line (and any line with no inter-word gaps) is
-                // left as start-aligned; ragged last lines are conventional.
-                // Justify slack is measured against the visible glyph width only
-                // (whitespace contributes its natural advance plus an even share
-                // of the remaining slack), so a gap stretches to
-                // natural_advance + justify_extra.
+                // The final line (and any line with no inter-word gaps) stays
+                // start-aligned. Slack is measured against the visible glyph width,
+                // so a gap stretches to natural_advance + justify_extra.
                 let justify_slack = (region_width - line.glyph_width).max(0.0);
                 let stretch = if line_index != last_index && line.justify_gaps > 0 {
                     justify_slack / line.justify_gaps as f32
@@ -179,8 +158,8 @@ fn flow_lines(
 ) -> Vec<Line> {
     let mut lines: Vec<Line> = Vec::new();
     let mut current: Vec<Token> = Vec::new();
-    // The pending word: visible tokens accumulated since the last break
-    // opportunity, flushed together so words wrap atomically.
+    // Pending word: tokens since the last break opportunity, flushed together so
+    // words wrap atomically.
     let mut word: Vec<Token> = Vec::new();
     let mut line_width = 0.0_f32; // width of `current` including trailing ws
     let mut word_width = 0.0_f32;
@@ -198,9 +177,7 @@ fn flow_lines(
         };
         for ch in run.text.chars() {
             if ch == '\n' {
-                // Commit any pending word, then hard-break. `line_width` is reset
-                // for the fresh line below, so the committed word width is not
-                // re-accumulated here.
+                // Commit any pending word, then hard-break.
                 current.append(&mut word);
                 word_width = 0.0;
                 flush_line(&mut lines, std::mem::take(&mut current), runs);
@@ -317,34 +294,16 @@ fn line_height_for(token: &Token, runs: &[TextRunInput]) -> f32 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// R8 — SDF atlas generator
-// ---------------------------------------------------------------------------
-//
-// [`MsdfAtlasPlan`] now generates a real CPU distance-field atlas from glyph
-// coverage rasters, alongside the glyph -> atlas-UV mapping the MSDF text shader
-// (`shaders/msdf_text.wgsl`) consumes. The layout above produces
-// `GlyphPlacement`s in region-local pixels; the GPU pass resolves each
-// placement's glyph against the plan to fetch the four corner UVs + the per-glyph
-// bearing, samples the atlas, and `median3(rgb)` reconstructs the signed
-// distance for `screenPxRange` AA.
-//
-// SDF, not MSDF-proper: a true multi-channel MSDF needs the glyph's vector
-// contours (to assign edges to color channels at corners), which fontdue does
-// not expose. This generates a single-channel signed distance field from the
-// fontdue coverage raster (`text.rs`) and replicates it into R/G/B, so the
-// shader's `median3` returns that one distance unchanged. Single-channel SDF
-// loses MSDF's sharp-corner reconstruction but is still resolution-independent
-// (the R9 win over a baked raster); MSDF-proper stays a documented follow-up.
-//
-// The distance transform is the 8-points Signed Sequential Euclidean Distance
-// Transform (dead-reckoning), pure and deterministic — no rng/time/IO and no new
-// crate — so the same coverage always yields byte-identical atlas pixels.
+// SDF atlas generator. Single-channel SDF, not MSDF-proper: a true MSDF needs the
+// glyph's vector contours (which fontdue does not expose), so this builds a
+// single-channel signed distance field from the fontdue coverage raster and
+// replicates it into R/G/B (the shader's `median3` returns that one distance
+// unchanged). The distance transform is the 8-points Signed Sequential Euclidean
+// Distance Transform (dead-reckoning), pure and deterministic, so the same coverage
+// always yields byte-identical atlas pixels.
 
-/// Identifies a rasterized MSDF glyph in the atlas. Mirrors the raster key in
-/// `text.rs` but is decoupled so the MSDF path can evolve independently. `px`
-/// is the quantized SDF cell size the glyph was generated at (MSDF is
-/// resolution-independent, but a fixed cell keeps the atlas predictable).
+/// Identifies a rasterized MSDF glyph in the atlas. `px` is the quantized SDF cell
+/// size (resolution-independent, but a fixed cell keeps the atlas predictable).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MsdfGlyphKey {
     pub font_index: usize,
@@ -352,57 +311,46 @@ pub struct MsdfGlyphKey {
     pub px: u16,
 }
 
-/// One glyph's slot in the MSDF atlas: the four corner UVs (CCW from top-left,
-/// matching the legacy atlas glyph layout in `text.rs`) plus the bearing/size
+/// One glyph's atlas slot: four corner UVs (CCW from top-left) plus the bearing/size
 /// metrics the shader applies to position the quad relative to the pen origin.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MsdfGlyphEntry {
     /// Corner UVs: [top-left, top-right, bottom-right, bottom-left].
     pub uv: [[f32; 2]; 4],
-    /// Horizontal bearing (px at `px` cell size) from pen origin to glyph left.
+    /// Bearing from pen origin to glyph left (px at `px` cell size).
     pub bearing_x: f32,
-    /// Vertical bearing (px at `px` cell size) from line top to glyph top.
+    /// Bearing from line top to glyph top (px at `px` cell size).
     pub bearing_y: f32,
-    /// Glyph quad width/height in px at `px` cell size.
     pub width: f32,
     pub height: f32,
 }
 
 /// A glyph's fontdue coverage raster + placement metrics, the generator input.
-/// `coverage` is row-major 8-bit alpha (1 byte/px, as fontdue's
-/// `rasterize_indexed` returns), `width`×`height` px. The bearings/`advance`
-/// mirror fontdue `Metrics` so the registered [`MsdfGlyphEntry`] positions the
-/// quad identically to the legacy atlas path in `text.rs`.
+/// `coverage` is row-major 8-bit alpha, `width`×`height` px.
 #[derive(Clone, Debug)]
 pub struct GlyphCoverage<'a> {
     pub key: MsdfGlyphKey,
     pub coverage: &'a [u8],
     pub width: usize,
     pub height: usize,
-    /// Horizontal bearing (px) from pen origin to glyph left (fontdue `xmin`).
+    /// Bearing from pen origin to glyph left (fontdue `xmin`).
     pub bearing_x: f32,
-    /// Vertical bearing (px) from line top to glyph top.
     pub bearing_y: f32,
 }
 
-/// The shader-facing SDF atlas: dimensions, the SDF distance range (in atlas
-/// texels) the shader uses to scale sampled distances to coverage, the glyph ->
-/// slot mapping, and the generated RGBA distance-field pixels. The atlas is
-/// populated by [`MsdfAtlasPlan::generate_glyph`] from fontdue coverage rasters.
+/// The shader-facing SDF atlas: dimensions, distance range, glyph->slot mapping, and
+/// the generated RGBA distance-field pixels.
 #[derive(Clone, Debug)]
 pub struct MsdfAtlasPlan {
     pub atlas_width: u32,
     pub atlas_height: u32,
-    /// Distance field spread in atlas texels; the shader divides screen-space
-    /// distance derivatives by this to recover anti-aliased edges. Doubles as the
-    /// padding added around each glyph cell so the field has room to ramp.
+    /// Distance field spread in atlas texels; the shader scales sampled distances by
+    /// this for AA. Doubles as the per-cell padding so the field has room to ramp.
     pub distance_range: f32,
     entries: std::collections::HashMap<MsdfGlyphKey, MsdfGlyphEntry>,
-    /// RGBA8 distance-field texels (`atlas_width * atlas_height * 4`). The signed
-    /// distance is replicated into R/G/B (single-channel SDF, see module note);
-    /// A is the same distance so an alpha-only sampler also works.
+    /// RGBA8 texels. The signed distance is replicated into R/G/B; A is the same.
     pixels: Vec<u8>,
-    /// Shelf allocator cursor (mirrors the `text.rs` atlas packer).
+    /// Shelf allocator cursor.
     cursor_x: u32,
     cursor_y: u32,
     row_height: u32,
@@ -417,8 +365,7 @@ impl MsdfAtlasPlan {
             atlas_height: height,
             distance_range: distance_range.max(1.0),
             entries: std::collections::HashMap::new(),
-            // 0 = fully outside (distance 0.0 < 0.5 threshold), so untouched
-            // texels never read as "inside".
+            // 0 = fully outside, so untouched texels never read as "inside".
             pixels: vec![0_u8; (width * height * 4) as usize],
             cursor_x: 1,
             cursor_y: 1,
@@ -426,18 +373,14 @@ impl MsdfAtlasPlan {
         }
     }
 
-    /// Register a pre-built glyph slot directly (used by tests / callers that
-    /// already hold an entry). Generation uses [`Self::generate_glyph`].
+    /// Register a pre-built glyph slot directly. Generation uses [`Self::generate_glyph`].
     pub fn insert(&mut self, key: MsdfGlyphKey, entry: MsdfGlyphEntry) {
         self.entries.insert(key, entry);
     }
 
-    /// Generate one glyph's SDF cell from its fontdue coverage raster, pack it
-    /// into the atlas, and register its [`MsdfGlyphEntry`]. Idempotent per key:
-    /// a glyph already generated returns its existing entry without re-packing.
-    /// `None` means the atlas is full (the caller falls back to the legacy
-    /// fontdue raster atlas). A blank glyph (empty coverage, e.g. a space) maps
-    /// to a zero-size entry so the shader emits no quad.
+    /// Generate one glyph's SDF cell, pack it, and register its entry. Idempotent
+    /// per key. `None` means the atlas is full (caller falls back to the legacy
+    /// raster atlas); a blank glyph maps to a zero-size entry (no quad).
     pub fn generate_glyph(&mut self, glyph: &GlyphCoverage<'_>) -> Option<MsdfGlyphEntry> {
         if let Some(entry) = self.entries.get(&glyph.key) {
             return Some(*entry);
@@ -454,8 +397,7 @@ impl MsdfAtlasPlan {
             return Some(entry);
         }
 
-        // Each cell is padded by `distance_range` texels on every side so the
-        // signed field has room to ramp from inside to outside.
+        // Pad each cell by `distance_range` texels so the field has room to ramp.
         let pad = self.distance_range.ceil().max(1.0) as u32;
         let glyph_w = glyph.width as u32;
         let glyph_h = glyph.height as u32;
@@ -464,7 +406,6 @@ impl MsdfAtlasPlan {
 
         let (origin_x, origin_y) = self.allocate_cell(cell_w, cell_h)?;
 
-        // Build the padded inside/outside field and write it into the atlas.
         let sdf = coverage_to_sdf(
             glyph.coverage,
             glyph.width,
@@ -485,9 +426,8 @@ impl MsdfAtlasPlan {
             }
         }
 
-        // The drawn quad covers the full padded cell so the AA ramp is visible;
-        // the bearings shift left/up by `pad` to keep the glyph's ink registered
-        // against the pen origin exactly as the unpadded raster would.
+        // The quad covers the full padded cell (AA ramp visible); bearings shift
+        // left/up by `pad` to keep the glyph's ink registered against the pen origin.
         let aw = self.atlas_width as f32;
         let ah = self.atlas_height as f32;
         let left = origin_x as f32 / aw;
@@ -505,8 +445,7 @@ impl MsdfAtlasPlan {
         Some(entry)
     }
 
-    /// Shelf-allocate a `w`×`h` cell, advancing to the next row when the current
-    /// one is full. `None` when no row has vertical room left.
+    /// Shelf-allocate a `w`×`h` cell; `None` when no row has vertical room left.
     fn allocate_cell(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
         if self.cursor_x + w >= self.atlas_width {
             self.cursor_x = 1;
@@ -522,9 +461,7 @@ impl MsdfAtlasPlan {
         Some(origin)
     }
 
-    /// Resolve a glyph's atlas slot for the shader. `None` means the glyph is
-    /// not yet generated and the caller should generate it (or fall back to the
-    /// legacy fontdue atlas).
+    /// Resolve a glyph's atlas slot; `None` means not yet generated.
     pub fn lookup(&self, key: &MsdfGlyphKey) -> Option<&MsdfGlyphEntry> {
         self.entries.get(key)
     }
@@ -533,23 +470,16 @@ impl MsdfAtlasPlan {
         self.entries.len()
     }
 
-    /// The generated RGBA8 distance-field texels, ready to upload as the MSDF
-    /// atlas texture the shader samples.
+    /// The generated RGBA8 distance-field texels, ready to upload.
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 }
 
 /// Build a single-channel signed distance field from a glyph coverage raster.
-///
-/// The coverage (`width`×`height`, 1 byte/px alpha) is thresholded at 0.5 into an
-/// inside/outside mask, embedded into a `pad`-padded cell, and converted with the
-/// 8-points Signed Sequential Euclidean Distance Transform (dead-reckoning): two
-/// passes propagate the nearest opposite-side feature point, yielding the
-/// unsigned distance to the edge, signed negative outside. The signed distance is
-/// then normalized so 0.5 sits exactly on the outline and ±`distance_range`
-/// texels map to the [0,1] ends — the encoding the MSDF shader's `screenPxRange`
-/// AA expects. Pure: same input -> identical output.
+/// Coverage is thresholded at 0.5 into an inside/outside mask in a `pad`-padded
+/// cell, converted via the 8SSEDT dead-reckoning transform, then normalized so 0.5
+/// sits on the outline and ±`distance_range` texels map to the [0,1] ends. Pure.
 fn coverage_to_sdf(
     coverage: &[u8],
     width: usize,
@@ -571,17 +501,13 @@ fn coverage_to_sdf(
         }
     }
 
-    // Two distance transforms (one per side), each to the boundary of the other
-    // side, combined into a signed distance. `INF` seeds far-from-edge cells.
+    // One distance transform per side, combined into a signed distance.
     let dist_inside = euclidean_distance_to_other(&inside, cell_w, cell_h, true);
     let dist_outside = euclidean_distance_to_other(&inside, cell_w, cell_h, false);
 
     let mut out = vec![0.0_f32; n];
     for i in 0..n {
-        // Signed distance to the outline: positive inside, negative outside.
-        // `dist_inside` is each inside cell's distance to the nearest outside cell
-        // (the inside depth); `dist_outside` the mirror. Subtracting a half-texel
-        // centers the zero crossing on the edge.
+        // Positive inside, negative outside; the half-texel centers the zero crossing.
         let signed = if inside[i] {
             dist_inside[i] - 0.5
         } else {
@@ -593,12 +519,9 @@ fn coverage_to_sdf(
     out
 }
 
-/// Euclidean distance transform: for every cell, the distance to the nearest
-/// cell whose `inside` flag is the opposite of `target` (i.e. when `target` is
-/// true, distance from each inside cell to the nearest outside cell, and vice
-/// versa). Cells not matching `target` get distance 0. Implemented as the
-/// dead-reckoning 8SSEDT: store the offset to the nearest boundary feature point
-/// and relax it in a forward then backward sweep.
+/// Euclidean distance from every `target`-side cell to the nearest opposite-side
+/// cell (others get 0). Dead-reckoning 8SSEDT: store the offset to the nearest
+/// boundary feature point and relax it in a forward then backward sweep.
 fn euclidean_distance_to_other(
     inside: &[bool],
     w: usize,
@@ -686,8 +609,7 @@ mod tests {
 
     const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
-    /// Stub measure: every char is `size` wide. Simple, deterministic, and
-    /// enough to exercise wrapping/alignment math without fontdue.
+    /// Stub measure: every char is `size` wide, to exercise wrapping without fontdue.
     fn unit_measure(_ch: char, size: f32) -> f32 {
         size
     }
@@ -725,11 +647,8 @@ mod tests {
 
         let line_ys = lines_of(&placements);
         assert_eq!(line_ys.len(), 3, "expected three wrapped lines");
-        // 9 visible glyphs, spaces dropped.
         assert_eq!(placements.len(), 9);
-        // Lines are spaced by line-height = size = 10.
         assert_eq!(line_ys, vec![0.0, 10.0, 20.0]);
-        // Each line starts at region_min.x.
         for line_first in [0usize, 3, 6] {
             assert_eq!(placements[line_first].x, 0.0);
         }
@@ -819,10 +738,8 @@ mod tests {
 
     #[test]
     fn justify_stretches_interior_gaps_but_not_last_line() {
-        // "aa bb cc" wraps? region 80px, glyph 10px: "aa bb cc" = 8 tokens,
-        // visible width 6*10=60 + 2 spaces*10 = 80, fits one line. Make it two
-        // lines by narrowing: region 50px. "aa bb" = 50 (4 glyphs + 1 space),
-        // then "cc". Justify stretches the first line's single gap to fill 50.
+        // Region 50px, glyph 10px: "aa bb" fills the first line, "cc" the second;
+        // justify stretches the first line's single gap to fill 50.
         let runs = [run("aa bb cc", 10.0)];
         let placements = layout_runs(
             &runs,
@@ -835,9 +752,7 @@ mod tests {
         let line_ys = lines_of(&placements);
         assert_eq!(line_ys.len(), 2, "expected two lines");
 
-        // First line: "aa bb" -> a@0, a@10, b@?, b@?. With one gap and slack
-        // (50 - 40 visible = 10) the gap becomes space(10) + extra(10) = 20.
-        // So second word 'b' starts at 20 + 20 = 40.
+        // One gap, slack 10: gap becomes space(10) + extra(10) = 20, so 'b' starts at 40.
         let first_line: Vec<&GlyphPlacement> =
             placements.iter().filter(|p| p.y == 0.0).collect();
         assert_eq!(first_line.len(), 4);

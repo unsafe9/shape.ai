@@ -1,10 +1,3 @@
-// U4 — toolbar shortcut dispatch + object-primitive mapping.
-//
-// The shortcut dispatcher matches a keydown against the object command catalog
-// (the wasm core's object_command_catalog(), loaded here via the real scene-core
-// WASM — P1, no TS mirror) and invokes a registered handler. The toolbar's
-// insert-* commands map to object-primitive kinds.
-
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -146,8 +139,7 @@ describe("createShortcutDispatcher", () => {
   });
 
   it("still allows clear-selection (Escape) while typing", () => {
-    // clear-selection is a synthetic shell command (not in the wasm catalog); add
-    // it to the dispatcher's catalog to assert the focus-exempt path.
+    // clear-selection is a synthetic shell command, not in the wasm catalog.
     const clear = vi.fn();
     const withEscape: ObjectCommand[] = [
       ...catalog,
@@ -160,7 +152,7 @@ describe("createShortcutDispatcher", () => {
   });
 });
 
-describe("toolbar object-primitive mapping (U1)", () => {
+describe("toolbar object-primitive mapping", () => {
   it("maps the exact insert-* primitive ids", () => {
     expect(primitiveForCommand("insert-rectangle")).toBe("rectangle");
     expect(primitiveForCommand("insert-ellipse")).toBe("ellipse");
@@ -179,7 +171,7 @@ describe("toolbar object-primitive mapping (U1)", () => {
   });
 });
 
-describe("toolbar shape buttons (TB1 / D7)", () => {
+describe("toolbar shape buttons", () => {
   it("shows only rect/ellipse/line buttons in order", () => {
     expect(toolbarShapeKinds).toEqual(["rectangle", "ellipse", "line"]);
   });
@@ -195,17 +187,17 @@ describe("toolbar shape buttons (TB1 / D7)", () => {
   });
 });
 
-describe("toggleColorPopup (TB1 / #3 — single toggle button)", () => {
+describe("toggleColorPopup (single toggle button)", () => {
   it("opens a closed popup and closes an open one (open->close on re-click)", () => {
-    expect(toggleColorPopup(false)).toBe(true); // closed -> open
-    expect(toggleColorPopup(true)).toBe(false); // open  -> closed (re-click closes)
+    expect(toggleColorPopup(false)).toBe(true);
+    expect(toggleColorPopup(true)).toBe(false);
   });
 });
 
-describe("toggleStrokePopup (S1 / #4 — Stroke toggle button)", () => {
+describe("toggleStrokePopup (Stroke toggle button)", () => {
   it("opens a closed popup and closes an open one (open->close on re-click)", () => {
-    expect(toggleStrokePopup(false)).toBe(true); // closed -> open
-    expect(toggleStrokePopup(true)).toBe(false); // open  -> closed (re-click closes)
+    expect(toggleStrokePopup(false)).toBe(true);
+    expect(toggleStrokePopup(true)).toBe(false);
   });
 
   it("is its own exported helper, independent of toggleColorPopup", () => {
@@ -214,10 +206,8 @@ describe("toggleStrokePopup (S1 / #4 — Stroke toggle button)", () => {
   });
 });
 
-describe("toolbar Stroke popup UI (S1 / #4)", () => {
-  // No DOM in the node test env: assert the wiring against the .svelte source.
-  // Falsifiable — re-adding the auto draw sub-toolbar, dropping the toggle button,
-  // or losing the size/color controls inside the popup all fail these.
+describe("toolbar Stroke popup UI", () => {
+  // No DOM in node: assert the wiring against the .svelte source.
   const source = readFileSync(
     fileURLToPath(new URL("../platforms/web/ui/Toolbar.svelte", import.meta.url)),
     "utf8"
@@ -241,7 +231,7 @@ describe("toolbar Stroke popup UI (S1 / #4)", () => {
     const popup = source.slice(strokeStart, colorStart);
     expect(popup).toMatch(/\{#each penWidths as width/);
     expect(popup).toMatch(/onclick=\{\(\)\s*=>\s*onSetPenWidth\(width\)\}/);
-    // The brush color swatches were removed; color is set via the Color popup only.
+    // Brush color swatches removed; color is set via the Color popup only.
     expect(popup).not.toMatch(/color-popup-swatches/);
     expect(source).not.toMatch(/onSetPenColor/);
   });
@@ -253,10 +243,7 @@ describe("toolbar Stroke popup UI (S1 / #4)", () => {
 });
 
 describe("pen recognition mode (Basic default, Shift-hold Free)", () => {
-  // No DOM in the node test env: assert the wiring against the .svelte sources.
-  // Falsifiable — re-adding the removed toggle button/prop, keeping the toggle
-  // state, dropping the Shift mirror, or not forwarding the mode to the freehand
-  // commit all fail these.
+  // No DOM in node: assert the wiring against the .svelte sources.
   const toolbar = readFileSync(
     fileURLToPath(new URL("../platforms/web/ui/Toolbar.svelte", import.meta.url)),
     "utf8"
@@ -273,23 +260,18 @@ describe("pen recognition mode (Basic default, Shift-hold Free)", () => {
   });
 
   it("App drives Free recognition from a held Shift, defaulting to Basic", () => {
-    // No toolbar toggle state remains — only the keydown/keyup Shift mirror, read
-    // at pen-up to pick the freehand recognition mode.
     expect(app).not.toMatch(/let freeRecognition\b/);
     expect(app).not.toContain("onToggleFreeRecognition");
     expect(app).toMatch(/let freeRecognitionHeld = \$state\(false\)/);
-    // Routed through the catalog-backed predicate (C2 single source), not a magic
-    // event.shiftKey, so the gesture self-documents in the settings modal.
+    // Routed through the catalog-backed predicate, not a raw event.shiftKey, so the
+    // gesture self-documents in the settings modal.
     expect(app).toMatch(/freeRecognitionHeld = isFreeRecognizeHold\(event\)/);
     expect(app).toMatch(/freeRecognitionHeld \? "free" : "basic"/);
   });
 });
 
-describe("toolbar color-popup UI (TB1 / #3)", () => {
-  // The node test env has no DOM, so we assert the component's prop/callback
-  // contract and the popup wiring against the .svelte source. Falsifiable: dropping
-  // the single toggle button, the popup-gated swatches, the native <input
-  // type="color">, the selectedColor prop, or the onSelectColor wiring fails this.
+describe("toolbar color-popup UI", () => {
+  // No DOM in node: assert the prop/callback contract against the .svelte source.
   const source = readFileSync(
     fileURLToPath(new URL("../platforms/web/ui/Toolbar.svelte", import.meta.url)),
     "utf8"
@@ -304,8 +286,7 @@ describe("toolbar color-popup UI (TB1 / #3)", () => {
     expect(source).toMatch(/class="icon-button color-trigger/);
     expect(source).toMatch(/onclick=\{toggleColorPopupOpen\}/);
     expect(source).toMatch(/aria-expanded=\{colorPopupOpen\}/);
-    // The popup (and therefore the swatches + picker) is gated behind the open
-    // state — it is NOT an always-visible row.
+    // The popup is gated behind the open state, not an always-visible row.
     expect(source).toMatch(/\{#if colorPopupOpen\}/);
   });
 

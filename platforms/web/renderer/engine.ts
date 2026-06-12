@@ -24,112 +24,68 @@ import {
 } from "../controller/gestureBindings";
 import { detectMac } from "../controller/shortcuts";
 
-/** W2-03: the active pointer tool. One unified "select" Move/Select pointer
- *  (picks/drags/marquees), "draw" (freehand capture, FC-11), "create" (W2-07
- *  drag-to-create shapes), and "erase" (W2-08 whole/partial stroke eraser). Pan
- *  is no longer a separate tool — it rides Space-hold/middle-button/wheel (see
- *  {@link isPanIntent}). */
+// The active pointer tool: "select" (picks/drags/marquees), "draw" (freehand capture), "create"
+// (drag-to-create shapes), "erase" (whole/partial stroke eraser). Pan is not a tool — it rides
+// Space-hold/middle-button/wheel (see `isPanIntent`).
 export type ActiveTool = "select" | "draw" | "create" | "erase";
 
-// W2-03: a pointer-down is a pan gesture (not a pick/marquee) when the Space key
-// is held OR the middle mouse button is used. EN1: the binding (Space / middle
-// button) is the C2 `pan-space`/`pan-middle` gesture, routed through the single
-// source in gestureBindings (no magic literal here). Pure so the shell test can
-// pin the classification without a renderer.
+// A pointer-down is a pan gesture (not a pick/marquee) when Space is held OR the middle button is
+// used; the binding is routed through the single source in gestureBindings (no magic literal here).
 export function isPanIntent(intent: { spaceHeld: boolean; button: number }): boolean {
   return isPanGesture(intent);
 }
 
-// W2-04/W2-05: the gesture that produced a transform delta. Mirrors the Rust
-// ObjectTransformDelta.kind; the shell uses it to drive the commit op kind/status.
+// The gesture that produced a transform delta; mirrors the Rust ObjectTransformDelta.kind.
 export type TransformKind = "translate" | "resize" | "rotate";
 
-// W2-07: whether a shape drag-create phase should run the outline snap query. Snap
-// is bypassed when the snap-bypass gesture (C2 `no-snap-alt`: Alt held) is active
-// — routed through the single source in gestureBindings — or on the terminal
-// `cancel` phase (no preview to snap). Pure so the shell test can pin the decision
-// without a renderer.
+// Whether a drag-create phase should run the outline snap query: bypassed when the snap-bypass
+// gesture (Alt held) is active, or on the terminal `cancel` phase (no preview to snap).
 export function shouldQuerySnap(intent: { altHeld: boolean; phase: "start" | "move" | "end" | "cancel" }): boolean {
   return !isSnapBypass({ altKey: intent.altHeld }) && intent.phase !== "cancel";
 }
 
-// W3-G9 (#3): classify a create-tool pointer move while the create tool is armed.
-// A move with NO drag in progress is a HOVER probe (it emits a persistent anchor-
-// ring snap before any drag, request #3); a move during a drag is the regular
-// rubber-band drag move. Pure so the shell test can pin the classification without
-// a renderer — falsifiable: it returns "hover" for a button-up move (it would
-// return "drag" if the old drag-gated behavior leaked back in).
+// A create/draw-tool move with NO drag in progress is a HOVER probe (emits a persistent anchor-ring
+// snap before any drag); a move during a drag is the regular rubber-band drag move.
 export function createMoveEmission(intent: { dragActive: boolean }): "hover" | "drag" {
   return intent.dragActive ? "drag" : "hover";
 }
 
 export type EngineEvent =
   | { type: "stats"; stats: FrameStats }
-  // FC-08: object-path input results. `object-select` rides the pointer-down that
-  // picked an object; `object-transform-preview` rides each pointer-move during an
-  // object drag (a non-destructive preview the shell composes onto the scene); it
-  // is emitted once on pointer-up when the drag moved, and is the single undoable
-  // op; `object-marquee` rides the pointer-up of an empty-start drag.
-  // W2-04/W2-05: the transform is the full cumulative world-space delta matrix
-  // (row-major, PRE-multiplied onto the object's transform) plus the gesture
-  // `kind`, generalizing the FC-08 translate-only path to resize/rotate.
-  // W2-03: `additive` carries the shift/meta held at pick time so the shell can
-  // toggle the object in/out of the multi-select set instead of replacing it.
+  // Object-path input results. `object-select` rides the pick pointer-down (`additive` = shift/meta
+  // held, toggling multi-select instead of replacing); `object-transform-preview` rides each drag move
+  // (non-destructive; the matrix is the cumulative world-space delta PRE-multiplied onto the transform,
+  // plus the gesture `kind`); `object-marquee` rides an empty-start drag's pointer-up.
   | { type: "object-select"; id: string; additive: boolean }
   | { type: "object-transform-preview"; id: string; matrix: RenderTransform3x3; kind: TransformKind }
-  // v3 §3 (DU4): `detach` is the C2 `detach-alt` gesture bit (Alt held at release)
-  // — the shell branches an anchored open-class body drag into a whole translate
-  // plus an anchor-clearing set-anchor; the class/anchor judgment stays in the core.
+  // `detach` is the Alt-held-at-release bit — the shell branches an anchored open-class body drag into
+  // a whole translate plus an anchor-clearing set-anchor; the class/anchor judgment stays in the core.
   | { type: "object-transform-commit"; id: string; matrix: RenderTransform3x3; kind: TransformKind; detach: boolean }
-  // v3 §2b: open-class endpoint drag. `object-endpoint-preview` rides each move of
-  // an endpoint-handle drag (the chord deform is already live on the GPU via
-  // setObjectEndpointPreview; the payload carries the release-snap probe so the
-  // shell drives the anchor ring); `object-endpoint-commit` rides the pointer-up
-  // and is the single undoable release (the shell authors endpoint_release_ops
-  // from it). `nodeIndex` is the dragged endpoint in geometry PAIR space (0 |
-  // last); `world` the endpoint's world position (the snapped outline point when
-  // `snapped`); `targetId` the snap target for the anchor rebind (null = unbind).
+  // Open-class endpoint drag. `object-endpoint-preview` rides each move (chord deform already live on the
+  // GPU; payload carries the release-snap probe for the anchor ring); `object-endpoint-commit` rides
+  // pointer-up (the shell authors endpoint_release_ops). `nodeIndex` is the dragged endpoint in PAIR
+  // space (0 | last); `world` its position (snapped outline point when `snapped`); `targetId` = null unbinds.
   | { type: "object-endpoint-preview"; id: string; nodeIndex: number; world: WorldPoint; snapped: boolean; targetId: string | null }
   | { type: "object-endpoint-commit"; id: string; nodeIndex: number; world: WorldPoint; snapped: boolean; targetId: string | null }
   | { type: "object-marquee"; ids: string[] }
-  // RA2b: a double-click landed on an object. The shell drills into a container
-  // (hasChildren) or enters inline text edit on a leaf. Missed double-clicks emit
-  // nothing (the core returns null), so this event only rides a real object hit.
+  // A double-click landed on an object; the shell drills into a container (hasChildren) or edits a leaf. Misses emit nothing.
   | { type: "object-double-click"; id: string; hasChildren: boolean }
-  // FC-11: freehand pen capture. While the draw tool is active, pointer/mouse
-  // down/move/up emit draw phases instead of the select/marquee path; the shell
-  // accumulates the world points and commits the stroke to an object on `end`.
-  // v3 §4 freehand anchoring: `snap` is the outline snap probe under the cursor
-  // (the SAME W2-06 query as create, honoring the Alt bypass) so the shell can
-  // seed/author endpoint anchors for a recognized OPEN stroke. `world` stays the
-  // RAW pointer — mid-stroke samples are never pulled onto an edge (that would
-  // distort the drawn silhouette); only the shell's start/release handling pulls.
+  // Freehand pen capture phases; the shell accumulates world points and commits the stroke on `end`.
+  // `snap` is the outline snap probe under the cursor (same query as create, honoring the Alt bypass) so
+  // the shell can seed/author endpoint anchors. `world` stays the RAW pointer — mid-stroke samples are
+  // never pulled onto an edge (that would distort the drawn silhouette).
   | { type: "draw"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint; snap: { at: WorldPoint; targetId: string } | null }
-  // W2-07: drag-to-create shapes. While the create tool is active, pointer/mouse
-  // down-drag-up rubber-band a bbox; the shell renders a transient preview and
-  // commits a sized primitive on `end`. `world` is the pointer in world space,
-  // already snapped to the nearest object outline anchor when within tolerance
-  // (`snapped` true) unless the snap-bypass modifier (Alt) was held. AP5 (#14):
-  // `targetId` is the object whose outline the corner snapped to (null when not
-  // snapped), so the shell can author a persistent anchor binding the endpoint.
+  // Drag-to-create shapes; the shell rubber-bands a bbox and commits a sized primitive on `end`. `world`
+  // is already snapped to the nearest outline anchor within tolerance (`snapped` true) unless Alt was held;
+  // `targetId` is the snapped object (null when not snapped) so the shell can bind the endpoint to it.
   | { type: "create"; phase: "start" | "move" | "end" | "cancel"; world: WorldPoint; snapped: boolean; targetId: string | null }
-  // W3-G9 (#3): a HOVER snap probe emitted while the create tool is armed and no
-  // button is down — a bare mouse/pen hover over an existing object's edge. The
-  // shell renders a PERSISTENT anchor ring from it (before any drag) so the user
-  // sees where the next create would anchor. Distinct from the drag "create" event
-  // (which only rides an active rubber-band). `snapped`/`targetId` mirror "create":
-  // the snapped WORLD outline point + the object whose edge it landed on (null when
-  // not snapped, so the shell clears the ring). Honors the Alt snap-bypass upstream.
+  // A HOVER snap probe emitted while the create tool is armed and no button is down. The shell renders a
+  // PERSISTENT anchor ring before any drag; `snapped`/`targetId` mirror "create" (null clears the ring).
   | { type: "create-hover"; world: WorldPoint; snapped: boolean; targetId: string | null }
-  // W2-08: eraser. While the erase tool is active, a pointer/mouse down/move over a
-  // stroke emits an erase touch carrying the hit object id + the touch in world
-  // space, plus whether the partial-erase modifier (Alt) was held (default = whole-
-  // stroke delete, modifier = partial subpath cut). The id comes from the core's
-  // object hit-test, so hit-test stays in the core (boundary); the shell authors
-  // the delete/edit-geometry op.
+  // Eraser touch over a stroke. The id comes from the core's hit-test (hit-test stays in the core);
+  // `partial` = the Alt modifier (default whole-stroke delete, modifier = partial subpath cut).
   | { type: "erase"; id: string; world: WorldPoint; partial: boolean }
-  // W2-03: the hover affordance under the cursor (from result.hoverAffordance on a
-  // no-drag pointer move). The shell maps it to a CSS cursor.
+  // The hover affordance under the cursor (from result.hoverAffordance on a no-drag move); the shell maps it to a cursor.
   | { type: "affordance"; affordance: HoverAffordance }
   | { type: "status"; message: string };
 
@@ -151,14 +107,11 @@ export type FocusBoundsOptions = {
 
 const MOUSE_POINTER_ID = -1;
 
-// W2-07: screen-pixel snap radius for shape drag-create. Passed to the W2-06 core
-// query (nearestOutlinePoint), which converts it to world via the camera zoom.
+// Screen-pixel snap radius for drag-create; the core query converts it to world via the camera zoom.
 const CREATE_SNAP_TOLERANCE_PX = 8;
 
-// W3-G6 (#6): the transient preview regions buildFeedScene appends to the renderer
-// feed (the create rubber-band + its snap-indicator + the pen-stroke preview). The
-// create-drag snap query MUST exclude these, or the preview corner sitting under
-// the cursor self-snaps at distance ~0 and occludes every real object's edge.
+// The transient preview regions buildFeedScene appends to the feed. The snap query MUST exclude
+// these, or the preview corner under the cursor self-snaps at ~0 and occludes every real object's edge.
 const SNAP_EXCLUDE_IDS = ["create-preview", "create-snap-indicator", "draw-preview"];
 const SNAP_EXCLUDE_IDS_JSON = JSON.stringify(SNAP_EXCLUDE_IDS);
 
@@ -181,60 +134,36 @@ export class ShapeCanvasEngine {
   private webGpuUnavailableNotified = false;
   private mouseDragActive = false;
   private mouseFallbackTarget: EventTarget | null = null;
-  // W2-03: shift/meta held at the most recent pointer/mouse-down; consumed by the
-  // object-select event so the shell can build a transient multi-select set.
+  // Shift/meta held at the most recent down; consumed by object-select to build a transient multi-select set.
   private lastPointerAdditive = false;
-  // FC-11: the locally-tracked active tool. When "draw", pointer/mouse handlers
-  // emit draw phases instead of the renderer select/marquee input path.
+  // When "draw"/"create"/"erase", the handlers intercept input before it reaches the renderer (which stays "select").
   private activeTool: ActiveTool = "select";
-  // FC-08/W2-05: the in-progress object drag (id + cumulative world-space delta
-  // matrix + gesture kind). Set on the pointer-down that picks an object, updated on
-  // each move, and committed once on pointer-up when the matrix moved off identity.
-  // The renderer never mutates object transforms.
+  // The in-progress object drag (id + cumulative world-space delta matrix + gesture kind), committed
+  // once on pointer-up when the matrix moved off identity. The renderer never mutates object transforms.
   private objectDrag: { id: string; matrix: RenderTransform3x3; kind: TransformKind } | null = null;
-  // W2-03: whether Space is currently held (pushed from the shell). A pointer-down
-  // while Space is held — or a middle-button drag — is a pan gesture: the engine
-  // arms the core's hand-pan path for the gesture, then restores the user's tool on
-  // up. The pan state machine itself stays in the Rust core (boundary).
+  // A pointer-down while Space is held (or a middle-button drag) is a pan gesture; the engine flips the
+  // core tool to "hand" for the gesture and restores it on up. The pan state machine stays in the core.
   private spaceHeld = false;
   private panGestureActive = false;
-  // W2-08: true while the erase tool's pointer is held down, so a move keeps
-  // erasing along the drag (a bare hover never erases). Set on erase down, cleared
-  // on up/cancel.
+  // True while the erase tool's pointer is held down, so a move keeps erasing along the drag (a bare hover never erases).
   private eraseDragActive = false;
-  // W3-G9 (#3): true while a create drag is in progress (between create start and
-  // up/cancel). A pen/touch onPointerMove with this false is a bare hover, so it
-  // emits a create-hover snap probe instead of a drag create event. Set on create
-  // start, cleared on up/cancel.
+  // True while a create drag is in progress; a move with this false is a bare hover (emits a create-hover probe).
   private createDragActive = false;
-  // v3 §4: true while a freehand stroke is in progress. Mirrors createDragActive
-  // for the draw tool — a pen/touch move with this false is a bare hover and
-  // emits the create-hover snap probe (the draw tool shows the same pre-stroke
-  // anchor ring as create).
+  // True while a freehand stroke is in progress; a move with this false is a bare hover (the draw tool shows the same pre-stroke ring as create).
   private drawDragActive = false;
-  // W3-G9 (#3): the always-on hover mousemove target bound while the create tool is
-  // armed (mouse has no down-less move otherwise). Bound in setTool on entering
-  // create, unbound on leaving. Distinct from the mousedown-bound drag-move target,
-  // so a bare mouse hover emits a create-hover probe without disturbing the drag.
+  // The always-on hover mousemove target bound while create/draw is armed (mouse has no down-less move
+  // otherwise). Distinct from the mousedown-bound drag-move target so a bare hover never disturbs the drag.
   private createHoverTarget: EventTarget | null = null;
-  // EN1 (#3): the previous eraser sample's screen point, so each move runs RA3's
-  // swept hit-test over the segment (prev -> curr) and erases every crossed object
-  // — a fast drag that skips between samples still erases what the segment passes
-  // through. Set on erase down, advanced each move, cleared on up/cancel.
+  // The previous eraser sample's screen point, so each move runs the swept hit-test over (prev -> curr)
+  // and erases every crossed object — a fast drag that skips between samples still erases the whole path.
   private lastEraseScreen: WorldPoint | null = null;
-  // EN1 (#2): Shift held at the latest pointer/mouse event, mirroring the C2
-  // coarse-rotate gesture (`coarse-rotate-shift`). When a rotate transform delta
-  // arrives with Shift held, the engine re-snaps it to the catalog step (15°).
+  // Shift held at the latest event; a rotate delta with Shift held re-snaps to the catalog step (15°).
   private shiftHeld = false;
-  // v3: Alt held at the latest pointer/mouse event. Two C2 gestures ride it
-  // outside an event handler: the endpoint-drag release-snap bypass
-  // (`no-snap-alt`, read in processInputResult) and the transform-commit detach
-  // bit (`detach-alt`, read in commitObjectDrag).
+  // Alt held at the latest event. Two gestures read it outside a handler: the endpoint-drag release-snap
+  // bypass (processInputResult) and the transform-commit detach bit (commitObjectDrag).
   private altHeld = false;
-  // v3 §2b: the in-progress open-class endpoint drag — the dragged endpoint
-  // (geometry PAIR index) plus the latest world sample and its release-snap probe
-  // result. Set on each move carrying objectEndpointDelta, committed once on
-  // pointer-up, cleared on cancel (with the GPU chord deform reverted).
+  // The in-progress open-class endpoint drag — the dragged endpoint (PAIR index) plus the latest world
+  // sample and its release-snap probe. Committed once on pointer-up, cleared on cancel (GPU deform reverted).
   private endpointDrag: { id: string; nodeIndex: number; world: WorldPoint; snapped: boolean; targetId: string | null } | null = null;
 
   constructor(options: ShapeCanvasEngineOptions) {
@@ -286,17 +215,13 @@ export class ShapeCanvasEngine {
     this.sendInputBatch([{ kind: "fit-scene" }]);
   }
 
-  // W2-03/W2-07/W2-08: set the active pointer tool ("select" | "draw" | "create" |
-  // "erase"). The renderer-core only knows select/hand; "draw"/"create"/"erase" are
-  // shell-side routing (their input is intercepted by the engine before it reaches
-  // the renderer), so the core stays in "select".
+  // Set the active pointer tool. The core only knows select/hand; draw/create/erase are shell-side
+  // routing (intercepted before reaching the renderer), so the core stays "select".
   setTool(tool: ActiveTool) {
     this.activeTool = tool;
     this.coreSetTool("select");
-    // W3-G9 (#3)/v3 §4: a bare mouse hover has no down-less move under the canvas,
-    // so the create AND draw tools arm an always-on hover mousemove to drive the
-    // persistent anchor ring (a stroke started on an edge anchors its start);
-    // leaving them unbinds it (and clears the stale drag flags).
+    // The create AND draw tools arm an always-on hover mousemove (mouse has no down-less move) to drive
+    // the persistent anchor ring; leaving them unbinds it and clears the stale drag flags.
     if (tool === "create" || tool === "draw") {
       this.bindCreateHoverMove();
     } else {
@@ -306,16 +231,13 @@ export class ShapeCanvasEngine {
     if (tool !== "draw") this.drawDragActive = false;
   }
 
-  // W2-03: the shell mirrors the Space key down/up here. A pointer-down while
-  // Space is held becomes a pan gesture instead of a pick/marquee.
+  // The shell mirrors the Space key down/up here; a pointer-down while Space is held becomes a pan gesture.
   setSpaceHeld(held: boolean) {
     this.spaceHeld = held;
   }
 
-  // W2-03: arm the core's hand-pan path for the duration of one pan gesture
-  // (Space-hold + left-drag, or a middle-button drag). The core owns the pan state
-  // machine; the engine only flips the core tool to "hand" for the gesture and
-  // restores the user's tool ("select"/"draw") on pointer-up.
+  // Arm the core's hand-pan path for one pan gesture; the core owns the pan state machine, the engine
+  // only flips the core tool to "hand" and restores it on pointer-up.
   private armPanGesture() {
     this.panGestureActive = true;
     this.coreSetTool("hand");
@@ -324,13 +246,11 @@ export class ShapeCanvasEngine {
   private disarmPanGesture() {
     if (!this.panGestureActive) return;
     this.panGestureActive = false;
-    // "draw"/"create" are shell-side routing tools; the core only knows
-    // select/hand, so restore the core to "select" for any non-pan tool.
+    // The core only knows select/hand, so restore it to "select" for any non-pan tool.
     this.coreSetTool("select");
   }
 
-  // Push a raw core tool string (select|hand) without touching the shell-facing
-  // activeTool. Used only by the transient pan gesture.
+  // Push a raw core tool string (select|hand) without touching the shell-facing activeTool. Pan-gesture only.
   private coreSetTool(tool: "select" | "hand") {
     if (!this.webGpuRenderer) return;
     if (typeof this.webGpuRenderer.setTool === "function") {
@@ -348,10 +268,8 @@ export class ShapeCanvasEngine {
     this.sendInputBatch([{ kind: "set-tool", tool }]);
   }
 
-  // Push the transient multi-select highlight set to the renderer (marquee /
-  // shift-click). Prefers the direct wasm method; falls back to a set-multi-select
-  // input event. A wasm build predating either is a no-op (the multi highlight is
-  // additive over the single anchor, so older builds just lose it). Empty clears.
+  // Push the transient multi-select highlight set (marquee / shift-click). Prefers the direct wasm
+  // method, falls back to a set-multi-select input event. Empty clears.
   setMultiSelect(ids: string[]) {
     if (!this.webGpuRenderer) return;
     if (typeof this.webGpuRenderer.setMultiSelect === "function") {
@@ -503,7 +421,7 @@ export class ShapeCanvasEngine {
     if (isMousePointerEvent(event)) return;
     this.shiftHeld = event.shiftKey;
     this.altHeld = event.altKey;
-    // W2-03: Space-hold pans even under the draw tool; arm the core pan path first.
+    // Space-hold pans even under the draw tool; arm the core pan path first.
     const pan = isPanIntent({ spaceHeld: this.spaceHeld, button: event.button });
     if (this.activeTool === "draw" && !pan) {
       this.drawDragActive = true;
@@ -525,8 +443,6 @@ export class ShapeCanvasEngine {
       return;
     }
     if (pan) this.armPanGesture();
-    // EN1: additive-select (C2 `additive-select-shift`/`-mod`) — Shift or the
-    // platform primary modifier (Cmd/Ctrl) held at pick time, via the single source.
     this.lastPointerAdditive = isAdditiveSelect(event, detectMac());
     const screen = this.eventPoint(event);
     this.sendInputBatch([{ kind: "pointer-down", pointerId: event.pointerId, screen }]);
@@ -537,12 +453,9 @@ export class ShapeCanvasEngine {
     if (isMousePointerEvent(event)) return;
     this.shiftHeld = event.shiftKey;
     this.altHeld = event.altKey;
-    // W2-03: a Space-armed pan stays on the pan path for the whole gesture, even
-    // under the draw tool, so the move feeds the core pan instead of the stroke.
+    // A Space-armed pan stays on the pan path for the whole gesture, even under the draw tool.
     if (this.activeTool === "draw" && !this.panGestureActive) {
-      // v3 §4: a pen/touch move with no stroke in progress is a bare hover — emit
-      // the persistent anchor-ring snap probe (same as create) instead of a stroke
-      // sample, so the pre-stroke ring shows where a started stroke would anchor.
+      // A move with no stroke in progress is a bare hover — emit the anchor-ring snap probe instead of a stroke sample.
       if (createMoveEmission({ dragActive: this.drawDragActive }) === "hover") {
         this.emitCreateHover(event);
       } else {
@@ -551,8 +464,7 @@ export class ShapeCanvasEngine {
       return;
     }
     if (this.activeTool === "create" && !this.panGestureActive) {
-      // W3-G9 (#3): a pen/touch move with no create drag in progress is a bare hover
-      // — emit a persistent anchor-ring snap probe instead of a drag create event.
+      // A move with no create drag in progress is a bare hover — emit the anchor-ring snap probe.
       if (createMoveEmission({ dragActive: this.createDragActive }) === "hover") {
         this.emitCreateHover(event);
       } else {
@@ -658,8 +570,7 @@ export class ShapeCanvasEngine {
   private onMouseDown = (event: MouseEvent) => {
     this.shiftHeld = event.shiftKey;
     this.altHeld = event.altKey;
-    // W2-03: left (0) drives select/draw; middle (1) is a pan gesture. Right (2)
-    // is the context menu (handled in the shell) — ignore it here.
+    // Left (0) drives select/draw; middle (1) is a pan gesture; right (2) is the context menu (shell-handled) — ignore here.
     const pan = isPanIntent({ spaceHeld: this.spaceHeld, button: event.button });
     if (event.button !== 0 && !pan) return;
     event.preventDefault();
@@ -686,8 +597,6 @@ export class ShapeCanvasEngine {
       return;
     }
     if (pan) this.armPanGesture();
-    // EN1: additive-select (C2 `additive-select-shift`/`-mod`) — Shift or the
-    // platform primary modifier (Cmd/Ctrl) held at pick time, via the single source.
     this.lastPointerAdditive = isAdditiveSelect(event, detectMac());
     this.mouseDragActive = true;
     this.bindMouseFallbackMove();
@@ -747,11 +656,8 @@ export class ShapeCanvasEngine {
     this.disarmPanGesture();
   };
 
-  // W3-G9 (#3)/v3 §4: the always-on create/draw-tool hover mousemove. A bare mouse
-  // hover (no button down) over an object's edge emits a create-hover snap probe so
-  // the persistent anchor ring tracks the cursor BEFORE any drag/stroke. Skipped
-  // while a drag is in progress (mouseDragActive) so it never fights the
-  // mousedown-bound drag move, and while a Space-armed pan rides the tool.
+  // The always-on create/draw-tool hover mousemove: a bare hover emits a create-hover snap probe so the
+  // anchor ring tracks the cursor BEFORE any drag. Skipped during a drag or a Space-armed pan.
   private onCreateHoverMove = (event: MouseEvent) => {
     if (this.mouseDragActive || this.panGestureActive) return;
     this.emitCreateHover(event);
@@ -771,9 +677,7 @@ export class ShapeCanvasEngine {
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   }
 
-  // W3-G9 (#3): bind/unbind the always-on create-tool hover mousemove on the canvas
-  // (a bare mouse hover, no button down, has no other move source). Idempotent;
-  // bound when entering create in setTool, unbound on leave + on stop().
+  // Bind/unbind the always-on create-tool hover mousemove (a bare hover has no other move source). Idempotent.
   private bindCreateHoverMove() {
     if (this.createHoverTarget) return;
     this.createHoverTarget = this.canvas;
@@ -800,7 +704,6 @@ export class ShapeCanvasEngine {
     this.mouseFallbackTarget = null;
     this.mouseDragActive = false;
   }
-
 
   private sendInputBatch(events: RustCanvasInputEvent[]): RustInputBatchResult | null {
     if (!this.webGpuRenderer) {
@@ -829,42 +732,29 @@ export class ShapeCanvasEngine {
   }
 
   private processInputResult(result: RustInputBatchResult) {
-    // FC-08: object-path input results. An object pick on pointer-down starts a
-    // remembered drag; each move delta updates it and previews; an empty-start
-    // marquee forwards its ids. The commit op is authored on pointer-up.
+    // An object pick on pointer-down starts a remembered drag; each move delta updates it and previews;
+    // an empty-start marquee forwards its ids. The commit op is authored on pointer-up.
     if (typeof result.objectSelection === "string") {
       this.objectDrag = { id: result.objectSelection, matrix: IDENTITY_MATRIX, kind: "translate" };
       this.onEvent({ type: "object-select", id: result.objectSelection, additive: this.lastPointerAdditive });
     }
     if (result.objectTransformDelta) {
-      // W2-05: the cumulative delta is a full world-space matrix + gesture kind
-      // (translate/resize/rotate). Remember it and emit a non-destructive preview;
-      // the shell composes the matrix onto the object and commits on pointer-up.
       const { id, kind } = result.objectTransformDelta;
-      // EN1 (#2, inverted): the C2 coarse-rotate gesture (`coarse-rotate-shift`) now
-      // snaps BY DEFAULT — a rotate with no Shift quantizes the sweep to the catalog
-      // step (15°); holding Shift inverts to free (fine) rotation. Applied shell-side
-      // to the returned rotate matrix (RA2c semantics): extract the swept angle +
-      // center, re-snap, rebuild. Non-rotate deltas and a held Shift pass through.
+      // Coarse-rotate (inverted): a rotate with no Shift snaps to the catalog step (15°); Shift inverts
+      // to free rotation. Applied to the returned matrix (extract swept angle + center, re-snap, rebuild).
       const matrix =
         kind === "rotate" && !isCoarseRotate({ shiftKey: this.shiftHeld })
           ? snapRotateDeltaMatrix(result.objectTransformDelta.matrix, COARSE_ROTATE_SNAP_DEG)
           : result.objectTransformDelta.matrix;
       this.objectDrag = { id, matrix, kind };
-      // W2-11 drag zero-rebake: push the cumulative delta straight to the GPU
-      // instance matrix (no Svelte round-trip, lowest latency, no re-tessellation).
-      // The preview event still rides through so the shell does its commit/snap-back
-      // bookkeeping; it no longer drives a full feedScene rebuild.
+      // Drag zero-rebake: push the delta straight to the GPU instance matrix (no Svelte round-trip, no
+      // re-tessellation). The preview event still rides through for the shell's commit/snap-back bookkeeping.
       this.webGpuRenderer?.setObjectPreviewTransform?.(id, JSON.stringify(matrix));
       this.onEvent({ type: "object-transform-preview", id, matrix, kind });
     }
-    // v3 §2b: a live endpoint-drag sample (open-class selection). The chord deform
-    // rides the G14 single-object reexpand+patch path (setObjectEndpointPreview, no
-    // Svelte round-trip); the release-snap probe reuses the SAME outline query as
-    // drag-create (nearestOutlinePoint), excluding the dragged object so its own
-    // outline under the cursor never self-snaps, and honoring the Alt snap-bypass
-    // (C2 `no-snap-alt`). The preview event carries the probe so the shell drives
-    // the anchor ring; the commit is authored once on pointer-up.
+    // A live endpoint-drag sample. The chord deform rides setObjectEndpointPreview (no Svelte round-trip);
+    // the release-snap probe reuses the drag-create outline query, excluding the dragged object so its own
+    // outline never self-snaps, and honoring the Alt snap-bypass. The commit is authored once on pointer-up.
     if (result.objectEndpointDelta) {
       const { id, nodeIndex, x, y } = result.objectEndpointDelta;
       const snap = shouldQuerySnap({ altHeld: this.altHeld, phase: "move" }) ? this.querySnap({ x, y }, [id]) : null;
@@ -877,21 +767,16 @@ export class ShapeCanvasEngine {
     if (result.objectMarqueeIds != null) {
       this.onEvent({ type: "object-marquee", ids: result.objectMarqueeIds });
     }
-    // RA2b: a double-click that hit an object drills in (container) or edits a leaf;
-    // a missed double-click is null and emits nothing.
     if (result.objectDoubleClick) {
       const { id, hasChildren } = result.objectDoubleClick;
       this.onEvent({ type: "object-double-click", id, hasChildren });
     }
-    // W2-03: surface the hover affordance so the shell can set the cursor. The core
-    // computes it per no-drag move; older wasm builds omit it (defaults to "empty").
+    // Older wasm builds omit hoverAffordance (defaults to "empty").
     this.onEvent({ type: "affordance", affordance: result.hoverAffordance ?? "empty" });
   }
 
-  // FC-08/W2-05: emit the single undoable transform commit when an object drag
-  // moved (the cumulative matrix is off identity), then clear the remembered drag.
-  // Called on pointer-up/mouse-up AFTER the batch. `detach` is the C2 `detach-alt`
-  // gesture bit (v3 §3/DU4) — Alt held at release; the shell owns the branch.
+  // Emit the single undoable transform commit when an object drag moved (matrix off identity), then clear
+  // it. Called on pointer-up AFTER the batch. `detach` is the Alt-held-at-release bit; the shell owns the branch.
   private commitObjectDrag() {
     const drag = this.objectDrag;
     this.objectDrag = null;
@@ -906,42 +791,32 @@ export class ShapeCanvasEngine {
     }
   }
 
-  // v3 §2b: emit the single undoable endpoint release when an endpoint drag is in
-  // flight, then clear it. The release point + snap are the LAST move's sample
-  // (the pointer-up lands where the final move left it, mirroring the create
-  // path's release reuse). Called on pointer-up/mouse-up beside commitObjectDrag.
+  // Emit the single undoable endpoint release when a drag is in flight, then clear it. The release point
+  // + snap are the LAST move's sample (the pointer-up lands where the final move left it).
   private commitEndpointDrag() {
     const drag = this.endpointDrag;
     this.endpointDrag = null;
     if (drag) this.onEvent({ type: "object-endpoint-commit", ...drag });
   }
 
-  // v3 §2b: drop an in-flight endpoint drag without committing (pointer-cancel),
-  // reverting the live GPU chord deform to the canonical baked geometry.
+  // Drop an in-flight endpoint drag without committing (pointer-cancel), reverting the GPU chord deform.
   private cancelEndpointDrag() {
     const drag = this.endpointDrag;
     this.endpointDrag = null;
     if (drag) this.webGpuRenderer?.clearObjectEndpointPreview?.(drag.id);
   }
 
-  // v3 §2b: re-apply an in-flight endpoint drag's latest chord deform. A mid-drag
-  // scene re-feed (e.g. the shell's snap ring riding the feed) rebuilds every
-  // baked geometry from the canonical scene, wiping the live deform — the host
-  // calls this after each feed so the drag preview survives, including when the
-  // pointer holds still on the release point.
+  // Re-apply an in-flight endpoint drag's latest chord deform. A mid-drag re-feed rebuilds every baked
+  // geometry, wiping the live deform — the host calls this after each feed so the preview survives.
   refreshEndpointPreview(): void {
     const drag = this.endpointDrag;
     if (!drag) return;
     this.webGpuRenderer?.setObjectEndpointPreview?.(drag.id, drag.nodeIndex, drag.world.x, drag.world.y);
   }
 
-  // FC-11: emit a draw phase with the world point under the cursor. Used by the
-  // pointer/mouse handlers while the draw tool is active, replacing the renderer
-  // select/marquee input path. v3 §4: the phase also carries the outline snap
-  // probe (same W2-06 query + Alt bypass as create, preview ids excluded) so the
-  // shell can seed/author endpoint anchors — but `world` stays the RAW pointer:
-  // recognition normalizes the silhouette, so mid-stroke samples must not be
-  // pulled onto a passing edge.
+  // Emit a draw phase with the world point under the cursor (replaces the select/marquee path while the
+  // draw tool is active). Carries the outline snap probe so the shell can seed anchors, but `world` stays
+  // the RAW pointer — recognition normalizes the silhouette, so mid-stroke samples must not be pulled onto an edge.
   private emitDraw(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
     const world = screenToWorld(this.eventPoint(event), this.camera);
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(world) : null;
@@ -953,11 +828,8 @@ export class ShapeCanvasEngine {
     });
   }
 
-  // W2-07: emit a create phase with the dragged corner in world space. During the
-  // drag the corner snaps to the nearest object outline anchor when within
-  // tolerance, unless the snap-bypass modifier (Alt) is held (request 4: "modifier
-  // nullifies snap"). The snap query is the W2-06 core path (nearestOutlinePoint),
-  // so the geometry truth stays in Rust (P1) — the shell only forwards the result.
+  // Emit a create phase with the dragged corner in world space. The corner snaps to the nearest outline
+  // anchor within tolerance unless Alt is held. The snap query is the core path, so geometry truth stays in Rust.
   private emitCreate(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
     const raw = screenToWorld(this.eventPoint(event), this.camera);
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(raw) : null;
@@ -965,12 +837,8 @@ export class ShapeCanvasEngine {
     this.onEvent({ type: "create", phase, world, snapped: snap !== null, targetId: snap?.targetId ?? null });
   }
 
-  // W3-G9 (#3): emit a HOVER snap probe for a bare create-tool move (no button
-  // down). Runs the same W2-06 outline snap query as the drag move (it already
-  // excludes the transient preview ids), so the persistent anchor ring shows where
-  // the next create would anchor. Honors the Alt snap-bypass (no ring when an
-  // Alt-create would author no anchor), mirroring emitCreate's `shouldQuerySnap`
-  // gate — `phase: "move"` so a held Alt suppresses the query, never the position.
+  // Emit a HOVER snap probe for a bare create-tool move. Runs the same outline snap query as the drag
+  // move so the anchor ring shows where the next create would anchor. `phase: "move"` so a held Alt suppresses the query.
   private emitCreateHover(event: MouseEvent | PointerEvent) {
     const raw = screenToWorld(this.eventPoint(event), this.camera);
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase: "move" }) ? this.querySnap(raw) : null;
@@ -978,12 +846,8 @@ export class ShapeCanvasEngine {
     this.onEvent({ type: "create-hover", world, snapped: snap !== null, targetId: snap?.targetId ?? null });
   }
 
-  // W2-08: emit an erase touch for the stroke under the cursor. The object id
-  // comes from the core's object hit-test (hit-test stays in the core, boundary);
-  // a touch over empty canvas (no hit) emits nothing. `partial` is the C2
-  // partial-erase gesture (`partial-erase-alt`: Alt held — whole-stroke delete by
-  // default, partial subpath cut with the modifier), routed through the single
-  // gesture source. The shell authors the delete / edit-geometry op from the event.
+  // Emit an erase touch for the stroke under the cursor. The id comes from the core's hit-test (stays in
+  // the core); a touch over empty canvas emits nothing. `partial` = Alt held (whole-stroke delete by default).
   private emitErase(event: MouseEvent | PointerEvent) {
     const screen = this.eventPoint(event);
     const id = this.objectHitTest(screen);
@@ -992,13 +856,9 @@ export class ShapeCanvasEngine {
     this.onEvent({ type: "erase", id, world, partial: isPartialErase(event) });
   }
 
-  // EN1 (#3): emit one erase touch for EVERY object the eraser crossed since the
-  // previous sample. RA3's swept hit-test (`sweptEraseAt`) returns each object the
-  // segment (prev -> curr SCREEN samples) passes through, so a fast drag that skips
-  // between samples still erases the whole swept path — not just the object under
-  // the latest sample. Falls back to the single-sample `emitErase` when no prior
-  // sample exists or the swept method is unavailable (older wasm build). The world
-  // point + `partial` mirror `emitErase`.
+  // Emit one erase touch for EVERY object the eraser crossed since the previous sample (swept hit-test
+  // over prev -> curr SCREEN samples), so a fast drag erases the whole path. Falls back to single-sample
+  // `emitErase` when no prior sample exists or the swept method is unavailable.
   private emitSweptErase(event: MouseEvent | PointerEvent) {
     const curr = this.eventPoint(event);
     const prev = this.lastEraseScreen;
@@ -1013,10 +873,8 @@ export class ShapeCanvasEngine {
     for (const id of ids) this.onEvent({ type: "erase", id, world, partial });
   }
 
-  // EN1 (#3): RA3 swept hit-test boundary — the ids of every object crossed by the
-  // eraser between two consecutive SCREEN samples. Feature-detected: a wasm build
-  // predating `sweptEraseAt` returns null so the caller falls back to the
-  // single-sample pick.
+  // The ids of every object crossed by the eraser between two consecutive SCREEN samples.
+  // Feature-detected: a wasm build predating `sweptEraseAt` returns null so the caller falls back to single-sample.
   private sweptEraseHitTest(prev: WorldPoint, curr: WorldPoint): string[] | null {
     const renderer = this.webGpuRenderer;
     if (!renderer || typeof renderer.sweptEraseAt !== "function") return null;
@@ -1033,12 +891,9 @@ export class ShapeCanvasEngine {
     }
   }
 
-  // W2-07: snap a world point to the nearest object outline anchor via the W2-06
-  // core query. Returns the snapped WORLD point plus the target object id (AP5
-  // #14: the object whose outline was snapped to) when within tolerance, else
-  // null. Feature-detected: a wasm build predating the method never snaps.
-  // v3 §2b: `extraExcludeIds` lets the endpoint drag exclude the DRAGGED object —
-  // its own outline sits under the cursor and would otherwise self-snap at ~0.
+  // Snap a world point to the nearest object outline anchor via the core query: returns the snapped
+  // WORLD point + target object id within tolerance, else null. `extraExcludeIds` lets the endpoint drag
+  // exclude the DRAGGED object, whose own outline under the cursor would otherwise self-snap at ~0.
   private querySnap(world: WorldPoint, extraExcludeIds?: string[]): { x: number; y: number; targetId: string | null } | null {
     const renderer = this.webGpuRenderer;
     if (!renderer || typeof renderer.nearestOutlinePoint !== "function") return null;
@@ -1058,7 +913,7 @@ export class ShapeCanvasEngine {
     }
   }
 
-  // FC-08: pure object pick for the shell's right-click context menu.
+  // Pure object pick for the shell's right-click context menu.
   objectHitTest(screen: WorldPoint): string | null {
     if (!this.webGpuRenderer || typeof this.webGpuRenderer.hitTestObject !== "function") return null;
     try {
@@ -1076,9 +931,8 @@ export class ShapeCanvasEngine {
 
 }
 
-// W2-05: the row-major identity transform and an exact-equality check, used to
-// seed the remembered object drag and to detect a no-op (un-moved) drag so the
-// commit op is skipped — matching the FC-08 dx===0 && dy===0 predicate.
+// Row-major identity transform + exact-equality check, used to seed the remembered drag and detect a
+// no-op (un-moved) drag so the commit op is skipped.
 const IDENTITY_MATRIX: RenderTransform3x3 = [
   [1, 0, 0],
   [0, 1, 0],
@@ -1089,14 +943,9 @@ function isIdentityMatrix(m: RenderTransform3x3): boolean {
   return m.every((row, i) => row.every((v, j) => v === IDENTITY_MATRIX[i][j]));
 }
 
-// EN1 (#2) coarse-rotate: re-quantize a core-returned rotate-delta matrix to the
-// nearest `snapDeg`-degree step, mirroring RA2c's `rotate_delta_matrix_snapped`
-// shell-side. The core builds the delta as `rotate_about_3x3(theta, cx, cy)` =
-// `[[c,-s, cx-c*cx+s*cy],[s,c, cy-s*cx-c*cy],[0,0,1]]`, so the swept angle is
-// `theta = atan2(s, c)` and the center solves `(I - R) c = t` (det = 2(1-c), the
-// rotation part is recovered from the rotated translation column). A zero-angle
-// delta (nothing to snap) and a singular `I - R` (theta == 0) both return the
-// matrix unchanged. Pure; the GEOMETRY truth (sin/cos) stays standard math.
+// Re-quantize a core-returned rotate-delta matrix to the nearest `snapDeg` step. The core builds the
+// delta as `rotate_about_3x3(theta, cx, cy)`, so the swept angle is `theta = atan2(s, c)` and the center
+// solves `(I - R) c = t`. A zero-angle delta and a singular `I - R` (theta == 0) return the matrix unchanged.
 export function snapRotateDeltaMatrix(m: RenderTransform3x3, snapDeg: number): RenderTransform3x3 {
   const cos = m[0][0];
   const sin = m[1][0];

@@ -1,25 +1,12 @@
-// Renderer adapter scene types (object-native).
-//
-// The canonical canvas model is the object substrate (`platforms/web/shared/object.ts`,
-// D1). The renderer's object draw entry consumes a `RenderObjectScene` — the
-// object-substrate render view that mirrors the renderer-core
-// `render_object::RenderObjectScene` serde shape (camelCase keys; `geometryD` for
-// the path-string; bare 3x3 transform). The host (`lib/canvasHost.ts`) projects an
-// `ObjectScene` into this shape before handing it to the renderer.
-//
-// Camera/coordinate primitives live in `platforms/web/shared/geometry.ts` (render-time
-// camera/coords, not domain). The screen<->world helpers here are pure projection.
+// Renderer adapter scene types. The renderer's object draw entry consumes a `RenderObjectScene` —
+// the render view mirroring renderer-core `render_object::RenderObjectScene` (camelCase keys;
+// `geometryD` for the path-string; bare 3x3 transform). The host projects an `ObjectScene` into this shape.
 
 import type { CameraState, WorldPoint, WorldRect } from "../shared/geometry";
 
 export type { CameraState, WorldPoint, WorldRect };
 
-// ---------------------------------------------------------------------------
-// Object render feed — the object-substrate render view the renderer draws.
-// Mirrors `render_object::RenderObjectScene` (camelCase serde shape).
-// ---------------------------------------------------------------------------
-
-/** Bare 3x3 row-major transform `[[a,b,c],[d,e,f],[g,h,i]]`. */
+// Bare 3x3 row-major transform `[[a,b,c],[d,e,f],[g,h,i]]`.
 export type RenderTransform3x3 = [
   [number, number, number],
   [number, number, number],
@@ -60,7 +47,7 @@ export type RenderText = {
   valign?: "top" | "middle" | "bottom";
 };
 
-/** One object as the renderer draws it (D1): path-string geometry + inline style. */
+// One object as the renderer draws it: path-string geometry + inline style.
 export type RenderObject = {
   id: string;
   parent: string | null;
@@ -73,20 +60,15 @@ export type RenderObject = {
   clip: boolean;
 };
 
-/** The renderer-core object scene view (the renderer's object draw input). */
 export type RenderObjectScene = {
   sceneId: string;
   camera: CameraState;
   objects: RenderObject[];
-  /** Persisted single-anchor selection: id of the selected object, if any. */
+  // Persisted single-anchor selection: id of the selected object, if any.
   selection: string | null;
-  /** Transient multi-select set (never persisted). */
+  // Transient multi-select set (never persisted).
   multiSelect: string[];
 };
-
-// ---------------------------------------------------------------------------
-// Hit / overlay / frame stats — the adapter↔core call boundary value types.
-// ---------------------------------------------------------------------------
 
 export type RenderObjectKind = "group" | "card" | "edge" | "port" | "text";
 
@@ -205,10 +187,6 @@ export type FrameStats = {
   rustLastHitScreenY: number | null;
 };
 
-// ---------------------------------------------------------------------------
-// Screen <-> world projection (pure; camera/coords only).
-// ---------------------------------------------------------------------------
-
 export function rectsIntersect(a: WorldRect, b: WorldRect): boolean {
   return a.x <= b.x + b.width && a.x + a.width >= b.x && a.y <= b.y + b.height && a.y + a.height >= b.y;
 }
@@ -246,20 +224,12 @@ export function truncateText(value: string, maxLength: number): string {
   return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
-// ---------------------------------------------------------------------------
-// Theme (AP4 #12c) — light/dark mode shell driver.
-//
-// The C1 contract owns the canonical token set (scene-core `object::theme`,
-// renderer `object_theme`); the kebab names below mirror it so the shell can
-// reference default object styles by token and drive the renderer theme-bit.
-// `applyDocumentTheme` is the single toggle entry: it flips a root attribute
-// (CSS chrome), persists the choice, and drives RB1's renderer theme-bit
-// (`setObjectTheme`) so the canvas and chrome flip together.
-// ---------------------------------------------------------------------------
+// Light/dark mode shell driver. The canonical token set lives in scene-core `object::theme`; the
+// kebab names below mirror it so the shell can reference default object styles by token.
 
 export type Theme = "light" | "dark";
 
-/** The C1 kebab token names (mirrors `object::theme::ALL_TOKENS`). */
+// The kebab token names (mirrors `object::theme::ALL_TOKENS`).
 export const THEME_TOKEN_NAMES = [
   "canvas-bg",
   "surface",
@@ -273,7 +243,7 @@ export const THEME_TOKEN_NAMES = [
 
 export type ThemeTokenName = (typeof THEME_TOKEN_NAMES)[number];
 
-/** Default object style as C1 token refs (resolved renderer-side by RB1). */
+// Default object style as token refs (resolved renderer-side).
 export const DEFAULT_OBJECT_STYLE_TOKENS: {
   fill: ThemeTokenName;
   stroke: ThemeTokenName;
@@ -287,7 +257,7 @@ export const DEFAULT_OBJECT_STYLE_TOKENS: {
 export const THEME_STORAGE_KEY = "shape-ai-theme";
 export const THEME_ROOT_ATTRIBUTE = "data-theme";
 
-/** Minimal injectable surfaces so the toggle stays unit-testable (no globals). */
+// Injectable surfaces so the toggle stays unit-testable (no globals).
 export type ThemeRoot = { setAttribute(name: string, value: string): void };
 export type ThemeStorage = { getItem(key: string): string | null; setItem(key: string, value: string): void };
 
@@ -295,18 +265,14 @@ export function isTheme(value: string | null): value is Theme {
   return value === "light" || value === "dark";
 }
 
-/** Read the persisted theme, defaulting to light when absent/invalid. */
+// Read the persisted theme, defaulting to light when absent/invalid.
 export function readStoredTheme(storage: ThemeStorage): Theme {
   const stored = storage.getItem(THEME_STORAGE_KEY);
   return isTheme(stored) ? stored : "light";
 }
 
-/**
- * Apply `theme` across the shell: flip the root `data-theme` attribute (drives
- * the dark-mode CSS variables), persist it, and drive RB1's renderer theme-bit.
- * `setRendererTheme(dark)` is the feature-detected `ShapeWebGpuRenderer.setObjectTheme`
- * hook — called with the resolved dark bit so the canvas flips with the chrome.
- */
+// Apply `theme` across the shell: flip the root `data-theme` attribute, persist it, and drive the
+// renderer theme-bit. `setRendererTheme(dark)` is the feature-detected `ShapeWebGpuRenderer.setObjectTheme` hook.
 export function applyDocumentTheme(
   theme: Theme,
   opts: { root: ThemeRoot; storage: ThemeStorage; setRendererTheme?: (dark: boolean) => void }

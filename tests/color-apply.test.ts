@@ -1,9 +1,5 @@
-// AP1 (#5) — color apply. The toolbar's selected color must (a) become the default
-// fill/stroke of a NEW shape and (b) author a `set-style` op when a selected object
-// is recolored. Tier-3 moved these builders into the Rust core; these are contract
-// tests over the REAL scene-core wasm (`core.buildPrimitive` /
-// `buildPrimitiveFromDrag` / `buildSetStyleOp`), plus assert the App.svelte wiring
-// threads the color through the insert path and routes onSelectColor.
+// The toolbar's selected color must (a) become the default fill/stroke of a NEW
+// shape and (b) author a set-style op when a selected object is recolored.
 
 import { beforeAll, describe, expect, it } from "vitest";
 import { THEME_DEFAULT_COLOR, type DragSpan } from "../platforms/web/controller/objectPrimitives";
@@ -19,7 +15,7 @@ beforeAll(async () => {
   core = await loadSceneCore();
 });
 
-describe("buildPrimitive default color (AP1 insert path)", () => {
+describe("buildPrimitive default color (insert path)", () => {
   it("paints a NEW rectangle's fill AND stroke in the selected color", () => {
     const object = core.buildPrimitive("rectangle", { x: 0, y: 0 }, "rect-1", "a0", COLOR);
     expect(object.fill?.paint).toEqual({ kind: "solid", color: COLOR });
@@ -44,7 +40,7 @@ describe("buildPrimitive default color (AP1 insert path)", () => {
   });
 });
 
-describe("buildPrimitiveFromDrag default color (AP1 drag-create path)", () => {
+describe("buildPrimitiveFromDrag default color (drag-create path)", () => {
   it("paints an ellipse dragged to a bbox in the selected color", () => {
     const span: DragSpan = { start: { x: 0, y: 0 }, end: { x: 100, y: 80 } };
     const object = core.buildPrimitiveFromDrag("ellipse", span, "ell-1", "a0", COLOR);
@@ -53,9 +49,9 @@ describe("buildPrimitiveFromDrag default color (AP1 drag-create path)", () => {
   });
 });
 
-describe("buildSetStyleOp recolor (AP1 recolor-selection path)", () => {
-  // Closed d: the closed-class recolor contract (anchor-semantics v3 §1 routes
-  // OPEN-class color to the stroke — see the dedicated describe below).
+describe("buildSetStyleOp recolor (recolor-selection path)", () => {
+  // Closed d: the closed-class recolor contract (open-class routes color to the
+  // stroke, see below).
   function obj(extra: Partial<SceneObject>): SceneObject {
     return { id: "o1", order: "a0", geometry: { d: "M 0 0 L 8 0 L 8 8 Z" }, ...extra } as SceneObject;
   }
@@ -67,7 +63,7 @@ describe("buildSetStyleOp recolor (AP1 recolor-selection path)", () => {
     });
     const op = core.buildSetStyleOp(object, COLOR);
     // The core re-serializes the canonical Stroke, so the recolored stroke carries
-    // its full field set (the serde defaults the minimal fixture omitted).
+    // its full field set (serde defaults the minimal fixture omitted).
     expect(op).toEqual({
       kind: "set-style",
       id: "o1",
@@ -100,10 +96,9 @@ describe("buildSetStyleOp recolor (AP1 recolor-selection path)", () => {
   });
 });
 
-describe("open-class recolor routes to the stroke (anchor-semantics v3 §1)", () => {
-  // Open d (one open subpath): the color must reach the STROKE and never author
-  // a fill — open-class carries no fill (the shell stays class-ignorant; the
-  // routing lives in the core's build_set_style_op).
+describe("open-class recolor routes to the stroke", () => {
+  // Open-class carries no fill, so the color must reach the STROKE and never author
+  // a fill. The routing lives in the core, not the shell.
   function openObj(extra: Partial<SceneObject>): SceneObject {
     return { id: "o1", order: "a0", geometry: { d: "M 0 0 L 8 0" }, ...extra } as SceneObject;
   }
@@ -139,7 +134,7 @@ describe("open-class recolor routes to the stroke (anchor-semantics v3 §1)", ()
   });
 });
 
-describe("theme-default token (S2 / #5 — resolves through the core)", () => {
+describe("theme-default token (resolves through the core)", () => {
   it("paints a NEW shape authored with the sentinel as a text token (fill AND stroke)", () => {
     const object = core.buildPrimitive("rectangle", { x: 0, y: 0 }, "rect-t", "a0", THEME_DEFAULT_COLOR);
     expect(object.fill?.paint).toEqual({ kind: "token", name: "text" });
@@ -174,16 +169,12 @@ describe("theme-default token (S2 / #5 — resolves through the core)", () => {
   });
 });
 
-// The insertPrimitive / applySelectedColor wiring, exercised through the extracted
-// controller functions the shell now composes (no .svelte source pin).
-describe("controller color wiring (AP1)", () => {
+describe("controller color wiring", () => {
   function sceneWith(object: SceneObject): ObjectScene {
     return { ...emptyObjectScene(), objects: [object] };
   }
 
   it("threads selectedColor into the immediate-insert core builder", () => {
-    // buildInsertPrimitive paints the new object in the selected color (vs the
-    // kind default when no color is passed).
     const object = buildInsertPrimitive(core, "rectangle", { x: 0, y: 0 }, "rect-1", "a0", COLOR);
     expect(object.fill?.paint).toEqual({ kind: "solid", color: COLOR });
     expect(object.stroke?.paint).toEqual({ kind: "solid", color: COLOR });

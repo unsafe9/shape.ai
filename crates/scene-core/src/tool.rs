@@ -1,19 +1,10 @@
-//! Active-tool model (CC0.1) — the small enum the cockpit shell uses to track
-//! which canvas tool is currently armed.
-//!
-//! This is **ephemeral shell state**: scene-core owns only the type (and its
-//! default) so every platform shell shares one vocabulary. There is no
-//! persistence and no op variant for the active tool — picking a tool is a UI
-//! concern; the result of *using* one is an ordinary object op (`crate::object`).
+//! Active-tool enum — ephemeral shell state, no persistence and no op variant;
+//! scene-core owns only the type so every platform shell shares one vocabulary.
 
 use serde::{Deserialize, Serialize};
 
-/// The canvas tool currently armed in the cockpit.
-///
-/// `Select` (the default) drags/moves objects; `Hand` pans the viewport; the
-/// `Insert*` variants arm an insert gesture for the matching primitive. The
-/// serde tags are kebab-case to match the rest of the wire vocabulary and the
-/// command catalog ids (`select-move`, `hand-pan`, `insert-rectangle`, …).
+/// Serde tags are kebab-case to match the wire vocabulary and command catalog
+/// ids (`select-move`, `hand-pan`, `insert-rectangle`, …).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ActiveTool {
@@ -32,8 +23,6 @@ impl Default for ActiveTool {
     }
 }
 
-/// The default armed tool (`Select`). A free helper so a shell can request the
-/// default without naming the variant.
 pub fn default_tool() -> ActiveTool {
     ActiveTool::default()
 }

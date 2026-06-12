@@ -1,17 +1,3 @@
-// Windowed replica + canvas switch + reconnect tests (OB4.3 object data layer).
-//
-// These drive `SceneClient` / `WsTransport` over a MockWebSocket plus injected
-// manual timers and a deterministic random source, so windowing re-subscribe,
-// the reconnect backoff schedule, and offline buffering are all deterministic.
-//
-//   - DATA-LAYER WINDOWING: a region subscribe yields only the objects the server
-//     ships inside the window; a camera move re-subscribes with a new region; the
-//     resnapshot welcome loads entered objects and evicts exited ones.
-//   - RECONNECT: the backoff schedule grows per attempt within the jitter bounds;
-//     an offline burst of object ops is buffered (optimistic apply + outbox) and
-//     replayed on the reconnect welcome so state converges.
-//   - CANVAS SWITCH: switchCanvas reconnects and re-subscribes the same window.
-
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -182,11 +168,6 @@ function subscribeFrames(socket: MockWebSocket) {
 function opsFrames(socket: MockWebSocket) {
   return socket.sentMessages().filter((m): m is Extract<ClientMessage, { type: "ops" }> => m.type === "ops");
 }
-
-// The windowing math (windowFromViewport) + the default margin now live in the
-// core (crates/client-runtime `WindowState` / `window_from_viewport`, covered by
-// tests/windowing.rs); the shell only drives it. These suites exercise the
-// wasm-backed SceneClient decisions end to end.
 
 describe("SceneClient windowed subscribe", () => {
   it("seeds the connection window from the connect region (hello carries the bbox)", async () => {

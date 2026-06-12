@@ -1,24 +1,15 @@
-//! OB3.S9 — the object command catalog: the canonical list of user-facing
-//! actions over objects and their default keyboard shortcuts.
+//! The object command catalog: the canonical list of user-facing actions over
+//! objects and their default keyboard shortcuts, the single source every shell
+//! renders. `object_command_catalog_json()` is the wire seam.
 //!
-//! This data drives two surfaces: the U3 context menu and the U4 shortcut layer.
-//! Keeping it in scene-core lets every platform shell render the same catalog
-//! without re-declaring it, and `object_command_catalog_json()` is the wire seam
-//! the shell consumes.
-//!
-//! Where a command maps 1:1 onto an [`ObjectOp`], `op_kind` carries the same
-//! kebab discriminant string [`ObjectOp::kind`] returns, so the shell can route
-//! a command straight to an op. Composite or shell-only actions (copy/paste —
-//! clipboard I/O is shell-side per P1 — plus duplicate, select-all, undo, redo)
-//! leave `op_kind` `None`.
-//!
-//! Shortcuts use the platform-agnostic `Mod` token for the primary modifier
-//! (Cmd on macOS, Ctrl elsewhere); the shell resolves it per platform.
+//! Where a command maps 1:1 onto an [`ObjectOp`], `op_kind` carries the kebab
+//! discriminant [`ObjectOp::kind`] returns; composite or shell-only actions leave
+//! it `None`. Shortcuts use the platform-agnostic `Mod` token (Cmd on macOS, Ctrl
+//! elsewhere), resolved per platform by the shell.
 
 use serde::Serialize;
 
-/// The functional grouping an object command belongs to. Serialized kebab-case
-/// to match the rest of the wire model.
+/// Serialized kebab-case to match the wire model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ObjectCommandCategory {
@@ -46,8 +37,8 @@ pub struct ObjectCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_shortcut: Option<String>,
     pub description: String,
-    /// The [`ObjectOp`](crate::object::op::ObjectOp) kind this command lowers to, when it
-    /// maps 1:1. `None` for composite or shell-only actions.
+    /// The op kind this command lowers to when it maps 1:1; `None` for composite
+    /// or shell-only actions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub op_kind: Option<String>,
 }
@@ -76,8 +67,8 @@ impl ObjectCommand {
 pub fn object_command_catalog() -> Vec<ObjectCommand> {
     use ObjectCommandCategory::*;
     vec![
-        // Tool — arm a canvas tool. Picking a tool is shell UI state (see
-        // crate::tool::ActiveTool); using one yields an ordinary op, so no op kind.
+        // Tool — picking a tool is shell UI state; using one yields an ordinary
+        // op, so no op kind.
         ObjectCommand::new(
             "select-move",
             "Select / Move",
@@ -102,8 +93,8 @@ pub fn object_command_catalog() -> Vec<ObjectCommand> {
             "Arm the pen/draw tool.",
             None,
         ),
-        // Insert — arm an insert gesture for a primitive. The shell lowers the
-        // picked kind to an insert-object op, so these carry no direct op kind.
+        // Insert — the shell lowers the picked kind to an insert-object op, so
+        // these carry no direct op kind.
         ObjectCommand::new(
             "insert-rectangle",
             "Rectangle",
@@ -144,7 +135,7 @@ pub fn object_command_catalog() -> Vec<ObjectCommand> {
             "Insert a frame.",
             None,
         ),
-        // Clipboard — clipboard I/O is shell-side (P1), so these carry no op kind.
+        // Clipboard — clipboard I/O is shell-side, so these carry no op kind.
         ObjectCommand::new(
             "copy",
             "Copy",
@@ -361,9 +352,8 @@ pub fn object_command_catalog() -> Vec<ObjectCommand> {
             "Set the tags on the selection.",
             Some("set-tags"),
         ),
-        // View — viewport and shell-panel actions. Pure shell concerns; no op kind.
-        // Bindings use symbol tokens (`=`, `-`, `,`, `/`) the shell matcher resolves
-        // from `KeyboardEvent.key`, mirroring the existing `Mod+]` / `Mod+[` entries.
+        // View — pure shell concerns, no op kind. Bindings use symbol tokens
+        // (`=`, `-`, `,`, `/`) the shell matcher resolves from `KeyboardEvent.key`.
         ObjectCommand::new(
             "zoom-in",
             "Zoom In",
@@ -407,11 +397,9 @@ pub fn object_command_catalog() -> Vec<ObjectCommand> {
     ]
 }
 
-/// The object command catalog serialized to JSON — the seam the shell consumes
-/// (`object_command_catalog() -> JSON`).
+/// The catalog serialized to JSON — the seam the shell consumes.
 pub fn object_command_catalog_json() -> String {
-    // The catalog is statically constructed, so serialization cannot fail; the
-    // `expect` documents that invariant rather than masking a real error.
+    // Statically constructed, so serialization cannot fail.
     serde_json::to_string(&object_command_catalog()).expect("object command catalog serializes")
 }
 
@@ -504,9 +492,8 @@ mod tests {
 
     #[test]
     fn op_kinds_are_real_object_op_discriminants() {
-        // Every `op_kind` the catalog claims must equal some `ObjectOp::kind()`.
-        // Build the authoritative set straight from the op enum so this stays in
-        // lockstep with op.rs without re-listing the kebab strings here.
+        // The authoritative set is built straight from the op enum so this stays
+        // in lockstep with op.rs without re-listing the kebab strings.
         let known: HashSet<&'static str> = [
             ObjectOp::InsertObject {
                 object: crate::object::model::Object::new(

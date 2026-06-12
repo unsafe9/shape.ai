@@ -1,22 +1,15 @@
-// W3-G8/A drop-shadow composite: draw the blurred shadow mask under the fill.
+// Drop-shadow composite: a fullscreen-triangle pass sampling the twice-blurred
+// shadow mask and tinting it by the theme `shadow` token, src-over onto the
+// surface. Recorded FIRST in the visible object pass (right after the clear) so
+// fill/stroke/text draw on top.
 //
-// A fullscreen-triangle pass that samples the twice-blurred shadow mask and tints
-// it by the theme `shadow` token color, src-over onto the visible surface. It is
-// recorded FIRST in the visible object pass (right after the clear, before fill),
-// so fill/stroke/text draw on top.
-//
-// The mask's ALPHA is the blurred silhouette COVERAGE. The silhouette was rendered
-// with the theme `shadow` token's OWN translucent alpha, so the coverage ALREADY
-// encodes the shadow strength (peak ~= the token alpha, feathered to 0 at the rim).
-// The composite therefore takes the token's RGB from `tint` and uses the coverage
-// DIRECTLY as the output alpha (the token alpha is applied exactly once, via the
-// mask). Its rgb channel is discarded so no premultiplied dark-edge bleed reaches
-// the surface. An empty mask -> zero coverage -> fully transparent output: the
-// shadow simply disappears, never a wash.
+// The mask ALPHA is the blurred silhouette COVERAGE, already encoding the shadow
+// strength (the silhouette was rendered with the token's own translucent alpha), so
+// the composite takes only the token RGB from `tint` and uses coverage DIRECTLY as
+// the output alpha. An empty mask -> transparent output, never a wash.
 
 struct CompositeParams {
-  // The theme `shadow` token color (rgb + translucent a), resolved on the CPU
-  // through the token path and refreshed on a theme flip.
+  // The theme `shadow` token color, resolved on the CPU and refreshed on a flip.
   tint: vec4<f32>,
 };
 
@@ -41,10 +34,8 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOut {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-  // Coverage already carries the token alpha (the silhouette was rendered with the
-  // translucent shadow color), so use it DIRECTLY as the output alpha and take only
-  // the token RGB from the tint. The pipeline uses straight (non-premultiplied)
-  // ALPHA_BLENDING, so emit straight rgb with the coverage as alpha.
+  // Coverage already carries the token alpha, so use it directly as the output
+  // alpha with the token RGB (straight, non-premultiplied ALPHA_BLENDING).
   let coverage = textureSample(mask_tex, mask_sampler, input.uv).a;
   return vec4<f32>(params.tint.rgb, coverage);
 }

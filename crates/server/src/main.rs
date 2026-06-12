@@ -1,6 +1,5 @@
-//! Thin native entry point. Reads config from the environment, initialises
-//! tracing, and hands off to the library's `serve`. All behaviour lives in the
-//! lib so integration tests can exercise it without the binary.
+//! Thin entry point. Behaviour lives in the lib so integration tests can
+//! exercise it without the binary.
 
 use shape_server::{serve, Config};
 

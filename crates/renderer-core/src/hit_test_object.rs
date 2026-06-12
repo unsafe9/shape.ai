@@ -1,48 +1,29 @@
-//! Hit testing against an object's derived region (OB3.R5, D8).
+//! Hit testing against an object's derived region. A pointer is hit-tested by
+//! inverse-transforming it into object-local space and running a point-in-region
+//! test there, so rotation/scale/shear/perspective need no per-kind special case
+//! and the region stays in the local coordinates it was derived in.
 //!
-//! D8: a pointer is hit-tested by *inverse-transforming* it into object-local
-//! space and running a point-in-region test there, rather than by transforming
-//! the region into world space. Inverting the object's 3×3 projective matrix
-//! once and pushing the query point through it means rotation, scale, shear, and
-//! perspective are all handled by the same arithmetic — there is no special case
-//! per transform kind, and the region (D6) stays in the object-local coordinates
-//! it was derived/cached in.
-//!
-//! The transform is a full 3×3 projective matrix `[[f64;3];3]` operating on
-//! homogeneous `(x, y, 1)`; the third output row drives the perspective divide.
-//! Region outlines are object-local polygons in pixels (f32). Object-local
-//! quantized i32 path coordinates convert to f64 px by `/ 8.0` (D2: 8 units/px)
-//! before any matrix math.
-//!
-//! This module is pure CPU and host-neutral: no device, no time, no I/O. It is
-//! additive — the legacy `RenderGroup/RenderCard/RenderEdge` draw path and
-//! `ViewUniform` are untouched; this is wired into the GPU draw path at the OB-4
-//! cutover.
+//! The transform is a full 3×3 projective matrix `[[f64;3];3]` on homogeneous
+//! `(x, y, 1)` (third output row drives the perspective divide). Region outlines
+//! are object-local pixel polygons (f32); quantized i32 path coords convert to f64
+//! px by `/ 8.0` before any matrix math. Pure CPU: no device, no time, no I/O.
 
-/// Object-local coordinate quantization: path-string integer units per CSS
-/// pixel (D2). A quantized `i32` coordinate becomes `f64` px by dividing by this.
+/// Object-local quantization: path-string integer units per CSS pixel.
 pub const UNITS_PER_PX: f64 = 8.0;
 
-/// Selection-handle side length in SCREEN pixels (W2-02/W2-04). Handles are a
-/// fixed on-screen size regardless of zoom — the layout helper consumes an
-/// already-camera-transformed (screen-space) selection bbox, so this constant is
-/// the literal square size the shell draws and the pointer hit-tests against.
+/// Selection-handle side length in SCREEN pixels — a fixed on-screen size
+/// regardless of zoom (the layout helper consumes a screen-space selection bbox).
 pub const HANDLE_SIZE_PX: f64 = 8.0;
 
-/// Distance in SCREEN pixels from the selection's top edge up to the center of
-/// the rotate zone (W2-02/W2-04). The rotate zone is a handle-sized square
-/// centered above the top edge, used to detect the "rotate" affordance.
+/// Screen-pixel distance from the selection's top edge to the rotate zone center.
 pub const ROTATE_ZONE_OFFSET_PX: f64 = 20.0;
 
-/// A hover affordance: what the pointer is currently over, used by the shell to
-/// pick a cursor (W2-02). Stable string forms (via [`HoverAffordance::as_str`])
-/// are the wire contract the shell reads off the input-batch result; do not
+/// What the pointer is over, used by the shell to pick a cursor. The string forms
+/// (via [`HoverAffordance::as_str`]) are the wire contract the shell reads; do not
 /// rename them without updating the shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoverAffordance {
-    /// Blank canvas — nothing under the pointer.
     Empty,
-    /// Over an object's interior/fill.
     Body,
     ResizeNw,
     ResizeN,
@@ -52,20 +33,16 @@ pub enum HoverAffordance {
     ResizeS,
     ResizeSw,
     ResizeW,
-    /// Over the rotate zone above the selection's top edge.
     Rotate,
-    /// Anchor-semantics v3 §2b: over an OPEN-CLASS selection's START endpoint
-    /// handle (geometry pair 0). Open-class selections surface only the two
-    /// endpoint handles — no resize/rotate affordances.
+    /// START endpoint handle of an open-class selection (geometry pair 0); such
+    /// selections surface only the two endpoint handles, no resize/rotate.
     EndpointStart,
-    /// v3 §2b: over an OPEN-CLASS selection's END endpoint handle (the last
-    /// geometry coordinate pair).
+    /// END endpoint handle (the last geometry coordinate pair).
     EndpointEnd,
 }
 
 impl HoverAffordance {
-    /// The stable wire string the shell maps to a cursor. Keep in sync with the
-    /// shell's affordance->cursor table (W2-03).
+    /// The stable wire string the shell maps to a cursor.
     pub fn as_str(self) -> &'static str {
         match self {
             HoverAffordance::Empty => "empty",
@@ -85,9 +62,7 @@ impl HoverAffordance {
     }
 }
 
-/// An axis-aligned rectangle in SCREEN pixels (top-left origin), used for the
-/// selection-handle layout. Kept host-neutral (plain `f64`) so the pure hit-test
-/// module stays free of the renderer's camera/world types.
+/// An axis-aligned rectangle in SCREEN pixels (top-left origin) for handle layout.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScreenRect {
     pub x: f64,
@@ -102,15 +77,11 @@ impl ScreenRect {
     }
 }
 
-/// Screen-space geometry of a selection's 8 resize handles + rotate zone (W2-02).
-/// This is the SINGLE SOURCE OF TRUTH for handle placement: W2-02 builds it to
-/// classify the hover affordance over the selected object, and W2-04 reuses the
-/// same layout to RENDER the handles and to run the pointer-down hit-test, so the
-/// thing the user sees and the thing they can grab are guaranteed identical.
-///
-/// Each handle is a [`HANDLE_SIZE_PX`]-square centered on a corner / edge-midpoint
-/// of `bbox`; the rotate zone is the same-sized square centered
-/// [`ROTATE_ZONE_OFFSET_PX`] above the top edge's midpoint.
+/// Screen-space geometry of a selection's 8 resize handles + rotate zone. The
+/// single source of truth for handle placement: the same layout renders the
+/// handles and runs the hit-test, so what the user sees and can grab are identical.
+/// Each handle is a [`HANDLE_SIZE_PX`]-square on a corner/edge-midpoint of `bbox`;
+/// the rotate zone is centered [`ROTATE_ZONE_OFFSET_PX`] above the top-edge midpoint.
 #[derive(Clone, Copy, Debug)]
 pub struct SelectionHandles {
     pub nw: ScreenRect,
@@ -155,10 +126,8 @@ impl SelectionHandles {
         }
     }
 
-    /// Classify a screen point against the handles. Returns the resize/rotate
-    /// affordance the point falls in, or `None` when it is over no handle. The
-    /// rotate zone is tested first so it wins over a corner only where they do not
-    /// overlap (the offset keeps them apart for any non-degenerate selection).
+    /// Classify a screen point against the handles, or `None` over no handle. The
+    /// rotate zone is tested first so it wins over a corner where they overlap.
     pub fn affordance_at(&self, x: f64, y: f64) -> Option<HoverAffordance> {
         if self.rotate.contains(x, y) {
             return Some(HoverAffordance::Rotate);
@@ -180,23 +149,14 @@ impl SelectionHandles {
     }
 }
 
-/// Convert a quantized object-local `i32` coordinate to `f64` pixels.
-///
-/// `f64` exactly represents every `i32`, so this is lossless; the explicit
-/// helper keeps the `8 units/px` convention in one place instead of scattering
-/// `as f64 / 8.0` across callers.
+/// Convert a quantized object-local `i32` coordinate to `f64` pixels (8 units/px).
 pub fn quantized_to_px(units: i32) -> f64 {
     f64::from(units) / UNITS_PER_PX
 }
 
-/// Invert a 3×3 matrix via the adjugate / determinant. Returns `None` when the
-/// matrix is singular (determinant ≈ 0), which is exactly the case where no
-/// well-defined object-local preimage of a world point exists.
-///
-/// `m[row][col]`: row-major, so `m[i]` is the `i`-th row. The result satisfies
-/// `m * inv(m) ≈ identity` for any non-singular `m`.
+/// Invert a row-major 3×3 matrix via the adjugate / determinant. `None` when
+/// singular (det ≈ 0), the case where a world point has no object-local preimage.
 pub fn invert_3x3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
-    // Cofactors of the first row give the determinant by expansion.
     let c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1];
     let c01 = m[1][2] * m[2][0] - m[1][0] * m[2][2];
     let c02 = m[1][0] * m[2][1] - m[1][1] * m[2][0];
@@ -207,8 +167,7 @@ pub fn invert_3x3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
     }
     let inv_det = 1.0 / det;
 
-    // Remaining cofactors. The inverse is the transpose of the cofactor matrix
-    // (the adjugate) scaled by 1/det — note the [col][row] placement below.
+    // Inverse = adjugate (transpose of the cofactor matrix) / det; note [col][row].
     let c10 = m[0][2] * m[2][1] - m[0][1] * m[2][2];
     let c11 = m[0][0] * m[2][2] - m[0][2] * m[2][0];
     let c12 = m[0][1] * m[2][0] - m[0][0] * m[2][1];
@@ -229,10 +188,8 @@ pub fn invert_3x3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
     }
 }
 
-/// Apply a 3×3 projective matrix to a 2D point, dividing through by the
-/// homogeneous `w` component. Returns the projected `(x, y)`; when `w` is zero
-/// (point at infinity) the components are `±inf`/`NaN`, which callers detect via
-/// the `None` paths in [`world_to_local`].
+/// Apply a 3×3 projective matrix to a 2D point with the homogeneous `w` divide.
+/// A zero `w` (point at infinity) yields `±inf`/`NaN`, which [`world_to_local`] detects.
 pub fn apply_3x3(m: &[[f64; 3]; 3], x: f64, y: f64) -> (f64, f64) {
     let ox = m[0][0] * x + m[0][1] * y + m[0][2];
     let oy = m[1][0] * x + m[1][1] * y + m[1][2];
@@ -240,9 +197,8 @@ pub fn apply_3x3(m: &[[f64; 3]; 3], x: f64, y: f64) -> (f64, f64) {
     (ox / ow, oy / ow)
 }
 
-/// Multiply two row-major 3×3 matrices: `a * b`. Allocation-free fixed array.
-/// Used to compose a gesture's DELTA matrix to the LEFT of the object's existing
-/// world transform (W2-04): `new = delta * obj.transform`.
+/// Multiply two row-major 3×3 matrices `a * b`. A gesture delta is composed to the
+/// LEFT of the object's transform: `new = delta * obj.transform`.
 pub fn mat3_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut out = [[0.0; 3]; 3];
     for (i, orow) in out.iter_mut().enumerate() {
@@ -269,7 +225,7 @@ pub fn scale_about_3x3(sx: f64, sy: f64, ax: f64, ay: f64) -> [[f64; 3]; 3] {
 }
 
 /// Row-major rotation by `theta` (radians, CCW in the +y-down screen frame) about
-/// the center `(cx, cy)`: `T(c) * R(theta) * T(-c)`.
+/// `(cx, cy)`.
 pub fn rotate_about_3x3(theta: f64, cx: f64, cy: f64) -> [[f64; 3]; 3] {
     let (s, c) = theta.sin_cos();
     [
@@ -279,14 +235,9 @@ pub fn rotate_about_3x3(theta: f64, cx: f64, cy: f64) -> [[f64; 3]; 3] {
     ]
 }
 
-/// W2-04 resize delta: a scale about the OPPOSITE anchor of the dragged handle
-/// (drag NE -> anchor SW). `world_bbox` is `(min_x, min_y, max_x, max_y)` in WORLD
-/// px; `corner` is the grabbed handle; `world_now`/`world_start` are the live and
-/// pointer-down WORLD points. Edge handles gate to one axis (N/S keep `sx=1`, E/W
-/// keep `sy=1`). A degenerate start extent yields scale 1 on that axis (no NaN).
-///
-/// Returns the identity matrix for a non-resize `corner` so callers can route the
-/// drag kind through one function.
+/// Resize delta: a scale about the OPPOSITE anchor of the dragged handle (drag NE
+/// -> anchor SW). Edge handles gate to one axis (N/S keep `sx=1`, E/W keep `sy=1`).
+/// A non-resize `corner` returns identity so callers route every drag kind through one fn.
 pub fn resize_delta_matrix(
     world_bbox: (f64, f64, f64, f64),
     corner: HoverAffordance,
@@ -294,7 +245,6 @@ pub fn resize_delta_matrix(
     world_start: (f64, f64),
 ) -> [[f64; 3]; 3] {
     let (min_x, min_y, max_x, max_y) = world_bbox;
-    // Anchor = the OPPOSITE corner/edge; scale_x/scale_y gate which axes move.
     let (ax, ay, scale_x, scale_y) = match corner {
         HoverAffordance::ResizeNw => (max_x, max_y, true, true),
         HoverAffordance::ResizeNe => (min_x, max_y, true, true),
@@ -319,9 +269,8 @@ pub fn resize_delta_matrix(
     scale_about_3x3(sx, sy, ax, ay)
 }
 
-/// Per-axis scale factor from the anchor: how much the pointer's distance to the
-/// anchor changed between the start and now. A near-zero start extent (pointer
-/// grabbed at the anchor) returns 1 to avoid a divide-by-zero blow-up.
+/// Per-axis scale: how the pointer's distance to the anchor changed start->now. A
+/// near-zero start extent returns 1 to avoid a divide-by-zero.
 fn axis_scale(start: f64, now: f64, anchor: f64) -> f64 {
     let start_extent = start - anchor;
     if start_extent.abs() < f64::EPSILON {
@@ -330,9 +279,8 @@ fn axis_scale(start: f64, now: f64, anchor: f64) -> f64 {
     (now - anchor) / start_extent
 }
 
-/// W2-04 rotate delta: rotate about the bbox `center` by the angle swept from the
-/// pointer-down point to the live point (both WORLD px). `theta = atan2(now-c) -
-/// atan2(start-c)`.
+/// Rotate delta: rotate about `center` by the angle swept from the pointer-down to
+/// the live point (`theta = atan2(now-c) - atan2(start-c)`).
 pub fn rotate_delta_matrix(
     center: (f64, f64),
     world_now: (f64, f64),
@@ -343,17 +291,14 @@ pub fn rotate_delta_matrix(
     rotate_about_3x3(a_now - a_start, center.0, center.1)
 }
 
-/// Round `theta` (radians) to the nearest multiple of `snap_deg` (degrees). The
-/// coarse-rotate gesture (C2 `coarse-rotate-shift`, 15°) passes `snap_deg = 15`.
+/// Round `theta` (radians) to the nearest multiple of `snap_deg` (degrees).
 pub fn snap_angle(theta: f64, snap_deg: f64) -> f64 {
     let step = snap_deg.to_radians();
     (theta / step).round() * step
 }
 
-/// D5 coarse-rotate variant of [`rotate_delta_matrix`]: when `snap_deg` is
-/// `Some`, the swept delta theta is snapped to the nearest `snap_deg` increment
-/// before building the rotation; when `None`, behaves identically to
-/// [`rotate_delta_matrix`].
+/// Coarse-rotate variant of [`rotate_delta_matrix`]: with `Some(snap_deg)` the
+/// swept delta is snapped to the nearest increment; `None` behaves identically.
 pub fn rotate_delta_matrix_snapped(
     center: (f64, f64),
     world_now: (f64, f64),
@@ -375,10 +320,8 @@ pub fn identity_3x3() -> [[f64; 3]; 3] {
     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 }
 
-/// Map a world (or screen-pre-camera) point into the object's local space by
-/// inverting its transform and projecting the point through the inverse
-/// (D8). Returns `None` when the transform is singular or the result is not
-/// finite (e.g. the point maps to the transform's vanishing line).
+/// Map a world point into the object's local space via the inverse transform.
+/// `None` when the transform is singular or the result is non-finite (vanishing line).
 pub fn world_to_local(transform: &[[f64; 3]; 3], wx: f64, wy: f64) -> Option<(f64, f64)> {
     let inv = invert_3x3(transform)?;
     let (lx, ly) = apply_3x3(&inv, wx, wy);
@@ -389,15 +332,9 @@ pub fn world_to_local(transform: &[[f64; 3]; 3], wx: f64, wy: f64) -> Option<(f6
     }
 }
 
-/// Even-odd ray-cast point-in-polygon test. `poly` is a closed ring given as an
-/// ordered vertex list (the closing edge from the last vertex back to the first
-/// is implicit). Returns `true` when `(x, y)` is inside.
-///
-/// The crossing test compares the query `y` against each edge's endpoints using
-/// a strict-vs-inclusive pair (`(yi > y) != (yj > y)`) so a vertex shared by two
-/// edges is counted exactly once, avoiding the classic double-count / sign bug
-/// at horizontal extents. The x-intersection is computed in `f64` to keep the
-/// comparison robust for near-horizontal edges.
+/// Even-odd ray-cast point-in-polygon test over a closed ring (implicit closing
+/// edge). The `(yi > y) != (yj > y)` half-open test counts a shared vertex once,
+/// avoiding the double-count bug at horizontal extents; intersection math in `f64`.
 pub fn point_in_polygon(poly: &[(f32, f32)], x: f32, y: f32) -> bool {
     let n = poly.len();
     if n < 3 {
@@ -421,11 +358,8 @@ pub fn point_in_polygon(poly: &[(f32, f32)], x: f32, y: f32) -> bool {
     inside
 }
 
-/// Hit-test a world point against one object: invert its transform to reach
-/// object-local space (D8), then run an even-odd point-in-region test against
-/// the object's derived region outline (D6). Returns `false` when the transform
-/// is non-invertible (the point has no local preimage) — a degenerate object
-/// cannot be hit.
+/// Hit-test a world point against one object: invert to object-local space, then an
+/// even-odd point-in-region test. `false` when the transform is non-invertible.
 pub fn hit_test_object(
     transform: &[[f64; 3]; 3],
     region_outline: &[(f32, f32)],
@@ -438,9 +372,8 @@ pub fn hit_test_object(
     point_in_polygon(region_outline, lx as f32, ly as f32)
 }
 
-/// Object-local axis-aligned bounding box of an outline as `(min_x, min_y,
-/// max_x, max_y)`. `None` when the outline is empty or has no finite vertex.
-/// Used for the stroke/text/open/zero-size body grab fallback (RA3).
+/// Object-local AABB of an outline as `(min_x, min_y, max_x, max_y)`; `None` when
+/// empty or no finite vertex. Used for the stroke/text/open/zero-size grab fallback.
 pub fn outline_local_bbox(outline: &[(f32, f32)]) -> Option<(f32, f32, f32, f32)> {
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
@@ -462,18 +395,11 @@ pub fn outline_local_bbox(outline: &[(f32, f32)]) -> Option<(f32, f32, f32, f32)
     }
 }
 
-/// RA3 body hit with a bbox fallback for objects with no closed fill polygon.
-///
-/// A FILLED object (`closed == true`, a real ≥3-vertex polygon) keeps the
-/// even-odd fill hit, so empty canvas and a concave notch still MISS the body
-/// and fall through to the marquee. A stroke / text / open / zero-size object
-/// has no closed fill region; its even-odd test always misses (an open hull or
-/// a degenerate ring), making it ungrabbable. For those, fall back to the
-/// object-LOCAL bounding box of the outline (a zero-size bbox is grown by
-/// `bbox_pad_px` on each side so a collapsed object is still a finite target).
-///
-/// `bbox_pad_px` is an OBJECT-LOCAL pad; callers pass a screen-pixel grab radius
-/// already de-scaled to local units (or `0.0` to use the raw bbox).
+/// Body hit with a bbox fallback. A filled object (`closed`, ≥3 vertices) keeps the
+/// even-odd fill hit (a concave notch / empty canvas still misses). A stroke / text
+/// / open / zero-size object has no fill region, so it falls back to the local bbox
+/// of the outline, grown by `bbox_pad_px` (an object-local pad, so a collapsed
+/// object is still a finite target).
 pub fn hit_test_object_or_bbox(
     transform: &[[f64; 3]; 3],
     region_outline: &[(f32, f32)],
@@ -503,9 +429,8 @@ pub fn hit_test_object_or_bbox(
     }
 }
 
-/// Do the two segments `p1->p2` and `p3->p4` intersect (including touching at an
-/// endpoint)? Uses the orientation / cross-product test; handles the collinear
-/// overlap case via bounding-box containment of the touching point. Pure `f32`.
+/// Do `p1->p2` and `p3->p4` intersect (including endpoint touches)? Orientation /
+/// cross-product test, with the collinear case via bbox containment.
 fn segments_intersect(
     p1: (f32, f32),
     p2: (f32, f32),
@@ -534,10 +459,9 @@ fn segments_intersect(
         || (d4 == 0.0 && on_segment(p1, p2, p4))
 }
 
-/// Does the local-space segment `(ax, ay)->(bx, by)` cross / touch the polygon
-/// `poly` (a closed ring; implicit closing edge included)? True when either
-/// endpoint is inside the ring (even-odd) or the segment intersects any edge.
-/// `poly` shorter than a triangle is treated as edge-only (no interior).
+/// Does the local segment cross / touch the closed ring `poly`? True when either
+/// endpoint is inside or the segment intersects any edge. `poly` shorter than a
+/// triangle is edge-only (no interior).
 pub fn segment_hits_polygon(
     poly: &[(f32, f32)],
     ax: f32,
@@ -562,10 +486,8 @@ pub fn segment_hits_polygon(
     false
 }
 
-/// Does the local-space segment `(ax, ay)->(bx, by)` cross / touch the
-/// axis-aligned bbox `(min_x, min_y, max_x, max_y)`? True when either endpoint is
-/// inside the bbox or the segment crosses any of its four edges. Used for the RA3
-/// stroke/text/open/zero-size swept-erase fallback.
+/// Does the local segment cross / touch the AABB? True when an endpoint is inside
+/// or the segment crosses any of its four edges (swept-erase bbox fallback).
 pub fn segment_hits_bbox(
     bbox: (f32, f32, f32, f32),
     ax: f32,
@@ -594,16 +516,11 @@ pub fn segment_hits_bbox(
     false
 }
 
-/// RA3 swept hit-test for ONE object: does the WORLD-space segment
-/// `(world_ax, world_ay)->(world_bx, world_by)` cross / touch the object? Both
-/// segment endpoints are inverse-transformed into object-LOCAL space (D8) and the
-/// crossing is tested there against the local outline (filled) or its local bbox
-/// (stroke / text / open / zero-size, padded by `bbox_pad_px`). Returns `false`
-/// when the transform is non-invertible (no local preimage of either endpoint).
-///
-/// This is the per-object kernel a region-level swept-erase loop calls; it
-/// catches every object the segment passes through between two pointer samples,
-/// not just whichever is top-most at the endpoints.
+/// Swept hit-test for one object: both world-segment endpoints are inverse-
+/// transformed to object-local space and the crossing is tested against the local
+/// outline (filled) or local bbox (stroke/text/open/zero-size, padded). `false`
+/// when the transform is non-invertible. Catches every object the segment passes
+/// through between two pointer samples, not just the endpoints.
 pub fn swept_segment_hits_object(
     transform: &[[f64; 3]; 3],
     region_outline: &[(f32, f32)],
@@ -641,11 +558,8 @@ pub fn swept_segment_hits_object(
     }
 }
 
-/// One command in a parsed object-local geometry path (D2 SVG-subset):
-/// `M`/`L`/`C`/`Z`. Coordinates are object-local pixels (already de-quantized
-/// from the `i32` 8-units/px encoding). `C` carries absolute control points,
-/// matching the encoding (handles are stored relative to nodes but a `C`
-/// command is written with absolute control points).
+/// One command in a parsed geometry path (`M`/`L`/`C`/`Z`). Coordinates are
+/// object-local pixels (de-quantized); `C` carries absolute control points.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PathSeg {
     MoveTo { x: f64, y: f64 },
@@ -661,16 +575,9 @@ pub enum PathSeg {
     Close,
 }
 
-/// Parse a small SVG-subset path string (`M`/`L`/`C`/`Z`, absolute coords,
-/// multi-subpath) into a flat command list. This is a deliberately local parser
-/// so the renderer crate stays standalone (no scene-core dependency); it mirrors
-/// the geometry encoding: absolute integer coordinates, `C` with absolute
-/// control points, multiple subpaths in one string.
-///
-/// The input coordinates are the quantized `i32` units of the encoding; each is
-/// de-quantized to pixels via [`quantized_to_px`] as it is parsed. Returns
-/// `None` on any malformed command (unknown verb, short coordinate run, or a
-/// non-integer token).
+/// Parse a small SVG-subset path string (`M`/`L`/`C`/`Z`, absolute quantized i32
+/// coords, multi-subpath) into a flat command list, de-quantizing to px via
+/// [`quantized_to_px`]. `None` on any malformed command.
 pub fn parse_path(input: &str) -> Option<Vec<PathSeg>> {
     let mut tokens = input.split_whitespace().peekable();
     let mut out = Vec::new();
@@ -770,16 +677,13 @@ mod tests {
 
     #[test]
     fn translated_scaled_transform_maps_world_into_local_rect() {
-        // Object placed at world origin (10, 20) and scaled ×4. A point inside
-        // the on-screen rect must map back into the local unit rect and hit; a
-        // point just outside must miss.
+        // Object at world (10, 20), scaled ×4.
         let transform = [[4.0, 0.0, 10.0], [0.0, 4.0, 20.0], [0.0, 0.0, 1.0]];
 
         // World (12, 22) -> local (0.5, 0.5): inside.
         assert!(hit_test_object(&transform, &unit_rect(), 12.0, 22.0));
-        // World (15, 22) -> local (1.25, 0.5): outside the unit rect.
+        // World (15, 22) -> local (1.25, 0.5): outside.
         assert!(!hit_test_object(&transform, &unit_rect(), 15.0, 22.0));
-        // The corner just inside the far edge still hits.
         assert!(hit_test_object(&transform, &unit_rect(), 13.9, 23.9));
     }
 
@@ -948,10 +852,8 @@ mod tests {
 
     #[test]
     fn resize_ne_drag_scales_about_sw_anchor() {
-        // 100x100 bbox at world origin: (min,min,max,max) = (0,0,100,100).
-        // Grab NE (top-right) at start (100, 0); drag to (200, -100) so the box's
-        // top-right doubles its distance from the SW anchor (0, 100): width 100->200,
-        // height 100->200 => scale 2x about (0, 100).
+        // Grab NE at (100, 0), drag to (200, -100): doubles the box from the SW
+        // anchor (0, 100) => scale 2x about (0, 100).
         let bbox = (0.0, 0.0, 100.0, 100.0);
         let m = resize_delta_matrix(
             bbox,
@@ -993,8 +895,7 @@ mod tests {
 
     #[test]
     fn rotate_delta_is_rotation_about_center_by_swept_angle() {
-        // Center (0,0); pointer-down at (10, 0) (angle 0), now at (0, 10) (angle +pi/2
-        // in the +y-down frame). theta = pi/2.
+        // Sweep from (10,0) (angle 0) to (0,10) (+pi/2 in +y-down) => theta = pi/2.
         let m = rotate_delta_matrix((0.0, 0.0), (0.0, 10.0), (10.0, 0.0));
         let expected = rotate_about_3x3(std::f64::consts::FRAC_PI_2, 0.0, 0.0);
         assert!(
@@ -1005,9 +906,7 @@ mod tests {
 
     #[test]
     fn coarse_rotate_snaps_swept_delta_to_15deg_increments() {
-        // Center (0,0); start at angle 0 (1,0). `now` at angle `d` degrees gives a
-        // swept delta of exactly `d`. Expected matrix = rotation by the snapped (or
-        // raw) angle about the center.
+        // Start at angle 0; `now` at `d` degrees gives a swept delta of exactly `d`.
         let center = (0.0, 0.0);
         let start = (1.0, 0.0);
         let point_at = |deg: f64| (deg.to_radians().cos(), deg.to_radians().sin());
@@ -1035,8 +934,7 @@ mod tests {
 
     #[test]
     fn mat3_mul_premultiplies_delta_onto_transform() {
-        // new = delta * obj: a translate delta pre-multiplied onto a scale transform
-        // applies the scale first, then the translation.
+        // new = delta * obj: scale first, then the translation.
         let obj = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]];
         let delta = translate_3x3(5.0, 7.0);
         let m = mat3_mul(&delta, &obj);
@@ -1046,24 +944,18 @@ mod tests {
 
     #[test]
     fn bbox_fallback_grabs_zero_fill_open_stroke() {
-        // RA3 (1): an OPEN 2-vertex stroke from local (0,0)->(10,0). Its outline is
-        // not a closed fill, so the even-odd polygon test always misses — without the
-        // bbox fallback this object is ungrabbable. The fallback hits its local bbox
-        // (padded), so a point near the stroke grabs it; a far point still misses.
+        // An open 2-vertex stroke: the even-odd test always misses, so the padded
+        // bbox fallback makes it grabbable.
         let stroke = vec![(0.0_f32, 0.0_f32), (10.0, 0.0)];
-        // Bare polygon hit misses (open, < closed fill): proves the gap the fallback fills.
         assert!(!hit_test_object(&IDENTITY, &stroke, 5.0, 0.0));
-        // closed=false => bbox fallback. On the stroke (pad lets a slightly-off point hit).
         assert!(hit_test_object_or_bbox(&IDENTITY, &stroke, false, 1.0, 5.0, 0.5));
-        // Far outside the padded bbox: misses (empty space still misses).
         assert!(!hit_test_object_or_bbox(&IDENTITY, &stroke, false, 1.0, 50.0, 50.0));
     }
 
     #[test]
     fn bbox_fallback_does_not_make_filled_body_grab_empty_space() {
-        // RA3 (1): a CLOSED fill keeps the exact even-odd hit — the bbox fallback must
-        // NOT fire for filled objects, or a click in a concave notch / on empty canvas
-        // inside the bbox would wrongly grab. Concave arrow: notch reads as a miss.
+        // A closed fill keeps the exact even-odd hit (no bbox fallback), so a concave
+        // arrow's notch still reads as a miss.
         let arrow = vec![
             (0.0_f32, 0.0_f32),
             (4.0, 0.0),
@@ -1077,8 +969,7 @@ mod tests {
 
     #[test]
     fn zero_size_object_is_grabbable_via_padded_bbox() {
-        // RA3 (1): a collapsed (zero-size) object — a single local point. Its bbox is a
-        // point; only the pad makes it a finite target. A point within the pad hits.
+        // A collapsed object (single point): only the pad makes it a finite target.
         let collapsed = vec![(0.0_f32, 0.0_f32)];
         assert!(hit_test_object_or_bbox(&IDENTITY, &collapsed, false, 4.0, 2.0, 2.0));
         assert!(!hit_test_object_or_bbox(&IDENTITY, &collapsed, false, 4.0, 10.0, 10.0));
@@ -1086,16 +977,14 @@ mod tests {
 
     #[test]
     fn swept_segment_crosses_filled_object_between_endpoints() {
-        // RA3 (2): the unit rect [0,1]^2. A world segment from (-1,0.5) to (2,0.5)
-        // passes THROUGH the rect though NEITHER endpoint is inside it — the swept
-        // test must still hit (a point test at either endpoint would miss).
+        // A segment from (-1,0.5) to (2,0.5) passes through the rect though neither
+        // endpoint is inside; the swept test must still hit.
         let rect = unit_rect();
         assert!(!hit_test_object(&IDENTITY, &rect, -1.0, 0.5)); // endpoint A outside
         assert!(!hit_test_object(&IDENTITY, &rect, 2.0, 0.5)); // endpoint B outside
         assert!(swept_segment_hits_object(
             &IDENTITY, &rect, true, 0.0, -1.0, 0.5, 2.0, 0.5,
         ));
-        // A parallel segment that misses the rect entirely stays a miss.
         assert!(!swept_segment_hits_object(
             &IDENTITY, &rect, true, 0.0, -1.0, 5.0, 2.0, 5.0,
         ));
@@ -1103,13 +992,12 @@ mod tests {
 
     #[test]
     fn swept_segment_crosses_open_stroke_via_bbox() {
-        // RA3 (2): an open stroke local (0,0)->(10,0). A world segment crossing its
-        // local bbox (a near-vertical line at x=5) hits via the bbox-crossing fallback.
+        // A near-vertical segment at x=5 crossing the open stroke's local bbox hits
+        // via the bbox-crossing fallback.
         let stroke = vec![(0.0_f32, 0.0_f32), (10.0, 0.0)];
         assert!(swept_segment_hits_object(
             &IDENTITY, &stroke, false, 0.0, 5.0, -3.0, 5.0, 3.0,
         ));
-        // A segment well clear of the bbox misses.
         assert!(!swept_segment_hits_object(
             &IDENTITY, &stroke, false, 0.0, 50.0, -3.0, 50.0, 3.0,
         ));

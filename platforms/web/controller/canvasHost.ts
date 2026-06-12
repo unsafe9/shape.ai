@@ -1,26 +1,9 @@
-// Object-native Svelte↔renderer host (OB4.3).
+// Object-native Svelte↔renderer host. Owns the renderer lifecycle (load Rust core → create the
+// visible WebGPU renderer → construct/observe/start the input+camera engine) and bridges the
+// canonical `ObjectScene` to the renderer's object pipeline.
 //
-// Owns the renderer lifecycle (load Rust core → create the visible WebGPU
-// renderer → construct/observe/start the input+camera engine) and bridges the
-// object scene to the renderer's object pipeline.
-//
-// The canonical scene is an `ObjectScene` (D1). `loadObjectScene` projects it to
-// the renderer-core `RenderObjectScene` JSON and builds CPU object fill/stroke
-// geometry through the crate's `buildObjectSceneGeometry`
-// (`ObjectPipeline::build_scene_geometry`), proving the object→geometry path.
-//
-// The renderer crate now exposes `ShapeWebGpuRenderer.loadObjectScene` (build +
-// upload the object geometry on the live device/surface) and `.drawObjects` (record
-// the object GPU pass). `loadObjectScene` below feature-detects and calls them when
-// the live renderer is present.
-//
-// RUNTIME-DEFERRED (no GPU in CI): the live object GPU PASS still cannot run in the
-// test/build environment because there is no WebGPU device — `createWebGpuRenderer`
-// only succeeds in a real browser. So in CI the object geometry is built through the
-// CPU `buildObjectSceneGeometry` entry (and its counts surfaced); the actual
-// `loadObjectScene`/`drawObjects` rasterization is exercised at runtime in the
-// browser. The legacy `ShapeCanvasEngine` keeps the camera/input/stats loop alive.
-// This is the flagged live-pixels gap: build-verified, GPU-runtime-deferred.
+// The live object GPU pass only runs in a real browser (no WebGPU device in CI); in CI the geometry
+// is built through the CPU `buildObjectSceneGeometry` entry, with `ShapeCanvasEngine` keeping the loop alive.
 
 import type { CameraState } from "../shared/geometry";
 import { GEOMETRY_QUANTUM_PER_PX, type ObjectScene, type ObjectSelection, type Stroke } from "../shared/object";
@@ -38,8 +21,7 @@ export type RendererHealth = {
   webGpuRendererAvailable: boolean;
 };
 
-/** Result of building object geometry: the opaque crate geometry plus counts the
- *  diagnostics can surface. `null` when the object build entry is unavailable. */
+// The opaque crate geometry plus counts for diagnostics; `null` when no build entry is available.
 export type ObjectGeometryBuild = {
   fillVertexCount: number;
   strokeInstanceCount: number;
@@ -51,68 +33,47 @@ export type ShapeCanvasHostCallbacks = {
   onStats: (stats: RendererStats) => void;
   onStatus: (message: string) => void;
   onHealthChange: (health: RendererHealth) => void;
-  // FC-08/W2-05: object-path input results from the renderer. `onSelectObject` fires
-  // on the pointer-down that picked an object; `onTransformPreview` on each drag move
-  // (the cumulative world-space delta matrix + gesture kind — a non-destructive
-  // preview); `onTransformCommit` once on pointer-up when the drag moved (the single
-  // undoable op); `onMarquee` on an empty-start drag's pointer-up.
-  // W2-03: `additive` is true when shift/meta was held at pick time, so the shell
-  // toggles the object in/out of the multi-select set instead of replacing it.
+  // Object-path input results. `onSelectObject` fires on the pick pointer-down (`additive` = shift/meta
+  // held, so the shell toggles the multi-select set instead of replacing it); `onTransformPreview` on
+  // each drag move (cumulative world-space delta + gesture kind, non-destructive); `onTransformCommit`
+  // once on pointer-up when the drag moved; `onMarquee` on an empty-start drag's pointer-up.
   onSelectObject: (id: string, additive: boolean) => void;
   onTransformPreview: (id: string, matrix: RenderTransform3x3, kind: TransformKind) => void;
-  // v3 §3 (DU4): `detach` is the C2 `detach-alt` gesture bit (Alt held at release)
-  // — the shell branches an anchored open-class body drag into a whole translate
-  // plus an anchor-clearing set-anchor (the class/anchor judgment is the core's).
+  // `detach` is the Alt-held-at-release bit — the shell branches an anchored open-class body drag
+  // into a whole translate plus an anchor-clearing set-anchor (the class/anchor judgment is the core's).
   onTransformCommit: (id: string, matrix: RenderTransform3x3, kind: TransformKind, detach: boolean) => void;
-  // v3 §2b: open-class endpoint drag. `onEndpointPreview` rides each endpoint-drag
-  // move (the chord deform is already live on the GPU; the payload carries the
-  // release-snap probe so the shell drives the anchor ring); `onEndpointCommit`
-  // rides the pointer-up — the shell authors `endpointReleaseOps` from it (chord
-  // EditGeometry + anchor rebind/unbind). Optional so a host that omits them
-  // loses nothing.
+  // Open-class endpoint drag. `onEndpointPreview` rides each move (chord deform already live on the GPU;
+  // payload carries the release-snap probe for the anchor ring); `onEndpointCommit` rides pointer-up —
+  // the shell authors `endpointReleaseOps` from it.
   onEndpointPreview?: (id: string, nodeIndex: number, world: { x: number; y: number }, snapped: boolean, targetId: string | null) => void;
   onEndpointCommit?: (id: string, nodeIndex: number, world: { x: number; y: number }, snapped: boolean, targetId: string | null) => void;
   onMarquee: (ids: string[]) => void;
-  // RA2b/AP3: a double-click landed on an object. The shell drills into a container
-  // (hasChildren) or enters inline text edit on a leaf; a missed double-click never
-  // fires this. Optional so a host that omits it loses nothing.
+  // A double-click landed on an object; the shell drills into a container (hasChildren) or edits a leaf.
   onObjectDoubleClick?: (payload: { id: string; hasChildren: boolean }) => void;
-  // FC-16: optional — no engine event routes to it. The right-click context pick
-  // runs synchronously via `hitTestObjectAt` in the shell, not through an engine
-  // event, so a host that omits this loses nothing.
+  // No engine event routes here — the right-click context pick runs synchronously via `hitTestObjectAt`.
   onContextPick?: (id: string | null) => void;
-  // FC-11: freehand pen capture phases (world px). The shell accumulates the
-  // points across start/move and commits the RECOGNIZED stroke to an object on
-  // `end`. v3 §4: `snap` is the outline snap probe under the cursor (null when
-  // off any edge / Alt held) so the shell can seed/author endpoint anchors for
-  // an open result.
+  // Freehand pen capture phases (world px). The shell accumulates points across start/move and commits
+  // the RECOGNIZED stroke on `end`. `snap` is the outline snap probe under the cursor (null off any
+  // edge / Alt held) so the shell can seed/author endpoint anchors for an open result.
   onDraw: (
     phase: "start" | "move" | "end" | "cancel",
     world: { x: number; y: number },
     snap: { at: { x: number; y: number }; targetId: string } | null
   ) => void;
-  // W2-07: shape drag-create phases. `world` is the dragged corner (already snapped
-  // to the nearest outline anchor when `snapped`); the shell rubber-bands a bbox
-  // preview and commits a sized primitive on `end`. AP5 (#14): `targetId` is the
-  // object whose outline was snapped to (null when not snapped), so the shell can
-  // author a persistent anchor binding the created endpoint to it.
+  // Shape drag-create phases. `world` is the dragged corner (already snapped to the nearest outline
+  // anchor when `snapped`); the shell rubber-bands a bbox and commits a sized primitive on `end`.
+  // `targetId` is the snapped object (null when not snapped) so the shell can bind the created endpoint to it.
   onCreate: (
     phase: "start" | "move" | "end" | "cancel",
     world: { x: number; y: number },
     snapped: boolean,
     targetId: string | null
   ) => void;
-  // W3-G9 (#3): a bare create-tool hover snap probe (no button down). `targetId` is
-  // the object whose edge the cursor is over (null when not snapped); the shell
-  // renders a PERSISTENT anchor ring from it before any drag. Optional so a host
-  // that omits it loses nothing.
+  // A bare create-tool hover snap probe (no button down); the shell renders a PERSISTENT anchor ring before any drag.
   onCreateHover?: (world: { x: number; y: number }, snapped: boolean, targetId: string | null) => void;
-  // W2-08: eraser touch over a stroke. `id` is the hit object; `partial` is the
-  // partial-erase modifier (default = whole-stroke delete, modifier = subpath
-  // cut). The shell authors the delete / edit-geometry op from `world` + `id`.
+  // Eraser touch over a stroke. `partial` = the modifier (default whole-stroke delete, modifier = subpath cut).
   onErase: (id: string, world: { x: number; y: number }, partial: boolean) => void;
-  // W2-03: hover affordance under the cursor (empty/body/resize-*/rotate). The
-  // shell maps it to a CSS cursor.
+  // Hover affordance under the cursor (empty/body/resize-*/rotate); the shell maps it to a CSS cursor.
   onAffordance: (affordance: HoverAffordance) => void;
 };
 
@@ -125,10 +86,7 @@ const initialRustStatus: RustCoreStatus = {
   buildObjectSceneGeometry: null
 };
 
-// ---------------------------------------------------------------------------
-// Object scene -> renderer-core RenderObjectScene projection (the renderer feed).
-// Pure field renaming (transform / geometry.d -> geometryD); no domain op-apply.
-// ---------------------------------------------------------------------------
+// Object scene -> renderer-core RenderObjectScene projection: pure field renaming, no domain op-apply.
 
 const IDENTITY_3X3: [[number, number, number], [number, number, number], [number, number, number]] = [
   [1, 0, 0],
@@ -136,7 +94,7 @@ const IDENTITY_3X3: [[number, number, number], [number, number, number], [number
   [0, 0, 1]
 ];
 
-/** Project an `ObjectScene` to the renderer-core `RenderObjectScene` JSON shape. */
+// Project an `ObjectScene` to the renderer-core `RenderObjectScene` JSON shape.
 export function objectSceneToRenderObjectScene(
   scene: ObjectScene,
   camera: CameraState,
@@ -157,21 +115,16 @@ export function objectSceneToRenderObjectScene(
       fill: object.fill ?? null,
       stroke: projectStroke(object.stroke ?? undefined),
       text: object.text ?? null,
-      // W3-G9/#5: the D5 anchors must reach the core so `Bindings::build` inverts
-      // them into Reproject edges and a moved target reprojects its followers LIVE
-      // during the drag. Dropping them here silently leaves the bindings graph
-      // anchor-free (the host bindings test builds scenes directly, so it can't
-      // catch a missing wire projection).
+      // Anchors must reach the core so `Bindings::build` inverts them into Reproject edges and a moved
+      // target reprojects its followers LIVE during the drag; dropping them leaves the graph anchor-free.
       anchors: object.anchors ?? [],
       clip: object.clip ?? false
     }))
   };
 }
 
-/** Project an object's stroke into the renderer feed. The model stores stroke
- *  width and dash run lengths in QUANTIZED units (GEOMETRY_QUANTUM_PER_PX per px),
- *  but the renderer treats `RStroke.width`/`dash` as logical px (geometry coords
- *  are de-quantized inside the renderer), so convert width and each dash entry. */
+// The model stores stroke width and dash run lengths QUANTIZED (GEOMETRY_QUANTUM_PER_PX per px), but
+// the renderer treats `RStroke.width`/`dash` as logical px, so convert width and each dash entry.
 function projectStroke(stroke: Stroke | undefined): Record<string, unknown> | null {
   if (!stroke) return null;
   return {
@@ -181,11 +134,8 @@ function projectStroke(stroke: Stroke | undefined): Record<string, unknown> | nu
   };
 }
 
-/**
- * Object-native renderer host. The Svelte shell provides the three DOM nodes
- * through mount(); it reads camera/stats/health through callbacks and pushes the
- * object scene through {@link loadObjectScene}.
- */
+// The Svelte shell provides the three DOM nodes through mount(), reads camera/stats/health through
+// callbacks, and pushes the object scene through `loadObjectScene`.
 export class ShapeCanvasHost {
   private callbacks: ShapeCanvasHostCallbacks;
   private engine: ShapeCanvasEngine | null = null;
@@ -200,7 +150,7 @@ export class ShapeCanvasHost {
   private engineWebGpuDetail: string | null = null;
   private webGpuDetail = "Visible Rust/wgpu renderer has not been created.";
   private disposed = false;
-  /** Latest projected object scene, so a renderer recreation can re-feed it. */
+  // Latest projected object scene, so a renderer recreation can re-feed it.
   private lastObjectScene: ObjectScene | null = null;
   private lastSelection: ObjectSelection = { kind: "canvas" };
 
@@ -302,21 +252,9 @@ export class ShapeCanvasHost {
     this.engine = null;
   }
 
-  // ----- object scene feed -------------------------------------------------
-
-  /**
-   * Push the canonical `ObjectScene` to the renderer. Projects it to the
-   * renderer-core `RenderObjectScene`, then:
-   *  - if a live `ShapeWebGpuRenderer` with `loadObjectScene` is present, uploads
-   *    the object geometry to the GPU (the RAF `renderFrame` loop then draws it),
-   *    and
-   *  - always builds the CPU geometry through the crate's `buildObjectSceneGeometry`
-   *    for the returned counts.
-   *
-   * Returns the geometry build (counts + raw), or null when no build entry is
-   * available. The live GPU PASS only runs in a real browser (no WebGPU device in
-   * CI).
-   */
+  // Push the canonical `ObjectScene` to the renderer: project it to `RenderObjectScene`, upload the
+  // object geometry to the GPU when a live renderer is present, and (when `collectGeometry`) build the
+  // CPU geometry for the returned counts. Returns the build (counts + raw), or null when no build entry exists.
   loadObjectScene(scene: ObjectScene, selection: ObjectSelection, collectGeometry = false): ObjectGeometryBuild {
     this.lastObjectScene = scene;
     this.lastSelection = selection;
@@ -324,9 +262,8 @@ export class ShapeCanvasHost {
       objectSceneToRenderObjectScene(scene, this.camera, selection, `object-scene-v${scene.sceneVersion}`)
     );
     this.uploadObjectSceneToRenderer(json);
-    // The CPU geometry build is diagnostics-only (the live GPU upload above already
-    // tessellates + uploads). The live feed re-runs every drag/freehand frame and
-    // discards the result, so skip it unless a caller explicitly wants the counts.
+    // The CPU geometry build is diagnostics-only (the live GPU upload above already tessellates +
+    // uploads), so skip it unless a caller explicitly wants the counts.
     const build = collectGeometry ? this.rustStatus.buildObjectSceneGeometry : null;
     if (!build) return null;
     try {
@@ -338,44 +275,33 @@ export class ShapeCanvasHost {
     }
   }
 
-  /** W2-11 drag zero-rebake: revert the dragged object's GPU instance matrix to its
-   *  canonical baked transform, dropping the live preview. The shell calls this on a
-   *  commit-failure (defensive snap-back) before the canonical-scene rebake lands;
-   *  the success path lets the next `loadObjectScene` rebake drop the stale matrix.
-   *  No-op without a live renderer or on a wasm build predating the method. */
+  // Drag zero-rebake: revert the dragged object's GPU instance matrix to its canonical baked
+  // transform on a commit-failure (defensive snap-back); the success path lets the next
+  // `loadObjectScene` rebake drop the stale matrix. No-op without a live renderer.
   clearObjectPreview(id: string): void {
     this.webGpuRenderer?.clearObjectPreview?.(id);
   }
 
-  /** v3 §2b: revert an endpoint drag's live chord deform to the canonical baked
-   *  geometry. The shell calls this when the release authored nothing (no-op
-   *  release / failed commit); the success path lets the committed scene's re-feed
-   *  land the deformed geometry canonically. No-op without a live renderer or on a
-   *  wasm build predating the method. */
+  // Revert an endpoint drag's live chord deform to the canonical baked geometry when the release
+  // authored nothing; the success path lets the committed scene's re-feed land it. No-op without a live renderer.
   clearObjectEndpointPreview(id: string): void {
     this.webGpuRenderer?.clearObjectEndpointPreview?.(id);
   }
 
-  /** Upload the object scene to the live renderer when available (browser-only;
-   *  a no-op without a WebGPU device). FC-05: this only UPLOADS the geometry; the
-   *  RAF `renderFrame` loop is the sole frame driver and records the object pass
-   *  itself, so calling `drawObjects` here would double-acquire the swapchain. */
+  // Upload the object scene to the live renderer (browser-only; no-op without a WebGPU device). Only
+  // UPLOADS the geometry — the RAF `renderFrame` loop is the sole frame driver and records the object
+  // pass itself, so calling `drawObjects` here would double-acquire the swapchain.
   private uploadObjectSceneToRenderer(sceneJson: string): void {
     const renderer = this.webGpuRenderer;
     if (!renderer || typeof renderer.loadObjectScene !== "function") return;
     try {
       renderer.loadObjectScene(sceneJson);
-      // v3 §2b: a re-feed rebuilds every baked geometry from the canonical scene,
-      // wiping a live endpoint chord deform (the renderer resets its patch
-      // bookkeeping on feed). Re-apply the in-flight drag's latest sample — e.g.
-      // when the shell's snap ring rides the feed mid-drag.
+      // A re-feed rebuilds every baked geometry, wiping a live endpoint chord deform, so re-apply the in-flight drag's latest sample.
       this.engine?.refreshEndpointPreview();
     } catch (error) {
       this.callbacks.onStatus(errorMessage(error, "Object scene upload failed."));
     }
   }
-
-  // ----- camera ------------------------------------------------------------
 
   setCamera(camera: CameraState): void {
     if (cameraAlmostEqual(this.camera, camera)) return;
@@ -395,18 +321,17 @@ export class ShapeCanvasHost {
     this.engine?.wheelAtScreen(screen, deltaY);
   }
 
-  /** W2-03/W2-07/W2-08: set the active pointer tool (Select/Draw/Create/Erase). */
+  // Set the active pointer tool (Select/Draw/Create/Erase).
   setTool(tool: ActiveTool): void {
     this.engine?.setTool(tool);
   }
 
-  /** W2-03: mirror the Space key state so a Space-held drag pans. */
+  // Mirror the Space key state so a Space-held drag pans.
   setSpaceHeld(held: boolean): void {
     this.engine?.setSpaceHeld(held);
   }
 
-  /** AP4 (#12c): drive RB1's renderer theme-bit (dark/light). No-op without a live
-   *  renderer or on a wasm build predating the export; the shell feature-detects. */
+  // Drive the renderer theme-bit (dark/light). No-op without a live renderer.
   setObjectTheme(dark: boolean): void {
     this.webGpuRenderer?.setObjectTheme?.(dark);
   }
@@ -414,8 +339,6 @@ export class ShapeCanvasHost {
   getCamera(): CameraState {
     return this.camera;
   }
-
-  // ----- engine event routing ---------------------------------------------
 
   private handleEngineEvent(event: EngineEvent): void {
     if (event.type === "stats") {
@@ -440,7 +363,6 @@ export class ShapeCanvasHost {
       return;
     }
 
-    // FC-08: object-path input results route to the shell callbacks.
     if (event.type === "object-select") {
       this.callbacks.onSelectObject(event.id, event.additive);
       return;
@@ -453,7 +375,6 @@ export class ShapeCanvasHost {
       this.callbacks.onTransformCommit(event.id, event.matrix, event.kind, event.detach);
       return;
     }
-    // v3 §2b: open-class endpoint drag preview/commit route to the shell.
     if (event.type === "object-endpoint-preview") {
       this.callbacks.onEndpointPreview?.(event.id, event.nodeIndex, event.world, event.snapped, event.targetId);
       return;
@@ -466,40 +387,32 @@ export class ShapeCanvasHost {
       this.callbacks.onMarquee(event.ids);
       return;
     }
-    // RA2b/AP3: a double-click on an object routes to the shell's drill-in / text-edit.
     if (event.type === "object-double-click") {
       this.callbacks.onObjectDoubleClick?.({ id: event.id, hasChildren: event.hasChildren });
       return;
     }
-    // FC-11: freehand pen capture phase routes to the shell's draw controller.
     if (event.type === "draw") {
       this.callbacks.onDraw(event.phase, event.world, event.snap);
       return;
     }
-    // W2-07: shape drag-create phase routes to the shell's create controller.
     if (event.type === "create") {
       this.callbacks.onCreate(event.phase, event.world, event.snapped, event.targetId);
       return;
     }
-    // W3-G9 (#3): a bare create-tool hover snap probe routes to the shell's
-    // persistent anchor-ring controller.
     if (event.type === "create-hover") {
       this.callbacks.onCreateHover?.(event.world, event.snapped, event.targetId);
       return;
     }
-    // W2-08: eraser touch routes to the shell's erase controller.
     if (event.type === "erase") {
       this.callbacks.onErase(event.id, event.world, event.partial);
       return;
     }
-    // W2-03: hover affordance routes to the shell's cursor.
     if (event.type === "affordance") {
       this.callbacks.onAffordance(event.affordance);
     }
   }
 
-  /** FC-08: pure object pick (no mutation) at canvas-local screen coords, used by
-   *  the shell's right-click context menu. */
+  // Pure object pick (no mutation) at canvas-local screen coords, used by the right-click context menu.
   hitTestObjectAt(screenX: number, screenY: number): string | null {
     return this.engine?.objectHitTest({ x: screenX, y: screenY }) ?? null;
   }
@@ -521,10 +434,8 @@ export class ShapeCanvasHost {
   }
 }
 
-/** Summarize the opaque crate geometry build into counts for diagnostics. The
- *  wasm `buildObjectSceneGeometry` returns a flat summary
- *  `{ objects, fillVertices, fillTriangles, strokeVertices, draws }` whose counts
- *  are already numbers (see `ObjectGeometrySummary` in lib.rs), not arrays. */
+// Summarize the opaque crate geometry build into counts for diagnostics. `buildObjectSceneGeometry`
+// returns a flat summary `{ objects, fillVertices, fillTriangles, strokeVertices, draws }` of numbers, not arrays.
 function summarizeObjectGeometry(raw: unknown): ObjectGeometryBuild {
   const value = raw as { fillVertices?: unknown; strokeVertices?: unknown } | null;
   return {

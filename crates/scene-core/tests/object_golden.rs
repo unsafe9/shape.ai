@@ -1,18 +1,6 @@
-//! OB5.2 / OB5.3 — object scene-core hardening: golden + round-trip + regression.
-//!
-//! These are end-to-end checks against the public `shape_scene_core::object`
-//! surface (a `tests/` integration binary, so only the crate's re-exported API is
-//! in scope — no private internals). Rust is the single source of truth for the
+//! End-to-end golden + round-trip + regression checks against the public
+//! `shape_scene_core::object` surface. Rust is the single source of truth for the
 //! golden vector: it is embedded inline below, not derived from a TS oracle.
-//!
-//! - OB5.2 GOLDEN: a fixed, deterministic op sequence built on an empty scene must
-//!   serialize to a stable, byte-exact JSON, and re-running the same sequence must
-//!   produce byte-identical output (determinism).
-//! - OB5.2 ROUND-TRIP: path-string <-> parsed-geometry on several contour shapes,
-//!   and a full ObjectScene JSON serialize -> deserialize -> ensure_parsed equality.
-//! - OB5.3 REGRESSION: anchor re-projection on target edit, split<->merge round
-//!   trip, deterministic auto-layout spacing, coalesced-drag undo/redo, an identity
-//!   3-tier split/merge, and region point-in-polygon hit-test (AA + rotated).
 
 use shape_scene_core::object::{
     apply_object_op, apply_sequence, reproject_object_anchors, solve_layout, Anchor, Fill,
@@ -21,10 +9,6 @@ use shape_scene_core::object::{
     SubPath, Text, TextRun, Transform3x3, UndoStack,
 };
 use shape_scene_core::object::region::point_in_polygon;
-
-// ---------------------------------------------------------------------------
-// Shared geometry builders (object-local quantized i32, 1/8 px units).
-// ---------------------------------------------------------------------------
 
 /// A closed axis-aligned rect with corners (x0,y0)-(x1,y1).
 fn rect(x0: i32, y0: i32, x1: i32, y1: i32) -> Geometry {
@@ -53,17 +37,10 @@ fn connector(ax: i32, ay: i32, bx: i32, by: i32) -> Geometry {
     )
 }
 
-// ---------------------------------------------------------------------------
-// OB5.2 GOLDEN — a fixed op sequence -> stable, byte-exact ObjectScene JSON.
-// ---------------------------------------------------------------------------
-
-/// Build the golden scene from an empty `ObjectScene` by applying a fixed,
-/// deterministic op sequence: insert a rect + a text object + a connector with
-/// two anchors, then set-transform, set-style, edit-geometry, and reorder.
-///
-/// Every input is integer/`*.0` valued so the serialized form is fully
-/// predictable (no float-formatting ambiguity), and all `order` keys are fixed
-/// literals (no key generation), so the output is a stable golden.
+/// Build the golden scene by applying a fixed op sequence: insert a rect + text +
+/// connector (two anchors), then set-transform, set-style, edit-geometry, reorder.
+/// Every input is integer/`*.0` and all `order` keys are fixed literals, so the
+/// output is a stable golden.
 fn build_golden_scene() -> ObjectScene {
     let mut scene = ObjectScene::default();
 
@@ -128,8 +105,7 @@ fn build_golden_scene() -> ObjectScene {
     scene
 }
 
-/// The byte-exact expected golden JSON for `build_golden_scene()`. Rust is the
-/// single source of truth — this is hand-locked, not generated from a TS oracle.
+/// The byte-exact expected golden JSON for `build_golden_scene()`, hand-locked.
 const GOLDEN_JSON: &str = concat!(
     "{",
     "\"sceneVersion\":7,",
@@ -178,18 +154,13 @@ fn ob52_golden_scene_serializes_to_expected_json() {
 
 #[test]
 fn ob52_golden_sequence_is_deterministic() {
-    // Applying the identical fixed sequence twice yields byte-identical JSON.
     let a = serde_json::to_string(&build_golden_scene()).expect("serialize a");
     let b = serde_json::to_string(&build_golden_scene()).expect("serialize b");
     assert_eq!(a, b, "the same op sequence must be byte-deterministic");
 }
 
-// ---------------------------------------------------------------------------
-// OB5.2 ROUND-TRIP — path-string <-> parsed geometry, and scene JSON round-trip.
-// ---------------------------------------------------------------------------
-
-/// Encode contours to a path-string, parse them back, and assert the parsed form
-/// equals the original (path-string is the canonical at-rest/wire encoding).
+/// Encode contours to a path-string, parse back, and assert equality (path-string
+/// is the canonical at-rest/wire encoding).
 fn assert_path_round_trip(subpaths: Vec<SubPath>, fill_rule: FillRule, expected_d: &str) {
     let g = Geometry::from_subpaths(subpaths.clone(), fill_rule);
     assert_eq!(g.path_string, expected_d, "path-string encoding drifted");
@@ -283,10 +254,6 @@ fn ob52_scene_json_serialize_deserialize_ensure_parsed_equals_original() {
     back.ensure_parsed().expect("hydrate parsed geometry");
     assert_eq!(back, original, "scene differs after JSON round-trip + ensure_parsed");
 }
-
-// ---------------------------------------------------------------------------
-// OB5.3 REGRESSION
-// ---------------------------------------------------------------------------
 
 /// Two rects + a connector whose two endpoint nodes anchor onto each rect.
 fn scene_with_anchored_edge() -> ObjectScene {
@@ -528,8 +495,8 @@ fn ob53_auto_layout_spaces_children_deterministically() {
 
 #[test]
 fn ob53_coalesced_drag_is_one_undo_step_redo_replays() {
-    // A drag is many set-transform ops folded into ONE undo entry: undo lands at
-    // the pre-gesture state, redo replays the gesture's final state (D21).
+    // Many set-transform ops fold into ONE undo entry: undo lands at the
+    // pre-gesture state, redo replays the gesture's final state.
     let mut scene = ObjectScene::default();
     apply_object_op(
         &mut scene,

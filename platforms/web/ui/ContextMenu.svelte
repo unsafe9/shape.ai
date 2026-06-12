@@ -1,9 +1,8 @@
 <script lang="ts" module>
   import type { Icon } from "lucide-svelte";
 
-  // CC4.2 — context-appropriate right-click menu. Driven by an items array so the
-  // shell (CC4.3) can supply node / edge / group / canvas actions without this
-  // component branching on target kind. A `null` item renders a separator.
+  // Context-appropriate right-click menu, driven by an items array so the shell supplies actions without
+  // this component branching on target kind. A `null` item renders a separator.
   export type ContextMenuItem = {
     label: string;
     icon?: typeof Icon;

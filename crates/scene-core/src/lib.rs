@@ -1,14 +1,8 @@
-//! shape.ai shared scene core.
+//! Pure, platform-free logic shared by client (wasm32) and server (native).
 //!
-//! Pure, platform-free logic shared by the client (wasm32) and server (native):
-//! the object document model + op-apply, per-property LWW, fractional indexing,
-//! the template-recipe library, the wire protocol serde, and the canvas concept.
-//!
-//! Invariants (see CLAUDE.md + canvas-cockpit task breakdown):
-//! - No ambient time, randomness, threads, or IO. Every such seam is an injected
-//!   parameter (`now: &str`, an explicit operation id, etc.).
-//! - The object model (`object::*`) is the single canonical substrate; the
-//!   legacy Group/Card/Edge scene + RenderScenePatch path was removed at OB4.4.
+//! No ambient time, randomness, threads, or IO — every such seam is an injected
+//! parameter (`now: &str`, an explicit operation id, etc.). The object model
+//! (`object::*`) is the single canonical substrate.
 
 pub mod canvas;
 pub mod fractional;
@@ -18,8 +12,7 @@ pub mod object;
 pub mod tool;
 pub mod wire;
 
-// MG0.3/MG0.4: the wasm-bindgen JS bridge. Gated so native builds/tests and a
-// bare wasm32 check never pull wasm-bindgen; built on with `--features wasm`.
+// Gated so native builds/tests and a bare wasm32 check never pull wasm-bindgen.
 #[cfg(feature = "wasm")]
 pub mod wasm_api;
 

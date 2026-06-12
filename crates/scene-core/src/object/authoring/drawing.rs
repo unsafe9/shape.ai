@@ -1,31 +1,18 @@
-//! OB3.D1/D2 — freehand drawing capture primitives (pure geometry).
+//! Freehand drawing capture primitives (pure geometry): RDP simplification,
+//! tangent-estimated bezier fitting, the pen [`Brush`], and the partial-erase
+//! subpath split. The pen-up commit lives in [`crate::object::recognize`].
 //!
-//! Pen-and-ink capture math in the Rust core: RDP simplification, tangent-
-//! estimated bezier fitting, the pen [`Brush`], and the partial-erase subpath
-//! split. The pen-up COMMIT lives in [`crate::object::recognize`] (anchor-semantics v3
-//! §4): one stroke = one recognized object, which replaced the D12/D13 drawing
-//! session (a multi-stroke span committing to a single multi-subpath object).
-//!
-//! Pipeline per stroke:
-//!   raw points (transient, world px) --pen-up--> recognition
-//!   ([`crate::object::recognize::recognize_stroke`], which reuses [`rdp_simplify`] +
-//!   [`fit_beziers`] for its silhouette-preserving fallback) --> one committed
-//!   [`crate::object::model::Object`].
-//!
-//! Conventions (CLAUDE.md): pure (no time/rng/IO — all inputs passed in, the
-//! commit id/order are caller-supplied); pointer-width-agnostic (coords are i32
-//! @ [`GEOMETRY_QUANTUM_PER_PX`] units/px, no `usize` in data); no lossy `as`
-//! width casts (the one f64 -> i32 quantize step clamps into i32 range first,
-//! making the narrowing provably safe under a scoped `#[allow]`).
+//! Pure (no time/rng/IO — commit id/order are caller-supplied). Coords are i32 @
+//! [`GEOMETRY_QUANTUM_PER_PX`] units/px; the one f64 -> i32 quantize clamps into
+//! i32 range first, making the narrowing provably safe.
 
 use crate::object::model::{
     Geometry, HandlePoint, LineCap, LineJoin, Paint, PathNode, Stroke, SubPath,
     GEOMETRY_QUANTUM_PER_PX,
 };
 
-/// World-px -> quantized i32 (round to nearest, clamp into i32 range). The clamp
-/// makes the final narrowing safe: `value` is bounded to `[i32::MIN, i32::MAX]`
-/// as f64 before the cast, so no truncation/wrap can occur. NaN maps to 0.
+/// World-px -> quantized i32 (round to nearest, clamp into i32 range so the
+/// narrowing cannot truncate/wrap). NaN maps to 0.
 pub(crate) fn quantize_px(px: f64) -> i32 {
     if px.is_nan() {
         return 0;
@@ -40,12 +27,8 @@ pub(crate) fn quantize_px(px: f64) -> i32 {
     q
 }
 
-// ---------------------------------------------------------------------------
-// RDP polyline simplification (D1).
-// ---------------------------------------------------------------------------
-
-/// Perpendicular distance from `p` to the infinite line through `a`..`b`. If
-/// `a == b` the "line" degenerates to a point, so this is the point distance.
+/// Perpendicular distance from `p` to the infinite line through `a`..`b`; the
+/// point distance when `a == b`.
 pub(crate) fn perpendicular_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     let (px, py) = p;
     let (ax, ay) = a;
@@ -61,10 +44,8 @@ pub(crate) fn perpendicular_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)
     cross / seg_len
 }
 
-/// Ramer-Douglas-Peucker polyline simplification (recursive, perpendicular
-/// distance). Drops interior points that lie within `epsilon` of the chord
-/// between the kept endpoints; endpoints are always preserved. `epsilon <= 0`
-/// keeps every point. Inputs/outputs in the same units (world px).
+/// Ramer-Douglas-Peucker simplification. Drops interior points within `epsilon`
+/// of the chord; endpoints always preserved. `epsilon <= 0` keeps every point.
 pub fn rdp_simplify(points: &[(f64, f64)], epsilon: f64) -> Vec<(f64, f64)> {
     if points.len() <= 2 {
         return points.to_vec();
@@ -81,8 +62,6 @@ pub fn rdp_simplify(points: &[(f64, f64)], epsilon: f64) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// Recursively mark the point of maximum deviation on `points[start..=end]`
-/// when it exceeds `epsilon`, then recurse into the two halves.
 fn rdp_mark(points: &[(f64, f64)], start: usize, end: usize, epsilon: f64, keep: &mut [bool]) {
     if end <= start + 1 {
         return;
@@ -105,24 +84,14 @@ fn rdp_mark(points: &[(f64, f64)], start: usize, end: usize, epsilon: f64, keep:
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bezier fitting via tangent estimation (D1/D2).
-// ---------------------------------------------------------------------------
-
-/// Catmull-Rom tension: the fraction of the neighbor span used as the handle
-/// length. 1/6 reproduces the standard Catmull-Rom -> cubic-Bezier conversion
-/// (handle = (p[i+1] - p[i-1]) / 6).
+/// Catmull-Rom tension: 1/6 reproduces the standard Catmull-Rom -> cubic-Bezier
+/// conversion (handle = (p[i+1] - p[i-1]) / 6).
 const CATMULL_ROM_TENSION: f64 = 1.0 / 6.0;
 
-/// Convert a (simplified) polyline to [`PathNode`]s with cubic-bezier handles
-/// estimated from local tangents. For interior node `i` the tangent is the
-/// Catmull-Rom direction `p[i+1] - p[i-1]`: `out_handle` reaches toward the next
-/// node and `in_handle` is its mirror toward the previous node, each scaled by
-/// [`CATMULL_ROM_TENSION`]. Endpoints get a one-sided tangent toward their only
-/// neighbor. Node positions are quantized to i32 (D2); **endpoints are preserved
-/// exactly** (their quantized position is the quantization of the input point,
-/// untouched by fitting). A 0/1/2-point input yields plain corner nodes (no
-/// handles) since there is no interior to curve.
+/// Convert a polyline to [`PathNode`]s with cubic-bezier handles from local
+/// tangents. Interior tangent is the Catmull-Rom direction `p[i+1] - p[i-1]`;
+/// endpoints get a one-sided tangent. Positions quantized to i32, endpoints
+/// preserved exactly. A 0/1/2-point input yields plain corner nodes.
 pub fn fit_beziers(points: &[(f64, f64)]) -> Vec<PathNode> {
     if points.len() <= 2 {
         return points.iter().map(|&(x, y)| PathNode::corner(quantize_px(x), quantize_px(y))).collect();
@@ -133,7 +102,6 @@ pub fn fit_beziers(points: &[(f64, f64)]) -> Vec<PathNode> {
         let qx = quantize_px(x);
         let qy = quantize_px(y);
         let (out_handle, in_handle) = if i == 0 {
-            // First endpoint: one-sided tangent toward the next node.
             let (nx, ny) = points[1];
             let out = HandlePoint {
                 dx: quantize_px((nx - x) * CATMULL_ROM_TENSION),
@@ -141,7 +109,6 @@ pub fn fit_beziers(points: &[(f64, f64)]) -> Vec<PathNode> {
             };
             (Some(out), None)
         } else if i == last {
-            // Last endpoint: one-sided tangent toward the previous node.
             let (prx, pry) = points[i - 1];
             let in_h = HandlePoint {
                 dx: quantize_px((prx - x) * CATMULL_ROM_TENSION),
@@ -149,7 +116,6 @@ pub fn fit_beziers(points: &[(f64, f64)]) -> Vec<PathNode> {
             };
             (None, Some(in_h))
         } else {
-            // Interior: tangent direction is p[i+1] - p[i-1].
             let (prx, pry) = points[i - 1];
             let (nx, ny) = points[i + 1];
             let tx = (nx - prx) * CATMULL_ROM_TENSION;
@@ -163,20 +129,11 @@ pub fn fit_beziers(points: &[(f64, f64)]) -> Vec<PathNode> {
     nodes
 }
 
-// ---------------------------------------------------------------------------
-// Partial erase — subpath split/cut at a touched point (D4, W2-08).
-// ---------------------------------------------------------------------------
-
 /// Cut a stroke's geometry at a touched point: the node nearest `(x, y)` within
-/// `radius` (all in object-local quantized units) is removed, splitting its
-/// subpath into two open subpaths (`[0..i]` and `[i+1..]`). A produced piece
-/// with fewer than 2 nodes has no extent and is dropped, so erasing the only/
-/// final segment can leave the object empty (the caller deletes it then). Other
-/// subpaths pass through untouched.
-///
-/// This is a SIMPLE split — it removes the closest node, not a full geometric
-/// boolean. Returns `None` when no node lies within `radius` (the touch missed
-/// every node, so there is nothing to cut). Pure: no IO/time/rng.
+/// `radius` (object-local quantized units) is removed, splitting its subpath into
+/// two open pieces. A piece with fewer than 2 nodes is dropped, so erasing the
+/// final segment can leave the object empty. `None` when no node is within
+/// `radius`. A simple node removal, not a full geometric boolean.
 pub fn split_subpath_at(geometry: &Geometry, x: i32, y: i32, radius: i32) -> Option<Geometry> {
     let radius_sq = i64::from(radius) * i64::from(radius);
     let mut best: Option<(usize, usize, i64)> = None; // (subpath, node, dist_sq)
@@ -198,8 +155,7 @@ pub fn split_subpath_at(geometry: &Geometry, x: i32, y: i32, radius: i32) -> Opt
             out.push(sp.clone());
             continue;
         }
-        // Split this subpath around the removed node, dropping degenerate pieces.
-        // A closed subpath opens once it is cut (the cut breaks the loop).
+        // A closed subpath opens once cut (the cut breaks the loop).
         let left = &sp.nodes[..target_ni];
         let right = &sp.nodes[target_ni + 1..];
         if left.len() >= 2 {
@@ -212,9 +168,8 @@ pub fn split_subpath_at(geometry: &Geometry, x: i32, y: i32, radius: i32) -> Opt
     Some(Geometry::from_subpaths(out, geometry.fill_rule))
 }
 
-/// An open subpath from a node slice. The cut endpoints lose the dangling handle
-/// that pointed at the removed node so the open ends render cleanly (the first
-/// node drops its in-handle, the last drops its out-handle).
+/// An open subpath from a node slice; the cut ends drop the handle that pointed
+/// at the removed node so they render cleanly.
 fn open_subpath(nodes: &[PathNode]) -> SubPath {
     let mut nodes = nodes.to_vec();
     if let Some(first) = nodes.first_mut() {
@@ -226,13 +181,8 @@ fn open_subpath(nodes: &[PathNode]) -> SubPath {
     SubPath { closed: false, nodes }
 }
 
-// ---------------------------------------------------------------------------
-// Brush + pressure (D2 per-node width slot).
-// ---------------------------------------------------------------------------
-
-/// A pen brush: stroke color, base width in logical px, and a dash pattern in
-/// logical px (empty => solid). The brush is the session's stroke style; on
-/// commit it lowers to a [`Stroke`] (width + dash converted to quantized units).
+/// A pen brush: stroke color, base width and dash in logical px (empty dash =>
+/// solid). On commit it lowers to a [`Stroke`] (quantized units).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Brush {
     pub color: String,
@@ -241,14 +191,12 @@ pub struct Brush {
 }
 
 impl Brush {
-    /// A solid brush with no dash.
     pub fn new(color: impl Into<String>, width_px: f64) -> Self {
         Brush { color: color.into(), width_px, dash: Vec::new() }
     }
 
-    /// Lower the brush to a [`Stroke`] (D2): solid paint, width + dash in
-    /// quantized units, round cap/join (freehand ink reads better round). The
-    /// per-node `width` slot stays open for pressure data (D2/D13).
+    /// Solid paint, quantized width + dash, round cap/join (freehand ink reads
+    /// better round).
     pub(crate) fn to_stroke(&self) -> Stroke {
         Stroke {
             paint: Paint::Solid { color: self.color.clone() },
@@ -261,17 +209,12 @@ impl Brush {
     }
 }
 
-/// Map a normalized pen pressure (`0.0..=1.0`) to a per-node stroke width in
-/// quantized units (D2 `PathNode.width` slot). Linear in `[0,1]`: pressure 0 ->
-/// 0 width, pressure 1 -> `base_width_px`. Out-of-range pressure is clamped.
+/// Normalized pen pressure (`0.0..=1.0`) to a per-node stroke width in quantized
+/// units. Linear: 0 -> 0, 1 -> `base_width_px`. Out-of-range pressure is clamped.
 pub fn pressure_to_width(pressure: f64, base_width_px: f64) -> i32 {
     let p = pressure.clamp(0.0, 1.0);
     quantize_px(p * base_width_px)
 }
-
-// ---------------------------------------------------------------------------
-// Tests.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -280,8 +223,6 @@ mod tests {
 
     #[test]
     fn rdp_drops_collinear_midpoint() {
-        // Three exactly-collinear points: the midpoint deviates by 0, so RDP
-        // drops it, leaving only the two endpoints.
         let pts = [(0.0, 0.0), (5.0, 0.0), (10.0, 0.0)];
         let out = rdp_simplify(&pts, 0.5);
         assert_eq!(out, vec![(0.0, 0.0), (10.0, 0.0)]);
@@ -289,7 +230,6 @@ mod tests {
 
     #[test]
     fn rdp_keeps_deviating_midpoint() {
-        // A midpoint well off the chord is kept.
         let pts = [(0.0, 0.0), (5.0, 5.0), (10.0, 0.0)];
         let out = rdp_simplify(&pts, 0.5);
         assert_eq!(out, vec![(0.0, 0.0), (5.0, 5.0), (10.0, 0.0)]);
@@ -303,17 +243,13 @@ mod tests {
 
     #[test]
     fn fit_beziers_preserves_endpoints() {
-        // Endpoints quantize to the exact quantization of the input points and
-        // are not displaced by fitting. (×8: 0->0, 10->80.)
         let pts = [(0.0, 0.0), (5.0, 10.0), (10.0, 0.0)];
         let nodes = fit_beziers(&pts);
         assert_eq!(nodes.len(), 3);
         assert_eq!((nodes[0].x, nodes[0].y), (0, 0));
         assert_eq!((nodes[2].x, nodes[2].y), (80, 0));
-        // First node has only an out-handle, last only an in-handle (one-sided).
         assert!(nodes[0].in_handle.is_none() && nodes[0].out_handle.is_some());
         assert!(nodes[2].in_handle.is_some() && nodes[2].out_handle.is_none());
-        // Interior node carries mirrored handles.
         let interior = nodes[1];
         let out = interior.out_handle.unwrap();
         let in_h = interior.in_handle.unwrap();
@@ -334,7 +270,7 @@ mod tests {
     fn brush_lowers_to_a_round_quantized_stroke() {
         let stroke = Brush::new("#112233", 2.0).to_stroke();
         assert_eq!(stroke.paint, Paint::Solid { color: "#112233".into() });
-        assert_eq!(stroke.width, 16); // 2px * 8 units/px
+        assert_eq!(stroke.width, 16);
         assert_eq!(stroke.cap, LineCap::Round);
         assert_eq!(stroke.join, LineJoin::Round);
         assert!(stroke.dash.is_empty());
@@ -342,19 +278,16 @@ mod tests {
 
     #[test]
     fn pressure_to_width_scales_linearly() {
-        // base 10px -> 80 quantized units at full pressure; half at 0.5.
         assert_eq!(pressure_to_width(1.0, 10.0), 80);
         assert_eq!(pressure_to_width(0.5, 10.0), 40);
         assert_eq!(pressure_to_width(0.0, 10.0), 0);
-        // Out-of-range pressure clamps.
         assert_eq!(pressure_to_width(2.0, 10.0), 80);
         assert_eq!(pressure_to_width(-1.0, 10.0), 0);
     }
 
     #[test]
     fn split_subpath_cuts_at_nearest_node_into_two_open_pieces() {
-        // A 5-node polyline; cutting at the middle node (index 2) drops it and
-        // leaves two open pieces: nodes [0,1] and [3,4].
+        // Cutting the middle node (index 2) leaves two open pieces: [0,1] and [3,4].
         let geometry = Geometry::from_subpaths(
             vec![SubPath {
                 closed: false,
@@ -379,7 +312,6 @@ mod tests {
 
     #[test]
     fn split_subpath_drops_degenerate_endpoint_pieces() {
-        // Cutting the first node leaves no left piece and a 2-node right piece.
         let geometry = Geometry::from_subpaths(
             vec![SubPath {
                 closed: false,
@@ -407,9 +339,8 @@ mod tests {
 
     #[test]
     fn split_subpath_leaves_other_subpaths_untouched() {
-        // A two-subpath object; cutting the middle node of the second subpath
-        // leaves the first whole. The second's two flanks are each a single node
-        // (degenerate), so they drop — only the untouched first subpath remains.
+        // Cutting the middle node of the second subpath leaves the first whole; the
+        // second's two single-node flanks drop.
         let geometry = Geometry::from_subpaths(
             vec![
                 SubPath {
@@ -437,7 +368,6 @@ mod tests {
     fn quantize_rounds_to_nearest() {
         assert_eq!(quantize_px(1.0), 8);
         assert_eq!(quantize_px(0.5), 4);
-        // 0.1px * 8 = 0.8 -> rounds to 1.
         assert_eq!(quantize_px(0.1), 1);
         assert_eq!(quantize_px(-1.0), -8);
         assert_eq!(quantize_px(f64::NAN), 0);

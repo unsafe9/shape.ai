@@ -1,30 +1,15 @@
 //! wasm-bindgen session bridge — gated behind `cfg(feature = "wasm")`.
 //!
-//! `WasmSession` is the THIN FFI wrapper the web shell drives: it owns the pure
-//! [`SyncEngine`](crate::sync_engine::SyncEngine) (over an in-memory bookkeeping
-//! outbox + a buffering transport) and a [`PeerRegistry`](crate::peers), and
-//! exposes their decisions as JSON-in / JSON-out methods. The collaboration logic
-//! — optimistic apply, transient ownership, the coalescing flush decision,
-//! reconnect replay, peer latest-wins/TTL — runs HERE in Rust; the TS shell keeps
-//! only the IO seams (the WS socket, IndexedDB durability, the flush/expiry
-//! timers).
+//! `WasmSession` is the thin FFI wrapper the web shell drives: it owns the pure
+//! [`SyncEngine`](crate::sync_engine::SyncEngine) and a [`PeerRegistry`](crate::peers)
+//! and exposes their decisions as JSON-in / JSON-out methods. The collaboration
+//! logic runs HERE; the TS shell keeps only the IO seams (WS socket, IndexedDB
+//! durability, the flush/expiry timers).
 //!
-//! Error policy mirrors `scene-core`'s `wasm_api.rs`: these methods never panic
-//! across the FFI boundary. A malformed-input/serialize failure is returned as a
-//! JSON `{"error": "<message>"}` string (the TS adapter branches on it); domain
-//! failures flow through normally (e.g. a rejected op rides the `errors` array of
-//! the author result).
-//!
-//! Seams the TS shell still drives:
-//!   - persistence: [`WasmSession::author`] returns the durable `WireOp` entry the
-//!     shell writes to IndexedDB; ack/reject return the removed `OpId`s so the
-//!     shell drops the matching rows. On reconnect the shell reads its rows back
-//!     and hands them to [`WasmSession::reconcile_snapshot`] for replay.
-//!   - transport: buffered coalesced envelopes are drained with
-//!     [`WasmSession::take_pending`] and shipped on the socket.
-//!   - timers: the shell arms its coalescing timer while
-//!     [`WasmSession::flush_armed`] is true and fires [`WasmSession::on_flush_due`];
-//!     it stamps each `ts` and each peer-frame `now_ms`.
+//! Error policy mirrors scene-core's `wasm_api`: these methods never panic across
+//! the FFI. A malformed-input/serialize failure returns a JSON `{"error": ...}`
+//! string; domain failures flow through normally (e.g. a rejected op rides the
+//! author result's `errors` array).
 
 use serde::Serialize;
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -38,8 +23,8 @@ use crate::peers::PeerRegistry;
 use crate::scene_client::{Bbox, WindowState};
 use crate::sync_engine::{EngineTransport, SyncEngine};
 
-/// Serialize `value`, or fall back to an `{"error": ...}` JSON if serialization
-/// fails. Keeps every success payload infallible across the boundary.
+/// Serialize `value`, or fall back to an `{"error": ...}` JSON, keeping every
+/// success payload infallible across the boundary.
 fn ok_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|e| error_json(&format!("serialize failed: {e}")))
 }
@@ -59,10 +44,9 @@ fn parse<T: serde::de::DeserializeOwned>(label: &str, json: &str) -> Result<T, S
     serde_json::from_str(json).map_err(|e| error_json(&format!("invalid {label} JSON: {e}")))
 }
 
-/// Convert a JS-supplied millisecond `f64` (timestamp / duration / revision) to
-/// the `i64` the pure cores carry. wasm-bindgen forces JS numbers across the FFI
-/// as `f64`; these values are always integral ms, so round to the nearest integer
-/// and clamp to the `i64` range.
+/// Convert a JS-supplied millisecond `f64` to the `i64` the cores carry.
+/// wasm-bindgen forces JS numbers across the FFI as `f64`; these are integral ms,
+/// so round and clamp to the `i64` range.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "JS-supplied integral ms rounded + clamped to i64; the only f64->i64 seam"
@@ -71,17 +55,15 @@ fn ms(value: f64) -> i64 {
     value.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64
 }
 
-/// Buffering transport: the engine pushes coalesced batches here; the shell drains
-/// them with [`WasmSession::take_pending`] and ships them on the WS socket. The
-/// inner buffer is FLAT (concatenated entries) — the TS adapter sends one `ops`
-/// frame per flush, which is exactly one drained batch.
+/// Buffering transport: the engine pushes coalesced batches here; the shell
+/// drains them with [`WasmSession::take_pending`] and ships them on the WS
+/// socket. The buffer is FLAT — one `ops` frame per flush is one drained batch.
 #[derive(Default)]
 struct BufferTransport {
     flushed: Vec<OutboxEntry>,
 }
 
 impl BufferTransport {
-    /// Drain the buffered envelopes the engine has flushed so far.
     fn take(&mut self) -> Vec<OutboxEntry> {
         std::mem::take(&mut self.flushed)
     }
@@ -93,10 +75,9 @@ impl EngineTransport for BufferTransport {
     }
 }
 
-/// The author-result wire shape returned to the shell: the rejecting-core errors
-/// (empty on success), the minted `op_id`, the captured inverse op (the undo
-/// entry, D21), and the durable `WireOp` entry the shell persists to IndexedDB
-/// (null when the op was rejected and nothing was enqueued).
+/// The author-result wire shape (camelCase): rejecting-core errors, the minted
+/// `op_id`, the inverse undo op, and the durable `WireOp` entry the shell
+/// persists.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthorWire<'a> {
@@ -115,10 +96,9 @@ pub struct WasmSession {
 
 #[wasm_bindgen]
 impl WasmSession {
-    /// Build a session from the `welcome` scene JSON. `client_id` is stamped into
-    /// every `opId.clientId` + `WireOp.actor`; `self_user_id` (empty for none) is
-    /// the peer self-skip identity; `coalesce_ms < 0` uses the default window;
-    /// `peer_ttl_ms < 0` uses the default stale window.
+    /// Build a session from the `welcome` scene JSON. `client_id` stamps every
+    /// `opId.clientId` + `WireOp.actor`; `self_user_id` (empty for none) is the
+    /// peer self-skip identity; negative `coalesce_ms`/`peer_ttl_ms` use defaults.
     #[wasm_bindgen(constructor)]
     pub fn new(
         welcome_scene_json: &str,
@@ -143,10 +123,8 @@ impl WasmSession {
         })
     }
 
-    /// Author a local op (`op_json`) stamped at `ts`: optimistic apply, take
-    /// transient ownership, persist + buffer. Returns the [`AuthorWire`] JSON
-    /// (errors / opId / inverse / the durable entry to persist), or `{error}` on
-    /// malformed input.
+    /// Author a local op (`op_json`) stamped at `ts`. Returns the [`AuthorWire`]
+    /// JSON, or `{error}` on malformed input.
     pub fn author(&mut self, op_json: &str, ts: &str) -> String {
         let op: ObjectOp = match parse("op", op_json) {
             Ok(v) => v,
@@ -169,9 +147,8 @@ impl WasmSession {
         }
     }
 
-    /// Apply a REMOTE op (`op_json`) honoring transient ownership. Returns `"true"`
-    /// when applied, `"false"` when dropped (owned key or a domain reject), or
-    /// `{error}` on malformed input.
+    /// Apply a REMOTE op (`op_json`) honoring transient ownership. Returns
+    /// `"true"` when applied, `"false"` when dropped, or `{error}` on bad input.
     pub fn apply_remote(&mut self, op_json: &str) -> String {
         let op: ObjectOp = match parse("op", op_json) {
             Ok(v) => v,
@@ -180,10 +157,9 @@ impl WasmSession {
         ok_json(&self.engine.apply_remote(op))
     }
 
-    /// Reconcile an ack: drop the acked `op_ids` (a JSON `OpId[]`) from the outbox
-    /// bookkeeping, release ownership, advance the base revision (`revision < 0` =
-    /// no revision). Returns the removed `OpId[]` JSON so the shell drops the
-    /// matching IndexedDB rows, or `{error}` on malformed input.
+    /// Reconcile an ack for `op_ids` (a JSON `OpId[]`): release ownership and
+    /// advance the base revision (`revision < 0` = none). Returns the removed
+    /// `OpId[]` JSON so the shell drops the rows, or `{error}` on bad input.
     pub fn on_ack(&mut self, op_ids_json: &str, revision: f64) -> String {
         let op_ids: Vec<OpId> = match parse("opIds", op_ids_json) {
             Ok(v) => v,
@@ -196,9 +172,8 @@ impl WasmSession {
         ok_json(&op_ids)
     }
 
-    /// Reconcile a rejected op: drop its `op_ids` (a JSON `OpId[]`) and release
-    /// ownership. Returns the removed `OpId[]` JSON (the shell drops the rows), or
-    /// `{error}` on malformed input.
+    /// Reconcile a rejected op for `op_ids` (a JSON `OpId[]`): release ownership.
+    /// Returns the removed `OpId[]` JSON, or `{error}` on bad input.
     pub fn on_rejected(&mut self, op_ids_json: &str) -> String {
         let op_ids: Vec<OpId> = match parse("opIds", op_ids_json) {
             Ok(v) => v,
@@ -210,11 +185,10 @@ impl WasmSession {
         ok_json(&op_ids)
     }
 
-    /// Reconnect reconcile: reset the base to the `snapshot_json` scene, seed the
-    /// bookkeeping outbox from `persisted_entries_json` (the durable `WireOp[]` the
-    /// shell read back from IndexedDB), then replay them on top — re-buffering them
-    /// for re-send. Returns `null` on success or `{error}` on malformed input. The
-    /// shell drains the replayed batch with [`take_pending`](Self::take_pending).
+    /// Reconnect reconcile: reset the base to `snapshot_json`, seed the outbox
+    /// from `persisted_entries_json` (the durable `WireOp[]` the shell read back),
+    /// then replay them on top. Returns `null` or `{error}`; the shell drains the
+    /// replayed batch with [`take_pending`](Self::take_pending).
     pub fn reconcile_snapshot(
         &mut self,
         snapshot_json: &str,
@@ -235,21 +209,18 @@ impl WasmSession {
         "null".to_string()
     }
 
-    /// Flush the buffered coalesced frame immediately (gesture end / shutdown).
-    /// Disarms the flush decision. The shell ships the result of a following
-    /// [`take_pending`](Self::take_pending).
+    /// Flush the buffered coalesced frame immediately (gesture end / shutdown);
+    /// the shell ships a following [`take_pending`](Self::take_pending).
     pub fn flush(&mut self) {
         self.engine.flush();
     }
 
-    /// The shell's coalescing timer fired: drain the pending buffer into one frame
-    /// (the engine's decision). Disarms the flush decision.
+    /// The shell's coalescing timer fired: drain the pending buffer into one frame.
     pub fn on_flush_due(&mut self) {
         self.engine.on_flush_due();
     }
 
-    /// Drain the buffered envelopes the engine flushed: the `WireOp[]` JSON the
-    /// shell ships as one `ops` frame. Empty when nothing is pending.
+    /// Drain the flushed envelopes as `WireOp[]` JSON; empty when nothing pending.
     pub fn take_pending(&mut self) -> String {
         ok_json(&self.engine.transport_mut().take())
     }
@@ -264,28 +235,26 @@ impl WasmSession {
         self.engine.base_revision() as f64
     }
 
-    /// True while the shell must keep its coalescing timer armed (a flush is due).
+    /// True while the shell must keep its coalescing timer armed.
     pub fn flush_armed(&self) -> bool {
         self.engine.flush_armed()
     }
 
-    /// Number of currently-unacked outbox entries (the bookkeeping count).
+    /// Number of currently-unacked outbox entries.
     pub fn outbox_len(&self) -> u32 {
         u32::try_from(self.engine.outbox_len()).unwrap_or(u32::MAX)
     }
 
-    /// The `(object,field)` keys currently held under transient ownership, as a
-    /// sorted `string[]` JSON. Diagnostic parity with the engine's `owned_key_set`.
+    /// The `(object,field)` keys held under transient ownership, sorted
+    /// `string[]` JSON.
     pub fn owned_key_set(&self) -> String {
         ok_json(&self.engine.owned_key_set())
     }
 
     // --- peer presence registry ----------------------------------------------
 
-    /// Ingest one inbound presence `payload_json` frame, stamping `now_ms` as its
-    /// `last_seen`. Returns `"true"` when it updated the registry, `"false"`
-    /// otherwise (no `userId`, or the local user's own frame), or `{error}` on
-    /// malformed input.
+    /// Ingest one presence `payload_json` frame, stamping `now_ms`. Returns
+    /// `"true"` when it updated the registry, `"false"` otherwise, or `{error}`.
     pub fn ingest_presence(&mut self, payload_json: &str, now_ms: f64) -> String {
         let payload: serde_json::Value = match parse("presence payload", payload_json) {
             Ok(v) => v,
@@ -294,14 +263,13 @@ impl WasmSession {
         ok_json(&self.peers.ingest(&payload, ms(now_ms)))
     }
 
-    /// Drop peers whose last frame is older than the TTL relative to `now_ms`.
-    /// Returns `"true"` when any peer was removed (so the shell re-emits).
+    /// Drop peers older than the TTL relative to `now_ms`. Returns `"true"` when
+    /// any peer was removed (so the shell re-emits).
     pub fn expire_peers(&mut self, now_ms: f64) -> String {
         ok_json(&self.peers.expire(ms(now_ms)))
     }
 
-    /// The live (currently-tracked) peers as a `PeerPresence[]` JSON, stable-
-    /// ordered by `userId`.
+    /// The live peers as `PeerPresence[]` JSON, stable-ordered by `userId`.
     pub fn peers(&self) -> String {
         let peers: Vec<PeerWire> = self
             .peers
@@ -325,10 +293,8 @@ impl WasmSession {
 }
 
 /// wasm-bindgen wrapper over [`WindowState`](crate::scene_client::WindowState):
-/// the viewport-windowing DECISION layer the web shell drives. It owns the
-/// currently-subscribed window and the margin; the shell owns the debounce timer
-/// and the transport. Bboxes cross the boundary as `{x,y,width,height}` JSON; an
-/// empty string / `"null"` is whole-canvas (the `None` window).
+/// the viewport-windowing decision layer. Bboxes cross the boundary as
+/// `{x,y,width,height}` JSON; an empty string / `"null"` is whole-canvas (`None`).
 #[wasm_bindgen]
 pub struct WasmWindow {
     state: WindowState,
@@ -336,8 +302,8 @@ pub struct WasmWindow {
 
 #[wasm_bindgen]
 impl WasmWindow {
-    /// Seed the window from the connect region's bbox JSON (`""` = whole canvas)
-    /// with an explicit margin fraction (`margin < 0` uses the default).
+    /// Seed from the connect region's bbox JSON (`""` = whole canvas) with an
+    /// explicit margin (`margin < 0` uses the default).
     #[wasm_bindgen(constructor)]
     pub fn new(seed_bbox_json: &str, margin: f64) -> Result<WasmWindow, String> {
         let seed = parse_window_bbox("seed bbox", seed_bbox_json)?;
@@ -349,9 +315,9 @@ impl WasmWindow {
         Ok(WasmWindow { state })
     }
 
-    /// Grow a camera `viewport_json` into the window bbox (margin applied) and
-    /// decide whether to re-aim. Returns the bbox JSON to `subscribe` to, `"null"`
-    /// when unchanged (no frame), or `{error}` on malformed input.
+    /// Grow `viewport_json` into the window bbox and decide whether to re-aim.
+    /// Returns the bbox JSON to `subscribe` to, `"null"` when unchanged, or
+    /// `{error}` on bad input.
     pub fn on_viewport(&mut self, viewport_json: &str) -> String {
         let viewport: Bbox = match parse("viewport", viewport_json) {
             Ok(v) => v,
@@ -360,8 +326,8 @@ impl WasmWindow {
         ok_json(&self.state.on_viewport(viewport))
     }
 
-    /// Re-aim the window to `bbox_json` directly (no margin). Returns the bbox JSON
-    /// to `subscribe` to, `"null"` when unchanged, or `{error}` on malformed input.
+    /// Re-aim the window to `bbox_json` directly (no margin). Returns the bbox
+    /// JSON to `subscribe` to, `"null"` when unchanged, or `{error}` on bad input.
     pub fn set_window(&mut self, bbox_json: &str) -> String {
         let bbox: Bbox = match parse("bbox", bbox_json) {
             Ok(v) => v,
@@ -370,9 +336,8 @@ impl WasmWindow {
         ok_json(&self.state.set_window(bbox))
     }
 
-    /// Drop the window: decide whether to re-subscribe to the whole canvas. Returns
-    /// `true` when a whole-canvas `subscribe` must be sent, `false` when already
-    /// whole-canvas (no frame).
+    /// Drop the window: returns `true` when a whole-canvas `subscribe` must be
+    /// sent, `false` when already whole-canvas.
     pub fn subscribe_whole_canvas(&mut self) -> bool {
         self.state.subscribe_whole_canvas()
     }
@@ -383,8 +348,8 @@ impl WasmWindow {
     }
 }
 
-/// Parse an optional window bbox: `""` is the whole-canvas window (`None`),
-/// otherwise the `{x,y,width,height}` JSON.
+/// Parse an optional window bbox: `""` is whole-canvas (`None`), otherwise the
+/// `{x,y,width,height}` JSON.
 fn parse_window_bbox(label: &str, json: &str) -> Result<Option<Bbox>, String> {
     if json.is_empty() {
         return Ok(None);

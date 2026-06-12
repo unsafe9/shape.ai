@@ -1,10 +1,5 @@
-//! HTTP router assembly.
-//!
-//! This is the platform seam: it wires transport (axum routes) and static hosting
-//! only. Canvas behaviour lives in `shape_scene_core`; this crate never
-//! reimplements op-apply. The object-native cutover (OB4.1) mounts the WS
-//! transport + the object MCP endpoint and drops the bespoke REST domain routes
-//! (groups/comments/export are now Feature frames over WS).
+//! HTTP router assembly: wires axum routes and static hosting only. Canvas
+//! behaviour lives in `shape_scene_core`; this crate never reimplements op-apply.
 
 use std::path::Path;
 
@@ -26,12 +21,8 @@ use crate::mcp::SceneMcp;
 use crate::registry::CanvasRegistry;
 use crate::ws::ws_handler;
 
-/// Build the application router for the given configuration.
-///
-/// Routes:
-/// - `GET /api/health` — liveness probe with build identity.
-/// - `GET /api/ready`  — readiness probe (200 once the process is serving).
-/// - static client assets under `client_dir` with SPA fallback, when present.
+/// Base router: health/ready probes and static client assets. Registry-free so
+/// HTTP-only tests can drive it without constructing a registry.
 pub fn build_router(config: &Config) -> Router {
     let api = Router::new()
         .route("/api/health", get(health))
@@ -51,18 +42,8 @@ pub fn build_router(config: &Config) -> Router {
     router.layer(TraceLayer::new_for_http())
 }
 
-/// Build the full router including the WS transport + the object MCP endpoint.
-///
-/// This is the entry point [`crate::serve`] uses:
-/// - `GET /ws` — the WebSocket transport (two logical channels over one socket),
-///   bridged to the per-canvas object actor.
-/// - `POST/GET/DELETE /mcp` — the streamable-HTTP object MCP transport.
-/// - `GET/POST/DELETE /api/canvases` — canvas CRUD until WS-native canvas ops.
-/// - `GET /api/templates` — the builtin object-template catalog.
-///
-/// `canvases` is the shared canvas actor registry the MCP tools and the WS
-/// transport drive. The base [`build_router`] is registry-free so the HTTP-only
-/// tests can drive it without constructing a registry.
+/// Full router: the base plus the WS transport, the object MCP endpoint, canvas
+/// CRUD, and the template catalog, all sharing `canvases`.
 pub fn build_router_with_mcp(config: &Config, canvases: CanvasRegistry) -> Router {
     let mcp_service = mcp_service(canvases.clone());
 
@@ -70,18 +51,13 @@ pub fn build_router_with_mcp(config: &Config, canvases: CanvasRegistry) -> Route
         .route("/ws", get(ws_handler))
         .with_state(canvases.clone());
 
-    // Canvas CRUD: the client switch UI drives these until WS-native canvas ops
-    // land. State is the same registry the WS/MCP surfaces use, so a create here
-    // is immediately openable over /ws.
     let canvas_api = Router::new()
         .route("/api/canvases", get(list_canvases).post(create_canvas))
         .route("/api/canvases/:id", delete(delete_canvas))
         .with_state(canvases);
 
-    // Template catalog: object templates are code-defined builtin recipes
-    // (`object::templates`), not stored documents, so the catalog is read-only
-    // and needs no shared state — the picker lists ids/labels/categories and the
-    // client lowers a chosen template to ops via the wasm bridge / a feature frame.
+    // Object templates are code-defined builtin recipes, not stored documents,
+    // so the catalog is read-only and needs no shared state.
     let template_api = Router::new().route("/api/templates", get(list_templates));
 
     build_router(config)
@@ -91,8 +67,8 @@ pub fn build_router_with_mcp(config: &Config, canvases: CanvasRegistry) -> Route
         .nest_service("/mcp", mcp_service)
 }
 
-/// Construct the streamable-HTTP MCP transport service. Its factory closure runs
-/// once per session, minting a fresh [`SceneMcp`] bound to the shared registry.
+/// Streamable-HTTP MCP transport. Its factory closure runs once per session,
+/// minting a fresh [`SceneMcp`] bound to the shared registry.
 fn mcp_service(canvases: CanvasRegistry) -> StreamableHttpService<SceneMcp, LocalSessionManager> {
     StreamableHttpService::new(
         move || Ok(SceneMcp::new(canvases.clone())),
@@ -101,7 +77,6 @@ fn mcp_service(canvases: CanvasRegistry) -> StreamableHttpService<SceneMcp, Loca
     )
 }
 
-/// `GET /api/canvases` — list every canvas from the durable index.
 async fn list_canvases(State(canvases): State<CanvasRegistry>) -> Json<Value> {
     Json(json!({ "canvases": canvases.list_canvases() }))
 }
@@ -111,7 +86,6 @@ struct CreateCanvasBody {
     title: Option<String>,
 }
 
-/// `POST /api/canvases` — create a canvas and return its summary.
 async fn create_canvas(
     State(canvases): State<CanvasRegistry>,
     body: Option<Json<CreateCanvasBody>>,
@@ -125,7 +99,6 @@ async fn create_canvas(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// `DELETE /api/canvases/:id` — delete a canvas (evict, de-index, prune scene).
 /// Returns 404 when the id was not in the index.
 async fn delete_canvas(
     State(canvases): State<CanvasRegistry>,
@@ -139,15 +112,10 @@ async fn delete_canvas(
     }
 }
 
-/// `GET /api/templates` — the builtin object-template catalog (id, label,
-/// category, description), in picker display order. Object templates are pure
-/// builder recipes in `shape_scene_core::object::templates`, so this is a static
-/// read-only list with no persistence.
 async fn list_templates() -> Json<Value> {
     Json(json!({ "templates": shape_scene_core::object::object_template_catalog() }))
 }
 
-/// Liveness: the server is up and identifies itself.
 async fn health() -> Json<Value> {
     Json(json!({
         "ok": true,
@@ -156,14 +124,12 @@ async fn health() -> Json<Value> {
     }))
 }
 
-/// Readiness: 200 with a tiny body once the process can serve requests.
 async fn ready() -> Json<Value> {
     Json(json!({ "ready": true }))
 }
 
-/// A router that serves the pre-built SPA from `dir`, falling back to
-/// `index.html` for client-side routes. Returns `None` if the directory or its
-/// `index.html` is absent, so static hosting is skipped gracefully.
+/// Serves the pre-built SPA from `dir` with `index.html` fallback. `None` when
+/// the directory or its `index.html` is absent, so static hosting is skipped.
 fn static_service(dir: &Path) -> Option<Router> {
     let index = dir.join("index.html");
     if !dir.is_dir() || !index.is_file() {

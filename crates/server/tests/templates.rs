@@ -1,11 +1,5 @@
-//! Integration tests for the object-template HTTP surface
-//! (`GET /api/templates`), driving the router in-process via
-//! `tower::ServiceExt::oneshot` (no socket bind).
-//!
-//! Object templates are code-defined builtin recipes in
-//! `shape_scene_core::object::templates`, so the catalog is read-only: there is
-//! no user-template CRUD and no persistence (the legacy recipe `TemplateContract`
-//! store was removed at OB-follow-up 1).
+//! Integration tests for `GET /api/templates`. Object templates are code-defined
+//! builtin recipes, so the catalog is read-only — no CRUD, no persistence.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -46,12 +40,10 @@ async fn list_returns_the_builtin_object_template_catalog() {
     let body = body_json(response).await;
     let templates = body["templates"].as_array().unwrap();
 
-    // The served list is exactly the object catalog (same length + ids).
     let catalog = shape_scene_core::object::object_template_catalog();
     assert_eq!(templates.len(), catalog.len());
     assert!(!templates.is_empty(), "catalog is never empty");
 
-    // Each served entry carries the picker metadata (id/label/category/description).
     for (served, expected) in templates.iter().zip(catalog.iter()) {
         assert_eq!(served["id"], expected.id);
         assert_eq!(served["label"], expected.label);
@@ -59,7 +51,6 @@ async fn list_returns_the_builtin_object_template_catalog() {
         assert!(served["category"].is_string());
     }
 
-    // The real builtins are present by id.
     let ids: Vec<&str> = templates.iter().map(|t| t["id"].as_str().unwrap()).collect();
     for want in ["decision_map", "todo_board", "idea_board", "wiki_note"] {
         assert!(ids.contains(&want), "missing {want}");

@@ -1,45 +1,28 @@
-//! OB3.S2 — pure structural validators over the object model.
+//! Pure structural validators over the object model — reject malformed scenes
+//! before they are journaled / applied (degenerate geometry, looping parent
+//! chain, anchor/comment addressing a missing node or object). apply.rs gates
+//! each op on the relevant validator. Returns a structured [`ValidationError`]
+//! matching `ApplyError`'s shape, since the apply path matches on it.
 //!
-//! These reject malformed scenes *before* they are journaled / applied: a
-//! degenerate geometry, a parent chain that loops, or an anchor (or comment)
-//! that addresses a node or object that does not exist. apply.rs (OB3.S1) is the
-//! caller — it gates each op on the relevant validator so the apply path itself
-//! stays a straight-line mutation.
+//! Pure: no IO/time/rng. Pointer-width-agnostic — node indices are i32, the
+//! flattened count is compared via i64 so no `usize`/`as` narrowing leaks in.
 //!
-//! Style mirrors the standalone group validators in `lww.rs`
-//! (`validate_no_group_cycle` / `validate_group_targets` / `validate_bounds_positive`)
-//! but returns a structured [`ValidationError`] (matching `ApplyError`'s enum
-//! shape) instead of free-form strings, since the apply path matches on it.
-//!
-//! Pure: no IO/time/rng. Pointer-width-agnostic — every node index is i32 and
-//! the flattened node count is compared via `i64` so no `usize`/`as` narrowing
-//! leaks into the addressing math.
-//!
-//! **Node addressing (D5/D2):** an [`Anchor::node_index`] and a
-//! [`CommentAnchor::Node`] index address a node in the object's *own* geometry,
-//! counted flat across every subpath in declaration order (subpath 0's nodes,
-//! then subpath 1's, …). Valid range is `0 <= node_index < total_nodes`.
+//! Node addressing: an [`Anchor::node_index`] / [`CommentAnchor::Node`] index
+//! addresses a node in the object's *own* geometry, counted flat across every
+//! subpath in declaration order. Valid range is `0 <= node_index < total_nodes`.
 
 use std::collections::HashMap;
 
 use crate::object::model::{CommentAnchor, Geometry, Object, ObjectScene};
 
-/// A single structural defect found in the object model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationError {
-    /// A geometry with no drawable contour (empty path, or only empty subpaths).
     EmptyGeometry,
-    /// A subpath too short to form its declared topology: an open contour needs
-    /// >= 2 nodes, a closed one >= 3. Carries the offending subpath index.
+    /// Open needs >= 2 nodes, closed >= 3.
     DegenerateSubpath { subpath: i32, closed: bool, nodes: i32 },
-    /// An object sits on a parent-chain cycle (it is its own ancestor).
     ParentCycle { id: String },
-    /// An anchor points at a `target` object id that is not in the scene.
     MissingAnchorTarget { id: String, target: String },
-    /// An anchor's `node_index` is out of range for the *owning* object's
-    /// geometry (negative, or >= the flattened node count).
     AnchorNodeOutOfRange { id: String, node_index: i32, node_count: i32 },
-    /// A comment's `Node` anchor index is out of range for its object's geometry.
     CommentNodeOutOfRange { id: String, comment_id: String, node_index: i32, node_count: i32 },
 }
 
@@ -73,11 +56,8 @@ impl core::fmt::Display for ValidationError {
     }
 }
 
-/// Total node count across every subpath, as an i32 (the addressing width).
-///
-/// Node indices are i32; the flattened count is accumulated in i64 and narrowed
-/// once with a checked `try_from` so an absurd geometry saturates rather than
-/// wrapping (it would already have failed `validate_geometry`).
+/// Total node count across every subpath. Accumulated in i64 and narrowed once
+/// with a checked `try_from` so an absurd geometry saturates rather than wrapping.
 fn flattened_node_count(geometry: &Geometry) -> i32 {
     let total: i64 = geometry
         .subpaths
@@ -87,11 +67,8 @@ fn flattened_node_count(geometry: &Geometry) -> i32 {
     i32::try_from(total).unwrap_or(i32::MAX)
 }
 
-/// Reject degenerate geometry (D2): an empty path, or any subpath too short for
-/// its topology — open needs >= 2 nodes, closed needs >= 3.
-///
-/// Operates on the parsed `subpaths`; the caller hydrates via
-/// `Geometry::ensure_parsed` (apply.rs already does so before edit/insert).
+/// Reject an empty path or a subpath too short for its topology. Operates on the
+/// parsed `subpaths`; the caller hydrates via `Geometry::ensure_parsed`.
 pub fn validate_geometry(geometry: &Geometry) -> Result<(), ValidationError> {
     let has_drawable = geometry.subpaths.iter().any(|sp| !sp.nodes.is_empty());
     if !has_drawable {
@@ -115,13 +92,9 @@ pub fn validate_geometry(geometry: &Geometry) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// No object may be its own ancestor through the `parent` chain (D3).
-///
-/// Walks each object's parent chain; if it revisits a node already on the walk,
-/// the start object lies on a cycle and is reported. A parent id that does not
-/// resolve to an object simply ends the walk (dangling parents are out of scope
-/// here — distinct from anchor-target existence, which `validate_anchor_targets`
-/// owns). Returns the *first* offending object.
+/// No object may be its own ancestor through the `parent` chain. A parent id that
+/// resolves to nothing ends the walk (dangling parents are out of scope here).
+/// Returns the first offending object.
 pub fn validate_no_parent_cycle(scene: &ObjectScene) -> Result<(), ValidationError> {
     let parent_of: HashMap<&str, Option<&str>> = scene
         .objects
@@ -144,9 +117,8 @@ pub fn validate_no_parent_cycle(scene: &ObjectScene) -> Result<(), ValidationErr
     Ok(())
 }
 
-/// Every anchor must resolve: its `target` is a live object, and its
-/// `node_index` is in range for the *owning* object's geometry (D5). Returns the
-/// first defect across the scene.
+/// Every anchor must resolve: `target` is a live object and `node_index` is in
+/// range for the *owning* object's geometry. Returns the first defect.
 pub fn validate_anchor_targets(scene: &ObjectScene) -> Result<(), ValidationError> {
     let ids: std::collections::HashSet<&str> =
         scene.objects.iter().map(|o| o.id.as_str()).collect();
@@ -175,10 +147,8 @@ pub fn validate_anchor_targets(scene: &ObjectScene) -> Result<(), ValidationErro
     Ok(())
 }
 
-/// Validate one object in isolation: its geometry is non-degenerate, and every
-/// comment with a `Node` anchor addresses an in-range node of *this* object's
-/// geometry. (Anchor targets are cross-object, so they are checked at the scene
-/// level by [`validate_anchor_targets`].)
+/// One object in isolation: non-degenerate geometry + in-range `Node`-anchored
+/// comments. Anchor targets are cross-object, checked by [`validate_anchor_targets`].
 pub fn validate_object(object: &Object) -> Result<(), ValidationError> {
     validate_geometry(&object.geometry)?;
     let node_count = flattened_node_count(&object.geometry);
@@ -197,11 +167,8 @@ pub fn validate_object(object: &Object) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Run every validator across the whole scene, collecting *all* defects.
-///
-/// Per-object checks ([`validate_object`]) run for each object; the scene-wide
-/// parent-cycle and anchor-target checks run once each. Unlike the single-error
-/// helpers above, this accumulates so a caller can report every problem at once.
+/// Run every validator, accumulating all defects (unlike the single-error
+/// helpers) so a caller can report every problem at once.
 pub fn validate_scene(scene: &ObjectScene) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     for object in &scene.objects {
@@ -218,10 +185,6 @@ pub fn validate_scene(scene: &ObjectScene) -> Vec<ValidationError> {
     errors
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,7 +193,6 @@ mod tests {
         PathNode, SubPath,
     };
 
-    /// A closed unit rect (4 nodes) in quantized units — non-degenerate.
     fn rect() -> Geometry {
         Geometry::from_subpaths(
             vec![SubPath {
@@ -261,7 +223,6 @@ mod tests {
     #[test]
     fn geometry_happy_path() {
         assert_eq!(validate_geometry(&rect()), Ok(()));
-        // An open polyline of 2 nodes is the minimum valid open contour.
         let open = Geometry::from_subpaths(
             vec![SubPath { closed: false, nodes: vec![PathNode::corner(0, 0), PathNode::corner(10, 0)] }],
             FillRule::NonZero,
@@ -272,7 +233,6 @@ mod tests {
     #[test]
     fn geometry_empty_rejected() {
         assert_eq!(validate_geometry(&Geometry::default()), Err(ValidationError::EmptyGeometry));
-        // A geometry whose only subpath is empty is also "no drawable contour".
         let all_empty = Geometry {
             subpaths: vec![SubPath { closed: false, nodes: vec![] }],
             ..Default::default()
@@ -330,8 +290,6 @@ mod tests {
 
     #[test]
     fn dangling_parent_is_not_a_cycle() {
-        // A parent id that resolves to nothing ends the walk cleanly; cycle
-        // detection does not own dangling-reference rejection.
         let s = scene(vec![obj("child", Some("ghost"))]);
         assert_eq!(validate_no_parent_cycle(&s), Ok(()));
     }
@@ -359,7 +317,6 @@ mod tests {
 
     #[test]
     fn anchor_node_index_out_of_range_rejected() {
-        // rect() has 4 nodes => valid indices 0..4; index 4 is out of range.
         let mut edge = obj("e", None);
         edge.anchors = vec![Anchor { node_index: 4, target: "a".into(), at: LocalPoint { x: 0, y: 0 } }];
         let s = scene(vec![obj("a", None), edge]);
@@ -431,7 +388,6 @@ mod tests {
 
     #[test]
     fn object_point_anchored_comment_skips_node_check() {
-        // A `Point`-anchored comment is never node-range-checked.
         let mut o = obj("o", None);
         o.comments = vec![Comment {
             id: "c1".into(),
@@ -455,8 +411,6 @@ mod tests {
 
     #[test]
     fn scene_collects_all_defects() {
-        // bad-geo: degenerate geometry; loops: self parent cycle; anchored:
-        // missing anchor target. validate_scene reports all three.
         let mut bad_geo = obj("bad-geo", None);
         bad_geo.geometry = Geometry::from_subpaths(
             vec![SubPath { closed: true, nodes: vec![PathNode::corner(0, 0), PathNode::corner(1, 0)] }],

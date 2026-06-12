@@ -1,21 +1,15 @@
-//! Error type shared across the storage core.
-
 use std::fmt;
 
 /// Errors surfaced by adapters and the portable export/import format.
 #[derive(Debug)]
 pub enum StorageError {
-    /// A record with the requested id was not found.
     NotFound { id: String },
-    /// The on-disk format did not match expectations (bad magic, version,
-    /// truncated frame, checksum mismatch, ...).
+    /// On-disk format mismatch (bad magic, version, truncated frame, bad CRC).
     Format(String),
-    /// Underlying I/O failure (file open/read/write, directory create, ...).
     Io(String),
     /// (De)serialization of metadata/manifest failed.
     Serde(String),
-    /// The adapter cannot satisfy the request because it is an unimplemented
-    /// stub (sqlite/postgres/s3/remote when their backends are unavailable).
+    /// The adapter is an unimplemented stub (backend unavailable).
     Unsupported { kind: &'static str, op: &'static str },
 }
 
@@ -47,5 +41,4 @@ impl From<serde_json::Error> for StorageError {
     }
 }
 
-/// Convenience alias for fallible storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;

@@ -1,18 +1,3 @@
-// AP3 (#9,#13,#18) — group / hierarchy / menus. Tier-4 moved the containment
-// op-generation + forest queries into scene-core; these pin the live paths
-// through the REAL scene-core wasm (no TS reimplementation), plus the App.svelte
-// wiring at the code level (no renderer / no Svelte mount):
-//  (a) group works on 1+ objects (the App.svelte guard is `< 1`, not `< 2`);
-//  (b) the double-click drill-in decision (core `doubleClickAction`): a container
-//      drills in, a leaf edits text; App.svelte wires it through
-//      `handleObjectDoubleClick` + `activeContainer`;
-//  (c) ungroup is enabled ONLY for a container object (one WITH children) and
-//      disabled for a childless leaf (core `ungroupEnabled` / `hasChildren`);
-//  (d) pop-out reparents a child to its grandparent / canvas root (core `popOutOp`);
-//  (f) the insert-text CANVAS_MENU entry + its handler are gone (D7).
-// Falsifiable: any of these behaviors drifting (guard flips back, ungroup enabled
-// for a leaf, pop-out lands at the wrong parent, insert-text returns) fails a case.
-
 import { beforeAll, describe, expect, it } from "vitest";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
 import { emptyObjectScene, type Object as SceneObject, type ObjectScene, type ObjectSelection } from "../platforms/web/shared/object";
@@ -47,8 +32,7 @@ function sceneOf(objects: SceneObject[]): ObjectScene {
   return { ...emptyObjectScene(), objects };
 }
 
-describe("doubleClickAction (RA2b drill-in branch, #9 / D6) — core query", () => {
-  // A container (frame with a child) and a childless leaf.
+describe("doubleClickAction (drill-in branch) — core query", () => {
   const scene = sceneOf([obj("frame", undefined), obj("child", "frame"), obj("leaf", undefined)]);
 
   it("drills into a container (has children) and edits a leaf", () => {
@@ -57,8 +41,7 @@ describe("doubleClickAction (RA2b drill-in branch, #9 / D6) — core query", () 
   });
 });
 
-describe("ungroupEnabled (#13) — core query", () => {
-  // A container (frame with a child) and a childless leaf.
+describe("ungroupEnabled — core query", () => {
   const scene = sceneOf([obj("frame", undefined), obj("child", "frame"), obj("leaf", undefined)]);
 
   it("is enabled for a container object (one WITH children)", () => {
@@ -76,8 +59,8 @@ describe("ungroupEnabled (#13) — core query", () => {
   });
 });
 
-describe("popOutOp (pop a child out one level, #18) — core query", () => {
-  // root frame -> mid frame -> deep child.
+describe("popOutOp (pop a child out one level) — core query", () => {
+  // root -> mid -> deep.
   const scene = sceneOf([obj("root", undefined), obj("mid", "root"), obj("deep", "mid"), obj("top", undefined)]);
 
   it("reparents a child to its GRANDPARENT", () => {
@@ -85,7 +68,6 @@ describe("popOutOp (pop a child out one level, #18) — core query", () => {
   });
 
   it("reparents to the canvas ROOT (absent parent) when the parent sits at the root", () => {
-    // `mid`'s parent is `root`, whose parent is absent -> pop out to canvas root.
     expect(core.popOutOp(scene, "mid")).toEqual({ kind: "reparent", id: "mid", order: "a0" });
   });
 
@@ -95,10 +77,7 @@ describe("popOutOp (pop a child out one level, #18) — core query", () => {
   });
 });
 
-// The group / double-click / context-menu wiring, exercised through the extracted
-// controller functions the shell now composes (no .svelte source pin).
-describe("controller group/hierarchy wiring (AP3)", () => {
-  // A 1x1 unit obj used for the group AABB; an object with a real geometry path.
+describe("controller group/hierarchy wiring", () => {
   function geoObj(id: string, tx: number, ty: number): SceneObject {
     return {
       id,
@@ -117,7 +96,6 @@ describe("controller group/hierarchy wiring (AP3)", () => {
     const one = geoObj("a", 100, 100);
     const { ops, frameId } = buildGroupOps(["a"], [one], { minX: 100, minY: 100, maxX: 180, maxY: 140 }, "frame-1", "z0", rectPathQuantized);
     expect(ops[0]).toMatchObject({ kind: "insert-object", object: { id: "frame-1" } });
-    // The child is reparented under the new frame.
     expect(ops.slice(1)).toEqual([{ kind: "reparent", id: "a", parent: "frame-1", order: "a0" }]);
     expect(frameId).toBe("frame-1");
   });
@@ -126,22 +104,19 @@ describe("controller group/hierarchy wiring (AP3)", () => {
     const scene = sceneOf([obj("frame", undefined), obj("child", "frame"), obj("leaf", undefined)]);
     expect(resolveDoubleClick(core, scene, { id: "frame", hasChildren: true })).toEqual({ kind: "drill-in", id: "frame" });
     expect(resolveDoubleClick(core, scene, { id: "leaf", hasChildren: false })).toEqual({ kind: "edit-leaf", id: "leaf" });
-    // A null signal (double-click missed every object) is a no-op.
     expect(resolveDoubleClick(core, scene, null)).toEqual({ kind: "none" });
   });
 
   it("gates ungroup + pop-out on the core children/parent queries", () => {
     const scene = sceneOf([obj("frame", undefined), obj("child", "frame"), obj("leaf", undefined), obj("deep", "child")]);
-    // ungroup: only for a container object (has children).
     expect(ungroupPickEnabled(core, scene, { kind: "object", id: "frame" })).toBe(true);
     expect(ungroupPickEnabled(core, scene, { kind: "object", id: "leaf" })).toBe(false);
     expect(ungroupPickEnabled(core, scene, { kind: "multi", ids: ["frame"] })).toBe(false);
-    // pop-out: only when the picked object has a parent.
     expect(popOutPickEnabled(core, scene, { kind: "object", id: "child" })).toBe(true);
     expect(popOutPickEnabled(core, scene, { kind: "object", id: "frame" })).toBe(false);
   });
 
-  it("the OBJECT_MENU carries the pop-out entry; the CANVAS_MENU drops insert-text (D7)", () => {
+  it("the OBJECT_MENU carries the pop-out entry; the CANVAS_MENU drops insert-text", () => {
     expect(OBJECT_MENU).toContainEqual({ id: "pop-out", label: "Pop out one level" });
     const canvasIds = CANVAS_MENU.filter((e): e is Exclude<typeof e, "separator"> => e !== "separator").map((e) => e.id);
     expect(canvasIds).not.toContain("insert-text");
@@ -156,16 +131,14 @@ describe("controller group/hierarchy wiring (AP3)", () => {
       if (entry.id === "pop-out") return popOutPickEnabled(core, scene, p);
       return true;
     };
-    // Only entries with a handler survive; a leaf (no children, no parent) disables
-    // ungroup + pop-out.
+    // Only entries with a handler survive; a leaf disables ungroup + pop-out.
     const items = resolveContextMenuItems<string>(picked, [], (id) => id !== "add-comment", enabledFor);
     const present = items.filter((i): i is NonNullable<typeof i> => i !== null);
     const byId = new Map(present.map((i) => [i.id, i]));
-    // add-comment had no handler -> dropped entirely.
     expect(byId.has("add-comment")).toBe(false);
     expect(byId.get("ungroup")?.disabled).toBe(true);
     expect(byId.get("pop-out")?.disabled).toBe(true);
-    // group is disabled for a single object (disabledFor: "object").
+    // group is disabled for a single object.
     expect(byId.get("group")?.disabled).toBe(true);
     expect(byId.get("duplicate")?.disabled).toBe(false);
   });

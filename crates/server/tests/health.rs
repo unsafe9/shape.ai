@@ -1,5 +1,5 @@
 //! Integration tests for the HTTP surface, driving the router in-process via
-//! `tower::ServiceExt::oneshot` (no socket bind).
+//! `oneshot` (no socket bind).
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -9,8 +9,8 @@ use shape_server::{build_router, Config};
 use tower::ServiceExt;
 
 fn test_config() -> Config {
-    // Point at a directory with no client assets so static hosting is skipped
-    // and the test exercises the API surface deterministically.
+    // No client assets so static hosting is skipped and the API is exercised
+    // deterministically.
     Config {
         host: "127.0.0.1".to_string(),
         port: 0,

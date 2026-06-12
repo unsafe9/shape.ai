@@ -1,10 +1,5 @@
-// Pure affine/geometry helpers lifted out of App.svelte's god-controller.
-//
-// These take every input as an explicit parameter (no Svelte reactivity, no DOM,
-// no ambient state), so the shell composes them and the unit gate can pin them
-// without a mount. They cover the transform math the op-authoring paths reach for:
-// reading an origin, structural transform equality, a translate shift, the inverse
-// affine into object-local quantized space, the union world-AABB of objects, the
+// Pure affine/geometry helpers the op-authoring paths reach for: origin read, structural transform
+// equality, translate shift, the inverse affine into object-local quantized space, union world-AABB,
 // path-string local bbox, and a quantized rect path.
 
 import {
@@ -15,21 +10,20 @@ import {
   type Transform3x3
 } from "../shared/object";
 
-/** The translation column of a (possibly absent) 3x3 transform; identity = origin. */
+// The translation column of a (possibly absent) 3x3 transform; absent = origin.
 export function transformOrigin(transform: SceneObject["transform"]): [number, number] {
   if (!transform) return [0, 0];
   return [transform[0][2], transform[1][2]];
 }
 
-// FC-16: structural equality of two (possibly absent) 3x3 transforms. An absent
-// transform is the identity, so it compares equal to an explicit identity.
+// Structural equality of two (possibly absent) 3x3 transforms; an absent transform equals identity.
 export function transformsEqual(a: SceneObject["transform"], b: SceneObject["transform"]): boolean {
   const m = a ?? IDENTITY_TRANSFORM;
   const n = b ?? IDENTITY_TRANSFORM;
   return m.every((row, i) => row.every((v, j) => v === n[i][j]));
 }
 
-/** Shift a transform's origin by (dx, dy), preserving its linear part. */
+// Shift a transform's origin by (dx, dy), preserving its linear part.
 export function shiftTransform(transform: SceneObject["transform"], dx: number, dy: number): Transform3x3 {
   const [ox, oy] = transformOrigin(transform);
   if (!transform) return translateTransform(dx, dy);
@@ -40,10 +34,8 @@ export function shiftTransform(transform: SceneObject["transform"], dx: number, 
   ];
 }
 
-// W2-08: map a world point into an object's local quantized geometry space
-// (inverse affine transform, then quantize by GEOMETRY_QUANTUM_PER_PX). Returns
-// null when the transform is non-invertible (degenerate scale). Used to place
-// the partial-erase cut in the same coordinate space as the stored geometry.
+// Map a world point into an object's local quantized geometry space (inverse affine, then quantize
+// by GEOMETRY_QUANTUM_PER_PX). Null when the transform is non-invertible (degenerate scale).
 export function worldToObjectLocalQuantized(
   object: SceneObject,
   world: { x: number; y: number }
@@ -64,9 +56,8 @@ export function worldToObjectLocalQuantized(
   return { x: Math.round(localX * GEOMETRY_QUANTUM_PER_PX), y: Math.round(localY * GEOMETRY_QUANTUM_PER_PX) };
 }
 
-// FC-14: the union world-AABB of the given objects, computed from each object's
-// geometry path bbox (object-local quantized px → logical px) transformed by its
-// affine transform. Returns null when no object yields a finite bbox.
+// The union world-AABB of the given objects, each from its geometry path bbox (object-local
+// quantized px → logical px) run through its affine transform. Null when no object yields a finite bbox.
 export function unionWorldAabb(
   objects: SceneObject[]
 ): { minX: number; minY: number; maxX: number; maxY: number } | null {
@@ -94,10 +85,8 @@ export function unionWorldAabb(
   return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
 }
 
-// The object-local bbox (in logical px) of a path-string's coordinate pairs.
-// Coords are quantized integers (GEOMETRY_QUANTUM_PER_PX per px); commands are
-// single letters, so reading every numeric pair covers M/L/C control points —
-// a conservative-enough enclosing box for the group frame.
+// The object-local bbox (logical px) of a path-string's coordinate pairs. Coords are quantized
+// integers (GEOMETRY_QUANTUM_PER_PX per px); reading every numeric pair covers M/L/C control points.
 export function pathLocalBbox(d: string): { minX: number; minY: number; maxX: number; maxY: number } | null {
   const nums = d.match(/-?\d+(?:\.\d+)?/g);
   if (!nums || nums.length < 2) return null;
@@ -116,7 +105,7 @@ export function pathLocalBbox(d: string): { minX: number; minY: number; maxX: nu
   return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
 }
 
-// FC-14: a closed object-local rect path of `w`×`h` logical px, quantized.
+// A closed object-local rect path of `w`×`h` logical px, quantized.
 export function rectPathQuantized(w: number, h: number): string {
   const qw = Math.round(Math.max(1, w) * GEOMETRY_QUANTUM_PER_PX);
   const qh = Math.round(Math.max(1, h) * GEOMETRY_QUANTUM_PER_PX);

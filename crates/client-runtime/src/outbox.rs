@@ -1,31 +1,24 @@
-//! Durable outbox for unacked client ops (port of `runtime/outbox.ts`).
+//! Durable outbox for unacked client ops.
 //!
-//! Every op a shell authors is appended here BEFORE it is sent on the wire and is
-//! removed only when the server acks its `op_id`. This makes the unacked tail
-//! survive a reload/reconnect: on (re)connect the engine replays every entry in
-//! `local_seq` order so an op authored offline (or in flight when the socket
-//! dropped) is re-sent rather than lost. Re-sending the same `op_id` is safe — the
-//! server dedups by it and re-acks the original seq (idempotent).
+//! Every authored op is appended here BEFORE the wire send and removed only on
+//! ack, so the unacked tail survives a reload/reconnect: on (re)connect the
+//! engine replays every entry in `local_seq` order. Re-sending the same `op_id`
+//! is safe — the server dedups by it and re-acks idempotently.
 //!
-//! An entry is a [`WireOp`] (the exact wire envelope, `prop_delta` carrying the
-//! `ObjectOp` delta), so a row can be re-sent verbatim with no re-encoding.
-//!
-//! Persistence sits behind the [`OutboxStore`] port: the web shell keeps an
-//! IndexedDB impl, this crate keeps only the in-memory impl (tests + a
-//! no-persistence fallback). The port is synchronous — append/remove/replay/seq
-//! are pure decisions; a backend's async IO is the shell's concern to wrap.
+//! Persistence sits behind the [`OutboxStore`] port (the web shell keeps an
+//! IndexedDB impl; this crate keeps only the in-memory one). The port is
+//! synchronous: append/remove/replay/seq are pure decisions, the backend's async
+//! IO is the shell's concern.
 
 pub use shape_scene_core::wire::OpId;
 use shape_scene_core::wire::WireOp;
 
-/// One outbox row: an `op_id`-stamped [`WireOp`] envelope around an `ObjectOp`
-/// delta. Field-for-field the `ops` envelope the WS protocol carries, so an entry
-/// can be re-sent verbatim with no re-encoding.
+/// One outbox row: the `op_id`-stamped [`WireOp`] envelope the WS protocol
+/// carries, so an entry re-sends verbatim with no re-encoding.
 pub type OutboxEntry = WireOp;
 
-/// A persistence-backend failure surfaced by an [`OutboxStore`] impl. The
-/// in-memory impl never fails; a durable backend (IndexedDB, sqlite, …) maps its
-/// errors onto this so the engine can react.
+/// A persistence-backend failure surfaced by an [`OutboxStore`]. The in-memory
+/// impl never fails; a durable backend maps its errors onto this.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutboxError(pub String);
 
@@ -40,12 +33,9 @@ pub fn op_id_key(op_id: &OpId) -> String {
     format!("{}:{}", op_id.client_id, op_id.local_seq)
 }
 
-/// Durable append-only log of unacked ops, keyed by `op_id`.
-///
-/// `append` persists before send; `remove` drops acked ids; `all` returns the
-/// replay set in `local_seq` order. Implementations must keep `local_seq`
-/// monotonic per `client_id` and persist that counter alongside the rows so it
-/// never repeats across reloads.
+/// Durable append-only log of unacked ops, keyed by `op_id`. Implementations
+/// must keep `local_seq` monotonic per `client_id` and persist that counter so
+/// it never repeats across reloads.
 pub trait OutboxStore {
     /// Persist an entry (call before sending it on the wire).
     fn append(&mut self, entry: OutboxEntry) -> Result<(), OutboxError>;
@@ -57,10 +47,10 @@ pub trait OutboxStore {
     fn clear(&mut self) -> Result<(), OutboxError>;
     /// Next monotonic `local_seq` for this client; advances and persists.
     fn next_local_seq(&mut self) -> Result<i64, OutboxError>;
-    /// Replace the contents with `entries` (durable rows read back from the shell's
-    /// persistence on a fresh-session reconnect) so the engine can replay them. A
-    /// durable backend persists its own `local_seq` high-water, so the default only
-    /// clears + re-appends; the in-memory store overrides to also reset the counter.
+    /// Replace the contents with durable rows read back on a fresh-session
+    /// reconnect, so the engine can replay them. A durable backend persists its
+    /// own `local_seq` high-water, so the default only clears + re-appends; the
+    /// in-memory store overrides to also reset the counter.
     fn reseed(&mut self, entries: Vec<OutboxEntry>) -> Result<(), OutboxError> {
         self.clear()?;
         for entry in entries {
@@ -70,9 +60,8 @@ pub trait OutboxStore {
     }
 }
 
-/// Non-durable [`OutboxStore`] backed by a plain `Vec`. Entries are lost on reload;
-/// tests simulate a "reconnect" by reusing the SAME instance (the durable case),
-/// which is what a real persistent impl guarantees across a reload.
+/// Non-durable [`OutboxStore`] backed by a `Vec`. Entries are lost on reload;
+/// tests simulate a "reconnect" by reusing the SAME instance (the durable case).
 #[derive(Default)]
 pub struct InMemoryOutboxStore {
     entries: Vec<OutboxEntry>,

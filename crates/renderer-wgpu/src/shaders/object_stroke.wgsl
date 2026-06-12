@@ -1,18 +1,12 @@
-// OB-3 object stroke shader (OB3.R2 stroke ribbon + OB3.R8 analytic AA).
+// Object stroke shader: triangle ribbon + analytic AA.
 //
-// The stroke is uploaded as a triangle ribbon along the path. Each ribbon vertex
-// carries the on-path position plus the unit normal at that point, a `side` flag
-// (+1 / -1) picking which bank of the ribbon it belongs to, and the per-node
-// half-extent width — so variable-width strokes (D2 stroke.width can taper per
-// node) are expressed entirely in vertex data. The VS offsets each vertex along
-// its normal by `side * width * 0.5` to give the ribbon its thickness; the FS
-// paints the stroke color, applies dashing by discarding gaps, and softens both
-// the long ribbon edges and the dash ends analytically.
-//
-// Camera + projective transform mirror object_fill.wgsl exactly so fills and
-// strokes of the same object land in the same coordinate frame. Width is offset
-// in object-local space *before* the projective divide, so a sheared/perspective
-// transform thickens the stroke consistently with the body it outlines.
+// Each ribbon vertex carries on-path position, unit normal, a `side` flag (+1/-1
+// picking the bank), and per-node width, so variable-width strokes live entirely
+// in vertex data. The VS offsets each vertex by `side * width * 0.5` along the
+// normal; the FS paints, applies dashing by discarding gaps, and softens the banks
+// and dash ends. Width is offset in object-local space BEFORE the projective
+// divide, so a sheared/perspective transform thickens the stroke consistently.
+// Camera + projective transform mirror object_fill.wgsl.
 
 struct View {
   camera: vec4<f32>,
@@ -23,18 +17,17 @@ struct View {
 var<uniform> view: View;
 
 struct VertexIn {
-  // On-path position in object-local CSS px.
+  // On-path position, object-local CSS px.
   @location(0) position: vec2<f32>,
-  // Unit normal at this path point (object-local).
+  // Unit normal (object-local).
   @location(1) normal: vec2<f32>,
-  // +1 / -1: which bank of the ribbon this vertex offsets toward.
+  // +1 / -1: which ribbon bank this vertex offsets toward.
   @location(2) side: f32,
-  // Per-node stroke width (full width in px); half is applied along the normal.
+  // Per-node full width in px; half is applied along the normal.
   @location(3) width: f32,
-  // Arc length from the start of the (sub)path to this point, in px. Drives the
-  // dash pattern; monotonically increasing along the ribbon.
+  // Arc length from the (sub)path start, px; drives the dash pattern.
   @location(4) distance_along: f32,
-  // Instance-step per-object projective matrix columns + stroke paint.
+  // Instance-step projective matrix columns + stroke paint.
   @location(5) m0: vec3<f32>,
   @location(6) m1: vec3<f32>,
   @location(7) m2: vec3<f32>,
@@ -42,8 +35,7 @@ struct VertexIn {
 };
 
 struct StrokeUniform {
-  // x: dash on-length (px), y: dash period (on + off) (px), z: stroke opacity,
-  // w: 0 => no dash (solid), 1 => dashed.
+  // x: dash on-length px, y: dash period (on+off) px, z: opacity, w: 0 solid / 1 dashed.
   dash: vec4<f32>,
 };
 
@@ -54,8 +46,8 @@ struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) stroke: vec4<f32>,
   @location(1) distance_along: f32,
-  // Signed across-ribbon coordinate in px: -half..+half. |edge_pos| near the
-  // half-width is the ribbon silhouette, used for analytic AA along the banks.
+  // Signed across-ribbon coordinate px (-half..+half); |edge_pos| near half_width
+  // is the silhouette, used for bank AA.
   @location(2) edge_pos: f32,
   @location(3) half_width: f32,
 };
@@ -78,7 +70,7 @@ fn world_to_clip(world: vec2<f32>) -> vec2<f32> {
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
   let half = input.width * 0.5;
-  // OB3.R2: expand the ribbon by offsetting along the per-vertex normal.
+  // Expand the ribbon by offsetting along the per-vertex normal.
   let local = input.position + input.normal * (input.side * half);
   let world = world_from_local(local, input.m0, input.m1, input.m2);
 
@@ -93,16 +85,14 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-  // Dash gating (D2 stroke.dash). With a period p and on-length on, a fragment is
-  // painted when its arc-length position falls inside the on-segment. We soften
-  // the dash boundary by one pixel of arc length so dash ends do not shimmer.
+  // Dash gating: paint where the arc-length position falls in the on-segment,
+  // softened by one pixel of arc length so dash ends do not shimmer.
   var dash_coverage = 1.0;
   if (stroke_params.dash.w > 0.5) {
     let period = max(stroke_params.dash.y, 1e-4);
     let phase = fract(input.distance_along / period) * period;
     let on_len = stroke_params.dash.x;
     let daa = fwidth(input.distance_along);
-    // Rising edge at phase=0, falling edge at phase=on_len.
     let rise = smoothstep(0.0, daa, phase);
     let fall = 1.0 - smoothstep(on_len - daa, on_len, phase);
     dash_coverage = rise * fall;
@@ -111,8 +101,8 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     }
   }
 
-  // OB3.R8 analytic AA across the ribbon banks: coverage falls off in the last
-  // pixel before |edge_pos| reaches the half width.
+  // Analytic AA across the banks: coverage falls off in the last pixel before
+  // |edge_pos| reaches the half width.
   let eaa = fwidth(input.edge_pos);
   let edge_coverage = 1.0 - smoothstep(input.half_width - eaa, input.half_width, abs(input.edge_pos));
 

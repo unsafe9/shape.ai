@@ -1,28 +1,22 @@
-//! Client object sync engine (port of `runtime/syncEngine.ts`): durable outbox +
-//! optimistic apply + transient ownership/unacked discard + coalescing policy +
-//! reconnect reconcile.
+//! Client object sync engine between the shell and the wire transport. It owns:
 //!
-//! The engine sits between the shell and the wire transport. It owns:
+//!   1. the durable outbox — every authored op is persisted before send, removed
+//!      on ack, and replayed in `local_seq` order on (re)connect;
+//!   2. the optimistic local `ObjectScene` — ops apply the instant they're
+//!      authored, so the shell never waits for a round-trip;
+//!   3. transient ownership — while a local write on an `(object, field)` is
+//!      unacked, a remote op for that same key is ignored, so a peer/echo can't
+//!      clobber the value the user is still dragging;
+//!   4. coalescing POLICY — rapid ops batch into one frame within a ~33ms window;
+//!      the engine decides ([`flush_armed`]/[`on_flush_due`]), the shell times it;
+//!   5. reconnect reconcile — a fresh `welcome` snapshot resets the base and
+//!      replays the outbox on top.
 //!
-//!   1. the durable outbox — every authored op is persisted (as the [`WireOp`]
-//!      envelope) before it is sent, removed on ack, and replayed in `local_seq`
-//!      order on (re)connect;
-//!   2. the optimistic local `ObjectScene` — ops apply locally the instant they
-//!      are authored, so the shell never waits for a round-trip;
-//!   3. transient ownership / unacked discard — while a local write on an
-//!      `(object, field)` is still unacked, an incoming REMOTE op for that same
-//!      `(object, field)` is ignored, so a peer/echo can't clobber the value the
-//!      user is still dragging;
-//!   4. coalescing POLICY — rapid ops (continuous move/transform) are batched into
-//!      one `ops` frame within a ~33ms window. This crate exposes the "flush due"
-//!      decision ([`SyncEngine::flush_armed`] / [`SyncEngine::on_flush_due`]); the
-//!      shell drives the actual timer;
-//!   5. reconnect reconcile — on a fresh `welcome` snapshot the local base is
-//!      reset to the snapshot and the outbox is replayed on top.
+//! Op-apply is THE scene-core [`apply_object_op`] the server runs, applied to a
+//! clone so a rejected op leaves the scene untouched.
 //!
-//! The op-apply is THE scene-core object op-apply
-//! ([`apply_object_op`]) — Rust-to-Rust, the same logic the server runs — applied
-//! to a clone so a rejected op leaves the scene untouched.
+//! [`flush_armed`]: SyncEngine::flush_armed
+//! [`on_flush_due`]: SyncEngine::on_flush_due
 
 use std::collections::HashMap;
 
@@ -36,16 +30,15 @@ use crate::outbox::{op_id_key, OutboxEntry, OutboxError, OutboxStore};
 /// Default coalescing window (ms): rapid ops within this many ms ride one frame.
 pub const COALESCE_MS: i64 = 33;
 
-/// The narrow transport sink the engine drives. The shell implements it; the
-/// engine never touches the socket directly. It receives a batch of [`WireOp`]
-/// envelopes to send on the reliable channel.
+/// The transport sink the engine drives. The shell implements it; the engine
+/// never touches the socket directly.
 pub trait EngineTransport {
     /// Send a batch of `WireOp` envelopes on the reliable channel.
     fn send_envelopes(&mut self, entries: &[OutboxEntry]);
 }
 
 /// Result of [`SyncEngine::author`]: errors (empty on success), the minted
-/// `op_id`, and the captured inverse op (the undo entry, D21).
+/// `op_id`, and the captured inverse op (the undo entry).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuthorResult {
     pub errors: Vec<String>,
@@ -53,18 +46,11 @@ pub struct AuthorResult {
     pub inverse: Option<ObjectOp>,
 }
 
-/// Granularity of transient ownership: per `(objectId, field)`.
-///
-/// Ownership protects an in-flight CONTINUOUS field edit (transform/geometry/
-/// text/style) so a peer or self-echo can't clobber the value the user is still
-/// authoring before our op is acked. A `set-transform` owns `(id, "transform")`;
-/// a `set-text` owns `(id, "text")`; `edit-geometry` owns `(id, "geometry")`;
-/// `set-style` owns `(id, "style")`.
-///
-/// Structural ops (insert/delete/reparent/reorder/tags/...) take NO ownership: a
-/// later remote field edit on the same object is a legitimate concurrent change,
-/// and create/delete conflicts are settled by the server's authoritative seq
-/// ordering. A batch contributes the union of its members' field keys.
+/// The `(objectId, field)` keys an op takes transient ownership of, protecting
+/// an in-flight continuous field edit (transform/geometry/text/style) until ack.
+/// Structural ops (insert/delete/reparent/reorder/tags/...) take NO ownership —
+/// those conflicts are settled by the server's authoritative seq ordering. A
+/// batch contributes the union of its members' keys.
 fn owned_keys(op: &ObjectOp) -> Vec<String> {
     match op {
         ObjectOp::SetTransform { id, .. } => vec![format!("{id}:transform")],
@@ -84,9 +70,8 @@ fn remote_touches_owned_key(op: &ObjectOp, owned: &HashMap<String, i64>) -> bool
     owned_keys(op).iter().any(|key| owned.contains_key(key))
 }
 
-/// Build the `WireOp` envelope for an `ObjectOp`. The `prop_delta` carries the
-/// full op; `object_id`/`kind` are descriptive (mirroring the server's
-/// `op_to_wire`: the first target id, the op's serde tag).
+/// Build the `WireOp` envelope for an `ObjectOp`. `prop_delta` carries the full
+/// op; `object_id`/`kind` are descriptive (first target id, the op's serde tag).
 fn wire_op(op: &ObjectOp, client_id: &str, local_seq: i64, base_revision: i64, ts: &str) -> WireOp {
     WireOp {
         op_id: OpId {
@@ -102,7 +87,7 @@ fn wire_op(op: &ObjectOp, client_id: &str, local_seq: i64, base_revision: i64, t
     }
 }
 
-/// The kebab-case `kind` tag of an op, read off its serde tag.
+/// The op's kebab-case `kind` tag, read off its serde tag.
 fn op_kind(op: &ObjectOp) -> String {
     match serde_json::to_value(op) {
         Ok(serde_json::Value::Object(map)) => map
@@ -125,14 +110,13 @@ pub struct SyncEngine<T: EngineTransport, S: OutboxStore> {
     /// Revision the next authored op is based on (server revision + local lead).
     base_revision: i64,
 
-    /// Buffer of envelopes waiting on the coalescing flush.
+    /// Envelopes waiting on the coalescing flush.
     pending: Vec<OutboxEntry>,
-    /// Whether the shell's coalescing timer is currently armed.
     timer_armed: bool,
 
-    /// `(object,field)` keys with an unacked local write, -> count of owning ops.
+    /// `(object,field)` keys with an unacked local write -> count of owning ops.
     ownership: HashMap<String, i64>,
-    /// `op_id` key -> the keys that op owns, so we release them on ack/reject.
+    /// `op_id` key -> the keys that op owns, released on ack/reject.
     op_owned_keys: HashMap<String, Vec<String>>,
 }
 
@@ -188,12 +172,10 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         self.timer_armed
     }
 
-    /// Borrow the transport sink (e.g. so the shell can inspect what was sent).
     pub fn transport(&self) -> &T {
         &self.transport
     }
 
-    /// Mutable transport sink (e.g. to reset a test capture between phases).
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
@@ -203,8 +185,7 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         self.outbox.all().map(|e| e.len()).unwrap_or(0)
     }
 
-    /// The persisted outbox entry for `op_id`, or `None`. Used by the wasm session
-    /// to return the just-appended durable `WireOp` to the shell for persistence.
+    /// The persisted outbox entry for `op_id`, or `None`.
     pub fn outbox_entry(&self, op_id: &OpId) -> Option<OutboxEntry> {
         let key = op_id_key(op_id);
         self.outbox
@@ -214,25 +195,22 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
             .find(|e| op_id_key(&e.op_id) == key)
     }
 
-    /// Reseed the bookkeeping outbox from durable rows (a fresh-session reconnect
-    /// where the shell read its persisted `WireOp`s back). A no-op store error is
-    /// swallowed (the in-memory bookkeeping store never fails). The caller then
-    /// runs [`reconcile_snapshot`](Self::reconcile_snapshot) to replay them.
+    /// Reseed the bookkeeping outbox from durable rows the shell read back, then
+    /// run [`reconcile_snapshot`](Self::reconcile_snapshot) to replay them.
     pub fn reseed_outbox(&mut self, entries: Vec<OutboxEntry>) {
         let _ = self.outbox.reseed(entries);
     }
 
-    /// Consume the engine and return its outbox store, so a fresh engine can be
-    /// built on the SAME durable outbox to model a reconnect (the durable case).
+    /// Consume the engine, returning its outbox store so a fresh engine can be
+    /// built on the SAME durable outbox to model a reconnect.
     pub fn into_outbox(self) -> S {
         self.outbox
     }
 
-    /// Author a local op: apply optimistically (to a clone, so a rejected op never
-    /// touches the scene), take transient ownership of its keys, persist its
-    /// `WireOp` envelope to the outbox, then buffer it for a coalesced send.
-    /// Rejected-by-core ops never enter the outbox or the wire. `ts` is the
-    /// envelope timestamp the shell stamps (injected clock).
+    /// Author a local op: apply optimistically (to a clone, so a rejected op
+    /// leaves the scene untouched), take ownership of its keys, persist its
+    /// `WireOp`, then buffer it for a coalesced send. Rejected-by-core ops never
+    /// enter the outbox or wire. `ts` is the shell-stamped envelope timestamp.
     pub fn author(&mut self, op: ObjectOp, ts: &str) -> Result<AuthorResult, OutboxError> {
         let mut next = self.scene.clone();
         let inverse = match apply_object_op(&mut next, op.clone()) {
@@ -261,9 +239,8 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         })
     }
 
-    /// Apply a REMOTE op (peer or self-echo) to the optimistic scene, honoring
-    /// transient ownership: a remote write to an `(object,field)` key we still own
-    /// is dropped until our local op is acked. Returns true if applied.
+    /// Apply a REMOTE op honoring transient ownership: a remote write to a key we
+    /// still own is dropped until our local op is acked. Returns true if applied.
     pub fn apply_remote(&mut self, op: ObjectOp) -> bool {
         if remote_touches_owned_key(&op, &self.ownership) {
             return false;
@@ -276,8 +253,8 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         true
     }
 
-    /// Reconcile an ack: drop the acked entries from the outbox, release their
-    /// ownership, and advance the base revision. A duplicate ack is harmless.
+    /// Reconcile an ack: drop the acked entries, release their ownership, and
+    /// advance the base revision. A duplicate ack is harmless.
     pub fn on_ack(&mut self, op_ids: &[OpId], revision: Option<i64>) -> Result<(), OutboxError> {
         self.outbox.remove(op_ids)?;
         for id in op_ids {
@@ -289,9 +266,9 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         Ok(())
     }
 
-    /// Reconcile a rejected op: drop it from the outbox and release its ownership
-    /// so subsequent remote writes for those keys apply. The optimistic write
-    /// stays in the local scene until the next snapshot/patch corrects it.
+    /// Reconcile a rejected op: drop it and release its ownership so later remote
+    /// writes for those keys apply. The optimistic write stays in the local scene
+    /// until the next snapshot/patch corrects it.
     pub fn on_rejected(&mut self, op_ids: &[OpId]) -> Result<(), OutboxError> {
         self.outbox.remove(op_ids)?;
         for id in op_ids {
@@ -300,11 +277,10 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         Ok(())
     }
 
-    /// Reconnect reconcile: reset the local base to a fresh `welcome` snapshot,
-    /// then REPLAY every outbox entry (re-send unacked ops). Ownership is rebuilt
-    /// from the replayed entries so transient ownership survives a reconnect. The
-    /// snapshot is authoritative for everything NOT under a surviving unacked
-    /// write.
+    /// Reconnect reconcile: reset the base to a fresh `welcome` snapshot, then
+    /// REPLAY every outbox entry (re-sending unacked ops) and rebuild ownership
+    /// from them. The snapshot is authoritative for everything NOT under a
+    /// surviving unacked write.
     pub fn reconcile_snapshot(&mut self, snapshot: ObjectScene) -> Result<(), OutboxError> {
         self.base_revision = snapshot.scene_version;
         self.scene = snapshot;
@@ -327,8 +303,8 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         Ok(())
     }
 
-    /// Flush any buffered coalesced frame immediately (e.g. on gesture end /
-    /// shutdown). Disarms the timer and sends whatever is pending.
+    /// Flush any buffered coalesced frame immediately (gesture end / shutdown).
+    /// Disarms the timer and sends whatever is pending.
     pub fn flush(&mut self) {
         self.timer_armed = false;
         if self.pending.is_empty() {
@@ -338,8 +314,8 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         self.transport.send_envelopes(&batch);
     }
 
-    /// The shell calls this when its coalescing timer fires: drain the pending
-    /// buffer into one `ops` frame. Disarms the timer.
+    /// The shell's coalescing timer fired: drain the pending buffer into one
+    /// frame. Disarms the timer.
     pub fn on_flush_due(&mut self) {
         self.timer_armed = false;
         if self.pending.is_empty() {
@@ -351,7 +327,7 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
 
     // --- internals -----------------------------------------------------------
 
-    /// Buffer an envelope and arm the coalescing timer if not already armed.
+    /// Buffer an envelope and arm the coalescing timer.
     fn enqueue(&mut self, entry: OutboxEntry) {
         self.pending.push(entry);
         self.timer_armed = true;

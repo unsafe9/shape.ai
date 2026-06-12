@@ -1,16 +1,9 @@
-//! Behavioral tests for both [`Coordinator`] impls.
-//!
-//! Lease/owner/presence semantics are driven by an injectable fake clock so we
-//! exercise TTL expiry without sleeping. Pub/sub is exercised with short real
-//! ttls / real time where a background poll is involved.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use shape_coordination::{Clock, Coordinator, FileCoordinator, InMemoryCoordinator};
 
-/// Test clock: starts at a fixed epoch and only advances when told to.
 struct FakeClock(AtomicU64);
 
 impl FakeClock {
@@ -31,8 +24,6 @@ impl Clock for FakeClock {
 fn ttl() -> Duration {
     Duration::from_secs(30)
 }
-
-// ---- InMemoryCoordinator -------------------------------------------------
 
 #[tokio::test]
 async fn inmem_acquire_grants() {
@@ -56,7 +47,6 @@ async fn inmem_second_owner_denied_while_held() {
 async fn inmem_same_owner_reacquire_refreshes() {
     let c = InMemoryCoordinator::with_clock(FakeClock::new());
     c.acquire_lease("cv", "alice", ttl()).await.unwrap();
-    // Re-acquiring as the same owner is allowed (idempotent refresh).
     let again = c.acquire_lease("cv", "alice", ttl()).await;
     assert!(again.is_ok());
 }
@@ -66,7 +56,7 @@ async fn inmem_steal_after_expiry() {
     let clock = FakeClock::new();
     let c = InMemoryCoordinator::with_clock(clock.clone());
     c.acquire_lease("cv", "alice", ttl()).await.unwrap();
-    clock.advance(Duration::from_secs(31)); // past the 30s ttl
+    clock.advance(Duration::from_secs(31));
     assert_eq!(c.find_owner("cv").await.unwrap(), None);
     let lease = c.acquire_lease("cv", "bob", ttl()).await.unwrap();
     assert_eq!(lease.owner, "bob");
@@ -80,7 +70,7 @@ async fn inmem_renew_extends() {
     let lease = c.acquire_lease("cv", "alice", ttl()).await.unwrap();
     clock.advance(Duration::from_secs(20));
     c.renew(&lease, ttl()).await.unwrap();
-    clock.advance(Duration::from_secs(20)); // 40s total, but renewed at 20s
+    clock.advance(Duration::from_secs(20));
     assert_eq!(c.find_owner("cv").await.unwrap(), Some("alice".to_string()));
 }
 
@@ -91,7 +81,6 @@ async fn inmem_renew_fails_after_steal() {
     let alice = c.acquire_lease("cv", "alice", ttl()).await.unwrap();
     clock.advance(Duration::from_secs(31));
     c.acquire_lease("cv", "bob", ttl()).await.unwrap();
-    // Alice's stale lease must not renew over bob's.
     assert!(c.renew(&alice, ttl()).await.is_err());
     assert_eq!(c.find_owner("cv").await.unwrap(), Some("bob".to_string()));
 }
@@ -102,7 +91,6 @@ async fn inmem_release_frees() {
     let lease = c.acquire_lease("cv", "alice", ttl()).await.unwrap();
     c.release(lease).await.unwrap();
     assert_eq!(c.find_owner("cv").await.unwrap(), None);
-    // Free again: bob can take it.
     c.acquire_lease("cv", "bob", ttl()).await.unwrap();
     assert_eq!(c.find_owner("cv").await.unwrap(), Some("bob".to_string()));
 }
@@ -114,7 +102,6 @@ async fn inmem_stale_release_is_noop() {
     let alice = c.acquire_lease("cv", "alice", ttl()).await.unwrap();
     clock.advance(Duration::from_secs(31));
     let bob = c.acquire_lease("cv", "bob", ttl()).await.unwrap();
-    // Alice releasing her stolen lease must not free bob's.
     c.release(alice).await.unwrap();
     assert_eq!(c.find_owner("cv").await.unwrap(), Some("bob".to_string()));
     drop(bob);
@@ -136,7 +123,6 @@ async fn inmem_pubsub_isolated_per_canvas() {
     let mut rx_b = c.subscribe("b");
     c.publish("a", b"to-a".to_vec()).await.unwrap();
     assert_eq!(rx_a.recv().await.unwrap(), b"to-a");
-    // b got nothing; a follow-up publish to b proves the channels are distinct.
     c.publish("b", b"to-b".to_vec()).await.unwrap();
     assert_eq!(rx_b.recv().await.unwrap(), b"to-b");
 }
@@ -162,13 +148,10 @@ async fn inmem_presence_put_get_with_expiry() {
         ]
     );
 
-    // Bob's 5s entry expires; alice's 30s entry remains.
     clock.advance(Duration::from_secs(6));
     let got = c.presence_get("cv").await.unwrap();
     assert_eq!(got, vec![("alice".to_string(), b"cursor:1".to_vec())]);
 }
-
-// ---- FileCoordinator -----------------------------------------------------
 
 fn file_coord(clock: Arc<FakeClock>) -> (FileCoordinator, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -213,7 +196,6 @@ async fn file_renew_extends_and_blocks_stale() {
     clock.advance(Duration::from_secs(20));
     assert_eq!(c.find_owner("cv").await.unwrap(), Some("alice".to_string()));
 
-    // After a steal, the old lease cannot renew.
     clock.advance(Duration::from_secs(31));
     c.acquire_lease("cv", "bob", ttl()).await.unwrap();
     assert!(c.renew(&alice, ttl()).await.is_err());
@@ -231,13 +213,11 @@ async fn file_release_frees() {
 
 #[tokio::test]
 async fn file_lease_visible_across_two_handles() {
-    // Two FileCoordinator handles over the same dir model two processes.
     let clock = FakeClock::new();
     let dir = tempfile::tempdir().unwrap();
     let c1 = FileCoordinator::open_with_clock(dir.path(), clock.clone()).unwrap();
     let c2 = FileCoordinator::open_with_clock(dir.path(), clock.clone()).unwrap();
     c1.acquire_lease("cv", "alice", ttl()).await.unwrap();
-    // The second "process" sees alice's lease and is denied.
     assert!(c2.acquire_lease("cv", "bob", ttl()).await.is_err());
     assert_eq!(c2.find_owner("cv").await.unwrap(), Some("alice".to_string()));
 }
@@ -263,7 +243,6 @@ async fn file_presence_put_get_with_expiry() {
 
 #[tokio::test]
 async fn file_pubsub_delivers_in_process() {
-    // Best-effort pub/sub over the log + poll task. Use a real short wait.
     let (c, _d) = file_coord(FakeClock::new());
     let mut rx = c.subscribe("cv");
     c.publish("cv", b"hello".to_vec()).await.unwrap();
@@ -276,13 +255,9 @@ async fn file_pubsub_delivers_in_process() {
 
 #[tokio::test]
 async fn file_distinct_ids_sharing_a_stem_do_not_collide() {
-    // `canvas-1` and `canvas_1` both sanitize to the same readable prefix, and
-    // `a/b` / `a-b` likewise — they must still map to distinct on-disk files so
-    // they neither contend for the same lease nor cross-deliver pub/sub.
     for (id_a, id_b) in [("canvas-1", "canvas_1"), ("a/b", "a-b")] {
         let (c, _d) = file_coord(FakeClock::new());
 
-        // Lease isolation: a lease on id_a must not block one on id_b.
         c.acquire_lease(id_a, "alice", ttl()).await.unwrap();
         c.acquire_lease(id_b, "bob", ttl())
             .await
@@ -290,7 +265,6 @@ async fn file_distinct_ids_sharing_a_stem_do_not_collide() {
         assert_eq!(c.find_owner(id_a).await.unwrap(), Some("alice".to_string()));
         assert_eq!(c.find_owner(id_b).await.unwrap(), Some("bob".to_string()));
 
-        // Pub/sub isolation: a publish to id_a must not leak to id_b's subscriber.
         let mut rx_b = c.subscribe(id_b);
         c.publish(id_a, b"to-a".to_vec()).await.unwrap();
         assert!(
@@ -299,7 +273,6 @@ async fn file_distinct_ids_sharing_a_stem_do_not_collide() {
                 .is_err(),
             "{id_b} must not receive a frame published to {id_a}"
         );
-        // A publish to id_b proves its own channel is live and distinct.
         c.publish(id_b, b"to-b".to_vec()).await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
             .await

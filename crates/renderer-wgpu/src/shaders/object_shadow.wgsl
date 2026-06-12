@@ -1,19 +1,9 @@
-// OB-3 object drop-shadow shader (RB3 #11 + D2 + D7 projective transform).
-//
-// A drop shadow drawn BENEATH every object's fill. The shadow is the object's OWN
-// fill silhouette (the exact region triangulation) translated by the drop-shadow
-// offset on the CPU (see `object_pipeline.rs`) — a clean offset copy for any
-// geometry, with no faceting. The shadow COLOR is the theme `shadow` token (RB1)
-// carried inline per-instance, so a theme flip is a per-instance color refresh,
-// never a re-tessellation. A soft blur is the GPU-cutover residual.
-//
-// Pipeline contract (compiled by wgpu at the OB-4 cutover; structurally validated
-// only here — there is no device in the CPU test environment). Shares the camera
-// uniform + projective per-object matrix convention with `object_fill.wgsl`.
-//
-//   - `feather` is a per-vertex 0..1 term, uniformly 0 for the flat offset
-//     silhouette (the FS falloff is then 1 -> a flat translucent shadow). The slot
-//     stays so a real soft-blur pass can ramp it at the GPU cutover.
+// Object drop-shadow shader: the object's own fill silhouette, offset on the CPU,
+// drawn BENEATH the fill. The shadow color is the theme `shadow` token carried
+// inline per-instance, so a theme flip is a color refresh, not a re-tessellation.
+// Shares the camera + projective matrix convention with `object_fill.wgsl`.
+// `feather` is a per-vertex 0..1 term (uniformly 0 for the flat silhouette today,
+// so the FS falloff is 1); the slot stays for a future soft-blur pass.
 
 struct View {
   camera: vec4<f32>,
@@ -25,10 +15,9 @@ var<uniform> view: View;
 
 struct VertexIn {
   @location(0) position: vec2<f32>,
-  // Per-vertex blur falloff: 0 at the shadow core, 1 at the soft outer edge.
+  // Blur falloff: 0 at the core, 1 at the soft outer edge.
   @location(1) feather: f32,
-  // Instance-step: three columns of the per-object 3x3 projective matrix and the
-  // inline shadow color (the theme `shadow` token, translucent).
+  // Instance-step projective matrix columns + inline (translucent) shadow color.
   @location(2) m0: vec3<f32>,
   @location(3) m1: vec3<f32>,
   @location(4) m2: vec3<f32>,
@@ -68,9 +57,8 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-  // Soft blur falloff: full shadow alpha at the core (feather=0), fading to zero
-  // at the outer edge (feather=1). A squared falloff approximates the Gaussian
-  // tail of a real blur cheaply.
+  // Soft blur falloff: full alpha at the core (feather=0) to zero at the edge
+  // (feather=1). The squared falloff cheaply approximates a Gaussian tail.
   let t = clamp(input.feather, 0.0, 1.0);
   let falloff = (1.0 - t) * (1.0 - t);
   return vec4<f32>(input.shadow.rgb, input.shadow.a * falloff);

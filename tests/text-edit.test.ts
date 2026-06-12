@@ -1,9 +1,3 @@
-// W2-10 — inline text editing + the borderless text primitive: the pure shell
-// pieces. The text primitive must be a borderless, style-less rect (no stroke, no
-// fill, no default "Note" text), and `textOverlayScreenRect` must place the inline
-// contenteditable overlay over the object's screen bbox via worldToScreen.
-// Framework-neutral so they pin without a renderer or a Svelte mount.
-
 import { beforeAll, describe, expect, it } from "vitest";
 import { textOverlayScreenRect, type DragSpan } from "../platforms/web/controller/objectPrimitives";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../platforms/web/bridge/sceneCoreWasm";
@@ -17,7 +11,7 @@ beforeAll(async () => {
   core = await loadSceneCore();
 });
 
-describe("text primitive (W2-10 borderless, style-less)", () => {
+describe("text primitive (borderless, style-less)", () => {
   it("is a borderless rect: no stroke, no fill, no default text", () => {
     const object = core.buildPrimitive("text", { x: 0, y: 0 }, "text-1", "a0");
     expect(object.stroke).toBeUndefined();
@@ -34,9 +28,9 @@ describe("text primitive (W2-10 borderless, style-less)", () => {
   });
 });
 
-describe("textOverlayScreenRect (W2-10 overlay placement)", () => {
+describe("textOverlayScreenRect (overlay placement)", () => {
   it("maps the object world bbox to screen via the camera (translation + zoom)", () => {
-    // A 180x80 text rect anchored so its top-left lands at world (100, 200).
+    // 180x80 text rect anchored so its top-left lands at world (100, 200).
     const object = core.buildPrimitive("text", { x: 100 + 90, y: 200 + 40 }, "text-1", "a0");
     const rect = textOverlayScreenRect(object, { x: 50, y: 30, zoom: 2 });
     expect(rect).not.toBeNull();

@@ -1,16 +1,11 @@
-//! OB1.3 — derived outline/region (D6).
-//!
-//! geometry -> outline/region. Open contour => concave hull / alpha-shape;
-//! closed => interior. The single derived region feeds fill area, text layout
-//! bounds, hit-test point-in, selection vis, and anchor border (D6). Computed
-//! once per geometry edit and cached by (object id, geometry revision) at the
-//! consumer. Pure: no IO/time/rng. Coordinates are object-local quantized i32.
+//! Derived outline/region: geometry -> outline/region. Pure (no IO/time/rng);
+//! coordinates are object-local quantized i32. The consumer caches by
+//! (object id, geometry revision).
 
 use serde::{Deserialize, Serialize};
 
 use crate::object::model::{Geometry, LocalPoint};
 
-/// An axis-aligned bound in object-local quantized units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalBounds {
@@ -20,11 +15,8 @@ pub struct LocalBounds {
     pub max_y: i32,
 }
 
-/// The derived "shape" of an object (D6). `outline` is the boundary polygon
-/// (flattened contour for closed geometry; concave hull for open). `closed`
-/// records whether the source classified as filled-interior vs open-stroke —
-/// fill/stroke render order keys off this (D6 fill-below-stroke; open => no
-/// fill).
+/// `closed` records filled-interior vs open-stroke; fill/stroke render order
+/// keys off it (fill-below-stroke; open => no fill).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Region {
@@ -33,37 +25,30 @@ pub struct Region {
     pub closed: bool,
 }
 
-/// Errors a region derivation can reject cleanly (degenerate geometry per D2:
-/// empty path, single point). Never panics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegionError {
     Empty,
     Degenerate,
 }
 
-/// The contract every consumer (fill/text/hit-test/anchor) shares. A backend
-/// (the renderer's lyon-backed impl, OB3.R4) implements this; scene-core ships
-/// the reference stub below. `flatness` is the curve-flattening tolerance in
-/// quantized units, varied per zoom bucket by the LOD layer (OB3.R6).
+/// The contract every consumer (fill/text/hit-test/anchor) shares. `flatness`
+/// is the curve-flattening tolerance in quantized units, varied per zoom bucket.
 pub trait OutlineDeriver {
     fn derive_region(&self, geometry: &Geometry, flatness: i32) -> Result<Region, RegionError>;
 
-    /// Point-in-region test for hit-testing (D8). Default: even-odd ray cast on
-    /// the derived outline.
     fn contains(&self, region: &Region, p: LocalPoint) -> bool {
         point_in_polygon(&region.outline, p)
     }
 
     /// Re-project an anchor's local point onto a (possibly edited) target region
-    /// without drift (D5/OB3.S4). Default: nearest outline vertex.
+    /// without drift. Default: nearest outline vertex.
     fn reproject(&self, region: &Region, at: LocalPoint) -> LocalPoint {
         nearest_on_outline(&region.outline, at).unwrap_or(at)
     }
 }
 
-/// Reference stub deriver: flattens to subpath node positions (no curve
-/// subdivision, no alpha-shape) and computes the AABB. Correctness placeholder
-/// for the OB1.3 contract + OB2.1 rect slice; OB3.R4 replaces with lyon/hull.
+/// Reference stub: flattens to subpath node positions (no curve subdivision, no
+/// alpha-shape) and computes the AABB.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StubOutlineDeriver;
 
@@ -99,9 +84,8 @@ impl OutlineDeriver for StubOutlineDeriver {
     }
 }
 
-/// Even-odd ray-cast point-in-polygon on quantized integer coordinates. Uses
-/// i64 for the cross-multiply so an i32*i32 product never overflows (no lossy
-/// `as`; satisfies workspace `cast_possible_truncation = deny`).
+/// Even-odd ray-cast point-in-polygon on quantized integer coordinates. i64 for
+/// the cross-multiply so an i32*i32 product never overflows (no lossy `as`).
 pub fn point_in_polygon(poly: &[LocalPoint], p: LocalPoint) -> bool {
     if poly.len() < 3 {
         return false;
@@ -113,9 +97,8 @@ pub fn point_in_polygon(poly: &[LocalPoint], p: LocalPoint) -> bool {
         let (xi, yi) = (i64::from(poly[i].x), i64::from(poly[i].y));
         let (xj, yj) = (i64::from(poly[j].x), i64::from(poly[j].y));
         if (yi > py) != (yj > py) {
-            // Ray cast: px < intersection_x of edge (i,j) with the horizontal
-            // line y=py. Cross-multiplied to stay integer; the `dy = yj - yi`
-            // sign flips the comparison (dividing by a negative).
+            // Cross-multiplied to stay integer; the `dy = yj - yi` sign flips
+            // the comparison (dividing by a negative).
             let dy = yj - yi;
             let lhs = (px - xi) * dy;
             let rhs = (xj - xi) * (py - yi);
@@ -129,7 +112,6 @@ pub fn point_in_polygon(poly: &[LocalPoint], p: LocalPoint) -> bool {
     inside
 }
 
-/// Nearest outline vertex to `at` (stub for reproject; OB3.R4 does edge-nearest).
 fn nearest_on_outline(poly: &[LocalPoint], at: LocalPoint) -> Option<LocalPoint> {
     poly.iter().copied().min_by_key(|q| {
         let dx = i64::from(q.x - at.x);

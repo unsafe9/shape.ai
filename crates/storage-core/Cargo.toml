@@ -9,7 +9,7 @@ crate-type = ["rlib"]
 
 [features]
 default = ["redb"]
-# Native embedded redb-on-file adapter (OB3) + zstd payload compression at rest.
+# Native embedded redb-on-file adapter + zstd payload compression at rest.
 # Both deps are native-only (std::fs); see the cfg-gated dependency table below.
 # `dep:redb` here references the NATIVE redb entry only; the wasm OPFS redb is a
 # separately-keyed dep (`redb_wasm`) so this default-on feature never pulls redb

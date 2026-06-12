@@ -1,30 +1,13 @@
-//! WebSocket wire protocol serde types (MG0.2d — 전송/sync seam).
-//!
-//! These are the on-the-wire messages exchanged over the transport's two logical
-//! channels. The shapes mirror the task-breakdown sync handshake:
-//!   `hello{canvasId,region,lastAckSeq}` → `welcome{snapshot(region)|deltaSince}`
-//!   → live; upstream `ops[{opId,objectId,kind,propDelta,baseRevision,actor,ts}]`
-//!   → `ack{opIds,seq,revision}`; downstream `patch{ops,seq}`; presence is
-//!   ephemeral; region change re-subscribes; reconnect = snapshot+reapply.
-//!
-//! Like the rest of scene-core this layer is platform-pure: clocks, ids, and
-//! sequence numbers are carried as plain fields, never sourced ambiently here.
-//!
-//! FUTURE: WebTransport / gRPC stream transports can map onto these same logical
-//! channels (O14).
+//! WebSocket wire protocol serde types. Platform-pure: clocks, ids, and sequence
+//! numbers are carried as plain fields, never sourced ambiently here.
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::Bounds;
 use crate::object::ObjectScene;
 
-// ---------------------------------------------------------------------------
-// Subscription region.
-// ---------------------------------------------------------------------------
-
 /// A windowed subscription into a canvas. `bbox == None` subscribes to the whole
-/// canvas; a `Some(bbox)` constrains the working set to that world-space rect
-/// (data-layer windowing for memory-bounded large canvases, PC10).
+/// canvas; a `Some(bbox)` constrains the working set to that world-space rect.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Region {
@@ -32,10 +15,6 @@ pub struct Region {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bbox: Option<Bounds>,
 }
-
-// ---------------------------------------------------------------------------
-// Per-op idempotency key + the granular op envelope (MG4.2).
-// ---------------------------------------------------------------------------
 
 /// `(clientId, localSeq)` idempotency key assigned at the transport boundary.
 /// The server dedups by this pair so a replayed outbox entry is a no-op.
@@ -45,15 +24,13 @@ pub struct Region {
 #[serde(rename_all = "camelCase")]
 pub struct OpId {
     pub client_id: String,
-    // i64 on the wire is a JSON number (JS `number`), not ts-rs's default `bigint`.
+    // i64 on the wire is a JSON number, not ts-rs's default `bigint`.
     #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub local_seq: i64,
 }
 
-/// A single granular operation as it travels over the wire: a per-property delta
-/// against a base revision, attributed to a user, with a client clock stamp.
-/// `prop_delta` stays an opaque JSON value so the wire schema does not couple to
-/// the full op union (the canvas actor decodes it server-side).
+/// A single granular operation on the wire. `prop_delta` stays an opaque JSON
+/// value so the wire schema does not couple to the full op union.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
@@ -62,25 +39,17 @@ pub struct WireOp {
     pub op_id: OpId,
     pub object_id: String,
     pub kind: String,
-    // On the wire `prop_delta` is an opaque JSON `Value`, but every delta the
-    // client authors/reads IS an `ObjectOp`; type it as such (matches the retired
-    // hand mirror) rather than ts-rs's raw `JsonValue`. `ObjectOp` is a sibling in
-    // the same generated file, so no import is needed.
+    // Typed as `ObjectOp` (a sibling in the generated file) rather than raw
+    // `JsonValue`, since every delta the client authors/reads IS an `ObjectOp`.
     #[cfg_attr(feature = "ts-gen", ts(type = "ObjectOp"))]
     pub prop_delta: serde_json::Value,
-    // i64 on the wire is a JSON number (JS `number`), not ts-rs's default `bigint`.
     #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub base_revision: i64,
-    /// userId of the authoring actor.
     pub actor: String,
     pub ts: String,
 }
 
-// ---------------------------------------------------------------------------
-// Client → Server messages.
-// ---------------------------------------------------------------------------
-
-/// Upstream messages. Internally tagged on `type`; the single-word variant names
+/// Upstream messages. Internally tagged on `type`; single-word variant names
 /// stay lowercase under camelCase rename (`hello`, `subscribe`, …).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -107,16 +76,12 @@ pub enum ClientMessage {
     },
 }
 
-// ---------------------------------------------------------------------------
-// Server → Client messages.
-// ---------------------------------------------------------------------------
-
 /// Downstream messages. Internally tagged on `type`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ServerMessage {
-    /// Handshake reply: either a region `snapshot` (fresh subscribe) or a
-    /// `delta_since` cursor (resume), plus the current server seq/revision.
+    /// Either a region `snapshot` (fresh subscribe) or a `delta_since` cursor
+    /// (resume), plus the current server seq/revision.
     #[serde(rename_all = "camelCase")]
     Welcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,12 +105,8 @@ pub enum ServerMessage {
     Error { message: String },
 }
 
-// ---------------------------------------------------------------------------
-// Logical transport channels.
-// ---------------------------------------------------------------------------
-
-/// The two logical channels multiplexed over a single transport (PC8). Ops/acks
-/// ride the reliable ordered channel; presence rides the lossy ephemeral one.
+/// The two logical channels multiplexed over a single transport. Ops/acks ride
+/// the reliable ordered channel; presence rides the lossy ephemeral one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Channel {
     #[serde(rename = "reliable_ordered")]
@@ -162,10 +123,6 @@ impl Channel {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

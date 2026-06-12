@@ -1,15 +1,6 @@
-// Anchor-semantics v3 §3 (DU4) — Alt-drag detach.
-//
-// An Alt-held BODY drag of an anchored open-class object must move it WHOLE and
-// detach its anchors: one set-anchor clearing the anchors vector plus a plain
-// SetTransform translate (the 0-rebake path) — NOT the pinned chord deform the
-// same drag produces without Alt. Three layers are pinned:
-//   1. the engine forwards the C2 `detach-alt` gesture bit on the transform
-//      commit (real engine, fake renderer);
-//   2. `altDetachOps` (the App.svelte commit composition) yields set-anchor [] +
-//      set-transform translate through the REAL core, and the un-detached
-//      moveOps on the SAME scene does NOT (the branch is load-bearing);
-//   3. the App.svelte source wires the branch through the core's isOpenClassD.
+// An Alt-held body drag of an anchored open-class object moves it WHOLE and detaches
+// its anchors (set-anchor [] + plain SetTransform translate), NOT the pinned chord
+// deform the same drag produces without Alt.
 
 import { beforeAll, describe, expect, it } from "vitest";
 
@@ -38,10 +29,6 @@ beforeAll(async () => {
   await ensureSceneCore();
   core = await loadSceneCore();
 });
-
-// ---------------------------------------------------------------------------
-// 1. Engine: the transform commit carries the detach-alt gesture bit.
-// ---------------------------------------------------------------------------
 
 const TRANSLATE_40_30: Transform3x3 = [
   [1, 0, 40],
@@ -127,25 +114,20 @@ describe("engine detach-alt gesture bit on the transform commit", () => {
     expect(driveBodyDrag(false)!.detach).toBe(false);
   });
 
-  it("routes through the frozen C2 detach-alt binding (single source)", () => {
+  it("routes through the frozen detach-alt binding (single source)", () => {
     expect(GESTURE_BINDINGS[GESTURE_DETACH_ALT]).toEqual({ modifier: "Alt" });
     expect(isDetachDrag({ altKey: true })).toBe(true);
     expect(isDetachDrag({ altKey: false })).toBe(false);
-    // The runtime catalog carries the registered gesture.
     expect(core.objectGestureCatalog().some((g) => g.id === GESTURE_DETACH_ALT)).toBe(true);
   });
 });
-
-// ---------------------------------------------------------------------------
-// 2. altDetachOps: the commit composition through the REAL core.
-// ---------------------------------------------------------------------------
 
 function obj(partial: Partial<SceneObject> & { id: string; geometry: SceneObject["geometry"] }): SceneObject {
   return { order: "a0", ...partial } as SceneObject;
 }
 
-// line-1's node 0 is anchored onto rect-1 — the body-drag policy without Alt pins
-// that end (chord deform); with Alt the whole line translates and detaches.
+// line-1 node 0 anchored onto rect-1: without Alt the body drag pins that end
+// (chord deform); with Alt the whole line translates and detaches.
 function anchoredScene(): ObjectScene {
   return {
     ...emptyObjectScene(),
@@ -173,7 +155,7 @@ describe("altDetachOps composition (the App onTransformCommit detach branch)", (
     const transform = ops.find((o) => o.kind === "set-transform" && o.id === LINE_ID);
     expect(transform).toBeDefined();
     if (transform?.kind !== "set-transform") throw new Error("expected set-transform");
-    // The translate composed onto the line's base translate(150,150).
+    // Composed onto the line's base translate(150,150).
     expect(transform.transform[0][2]).toBe(190);
     expect(transform.transform[1][2]).toBe(180);
     // No pinned-endpoint geometry rewrite rides the detach commit.
@@ -182,23 +164,16 @@ describe("altDetachOps composition (the App onTransformCommit detach branch)", (
 
   it("is load-bearing: the SAME drag without detach pins the anchored end instead", () => {
     const ops = core.moveOps(anchoredScene(), { kind: "single", id: LINE_ID }, TRANSLATE_40_30);
-    // The anchored body drag must NOT author a whole SetTransform translate for
-    // the line (the anchored end is pinned; the free end chord-deforms).
+    // Anchored end pinned, free end chord-deforms -> no whole SetTransform translate.
     expect(ops.some((o) => o.kind === "set-transform" && o.id === LINE_ID)).toBe(false);
   });
 });
-
-// ---------------------------------------------------------------------------
-// 3. commitBodyDrag: the App onTransformCommit branch, exercised through the
-//    extracted controller function (no .svelte source pin).
-// ---------------------------------------------------------------------------
 
 describe("commitBodyDrag detach branch (the App onTransformCommit decision)", () => {
   const SINGLE: ObjectSelection = { kind: "object", id: LINE_ID };
 
   it("an Alt-held translate of the anchored open-class line detaches: set-anchor [] + whole translate", () => {
     const { op, allOps } = commitBodyDrag(core, anchoredScene(), SINGLE, LINE_ID, TRANSLATE_40_30, "translate", true);
-    // Detach branch -> altDetachOps shape: set-anchor [] first, plus a whole translate.
     expect(allOps[0]).toEqual({ kind: "set-anchor", id: LINE_ID, anchors: [] });
     const transform = allOps.find((o) => o.kind === "set-transform" && o.id === LINE_ID);
     expect(transform?.kind === "set-transform" && transform.transform[0][2]).toBe(190);
@@ -216,15 +191,11 @@ describe("commitBodyDrag detach branch (the App onTransformCommit decision)", ()
     const line = scene.objects.find((o) => o.id === LINE_ID)!;
     const rect = scene.objects.find((o) => o.id === TARGET_ID)!;
     const single = { kind: "single", id: LINE_ID } as const;
-    // The full eligibility predicate fires only for the anchored open-class line.
     expect(isDetachableBodyDrag(core, line, single, "translate", true)).toBe(true);
-    // A non-translate gesture (e.g. rotate) never detaches.
     expect(isDetachableBodyDrag(core, line, single, "rotate", true)).toBe(false);
-    // Without the detach bit it never detaches.
     expect(isDetachableBodyDrag(core, line, single, "translate", false)).toBe(false);
-    // A closed-class object (the rect) is not detachable even with anchors held.
+    // Closed-class object (the rect) is not detachable even with anchors held.
     expect(isDetachableBodyDrag(core, { ...rect, anchors: [{ nodeIndex: 0, target: LINE_ID, at: { x: 0, y: 0 } }] }, single, "translate", true)).toBe(false);
-    // A multi root never detaches.
     expect(isDetachableBodyDrag(core, line, { kind: "multi", ids: [LINE_ID, TARGET_ID] }, "translate", true)).toBe(false);
   });
 });

@@ -1,13 +1,8 @@
-// G11 — multi-select-delete undo over a windowed/divergent scene, driven through
-// the REAL scene-core wasm core (`apply_object_op`). No TS op-apply here: this is
-// the data-loss regression for the bug where undoing a multi-delete restored ~one
-// object then threw "object not found" because a Delete-inverse set-anchor peer
-// restore hard-failed when the peer had diverged out of the local scene.
-//
-// Mirrors the App.svelte multi-select delete: `{ kind: "batch", ops: ids.map(id
-// => ({ kind: "delete", id })) }`. The captured inverse re-inserts the deleted
-// objects AND restores peer anchors via set-anchor; when a peer is ABSENT at undo
-// time the set-anchor restore must no-op (best-effort) so the re-insert commits.
+// Data-loss regression: undoing a multi-delete used to restore one object then throw
+// "object not found" when a Delete-inverse set-anchor peer restore hard-failed
+// against a diverged-out peer. The captured inverse re-inserts deleted objects AND
+// restores peer anchors; when a peer is absent the set-anchor restore must no-op so
+// the re-insert still commits.
 
 import { beforeAll, describe, expect, it } from "vitest";
 
@@ -45,9 +40,9 @@ function anchorTo(target: string): Anchor {
   return { nodeIndex: 0, target, at: { x: 0, y: 0 } };
 }
 
-describe("multi-select-delete undo over a divergent scene (G11)", () => {
+describe("multi-select-delete undo over a divergent scene", () => {
   it("restores the remaining object when a peer is absent at undo time", () => {
-    // Two mutually-anchored objects: A anchors B, B anchors A.
+    // A anchors B, B anchors A.
     let scene = emptyObjectScene();
     scene = core.applyObjectOp(scene, { kind: "insert-object", object: rect("A", "a0") }).scene;
     scene = core.applyObjectOp(scene, { kind: "insert-object", object: rect("B", "a1") }).scene;
@@ -62,24 +57,20 @@ describe("multi-select-delete undo over a divergent scene (G11)", () => {
     const undoOp = deleted.inverse!;
     expect(undoOp).not.toBeNull();
 
-    // Divergence: rebuild the post-delete scene but with B re-inserted only — i.e.
-    // when undo runs, only ONE of the two objects is present to receive its peer
-    // set-anchor restore. We drop A entirely so its set-anchor restore (owner A,
-    // and B's set-anchor restore targeting A) exercises both no-op-owner and
-    // filter-target paths. Apply the undo against a scene that has neither A nor B.
+    // Apply the undo against a scene that has neither A nor B, so the set-anchor
+    // peer restores hit both the no-op-owner and filter-target paths.
     const undone = core.applyObjectOp(emptyObjectScene(), undoOp);
 
-    // The fix: NO error, and the deleted objects are restored — the set-anchor
-    // peer restores degrade gracefully instead of aborting the whole batch.
+    // No error, objects restored: peer restores degrade gracefully instead of
+    // aborting the batch.
     expect(undone.errors).toEqual([]);
     const ids = undone.scene.objects.map((o) => o.id).sort();
     expect(ids).toEqual(["A", "B"]);
   });
 
   it("restores objects even when one peer stays diverged out of the scene", () => {
-    // Closer to the live bug: A anchors B, then delete only A. The inverse is a
-    // Batch[insert A, set-anchor B [target A]]. Apply it against a scene where B
-    // has diverged away (windowed load / applyRemote echo): A must still come back.
+    // A anchors B, delete only A. The inverse is Batch[insert A, set-anchor B [A]];
+    // applied against a scene where B diverged away, A must still come back.
     let scene = emptyObjectScene();
     scene = core.applyObjectOp(scene, { kind: "insert-object", object: rect("A", "a0") }).scene;
     scene = core.applyObjectOp(scene, { kind: "insert-object", object: rect("B", "a1") }).scene;
@@ -89,7 +80,6 @@ describe("multi-select-delete undo over a divergent scene (G11)", () => {
     expect(deleted.errors).toEqual([]);
     const undoOp = deleted.inverse!;
 
-    // Build a divergent scene: only B's deletion happened elsewhere — B is gone.
     let diverged = deleted.scene; // A removed; B still here
     diverged = core.applyObjectOp(diverged, { kind: "delete", id: "B" }).scene; // now B gone too
 

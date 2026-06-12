@@ -1,11 +1,8 @@
-//! OB-4 object GPU render pipeline (wgpu half).
-//!
-//! Builds the `wgpu` render pipelines (`ObjectPipeline`) and owns the buffer
-//! uploader + render-pass recorder (`ObjectRenderer`) for the OB-3 object model,
-//! consuming the device-independent CPU geometry built in
-//! [`shape_renderer_core::object_pipeline`]. The CPU vertex/instance layout
-//! structs and `build_scene_geometry*` live there and are re-exported below so the
-//! sibling `webgpu` modules resolve them through `crate::object_pipeline::*`.
+//! Object GPU render pipeline (wgpu half): builds `ObjectPipeline` and owns the
+//! buffer uploader + render-pass recorder `ObjectRenderer`, consuming the
+//! device-independent CPU geometry from [`shape_renderer_core::object_pipeline`].
+//! That crate's CPU vertex/instance structs are re-exported below so the sibling
+//! `webgpu` modules resolve them through `crate::object_pipeline::*`.
 
 #[cfg(feature = "wgpu-probe")]
 use shape_renderer_core::model::CameraState;
@@ -22,17 +19,11 @@ use shape_renderer_core::text_layout::MsdfAtlasPlan;
 #[cfg(feature = "wgpu-probe")]
 use crate::shaders::{MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_SHADOW_WGSL, OBJECT_STROKE_WGSL};
 
-// CPU geometry build + layout structs are re-exported from renderer-core so the
-// `webgpu` submodules keep resolving them via `crate::object_pipeline::*`.
 pub use shape_renderer_core::object_pipeline::*;
 
-// ---------------------------------------------------------------------------
-// Pipelines
-// ---------------------------------------------------------------------------
-
 /// Fill + stroke render pipelines for the object path, plus the shared camera
-/// bind group layout. Built once from a device; the actual draw buffers are
-/// owned by [`ObjectRenderer`].
+/// bind group layout. Built once from a device; draw buffers live in
+/// [`ObjectRenderer`].
 #[cfg(feature = "wgpu-probe")]
 pub struct ObjectPipeline {
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
@@ -46,10 +37,7 @@ pub struct ObjectPipeline {
 
 #[cfg(feature = "wgpu-probe")]
 impl ObjectPipeline {
-    /// Build the object fill and stroke pipelines for the given surface
-    /// `format`. The `queue` is unused at construction (kept in the signature to
-    /// mirror the legacy `ShapeWebGpuRenderer::create` convention and to leave
-    /// room for atlas uploads when MSDF text lands).
+    /// Build the object fill and stroke pipelines for the given surface `format`.
     pub fn new(
         device: &wgpu::Device,
         _queue: &wgpu::Queue,
@@ -88,8 +76,7 @@ impl ObjectPipeline {
                 }],
             });
 
-        // The stroke pipeline also needs binding(1): the dash params uniform,
-        // visible to the fragment stage.
+        // Stroke also needs binding(1): the dash params uniform (FRAGMENT).
         let stroke_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("shape.ai object stroke bind group layout"),
@@ -117,10 +104,8 @@ impl ObjectPipeline {
                 ],
             });
 
-        // The text pipeline's group(0): b0 view uniform (VERTEX, the shared camera),
-        // b1 MSDF atlas texture (FRAGMENT), b2 sampler (FRAGMENT), b3 text params
-        // uniform (FRAGMENT, atlas distance_range + dimensions). Matches
-        // `msdf_text.wgsl`'s group(0) bindings exactly.
+        // Text group(0), matching `msdf_text.wgsl`: b0 view uniform (VERTEX), b1
+        // MSDF atlas texture, b2 sampler, b3 text params uniform (b1-b3 FRAGMENT).
         let text_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("shape.ai object text bind group layout"),
@@ -172,13 +157,11 @@ impl ObjectPipeline {
 
         // ---- Fill pipeline ------------------------------------------------
         let fill_vertex_attrs = [
-            // @location(0) position: vec2<f32>
             wgpu::VertexAttribute {
                 offset: 0,
                 shader_location: 0,
                 format: wgpu::VertexFormat::Float32x2,
             },
-            // @location(1) edge: f32
             wgpu::VertexAttribute {
                 offset: std::mem::size_of::<[f32; 2]>() as u64,
                 shader_location: 1,
@@ -227,16 +210,13 @@ impl ObjectPipeline {
 
         // ---- Shadow pipeline ----------------------------------------------
         // slot0: ShadowVertex (position @0, feather @1); slot1: instance-step
-        // matrix columns m0/m1/m2 @2..4 + shadow color @5. Matches
-        // `object_shadow.wgsl`'s VertexIn.
+        // matrix columns @2..4 + shadow color @5. Matches `object_shadow.wgsl`.
         let shadow_vertex_attrs = [
-            // @location(0) position: vec2<f32>
             wgpu::VertexAttribute {
                 offset: 0,
                 shader_location: 0,
                 format: wgpu::VertexFormat::Float32x2,
             },
-            // @location(1) feather: f32
             wgpu::VertexAttribute {
                 offset: std::mem::size_of::<[f32; 2]>() as u64,
                 shader_location: 1,
@@ -285,31 +265,26 @@ impl ObjectPipeline {
 
         // ---- Stroke pipeline ----------------------------------------------
         let stroke_vertex_attrs = [
-            // @location(0) position: vec2<f32>
             wgpu::VertexAttribute {
                 offset: 0,
                 shader_location: 0,
                 format: wgpu::VertexFormat::Float32x2,
             },
-            // @location(1) normal: vec2<f32>
             wgpu::VertexAttribute {
                 offset: std::mem::size_of::<[f32; 2]>() as u64,
                 shader_location: 1,
                 format: wgpu::VertexFormat::Float32x2,
             },
-            // @location(2) side: f32
             wgpu::VertexAttribute {
                 offset: (std::mem::size_of::<[f32; 2]>() * 2) as u64,
                 shader_location: 2,
                 format: wgpu::VertexFormat::Float32,
             },
-            // @location(3) width: f32
             wgpu::VertexAttribute {
                 offset: (std::mem::size_of::<[f32; 2]>() * 2 + std::mem::size_of::<f32>()) as u64,
                 shader_location: 3,
                 format: wgpu::VertexFormat::Float32,
             },
-            // @location(4) distance_along: f32
             wgpu::VertexAttribute {
                 offset: (std::mem::size_of::<[f32; 2]>() * 2 + std::mem::size_of::<f32>() * 2)
                     as u64,
@@ -359,21 +334,18 @@ impl ObjectPipeline {
 
         // ---- Text pipeline ------------------------------------------------
         // slot0: TextVertex (position @0, uv @1, color @2); slot1: instance-step
-        // matrix columns m0/m1/m2 @3..5. Matches `msdf_text.wgsl`'s VertexIn.
+        // matrix columns @3..5. Matches `msdf_text.wgsl`.
         let text_vertex_attrs = [
-            // @location(0) position: vec2<f32>
             wgpu::VertexAttribute {
                 offset: 0,
                 shader_location: 0,
                 format: wgpu::VertexFormat::Float32x2,
             },
-            // @location(1) uv: vec2<f32>
             wgpu::VertexAttribute {
                 offset: std::mem::size_of::<[f32; 2]>() as u64,
                 shader_location: 1,
                 format: wgpu::VertexFormat::Float32x2,
             },
-            // @location(2) color: vec4<f32>
             wgpu::VertexAttribute {
                 offset: (std::mem::size_of::<[f32; 2]>() * 2) as u64,
                 shader_location: 2,
@@ -432,8 +404,8 @@ impl ObjectPipeline {
     }
 }
 
-/// Instance-step vertex attributes for the fill pipeline (`m0`/`m1`/`m2` columns
-/// then the inline fill color), packed to match [`FillInstance`].
+/// Instance-step attributes for fill: `m0`/`m1`/`m2` columns then inline fill
+/// color, packed to match [`FillInstance`].
 #[cfg(feature = "wgpu-probe")]
 fn fill_instance_attributes() -> [wgpu::VertexAttribute; 4] {
     let vec3 = std::mem::size_of::<[f32; 3]>() as u64;
@@ -461,9 +433,8 @@ fn fill_instance_attributes() -> [wgpu::VertexAttribute; 4] {
     ]
 }
 
-/// Instance-step vertex attributes for the stroke pipeline (`m0`/`m1`/`m2`
-/// columns at locations 5..7, stroke color at 8), packed to match
-/// [`StrokeInstance`].
+/// Instance-step attributes for stroke: `m0`/`m1`/`m2` at locations 5..7, stroke
+/// color at 8, packed to match [`StrokeInstance`].
 #[cfg(feature = "wgpu-probe")]
 fn stroke_instance_attributes() -> [wgpu::VertexAttribute; 4] {
     let vec3 = std::mem::size_of::<[f32; 3]>() as u64;
@@ -491,9 +462,8 @@ fn stroke_instance_attributes() -> [wgpu::VertexAttribute; 4] {
     ]
 }
 
-/// Instance-step vertex attributes for the text pipeline (`m0`/`m1`/`m2` columns
-/// at locations 3..5, NO color — color is per-glyph in [`TextVertex`]), packed to
-/// match [`TextInstance`] and `msdf_text.wgsl`'s @location(3..5) contract.
+/// Instance-step attributes for text: `m0`/`m1`/`m2` at locations 3..5, NO color
+/// (color is per-glyph in [`TextVertex`]). Matches `msdf_text.wgsl`'s @location(3..5).
 #[cfg(feature = "wgpu-probe")]
 fn text_instance_attributes() -> [wgpu::VertexAttribute; 3] {
     let vec3 = std::mem::size_of::<[f32; 3]>() as u64;
@@ -516,8 +486,8 @@ fn text_instance_attributes() -> [wgpu::VertexAttribute; 3] {
     ]
 }
 
-/// Owns the CPU-built object draw data and the GPU buffers it uploads to, and
-/// records the object render pass.
+/// Owns the CPU-built object draw data, the GPU buffers it uploads to, and the
+/// object render pass recorder.
 #[cfg(feature = "wgpu-probe")]
 pub struct ObjectRenderer {
     pub uniform_buffer: wgpu::Buffer,
@@ -541,35 +511,29 @@ pub struct ObjectRenderer {
     shadow_vertex_count: u32,
     stroke_vertex_count: u32,
     text_vertex_count: u32,
-    /// The retained FramePlan IR — the diffable draw-plan contract this renderer
-    /// last uploaded, keyed by per-object [`ResourceHandle`]s. [`apply_plan_diff`]
-    /// diffs a freshly-built plan against this one and patches only what changed
-    /// (transform/style writes, or a single object's geometry re-send) instead of
-    /// reconstructing on every canonical scene re-feed; on a structural change it
-    /// signals a rebuild. The GPU buffers above ARE the plan's geometry store, so
-    /// `self.plan.geometry` mirrors what is currently on the device.
+    /// The diffable draw-plan this renderer last uploaded. [`apply_plan_diff`]
+    /// diffs a freshly-built plan against this and patches only what changed. The
+    /// GPU buffers above ARE the plan's geometry store, so `self.plan.geometry`
+    /// mirrors the device.
     ///
     /// [`apply_plan_diff`]: ObjectRenderer::apply_plan_diff
     plan: FramePlan,
-    /// RB1: the active light/dark theme. Sources the canvas clear color and is
-    /// the bit [`ObjectRenderer::set_theme`] flips. Held so token-backed instance
-    /// colors re-resolve on a toggle without re-tessellation (P4).
+    /// The active light/dark theme: sources the canvas clear color and is the bit
+    /// [`ObjectRenderer::set_theme`] flips, so token-backed instance colors
+    /// re-resolve on toggle without re-tessellation.
     theme: Theme,
-    /// RA1: per-object live preview WORLD transform (`delta * base`) for objects
-    /// under an in-flight drag. Mirrors what `set_preview_transform` wrote to the
-    /// GPU instance buffer so the CPU side (selection handles / region bounds) can
-    /// track the dragged bbox without re-tessellation. Cleared on commit/snap-back.
-    /// A `Vec` (not a hashed map) keeps the pure core free of randomness; at most a
-    /// handful of objects are ever previewed at once.
+    /// Per-object live preview WORLD transform (`delta * base`) under an in-flight
+    /// drag, mirroring what `set_preview_transform` wrote to the GPU so the CPU side
+    /// (handles / region bounds) tracks the dragged bbox. A `Vec` (not a hashed map)
+    /// keeps the core free of randomness; at most a few objects are previewed at once.
     preview_transforms: Vec<(String, [[f64; 3]; 3])>,
 }
 
 #[cfg(feature = "wgpu-probe")]
 impl ObjectRenderer {
-    /// Build the renderer for a scene: tessellate each object's fill into a
-    /// shared megabuffer, expand its stroke into a ribbon, resolve per-object
-    /// instance data (matrix columns + paint), and upload all buffers. Records
-    /// nothing yet — call [`ObjectRenderer::render`] inside a frame.
+    /// Build the renderer for a scene: tessellate fills into a shared megabuffer,
+    /// expand strokes into ribbons, resolve per-object instance data, and upload
+    /// all buffers. Records nothing — call [`ObjectRenderer::render`] in a frame.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -579,9 +543,8 @@ impl ObjectRenderer {
         pixel_height: f32,
         theme: Theme,
     ) -> Self {
-        // Build the FramePlan IR (the single tessellation entry) and upload from its
-        // geometry store. The plan is retained so a later canonical re-feed diffs
-        // against it instead of reconstructing the whole renderer.
+        // Build the FramePlan (the single tessellation entry) and upload from its
+        // geometry store; retained so a later re-feed diffs against it.
         let plan = build_frame_plan(scene, theme);
         let build = &plan.geometry;
 
@@ -629,11 +592,9 @@ impl ObjectRenderer {
             ],
         });
 
-        // Widen the merged megabuffer positions (`[f32;2]`) to the pipeline's
-        // `FillVertex` layout (`position` + `edge`). The analytic-AA `edge` helper
-        // is the per-vertex silhouette flag built with the mesh topology (1 on the
-        // boundary, 0 interior; D4) — `fill_edges` is index-aligned with the
-        // megabuffer vertices, so the zip is a pure widening with no per-frame work.
+        // Widen the megabuffer positions (`[f32;2]`) to the `FillVertex` layout
+        // (`position` + `edge`). `fill_edges` (the per-vertex silhouette flag, 1 on
+        // the boundary / 0 interior) is index-aligned, so the zip is a pure widening.
         let fill_vertices: Vec<FillVertex> = build
             .fill
             .vertices
@@ -720,10 +681,8 @@ impl ObjectRenderer {
         }
 
         // ---- MSDF text atlas + params + bind group ------------------------
-        // The atlas is generated CPU-side by MsdfAtlasPlan (single-channel SDF
-        // replicated to RGB). The live atlas is populated from real fontdue glyph
-        // coverage at the GPU cutover (alongside the injected measure); here it is
-        // an empty plan giving a valid, uploadable RGBA8 texture + distance_range.
+        // An empty MsdfAtlasPlan giving a valid, uploadable RGBA8 texture +
+        // distance_range; real glyph coverage is populated at the GPU cutover.
         let atlas_plan = MsdfAtlasPlan::new(256, 256, 4.0);
         let msdf_atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shape.ai object msdf atlas"),
@@ -836,35 +795,28 @@ impl ObjectRenderer {
         self.draws.len()
     }
 
-    /// The retained FramePlan IR — the diffable contract this renderer last
-    /// uploaded. Exposed so the canonical re-feed can diff a freshly-built plan
-    /// against it (via [`apply_plan_diff`]) and so host tests can inspect the
-    /// handle-keyed cache.
+    /// The retained FramePlan this renderer last uploaded — the diff base for
+    /// [`apply_plan_diff`].
     ///
     /// [`apply_plan_diff`]: ObjectRenderer::apply_plan_diff
     pub fn plan(&self) -> &FramePlan {
         &self.plan
     }
 
-    /// IR CONSUMER (the diffable seam): re-feed the canonical object `scene` by
-    /// building its [`FramePlan`], diffing it against the retained plan, and
-    /// applying the targeted [`PlanPatch`]es through the GPU instance/geometry
-    /// write paths — instead of reconstructing the whole renderer on every feed.
+    /// Re-feed `scene` by building its [`FramePlan`], diffing it against the
+    /// retained plan, and applying the targeted [`PlanPatch`]es through the GPU
+    /// write paths instead of reconstructing on every feed.
     ///
-    /// - [`PlanPatch::TransformUpdate`] -> the 4-buffer matrix write (fill/stroke/
-    ///   text/shadow), the SAME instance-matrix path the live drag preview uses.
+    /// - [`PlanPatch::TransformUpdate`] -> the 4-buffer matrix write, the SAME path
+    ///   the drag preview uses.
     /// - [`PlanPatch::StyleUpdate`] -> the per-pass color-slot write, the SAME path
     ///   the theme toggle uses.
     /// - [`PlanPatch::GeometryUpdate`] -> a single object's mesh re-send over its
-    ///   existing ranges when size-safe; otherwise the whole diff degrades to a
-    ///   rebuild (the caller reconstructs).
-    /// - [`PlanDiff::Rebuild`] (structural: add/remove/reorder) -> signal a rebuild.
+    ///   existing ranges when size-safe; otherwise the diff degrades to a rebuild.
+    /// - [`PlanDiff::Rebuild`] (structural) -> signal a rebuild.
     ///
-    /// Returns [`PlanApplyStats`]: `patch_count` is the number of targeted patches
-    /// applied this feed; `needs_rebuild` is set when the diff (or an
-    /// unfittable geometry update) requires the caller to reconstruct the renderer.
     /// When `needs_rebuild` is true the GPU buffers are left untouched, so the
-    /// caller's fresh [`ObjectRenderer::new`] is the single, clean re-upload.
+    /// caller's fresh [`ObjectRenderer::new`] is the single clean re-upload.
     pub fn apply_plan_diff(
         &mut self,
         queue: &wgpu::Queue,
@@ -882,11 +834,9 @@ impl ObjectRenderer {
             PlanDiff::Patches(patches) => patches,
         };
 
-        // A geometry update is only safe in place when the new entry's vertex/index
-        // counts still fill the retained ranges (the `follower_patch_plan` guard).
-        // If ANY geometry update fails that guard, the buffers can't hold the new
-        // mesh, so the whole feed degrades to a rebuild — and we touch nothing,
-        // leaving a clean slate for the caller's `ObjectRenderer::new`.
+        // A geometry update is only safe in place when the new counts still fill the
+        // retained ranges (`follower_patch_plan` guard). If ANY fails, the whole feed
+        // degrades to a rebuild and we touch nothing, leaving a clean slate.
         for patch in &patches {
             if let PlanPatch::GeometryUpdate { index, entry, .. } = patch {
                 let old_draw = &self.plan.entries[*index].draw;
@@ -896,7 +846,6 @@ impl ObjectRenderer {
                         needs_rebuild: true,
                     };
                 }
-                // The entry's own ranges must equal the retained ones too (same slot).
                 debug_assert_eq!(entry.draw.fill_range, old_draw.fill_range);
             }
         }
@@ -905,10 +854,7 @@ impl ObjectRenderer {
         for patch in &patches {
             self.apply_patch(queue, &next, patch);
         }
-        // Adopt the new plan as the retained cache and refresh the mirror state the
-        // render loops read (`draws` + counts). Counts are unchanged by transform/
-        // style patches and by a size-safe geometry patch, but assigning keeps the
-        // mirror exact regardless of which patches ran.
+        // Adopt the new plan and refresh the mirror state the render loops read.
         self.draws = next.geometry.draws.clone();
         self.fill_index_count = next.geometry.fill.indices.len() as u32;
         self.shadow_vertex_count = next.geometry.shadow_vertices.len() as u32;
@@ -921,8 +867,8 @@ impl ObjectRenderer {
         }
     }
 
-    /// Apply one [`PlanPatch`] to the GPU buffers. `next` is the freshly-built plan
-    /// the patch came from (the geometry source for a `GeometryUpdate`).
+    /// Apply one [`PlanPatch`] to the GPU buffers. `next` is the plan the patch came
+    /// from (the geometry source for a `GeometryUpdate`).
     fn apply_patch(&mut self, queue: &wgpu::Queue, next: &FramePlan, patch: &PlanPatch) {
         match patch {
             PlanPatch::TransformUpdate { index, columns, .. } => {
@@ -934,9 +880,8 @@ impl ObjectRenderer {
                 self.write_instance_color(queue, *index, *slot, color);
             }
             PlanPatch::GeometryUpdate { index, entry, .. } => {
-                // Re-send ONLY this object's mesh over its existing ranges, then the
-                // new matrix + colors (the re-expand carries vertices; the instance
-                // attributes ride the same per-object slot).
+                // Re-send only this object's mesh over its existing ranges, then the
+                // new matrix + colors.
                 let rebuilt = geometry_reexpand(next, *index);
                 let id = entry.handle.object.clone();
                 self.patch_follower_geometry(queue, &id, &rebuilt);
@@ -947,18 +892,15 @@ impl ObjectRenderer {
                 self.write_instance_color(queue, *index, StyleSlot::Shadow, &entry.instance.shadow.shadow);
             }
             PlanPatch::Rebuild => {
-                // diff_plans only returns Rebuild via PlanDiff::Rebuild, handled by the
-                // caller before reaching here; a Rebuild inside a patch list is unreachable.
                 debug_assert!(false, "PlanPatch::Rebuild should never appear inside a patch list");
             }
         }
     }
 
-    /// Write the 36-byte matrix region (`m0,m1,m2` at offset 0) of object `index`'s
-    /// instance in EVERY per-pass instance buffer (fill/stroke/text/shadow), strided
-    /// by [`preview_instance_strides`]. This is the absolute-columns twin of
-    /// [`set_preview_transform`]'s `delta*base` write — same buffers, same offsets —
-    /// so the IR transform patch lands identically to the live drag matrix push.
+    /// Write the 36-byte matrix region (offset 0) of object `index`'s instance in
+    /// EVERY per-pass buffer (fill/stroke/text/shadow), strided by
+    /// [`preview_instance_strides`] — same buffers/offsets as
+    /// [`set_preview_transform`]'s `delta*base` write, with absolute columns.
     ///
     /// [`set_preview_transform`]: ObjectRenderer::set_preview_transform
     fn write_instance_matrix(&self, queue: &wgpu::Queue, index: usize, columns: &[[f32; 3]; 3]) {
@@ -975,10 +917,9 @@ impl ObjectRenderer {
         }
     }
 
-    /// Write the 16-byte color slot (past the 36-byte matrix) of object `index`'s
-    /// instance for one pass. The fill/stroke/shadow color sits at struct offset 36;
-    /// the matrix region before it is untouched, mirroring [`set_theme`]'s color
-    /// write exactly.
+    /// Write the 16-byte color slot (struct offset 36, past the matrix) of object
+    /// `index`'s instance for one pass, leaving the matrix untouched — the same
+    /// write [`set_theme`] uses.
     ///
     /// [`set_theme`]: ObjectRenderer::set_theme
     fn write_instance_color(
@@ -999,17 +940,16 @@ impl ObjectRenderer {
                 std::mem::size_of::<ShadowInstance>(),
             ),
         };
-        // The color slot is at offset 36 in all three instance structs (pinned by the
-        // renderer-core layout tests), strictly past the matrix region.
+        // Color slot is at offset 36 in all three instance structs (pinned by the
+        // renderer-core layout tests), strictly past the matrix.
         let offset = (index * stride + 36) as u64;
         queue.write_buffer(buffer, offset, bytemuck::cast_slice(color));
     }
 
-    /// Rebuild the camera uniform from the live camera + device-pixel viewport and
-    /// re-upload it (FC-06). Called every frame so pan/zoom moves objects without a
-    /// scene reload — the per-object instance matrices stay put while the shared
-    /// affine camera in this uniform tracks `self.camera`. Packing is byte-identical
-    /// to [`ObjectMatrixUniform::from_scene`].
+    /// Rebuild + re-upload the camera uniform from the live camera + viewport.
+    /// Called every frame so pan/zoom moves objects without a scene reload — the
+    /// per-object instance matrices stay put. Byte-identical packing to
+    /// [`ObjectMatrixUniform::from_scene`].
     pub fn update_camera(
         &self,
         queue: &wgpu::Queue,
@@ -1024,31 +964,22 @@ impl ObjectRenderer {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
     }
 
-    /// The active light/dark theme.
     pub fn theme(&self) -> Theme {
         self.theme
     }
 
-    /// RB1 ZERO-REBAKE THEME TOGGLE (D1/D2/P4): flip the renderer's theme bit and
-    /// re-resolve ONLY the token-backed instance colors, writing the 16-byte color
-    /// slot (offset 36, past the `m0,m1,m2` matrix) of each affected
-    /// `FillInstance`/`StrokeInstance` — the exact per-instance write path W2-11
-    /// uses for the drag matrix. Tessellation (the fill megabuffer, stroke ribbon
-    /// vertices, and every `draws` range) is NEVER touched: a theme flip is a
-    /// color refresh, not a rebuild. Objects whose paint is raw hex / gradient /
-    /// image are theme-invariant and skipped. The canvas clear color tracks
-    /// `self.theme` in [`ObjectRenderer::render`], so no buffer write is needed
-    /// for the backdrop. No-op (returns the unchanged bit) if `dark` already
-    /// matches the current theme.
+    /// Zero-rebake theme toggle: flip the theme bit and re-resolve ONLY the
+    /// token-backed instance colors, writing the 16-byte color slot (offset 36) of
+    /// each affected instance. Tessellation is never touched. Raw hex / gradient /
+    /// image paints are theme-invariant and skipped; the clear color tracks
+    /// `self.theme` in [`ObjectRenderer::render`]. No-op if `dark` already matches.
     pub fn set_theme(&mut self, queue: &wgpu::Queue, dark: bool) -> Theme {
         if self.theme.dark == dark {
             return self.theme;
         }
         self.theme = Theme { dark };
-        // RB3: the default drop-shadow color is the `shadow` token, so it flips with
-        // the bit too — re-resolve every object's shadow instance color (zero rebake,
-        // the geometry is untouched). Sourced from the same token table, never hard-
-        // coded.
+        // The default drop-shadow color is the `shadow` token, so re-resolve every
+        // shadow instance color from the same token table (zero rebake).
         let shadow_color = self.theme.shadow();
         for (i, draw) in self.draws.iter_mut().enumerate() {
             if !draw.shadow_range.is_empty() {
@@ -1080,10 +1011,9 @@ impl ObjectRenderer {
                 );
             }
         }
-        // Keep the retained FramePlan an accurate diff base: the theme write just
-        // moved instance COLORS on the GPU, so mirror them into the plan's entries
-        // (index-aligned with `self.draws`). Without this a later `apply_plan_diff`
-        // would re-emit redundant style updates against the stale pre-flip colors.
+        // Mirror the moved instance colors into the plan's entries so a later
+        // `apply_plan_diff` does not re-emit redundant style updates against the
+        // stale pre-flip colors.
         for (entry, draw) in self.plan.entries.iter_mut().zip(&self.draws) {
             entry.instance.fill = draw.fill_instance;
             entry.instance.stroke = draw.stroke_instance;
@@ -1092,16 +1022,11 @@ impl ObjectRenderer {
         self.theme
     }
 
-    /// W2-11 drag zero-rebake: write ONLY the dragged object's instance model
-    /// matrix to the GPU — no re-tessellation, no scene rebuild (P4). Looks up the
-    /// object's instance index `i` in `self.draws` (which is built in the same loop
-    /// as all instance buffers, so `draws[i]` ↔ instance `i` in fill, stroke AND
-    /// text), composes `delta * base` via [`preview_instance_columns`], and overwrites
-    /// the 36-byte matrix region (`m0,m1,m2` at offset 0) of `FillInstance`,
-    /// `StrokeInstance`, AND `TextInstance` at offset `i * size_of::<…>()` — so the
-    /// glyphs follow the drag too (G3). The baked color sits past byte 36 on fill/
-    /// stroke (and per-glyph for text), so it is preserved. Returns false if `id` is
-    /// absent.
+    /// Zero-rebake drag: write ONLY the dragged object's instance matrix to the GPU
+    /// — no re-tessellation. Looks up its instance index `i` in `self.draws`,
+    /// composes `delta * base` via [`preview_instance_columns`], and overwrites the
+    /// 36-byte matrix region (offset 0) of every per-pass instance so the whole
+    /// visual (fill, stroke, glyphs, shadow) follows. Returns false if `id` is absent.
     pub fn set_preview_transform(
         &mut self,
         queue: &wgpu::Queue,
@@ -1115,15 +1040,11 @@ impl ObjectRenderer {
         let (m0, m1, m2) = preview_instance_columns(delta, base);
         let columns: [[f32; 3]; 3] = [m0, m1, m2];
         let bytes = bytemuck::cast_slice(&columns);
-        // The matrix region (`m0,m1,m2` at offset 0) is overwritten in EVERY per-object
-        // instance buffer — fill, stroke, text (G3) AND shadow (G5) — so the dragged
-        // object's whole visual (region + glyphs + drop shadow) follows the preview in
-        // lockstep. Each buffer is index-aligned with `draws`, so the write lands at
-        // `i * stride`. `preview_instance_strides` is the single source of truth pairing
-        // each buffer with its struct stride; a dropped buffer here is a dropped
-        // sub-visual under drag (the G5 bug: shadow lagging at canonical until rebake).
-        // Baked color sits past byte 36 (fill/stroke/shadow) or per-glyph (text), so it
-        // survives the matrix write.
+        // The matrix region (offset 0) is overwritten in EVERY per-object instance
+        // buffer (fill, stroke, text, shadow), each index-aligned with `draws` so the
+        // write lands at `i * stride`. `preview_instance_strides` is the single source
+        // pairing each buffer with its struct stride; a dropped buffer is a dropped
+        // sub-visual under drag. Baked color survives (past byte 36, or per-glyph text).
         let strides = preview_instance_strides();
         let buffers = [
             &self.fill_instance_buffer,
@@ -1139,8 +1060,8 @@ impl ObjectRenderer {
         for (buffer, stride) in buffers.iter().zip(strides) {
             queue.write_buffer(buffer, (i as u64) * stride, bytes);
         }
-        // RA1: mirror the composed WORLD transform on the CPU side so selection
-        // handles / region bounds track the dragged bbox (read-only, no rebake).
+        // Mirror the composed WORLD transform on the CPU so handles / region bounds
+        // track the dragged bbox (read-only, no rebake).
         let world = shape_renderer_core::hit_test_object::mat3_mul(delta, base);
         match self.preview_transforms.iter_mut().find(|(pid, _)| pid == id) {
             Some(entry) => entry.1 = world,
@@ -1149,32 +1070,26 @@ impl ObjectRenderer {
         true
     }
 
-    /// W2-11: revert the dragged object's instance matrix to its canonical baked
-    /// transform (`delta = identity`), i.e. drop the live preview. Used by the
-    /// shell as a defensive snap-back on commit-failure before the canonical scene
-    /// rebake lands. Returns false if `id` is absent.
+    /// Revert the dragged object's instance matrix to its canonical baked transform
+    /// (`delta = identity`), dropping the live preview. Returns false if `id` is absent.
     pub fn clear_preview_transform(&mut self, queue: &wgpu::Queue, id: &str, base: &[[f64; 3]; 3]) -> bool {
         let written =
             self.set_preview_transform(queue, id, &shape_renderer_core::hit_test_object::identity_3x3(), base);
-        // RA1: drop the CPU preview so handles fall back to the canonical region.
+        // Drop the CPU preview so handles fall back to the canonical region.
         self.preview_transforms.retain(|(pid, _)| pid != id);
         written
     }
 
-    /// W3-G9/#4 LIVE anchor reproject: patch a follower's baked vertices in place so
-    /// its anchored node tracks a moved target DURING the drag (the follower is NOT
-    /// uniformly transformed — one node moves, so its shape changes and the
-    /// instance-matrix preview path cannot express it). `rebuilt` is the follower
-    /// re-expanded with the reprojected node ([`reexpand_single_object`]); this
-    /// writes its fill vertices, fill indices (rebased into the megabuffer), stroke
-    /// ribbon vertices and — W3-G13 — its drop-shadow silhouette + glyph quads over
-    /// the follower's EXISTING ranges — zero full rebake, O(one small object).
+    /// Patch a follower's baked vertices in place so its anchored node tracks a
+    /// moved target DURING a drag (the follower is not uniformly transformed, so the
+    /// instance-matrix preview cannot express it). `rebuilt` is the follower
+    /// re-expanded with the reprojected node; this writes its fill vertices, fill
+    /// indices (rebased), stroke ribbon, shadow silhouette, and glyph quads over the
+    /// follower's EXISTING ranges — O(one small object).
     ///
-    /// DEFENSIVE (GPU-blind): a vertex/index COUNT that no longer matches the baked
-    /// range (a topology/LOD edge case) makes [`follower_patch_plan`] return `None`,
-    /// and this SKIPS the write entirely — never a partial/mismatched range that
-    /// would corrupt the buffer or bleed into a neighbour. Returns false if `id` is
-    /// absent or the patch was skipped.
+    /// A vertex/index COUNT that no longer matches the baked range makes
+    /// [`follower_patch_plan`] return `None`, and this SKIPS the write entirely
+    /// rather than corrupt the buffer. Returns false if `id` is absent or skipped.
     pub fn patch_follower_geometry(
         &mut self,
         queue: &wgpu::Queue,
@@ -1188,16 +1103,15 @@ impl ObjectRenderer {
             return false;
         };
         // Fill vertices: same count as the baked range (guarded), so the write stays
-        // within `[start, end)` of the shared fill vertex buffer.
+        // within `[start, end)` of the shared buffer.
         if !rebuilt.fill_vertices.is_empty() {
             queue.write_buffer(
                 &self.fill_vertex_buffer,
                 plan.fill_vertex_byte_offset,
                 bytemuck::cast_slice(&rebuilt.fill_vertices),
             );
-            // Re-emit the indices rebased to the follower's vertex base. The count is
-            // guarded equal, so a re-tessellation that kept the count but changed the
-            // index pattern is still corrected (not just the positions).
+            // Re-emit indices rebased to the follower's vertex base (corrects a
+            // changed index pattern, not just positions).
             let rebased: Vec<u32> = rebuilt
                 .fill_indices
                 .iter()
@@ -1217,9 +1131,8 @@ impl ObjectRenderer {
                 bytemuck::cast_slice(&rebuilt.stroke_vertices),
             );
         }
-        // W3-G13: drop-shadow silhouette vertices (fill-derived, or stroke-ribbon-
-        // derived for fill-less open strokes per W3-G10/#3) — without this write the
-        // follower's shadow stayed at the OLD geometry until the commit rebake.
+        // Drop-shadow silhouette vertices — without this the follower's shadow stays
+        // at the OLD geometry until the commit rebake.
         if !rebuilt.shadow_vertices.is_empty() {
             queue.write_buffer(
                 &self.shadow_vertex_buffer,
@@ -1227,8 +1140,8 @@ impl ObjectRenderer {
                 bytemuck::cast_slice(&rebuilt.shadow_vertices),
             );
         }
-        // W3-G13: glyph quads — text layout depends on the region bbox, so a
-        // reprojected node moves the glyphs too.
+        // Glyph quads — text layout depends on the region bbox, so a reprojected node
+        // moves the glyphs too.
         if !rebuilt.text_vertices.is_empty() {
             queue.write_buffer(
                 &self.text_vertex_buffer,
@@ -1239,12 +1152,9 @@ impl ObjectRenderer {
         true
     }
 
-    /// RA1: the live preview WORLD transform (`delta * base`) for `id`, or `None`
-    /// when the object has no in-flight drag preview. The composed transform is the
-    /// one `set_preview_transform` pushed to the instance buffer, so a caller can
-    /// substitute it for the canonical `region.transform` to lay out selection
-    /// handles / region bounds against the PREVIEWED bbox during a drag — a pure
-    /// transform read, no re-tessellation.
+    /// The live preview WORLD transform (`delta * base`) for `id`, or `None` with no
+    /// in-flight drag — the transform `set_preview_transform` pushed, so a caller can
+    /// lay out handles / region bounds against the PREVIEWED bbox (a pure read).
     pub fn preview_transform(&self, id: &str) -> Option<[[f64; 3]; 3]> {
         self.preview_transforms
             .iter()
@@ -1252,11 +1162,9 @@ impl ObjectRenderer {
             .map(|(_, world)| *world)
     }
 
-    /// Record the object draw pass into `encoder` targeting `view`. Each object
-    /// is one instanced indexed fill draw (its megabuffer range against its
-    /// instance) followed by one instanced stroke draw. `clear` chooses whether
-    /// the pass clears the color attachment first (the object path owns the whole
-    /// surface at the cutover).
+    /// Record the object draw pass into `encoder` targeting `view`: one instanced
+    /// indexed fill draw per object, then one instanced stroke draw, then text.
+    /// `clear` chooses whether the pass clears the color attachment first.
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1265,8 +1173,8 @@ impl ObjectRenderer {
         clear: bool,
     ) {
         let load = if clear {
-            // RB1: the canvas backdrop is the `canvas-bg` token in the active
-            // theme — flips light/dark with `self.theme`, no buffer write needed.
+            // The canvas backdrop is the `canvas-bg` token, flipping with
+            // `self.theme` — no buffer write needed.
             let [r, g, b, a] = self.theme.canvas_bg();
             wgpu::LoadOp::Clear(wgpu::Color {
                 r: r as f64,
@@ -1295,14 +1203,11 @@ impl ObjectRenderer {
             multiview_mask: None,
         });
 
-        // W3-G8/A: the drop shadow is NO LONGER drawn here. It is rendered once to an
-        // offscreen mask ([`render_shadow_mask`]), separable-Gaussian-blurred, and
-        // composited UNDER the fill in the visible pass before this `render` runs
-        // (see `frame.rs`). This pass now starts with the fill so the blurred shadow
-        // it composited stays beneath fill/stroke/text.
+        // The drop shadow is rendered + blurred + composited UNDER the fill before
+        // this `render` runs (see `render_shadow_mask` / `frame.rs`); this pass starts
+        // with the fill so the composited shadow stays beneath fill/stroke/text.
 
-        // Fill pass: one indexed instanced draw per object, all sharing the merged
-        // megabuffer vertex/index buffers and the per-object instance buffer.
+        // Fill pass: one indexed instanced draw per object over the shared megabuffer.
         if self.fill_index_count > 0 {
             pass.set_pipeline(&pipeline.fill_pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -1322,7 +1227,7 @@ impl ObjectRenderer {
             }
         }
 
-        // Stroke pass: one instanced draw per object over its ribbon vertex range.
+        // Stroke pass: one instanced draw per object over its ribbon range.
         if self.stroke_vertex_count > 0 {
             pass.set_pipeline(&pipeline.stroke_pipeline);
             pass.set_bind_group(0, &self.stroke_bind_group, &[]);
@@ -1340,10 +1245,9 @@ impl ObjectRenderer {
             }
         }
 
-        // Text pass: one instanced draw per object over its glyph-quad range, drawn
-        // OVER fill+stroke (the pass already loads, never clears, between sub-passes).
-        // Each object's glyphs ride its own per-object matrix instance (index `i`),
-        // index-aligned with `draws` exactly like the fill/stroke loops.
+        // Text pass: one instanced draw per object over its glyph-quad range, OVER
+        // fill+stroke. Each object's glyphs ride its own matrix instance (index `i`),
+        // index-aligned with `draws` like the fill/stroke loops.
         if self.text_vertex_count > 0 {
             pass.set_pipeline(&pipeline.text_pipeline);
             pass.set_bind_group(0, &self.text_bind_group, &[]);
@@ -1362,14 +1266,11 @@ impl ObjectRenderer {
         }
     }
 
-    /// W3-G8/A: record the drop-shadow silhouette ONLY into an offscreen `mask`
-    /// view, clearing it to transparent first. This is the input to the separable
-    /// Gaussian blur ([`crate::shadow_blur::ShadowBlur`]). Each object's shadow
-    /// rides its own per-object matrix instance (index `i`), index-aligned with
-    /// `draws` exactly like the fill/stroke loops, so the projective transform path
-    /// places the silhouette identically to the fill. Records nothing (a single
-    /// transparent clear) when no object casts a shadow, so the blurred mask stays
-    /// empty and the composite is invisible.
+    /// Record the drop-shadow silhouette ONLY into an offscreen `mask` view (cleared
+    /// transparent first) — the input to [`crate::shadow_blur::ShadowBlur`]. Each
+    /// shadow rides its own matrix instance, index-aligned with `draws`, so the
+    /// silhouette is placed identically to the fill. Records only the clear when no
+    /// object casts a shadow, leaving the mask empty.
     pub fn render_shadow_mask(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1412,31 +1313,25 @@ impl ObjectRenderer {
         }
     }
 
-    /// Number of fill indices uploaded for the loaded scene (diagnostics).
     pub fn fill_index_count(&self) -> u32 {
         self.fill_index_count
     }
 
-    /// Number of drop-shadow quad vertices uploaded for the loaded scene (diagnostics).
     pub fn shadow_vertex_count(&self) -> u32 {
         self.shadow_vertex_count
     }
 
-    /// Number of stroke ribbon vertices uploaded for the loaded scene (diagnostics).
     pub fn stroke_vertex_count(&self) -> u32 {
         self.stroke_vertex_count
     }
 
-    /// Number of text glyph-quad vertices uploaded for the loaded scene (diagnostics).
     pub fn text_vertex_count(&self) -> u32 {
         self.text_vertex_count
     }
 }
 
-/// The result of an [`ObjectRenderer::apply_plan_diff`] feed, surfaced so the
-/// frame-stats keep their meaning: `patch_count` is the number of targeted IR
-/// patches applied (the "patch path" counter), and `needs_rebuild` tells the
-/// caller the diff required a full reconstruction (the "rebuild" counter).
+/// Result of an [`ObjectRenderer::apply_plan_diff`] feed: `patch_count` targeted
+/// patches applied, `needs_rebuild` set when the diff required a full reconstruction.
 #[cfg(feature = "wgpu-probe")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanApplyStats {
@@ -1444,12 +1339,10 @@ pub struct PlanApplyStats {
     pub needs_rebuild: bool,
 }
 
-/// Slice object `index`'s baked geometry out of a built [`FramePlan`] into a
-/// [`FollowerReexpand`] — the per-object vertex/index payload the in-place patch
-/// path (`patch_follower_geometry`) consumes. The fill indices in the plan's
-/// megabuffer are rebased by the object's vertex base; this rebases them back to
-/// object-LOCAL (0-based) so the patch can re-rebase them onto the live ranges
-/// (matching `reexpand_single_object`'s object-local contract).
+/// Slice object `index`'s baked geometry out of a [`FramePlan`] into a
+/// [`FollowerReexpand`] for the in-place patch path. The plan's megabuffer indices
+/// are rebased by the object's vertex base; this returns them object-LOCAL (0-based)
+/// to match `reexpand_single_object`'s contract.
 #[cfg(feature = "wgpu-probe")]
 fn geometry_reexpand(plan: &FramePlan, index: usize) -> FollowerReexpand {
     let geo = &plan.geometry;
@@ -1480,7 +1373,7 @@ fn geometry_reexpand(plan: &FramePlan, index: usize) -> FollowerReexpand {
 }
 
 /// Create a `VERTEX | COPY_DST` buffer sized for `data` (min 4 bytes so an empty
-/// scene still produces a valid, non-zero-sized buffer handle).
+/// scene still produces a valid buffer handle).
 #[cfg(feature = "wgpu-probe")]
 fn create_vertex_buffer<T: bytemuck::Pod>(
     device: &wgpu::Device,
@@ -1509,10 +1402,6 @@ fn create_index_buffer(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu
 mod tests {
     use super::*;
 
-    /// The fill/stroke instance attribute offsets tile each instance record with no
-    /// gaps/overlap and at the shader-declared locations (fill `m0..m2`+`fill` at
-    /// 2..5, stroke `m0..m2`+`stroke` at 5..8). FAILS if the `wgpu::VertexAttribute`
-    /// packing drifts from the per-object matrix+color layout the WGSL expects.
     #[test]
     fn fill_and_stroke_instance_attributes_match_shader_contract() {
         let fill_attrs = fill_instance_attributes();
@@ -1528,10 +1417,6 @@ mod tests {
         assert_eq!(stroke_attrs[3].offset, 36);
     }
 
-    /// COMMIT B (packing vs shader): the text instance attribute offsets/locations
-    /// match msdf_text.wgsl's @location(3..5) instance-step matrix columns —
-    /// m0@offset0/loc3, m1@12/loc4, m2@24/loc5. FAILS if the instance packing drifts
-    /// from the shader's expected per-object matrix layout.
     #[test]
     fn text_pipeline_layout_matches_msdf_shader_contract() {
         assert_eq!(std::mem::size_of::<TextVertex>(), 32);
@@ -1542,8 +1427,6 @@ mod tests {
         assert_eq!(attrs[1].shader_location, 4);
         assert_eq!(attrs[2].offset, 24);
         assert_eq!(attrs[2].shader_location, 5);
-        // TextVertex attribute formats: position Float32x2 @0, uv Float32x2 @8,
-        // color Float32x4 @16 — pinned via byte offsets implicit in the 32B size.
         assert_eq!(std::mem::offset_of!(TextVertex, position), 0);
         assert_eq!(std::mem::offset_of!(TextVertex, uv), 8);
         assert_eq!(std::mem::offset_of!(TextVertex, color), 16);
@@ -1589,18 +1472,12 @@ mod tests {
         }
     }
 
-    /// IR GEOMETRY-UPDATE PARITY (host, no GPU): `geometry_reexpand` slices an
-    /// object out of a built `FramePlan` into the EXACT bytes
-    /// `reexpand_single_object` produces for that object — the same payload the
-    /// in-place `patch_follower_geometry` write consumes. Pins that the IR's
-    /// geometry-update path re-sends correct, object-local geometry (fill vertices,
-    /// object-LOCAL rebased indices, stroke/shadow/text vertices) for a NON-first
-    /// object, where the megabuffer index rebase is load-bearing. FAILS if the slice
-    /// math or the index un-rebase drifts.
+    /// `geometry_reexpand` must slice an object out of a `FramePlan` into the EXACT
+    /// bytes `reexpand_single_object` produces, for a NON-first object where the
+    /// megabuffer index rebase is load-bearing.
     #[test]
     fn geometry_reexpand_slices_match_reexpand_single_object() {
-        // Two objects so object index 1 has a non-zero megabuffer vertex base — the
-        // case where slicing + un-rebasing the indices actually matters.
+        // Object index 1 has a non-zero megabuffer vertex base.
         let s = scene(vec![
             rect("a", "M0 0 L800 0 L800 800 L0 800 Z"),
             rect("b", "M0 0 L640 0 L640 640 L0 640 Z"),
@@ -1621,8 +1498,8 @@ mod tests {
             assert_eq!(sliced.text_vertices, oracle.text_vertices, "text parity (obj {index})");
         }
 
-        // The sliced geometry, paired with the plan's draw record, is size-safe to
-        // patch in place (the contract `apply_plan_diff`'s geometry route relies on).
+        // The sliced geometry is size-safe to patch in place (the contract
+        // `apply_plan_diff`'s geometry route relies on).
         let plan_b = &plan.entries[1].draw;
         assert!(
             follower_patch_plan(plan_b, &geometry_reexpand(&plan, 1)).is_some(),
@@ -1630,11 +1507,9 @@ mod tests {
         );
     }
 
-    /// IR INDEX UN-REBASE: object 1's indices in the merged megabuffer are rebased
-    /// by its vertex base, so a naive slice would carry merged (too-large) indices.
-    /// `geometry_reexpand` must return them object-LOCAL (0-based), so the max index
-    /// is below the object's own vertex count. FAILS if the un-rebase is dropped (the
-    /// patch would then write merged indices over a 0-based range — corruption).
+    /// `geometry_reexpand` must un-rebase object 1's merged-megabuffer indices back
+    /// to object-LOCAL (0-based), so the max index is below its own vertex count
+    /// (a dropped un-rebase would write merged indices over a 0-based range).
     #[test]
     fn geometry_reexpand_returns_object_local_indices() {
         let s = scene(vec![

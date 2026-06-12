@@ -1,8 +1,5 @@
-//! In-process [`Coordinator`] for single-process dev (the default).
-//!
-//! Lease + presence live in one tokio `Mutex`; pub/sub is a per-canvas
-//! `broadcast` channel. Expiry is checked lazily on read against a pluggable
-//! clock so tests can drive time without sleeping.
+//! In-process [`Coordinator`] for single-process dev (the default). Expiry is
+//! checked lazily on read against a pluggable clock so tests can drive time.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,7 +17,6 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
-/// Wall-clock implementation backed by `SystemTime`.
 #[derive(Default)]
 pub struct SystemClock;
 
@@ -47,16 +43,13 @@ struct PresenceEntry {
 #[derive(Default)]
 struct State {
     leases: HashMap<String, LeaseEntry>,
-    /// canvas_id -> (key -> entry)
     presence: HashMap<String, HashMap<String, PresenceEntry>>,
 }
 
-/// In-process coordinator. Cheap to clone-share behind an `Arc`.
 pub struct InMemoryCoordinator {
     state: Mutex<State>,
-    // Channels live behind a std mutex: the guard is never held across an await
-    // and is taken only briefly, so the synchronous `subscribe` can lock it
-    // without blocking the runtime or risking a dead throwaway channel.
+    // Channels behind a std mutex (guard never held across an await) so the
+    // synchronous `subscribe` can lock it without blocking the runtime.
     channels: StdMutex<HashMap<String, broadcast::Sender<Vec<u8>>>>,
     counter: AtomicU64,
     clock: Arc<dyn Clock>,
@@ -70,12 +63,10 @@ impl Default for InMemoryCoordinator {
 }
 
 impl InMemoryCoordinator {
-    /// New coordinator using the wall clock.
     pub fn new() -> Self {
         Self::with_clock(Arc::new(SystemClock))
     }
 
-    /// New coordinator with an injected clock (for deterministic tests).
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
             state: Mutex::new(State::default()),
@@ -91,7 +82,6 @@ impl InMemoryCoordinator {
         format!("{owner}-{n}")
     }
 
-    /// Get-or-create the broadcast sender for a canvas.
     fn sender(&self, canvas_id: &str) -> broadcast::Sender<Vec<u8>> {
         let mut chans = self.channels.lock().expect("channels mutex poisoned");
         chans
@@ -107,7 +97,6 @@ impl Coordinator for InMemoryCoordinator {
         let now = self.clock.now_ms();
         let mut state = self.state.lock().await;
         if let Some(existing) = state.leases.get(canvas_id) {
-            // Held by a different, still-live owner: single-writer denial.
             if existing.expires_at > now && existing.owner != owner {
                 anyhow::bail!(
                     "canvas '{canvas_id}' is leased by '{}' until {}",
@@ -157,7 +146,6 @@ impl Coordinator for InMemoryCoordinator {
     async fn release(&self, lease: Lease) -> Result<()> {
         let mut state = self.state.lock().await;
         if let Some(entry) = state.leases.get(&lease.canvas_id) {
-            // Only the current holder may release; a stale release is a no-op.
             if entry.token == lease.token && entry.owner == lease.owner {
                 state.leases.remove(&lease.canvas_id);
             }
@@ -177,7 +165,6 @@ impl Coordinator for InMemoryCoordinator {
 
     async fn publish(&self, canvas_id: &str, msg: Vec<u8>) -> Result<()> {
         let tx = self.sender(canvas_id);
-        // Err only means no live receivers; that is not a failure to publish.
         let _ = tx.send(msg);
         Ok(())
     }

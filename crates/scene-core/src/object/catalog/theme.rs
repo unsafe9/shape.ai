@@ -1,39 +1,19 @@
-//! Semantic theme token table (D-token contract).
-//!
-//! Pure: no time, randomness, threads, or I/O — a static light/dark RGBA lookup
-//! over a fixed set of kebab-case semantic token names. The wire convention is
-//! `Paint::Token { name }` ([`crate::object::model::Paint`]); the renderer resolves a
-//! token to its RGBA at draw time (a later wave), light/dark aware. This module
-//! is the single source of truth for which tokens exist and what they resolve to.
-//!
-//! Values are tasteful macOS-like: light mode pairs light surfaces with dark
-//! text and a dark translucent shadow; dark mode inverts to dark surfaces, light
-//! text, and a light translucent shadow. `selection-ring` is a blue accent in
-//! both modes.
+//! Semantic theme token table — the single source of truth for which tokens
+//! exist and what they resolve to. Pure: a static light/dark RGBA lookup over a
+//! fixed set of kebab-case names. The wire convention is `Paint::Token { name }`.
 
-/// A semantic theme token. Each variant maps to a stable kebab-case wire name
-/// (see [`Token::name`]) and a light/dark RGBA pair (see [`Token::rgba`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Token {
-    /// Infinite-canvas backdrop behind all objects.
     CanvasBg,
-    /// Raised surface (cards, panels) sitting on the canvas.
     Surface,
-    /// Muted/secondary surface (subtle backgrounds, hover wells).
     SurfaceMuted,
-    /// Default object fill.
     DefaultFill,
-    /// Default object stroke / hairline border.
     DefaultStroke,
-    /// Primary text / foreground.
     Text,
-    /// Translucent drop-shadow color.
     Shadow,
-    /// Selection highlight ring (blue accent).
     SelectionRing,
 }
 
-/// Every token, in a stable order (used for enumeration / snapshots).
 pub const ALL_TOKENS: [Token; 8] = [
     Token::CanvasBg,
     Token::Surface,
@@ -46,7 +26,6 @@ pub const ALL_TOKENS: [Token; 8] = [
 ];
 
 impl Token {
-    /// The kebab-case wire name (matches the `Paint::Token { name }` convention).
     pub const fn name(self) -> &'static str {
         match self {
             Token::CanvasBg => "canvas-bg",
@@ -60,17 +39,12 @@ impl Token {
         }
     }
 
-    /// Parse a kebab-case wire name back into a [`Token`], or `None` if unknown.
     pub fn from_name(name: &str) -> Option<Token> {
         ALL_TOKENS.into_iter().find(|t| t.name() == name)
     }
 
-    /// The RGBA (`[r, g, b, a]`, 0..=255) this token resolves to in the given
-    /// mode.
+    /// RGBA (`[r, g, b, a]`, 0..=255) in the given mode.
     pub const fn rgba(self, dark: bool) -> [u8; 4] {
-        // macOS-like values. Light: light surfaces / dark text / dark shadow.
-        // Dark: dark surfaces / light text / light shadow. Selection ring is a
-        // blue accent in both modes.
         match (self, dark) {
             (Token::CanvasBg, false) => [0xf5, 0xf5, 0xf7, 0xff],
             (Token::CanvasBg, true) => [0x1e, 0x1e, 0x20, 0xff],
@@ -90,19 +64,15 @@ impl Token {
             (Token::Text, false) => [0x1d, 0x1d, 0x1f, 0xff],
             (Token::Text, true) => [0xf5, 0xf5, 0xf7, 0xff],
 
-            // Translucent shadow: dark veil in light mode, light veil in dark.
             (Token::Shadow, false) => [0x00, 0x00, 0x00, 0x40],
             (Token::Shadow, true) => [0xff, 0xff, 0xff, 0xa8],
 
-            // Blue accent (macOS systemBlue-ish), slightly brighter in dark mode.
             (Token::SelectionRing, false) => [0x00, 0x7a, 0xff, 0xff],
             (Token::SelectionRing, true) => [0x0a, 0x84, 0xff, 0xff],
         }
     }
 }
 
-/// Resolve a kebab-case token `name` to its RGBA in the given mode, or `None`
-/// for an unknown name. `dark` selects the dark-mode table.
 pub fn resolve_token(name: &str, dark: bool) -> Option<[u8; 4]> {
     Token::from_name(name).map(|t| t.rgba(dark))
 }
@@ -130,7 +100,6 @@ mod tests {
 
     #[test]
     fn resolve_known_tokens_differ_by_mode() {
-        // canvas-bg / text / shadow must each differ between light and dark.
         for name in ["canvas-bg", "text", "shadow"] {
             let light = resolve_token(name, false).expect("light");
             let dark = resolve_token(name, true).expect("dark");

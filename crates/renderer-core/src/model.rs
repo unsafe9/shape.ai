@@ -330,9 +330,8 @@ pub struct SceneSnapshot {
     pub styles: Vec<SceneStyleToken>,
     #[serde(default)]
     pub selection: SceneSelection,
-    // Transient shell-owned multi-select set, pushed via `set-multi-select`. Never
-    // serialized: the persisted single-anchor `selection` invariant stays intact,
-    // while the draw path highlights every id in this set in addition to it.
+    // Transient shell-owned multi-select set; never serialized, so the persisted
+    // single-anchor `selection` invariant stays intact. Highlighted in addition to it.
     #[serde(skip)]
     pub multi_select: Vec<String>,
 }
@@ -351,10 +350,7 @@ pub enum SceneSelection {
     Edge {
         id: String,
     },
-    // Transient multi-select set produced by a drag marquee. The shell merges
-    // these ids into its own `multiSelectIds` set; the single-anchor persisted
-    // selection invariant lives in the shell, not here. Matches scene-core/TS
-    // `{ kind: "multi", ids: string[] }`.
+    // Transient marquee multi-select. Wire: `{ kind: "multi", ids: string[] }`.
     Multi {
         ids: Vec<String>,
     },
@@ -412,10 +408,7 @@ pub enum RenderScenePatch {
     },
 }
 
-// Active pointer tool. Select is the default: pointer-down on an object starts a
-// drag, pointer-down on empty space starts a marquee. Hand always pans. Insert
-// tools are handled shell-side via insert-primitive ops; the core only needs to
-// distinguish Select vs Hand for pointer routing.
+// Active pointer tool: Select (drag / marquee) is the default, Hand always pans.
 #[cfg(feature = "wgpu-probe")]
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -477,15 +470,13 @@ pub enum CanvasInputEvent {
     SetTool {
         tool: ActiveTool,
     },
-    // Replace the transient multi-select set highlighted on the canvas. The shell
-    // pushes its `multiSelectIds`; an empty list clears the set. The persisted
+    // Replace the transient multi-select set; an empty list clears it. The persisted
     // single-anchor selection is unaffected.
     SetMultiSelect {
         ids: Vec<String>,
     },
-    // Right-click pick: returns the hit for `screen` in CoreInputBatchResult
-    // without mutating selection or starting a drag, so the shell can show a
-    // context menu for the picked object (CC4.1).
+    // Right-click pick: returns the hit for `screen` without mutating selection or
+    // starting a drag, so the shell can show a context menu for the picked object.
     ContextPick {
         screen: WorldPoint,
     },

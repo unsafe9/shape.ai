@@ -1,14 +1,8 @@
-// W2-03 — the unified Move pointer's two pure shell classifications:
-//  - pan-intent: which pointer-down is a pan vs a pick/marquee, and
-//  - selection-toggle: how Shift+click grows/shrinks the multi-select set.
-// Both are framework-neutral so they can be pinned without a renderer or a Svelte
-// mount (the engine/App only wire them).
-
 import { describe, expect, it } from "vitest";
 import { isPanIntent } from "../platforms/web/renderer/engine";
 import { toggleObjectSelection, type ObjectSelection } from "../platforms/web/shared/object";
 
-describe("isPanIntent (W2-03 pan classification)", () => {
+describe("isPanIntent (pan classification)", () => {
   it("middle button always pans, regardless of Space", () => {
     expect(isPanIntent({ spaceHeld: false, button: 1 })).toBe(true);
     expect(isPanIntent({ spaceHeld: true, button: 1 })).toBe(true);
@@ -25,7 +19,7 @@ describe("isPanIntent (W2-03 pan classification)", () => {
   });
 });
 
-describe("toggleObjectSelection (W2-03 multi-select set)", () => {
+describe("toggleObjectSelection (multi-select set)", () => {
   it("adds an object to an empty (canvas) selection", () => {
     expect(toggleObjectSelection({ kind: "canvas" }, "a")).toEqual({ kind: "object", id: "a" });
   });

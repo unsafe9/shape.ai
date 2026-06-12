@@ -1,38 +1,26 @@
-//! W3-G8/A real drop-shadow blur: offscreen separable Gaussian (GPU passes).
-//!
-//! The pure kernel/constants (`gaussian_kernel`, `quarter_dim`,
-//! `SHADOW_BLUR_MAX_RADIUS`, `SHADOW_BLUR_RADIUS_PX`) live in
-//! [`shape_renderer_core::shadow_blur`]; this module holds only the wgpu
-//! offscreen-target + pipeline holder that consumes them.
+//! Offscreen separable-Gaussian drop-shadow blur (GPU passes). The pure kernel/
+//! constants live in [`shape_renderer_core::shadow_blur`].
 
 #[cfg(feature = "wgpu-probe")]
 mod gpu {
     use shape_renderer_core::shadow_blur::{quarter_dim, gaussian_kernel, SHADOW_BLUR_MAX_RADIUS, SHADOW_BLUR_RADIUS_PX};
     use crate::shaders::{SHADOW_BLUR_WGSL, SHADOW_COMPOSITE_WGSL};
 
-    /// Blur-pass uniform matching `shadow_blur.wgsl`'s `BlurParams`. `direction` is
-    /// `(1,0)` for the horizontal pass and `(0,1)` for the vertical pass, in
-    /// TEXEL units (the shader multiplies by `texel` to step one pixel). `texel` is
-    /// `(1/width, 1/height)` so the sample offsets are resolution-correct. `params`
-    /// is `vec4(radius_taps, _, _, _)`; the active tap count is read from `.x`.
-    /// `weights` holds the normalized one-sided+center Gaussian taps (index 0 is the
-    /// center, then taps 1..=radius), padded to the fixed max so the layout is
-    /// constant. std140 requires 16-byte alignment, so each weight occupies a full
-    /// `vec4` slot (`.x` carries the value).
+    /// Matches `shadow_blur.wgsl`'s `BlurParams`. `direction` is `(1,0)` H / `(0,1)`
+    /// V in TEXEL units; `texel` is `(1/width, 1/height)`; `params.x` is the active
+    /// tap count. std140 16-byte alignment forces each weight into a full `vec4`
+    /// slot (`.x` carries the value, index 0 = center tap).
     #[repr(C)]
     #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct BlurParams {
         pub direction: [f32; 2],
         pub texel: [f32; 2],
         pub params: [f32; 4],
-        // One weight per vec4 slot (std140): `[w, 0, 0, 0]`. Index 0 = center tap.
         pub weights: [[f32; 4]; SHADOW_BLUR_MAX_RADIUS + 1],
     }
 
-    /// Composite uniform matching `shadow_composite.wgsl`'s `CompositeParams`:
-    /// `tint` is the theme `shadow` token color (resolved through the token path,
-    /// never hardcoded). The shader multiplies the blurred mask's coverage (its
-    /// alpha) by this tint, so a theme flip is a single uniform write.
+    /// Matches `shadow_composite.wgsl`'s `CompositeParams`: `tint` is the theme
+    /// `shadow` token color (resolved through the token path, never hardcoded).
     #[repr(C)]
     #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct CompositeParams {
@@ -40,10 +28,7 @@ mod gpu {
     }
 
     /// Offscreen targets + pipelines for the separable-Gaussian drop-shadow blur.
-    /// Sized to the surface (`config.width` x `config.height`, PHYSICAL px); rebuilt
-    /// on resize. Owns three surface-format render targets — `mask` (the silhouette
-    /// rendered once), `ping`/`pong` (H then V blur scratch) — and the blur +
-    /// composite pipelines.
+    /// Sized to the surface (PHYSICAL px), rebuilt on resize.
     pub struct ShadowBlur {
         width: u32,
         height: u32,
@@ -51,9 +36,8 @@ mod gpu {
         mask_view: wgpu::TextureView,
         ping_view: wgpu::TextureView,
         pong_view: wgpu::TextureView,
-        // Held so the views stay valid; the textures/sampler/layouts/format are not
-        // read again after construction, but must outlive the views/pipelines/bind
-        // groups they back — hence the `_` prefix to silence the unused-field lint.
+        // Held so the views stay valid: not read again after construction, but must
+        // outlive the views/pipelines/bind groups they back.
         _format: wgpu::TextureFormat,
         _mask: wgpu::Texture,
         _ping: wgpu::Texture,
@@ -65,24 +49,22 @@ mod gpu {
         blur_pipeline: wgpu::RenderPipeline,
         composite_pipeline: wgpu::RenderPipeline,
 
-        // Two blur-param buffers (H then V) so both directions can be bound in one
-        // frame without a mid-frame overwrite race.
+        // Two blur-param buffers (H then V) so both directions bind in one frame
+        // without a mid-frame overwrite race.
         blur_h_buffer: wgpu::Buffer,
         blur_v_buffer: wgpu::Buffer,
         composite_buffer: wgpu::Buffer,
 
-        // Bind groups are stable for the lifetime of the targets (views don't
-        // change between frames), so they are built once here.
         blur_h_bind_group: wgpu::BindGroup,
         blur_v_bind_group: wgpu::BindGroup,
         composite_bind_group: wgpu::BindGroup,
     }
 
     impl ShadowBlur {
-        /// Build the offscreen targets + blur/composite pipelines for a surface of
-        /// `width` x `height` PHYSICAL px and `format` (the surface format, so the
-        /// mask blends identically to the visible pass). `dpr` scales the blur
-        /// radius so the screen feather is DPR-independent.
+        /// Build the offscreen targets + pipelines for a surface of `width` x
+        /// `height` PHYSICAL px and `format` (the surface format, so the mask blends
+        /// identically to the visible pass). `dpr` scales the blur radius so the
+        /// screen feather is DPR-independent.
         pub fn new(
             device: &wgpu::Device,
             queue: &wgpu::Queue,
@@ -93,9 +75,8 @@ mod gpu {
         ) -> Self {
             let width = width.max(1);
             let height = height.max(1);
-            // W3-G9/#1: the blur targets are QUARTER-res of the surface (guarded to
-            // 1). The stored `width`/`height` stay the FULL surface size so `matches`
-            // still compares against the surface; only the offscreen targets shrink.
+            // Blur targets are QUARTER-res; the stored `width`/`height` stay full so
+            // `matches` compares against the surface.
             let qw = quarter_dim(width);
             let qh = quarter_dim(height);
 
@@ -133,9 +114,8 @@ mod gpu {
                 ..Default::default()
             });
 
-            // group(0): b0 source texture (FRAGMENT), b1 sampler (FRAGMENT), b2
-            // params uniform (FRAGMENT). Shared shape for blur + composite (the
-            // composite uniform differs in contents only).
+            // group(0): b0 source texture, b1 sampler, b2 params uniform (all
+            // FRAGMENT). Shared by blur + composite (composite differs in contents).
             let sampled_layout_entries = [
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -184,9 +164,8 @@ mod gpu {
                 source: wgpu::ShaderSource::Wgsl(SHADOW_COMPOSITE_WGSL.into()),
             });
 
-            // The blur passes WRITE the full (premultiplied-ish) source through, so
-            // they REPLACE the target (no blend) — the source already carries the
-            // silhouette coverage. The composite blends src-over onto the surface.
+            // Blur passes REPLACE the target (the source already carries silhouette
+            // coverage); the composite blends src-over onto the surface.
             let replace_targets = [Some(wgpu::ColorTargetState {
                 format,
                 blend: Some(wgpu::BlendState::REPLACE),
@@ -275,9 +254,8 @@ mod gpu {
                 std::mem::size_of::<CompositeParams>() as u64,
             );
 
-            // H pass samples the MASK -> writes PING. V pass samples PING -> writes
-            // PONG. Composite samples PONG. The bind groups capture those source
-            // views; they are stable for these targets' lifetime.
+            // H samples MASK -> PING; V samples PING -> PONG; composite samples PONG.
+            // The bind groups capture those source views, stable for the targets' life.
             let make_bind_group = |label: &str,
                                    layout: &wgpu::BindGroupLayout,
                                    src: &wgpu::TextureView,
@@ -342,40 +320,33 @@ mod gpu {
                 blur_v_bind_group,
                 composite_bind_group,
             };
-            // The Gaussian kernel + texel only depend on size/dpr, both fixed for
-            // this target — so compute + upload the blur params ONCE here (the only
-            // place the kernel Vec is allocated), never per frame.
+            // Kernel + texel depend only on size/dpr (fixed for this target), so
+            // compute + upload ONCE here — the only place the kernel Vec is allocated,
+            // never per frame.
             blur.upload_blur_params(queue, dpr);
             blur
         }
 
-        /// Whether the targets already match a surface of `width` x `height`. The
-        /// caller (resize) rebuilds only on a mismatch.
+        /// Whether the targets already match a surface of `width` x `height`.
         pub fn matches(&self, width: u32, height: u32) -> bool {
             self.width == width.max(1) && self.height == height.max(1)
         }
 
-        /// Compute + upload the H/V Gaussian blur params (taps + texel + direction)
-        /// for this target's size and `dpr`-scaled blur radius. Called ONCE from
-        /// `new` (the kernel/texel are size-fixed); the per-frame path never touches
-        /// this, so the kernel `Vec` allocation stays off the hot path.
         fn upload_blur_params(&self, queue: &wgpu::Queue, dpr: f32) {
             let radius_px = (SHADOW_BLUR_RADIUS_PX * dpr.max(1.0)).round();
             let radius = (radius_px as usize).clamp(1, SHADOW_BLUR_MAX_RADIUS);
-            // A common rule of thumb: sigma ~= radius/3 keeps the tails inside the
-            // kernel support so the truncation error stays small.
+            // sigma ~= radius/3 keeps the tails inside the kernel support.
             let sigma = (radius as f32 / 3.0).max(0.5);
             let kernel = gaussian_kernel(radius, sigma);
             // `gaussian_kernel` returns the full `2*radius+1` symmetric kernel; the
-            // shader reads one-sided taps (center + positive side) and mirrors them,
-            // so pack `weights[0] = center`, `weights[k] = kernel[radius + k]`.
+            // shader reads one-sided taps and mirrors them, so pack `weights[0] =
+            // center`, `weights[k] = kernel[radius + k]`.
             let mut weights = [[0.0f32; 4]; SHADOW_BLUR_MAX_RADIUS + 1];
             for k in 0..=radius {
                 weights[k][0] = kernel[radius + k];
             }
-            // W3-G9/#1: the blur targets are quarter-res, so one quarter-res texel is
-            // `4 / full_width` — each of the 12 taps then steps 4 physical px, giving a
-            // ~48-physical-px one-sided reach on all sides at the same tap budget.
+            // Quarter-res target: one texel is `4 / full_dim`, so each tap steps 4
+            // physical px (~48-physical-px one-sided reach at the same tap budget).
             let texel = [4.0 / self.width as f32, 4.0 / self.height as f32];
             let h = BlurParams {
                 direction: [1.0, 0.0],
@@ -393,9 +364,8 @@ mod gpu {
             queue.write_buffer(&self.blur_v_buffer, 0, bytemuck::cast_slice(&[v]));
         }
 
-        /// Upload the composite tint (the theme `shadow` token color). A single
-        /// 16-byte uniform write with NO allocation — cheap enough to call per frame,
-        /// though in practice only the theme flip changes it.
+        /// Upload the composite tint (the theme `shadow` token color): a single
+        /// 16-byte uniform write, no allocation.
         pub fn set_tint(&self, queue: &wgpu::Queue, tint: [f32; 4]) {
             queue.write_buffer(
                 &self.composite_buffer,
@@ -405,8 +375,7 @@ mod gpu {
         }
 
         /// Record the H then V separable blur passes (mask -> ping -> pong), each a
-        /// fullscreen triangle. The MASK must already hold the rendered shadow
-        /// silhouette (see [`record_mask_into`]); this only blurs it.
+        /// fullscreen triangle. The MASK must already hold the shadow silhouette.
         pub fn record_blur(&self, encoder: &mut wgpu::CommandEncoder) {
             self.record_fullscreen(
                 encoder,
@@ -426,11 +395,9 @@ mod gpu {
 
         /// Record the composite pass: a fullscreen triangle sampling the blurred
         /// mask (pong), tinted by the theme shadow color, src-over into `target`.
-        /// This is the FIRST draw into the visible surface, so it both CLEARS the
-        /// surface to `clear` (the canvas-bg) and draws the shadow on top — the
-        /// subsequent fill/stroke/text pass then loads and draws over the shadow. By
-        /// owning the clear here the shadow is guaranteed to sit beneath the fill in
-        /// a single, well-ordered surface pass.
+        /// This is the FIRST draw into the visible surface, so it CLEARS to `clear`
+        /// (the canvas-bg) here, guaranteeing the shadow sits beneath the later
+        /// fill/stroke/text in one well-ordered pass.
         pub fn record_composite(
             &self,
             encoder: &mut wgpu::CommandEncoder,
@@ -465,9 +432,8 @@ mod gpu {
             pass.draw(0..3, 0..1);
         }
 
-        /// The mask view the shadow silhouette renders into (cleared to transparent
-        /// by the caller's render pass). Exposed so `ObjectRenderer` can record the
-        /// shadow-only sub-pass into it.
+        /// The mask view the shadow silhouette renders into, exposed so
+        /// `ObjectRenderer` can record the shadow-only sub-pass.
         pub fn mask_view(&self) -> &wgpu::TextureView {
             &self.mask_view
         }
@@ -485,8 +451,6 @@ mod gpu {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    // REPLACE blend + a clear here are equivalent for a full-coverage
-                    // triangle; clear keeps it well-defined even outside the tri.
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     store: wgpu::StoreOp::Store,
                 },

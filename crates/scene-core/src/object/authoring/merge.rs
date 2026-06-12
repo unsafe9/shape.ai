@@ -1,47 +1,29 @@
-//! Multi-stroke endpoint merge (anchor-semantics v3 §4 follow-up).
+//! Multi-stroke endpoint merge: when a freehand release recognizes OPEN and one
+//! of its ends lands within `tolerance_px` of an existing open-class object's
+//! endpoint (node 0 / last, world space), the stroke MERGES into that object
+//! instead of inserting:
+//!   (i)   one end matches      -> existing path + stroke chain into one open path;
+//!   (ii)  two ends match two   -> A + stroke + B chain; start-side survives, B
+//!         different objects        deleted;
+//!   (iii) two ends match the   -> the stroke closes that object into a ring.
+//!         SAME object's ends
 //!
-//! A user draws a rect in three strokes — left vertical, then an ㄱ (top +
-//! right), then the bottom bar. Per-stroke recognition alone leaves three
-//! independent open objects. This module makes strokes COMPOSE: when a freehand
-//! release recognizes OPEN and one of its ends lands within the endpoint
-//! tolerance of an existing open-class object's endpoint (node 0 / last, world
-//! space), the stroke MERGES into that object instead of inserting:
+//! The matched geometry is flattened to world px ([`FLATTEN_STEPS_PER_CURVE`] per
+//! curve), oriented around the junction(s), plus the raw stroke samples (matched
+//! ends snapped onto the junction), then RE-RECOGNIZED. A closing sequence
+//! canonicalizes per pen mode; a still-open chain keeps the Free pipeline (Basic's
+//! open force-line would collapse the chain to its chord).
 //!
-//!   (i)  one end matches            → existing path + stroke chain into one
-//!        open path;
-//!   (ii) the two ends match TWO     → A + stroke + B chain three ways; the
-//!        different objects            start-side match survives, B is deleted;
-//!   (iii) the two ends match the    → the stroke closes that object into a
-//!        SAME object's two ends       ring (closed-class).
+//! Ops (one batch, forward authoring only): ONE `edit-geometry` on the survivor
+//! (merged recognition mapped through inv(T_survivor), Q=8), a `set-anchor` that
+//! RELEASES anchors on endpoints the junction turned into interior/ring nodes (the
+//! far endpoint's anchor survives, remapped; a closed result clears all), and a
+//! `delete` of the absorbed case-(ii) object. The absorbed object's OWN far-endpoint
+//! anchor TRANSFERS onto the survivor's new far node before the `delete`. The new
+//! stroke is never inserted; `None` = no merge, the caller keeps insert + release.
+//! Endpoint merge takes priority over release-anchor authoring.
 //!
-//! The merged sample sequence is the matched geometry flattened to world px
-//! (beziers at a fixed step, [`FLATTEN_STEPS_PER_CURVE`]) oriented around the
-//! junction(s), plus the raw stroke samples (their matched ends snapped onto
-//! the junction). It is then RE-RECOGNIZED through [`recognize_stroke`]: a
-//! sequence that closes (the trim ladder included) canonicalizes per the pen
-//! mode — Basic snaps the 3-stroke rect to THE rect — while a still-open chain
-//! keeps the silhouette-preserving Free pipeline (Basic's open force-line
-//! would collapse a multi-stroke chain to its chord, destroying the corners
-//! the user just drew; a truly straight chain still resolves to the 2-node
-//! line through the Free line fit).
-//!
-//! Ops (one shell batch, forward authoring only — op-apply untouched): ONE
-//! `edit-geometry` on the survivor (the merged recognition mapped world →
-//! inv(T_survivor), Q=8 — id/style preserved), a `set-anchor` rewrite that
-//! RELEASES anchors on endpoints the junction turned into interior/ring nodes
-//! (the far endpoint's anchor survives, remapped to its new pair index; a
-//! closed result clears all of them, DU7=(b)), and a `delete` of the absorbed
-//! case-(ii) object. The absorbed object's geometry moves into the survivor, so
-//! its OWN far-endpoint anchor (an outward anchor to a third object) TRANSFERS
-//! onto the survivor's new far node before the `delete` (its junction-end anchor
-//! is consumed by the merge and dropped). The new stroke is NEVER inserted.
-//! `None` = no merge: the caller keeps the existing insert + release anchoring
-//! path. Endpoint merge takes PRIORITY over release-anchor authoring.
-//!
-//! Pure (no time/rng/IO), pointer-width-agnostic; recognition + merge run once
-//! at pen-up (no per-frame cost). The tolerance is WORLD px — the shell
-//! converts its screen-px constant through the zoom (the existing snap
-//! convention).
+//! Pure (no time/rng/IO); merge runs once at pen-up. Tolerance is WORLD px.
 
 use crate::object::anchor_follow::{affine_of, apply_affine, invert_affine, local_nodes};
 use crate::object::deform::round_unit;
@@ -55,13 +37,12 @@ use crate::object::recognize::{recognize_stroke, RecognizeMode};
 /// Quantized units per logical pixel (Q=8).
 const UNITS_PER_PX: f64 = GEOMETRY_QUANTUM_PER_PX as f64;
 
-/// Fixed-step sample count per cubic segment when flattening a matched
-/// object's geometry into the merged world sequence (pen-up one-shot cost).
+/// Fixed-step sample count per cubic segment when flattening a matched object's
+/// geometry into the merged world sequence.
 const FLATTEN_STEPS_PER_CURVE: usize = 16;
 
-/// One matched open-class endpoint: which scene object, which end (`node_last`
-/// = the last pair vs pair 0), its world-px position (the junction), and the
-/// match distance (squared) for nearest-candidate selection.
+/// One matched open-class endpoint: which object, which end (`node_last`), its
+/// world-px junction position, and the squared match distance.
 struct EndpointHit {
     index: usize,
     node_last: bool,
@@ -69,11 +50,9 @@ struct EndpointHit {
     dist_sq: f64,
 }
 
-/// The merge entry (module doc): the ops merging a released freehand stroke
-/// (raw world-px samples) into the open-class object(s) whose endpoint(s) its
+/// The ops merging a released freehand stroke into the open-class object(s) its
 /// ends landed on, or `None` when nothing merges — fewer than 2 samples, no
-/// endpoint within `tolerance_px` (world px), or the stroke recognizes CLOSED
-/// by itself (a self-closed shape commits through the normal insert path).
+/// endpoint within `tolerance_px`, or the stroke recognizes CLOSED by itself.
 pub fn merge_open_stroke_ops(
     scene: &ObjectScene,
     stroke_points_world: &[(f64, f64)],
@@ -83,9 +62,8 @@ pub fn merge_open_stroke_ops(
     if stroke_points_world.len() < 2 || !(tolerance_px > 0.0) {
         return None;
     }
-    // Each stroke end matches independently; nearest candidate wins. A
-    // degenerate double-match of ONE endpoint (a short hook landing where it
-    // started) keeps only the start-side match.
+    // Each stroke end matches independently; nearest candidate wins. A degenerate
+    // double-match of ONE endpoint keeps only the start-side match.
     let start_hit = nearest_open_endpoint(scene, stroke_points_world[0], tolerance_px);
     let end_hit = match (
         &start_hit,
@@ -101,16 +79,13 @@ pub fn merge_open_stroke_ops(
     if start_hit.is_none() && end_hit.is_none() {
         return None;
     }
-    // The merge gate: only an OPEN recognition chains — a stroke that closes
-    // by itself commits as its own shape through the normal insert path. (For
-    // open results recognition preserves the input endpoints exactly, so the
-    // raw-endpoint candidate scan above already matched the right points.)
+    // Only an OPEN recognition chains; a self-closing stroke commits through the
+    // normal insert path.
     if recognize_stroke(stroke_points_world, mode).closed {
         return None;
     }
 
-    // The stroke samples, matched ends snapped onto their junctions (the
-    // existing geometry's endpoint is the truth the new stroke landed near).
+    // Snap matched ends onto their junctions (the existing endpoint is the truth).
     let mut stroke_pts = stroke_points_world.to_vec();
     if let Some(hit) = &start_hit {
         stroke_pts[0] = hit.world;
@@ -119,8 +94,8 @@ pub fn merge_open_stroke_ops(
         let last = stroke_pts.len() - 1;
         stroke_pts[last] = hit.world;
     }
-    // A matched object flattened to world px, oriented so its junction
-    // endpoint sits LAST (`junction_last`) or FIRST in the chain.
+    // A matched object flattened to world px, oriented so its junction endpoint
+    // sits LAST (`junction_last`) or FIRST in the chain.
     let object_chain = |hit: &EndpointHit, junction_last: bool| -> Option<Vec<(f64, f64)>> {
         let object = &scene.objects[hit.index];
         let nodes = open_subpath_nodes(&object.geometry.path_string)?;
@@ -163,10 +138,8 @@ pub fn merge_open_stroke_ops(
         (None, None) => return None,
     };
 
-    // Re-recognize the merged sequence. A chain that stays open must keep its
-    // silhouette: Basic's open force-line would collapse the corners the user
-    // just chained, so the open case rides the Free pipeline (a truly straight
-    // chain still resolves to the 2-node line through its line fit).
+    // An open chain rides the Free pipeline so Basic's force-line cannot collapse
+    // the chained corners.
     let mut rec = recognize_stroke(&merged, mode);
     if !rec.closed && mode == RecognizeMode::Basic {
         rec = recognize_stroke(&merged, RecognizeMode::Free);
@@ -183,11 +156,10 @@ pub fn merge_open_stroke_ops(
         },
     }];
 
-    // Anchor rewrite: the junction endpoint became an interior node — release
-    // its anchor. The far endpoint stays an endpoint (open recognition
-    // preserves it exactly), so its anchor survives at its new pair index. A
-    // closed result clears everything (anchors live on open-class endpoints
-    // only, DU7=(b)). Anchor `node_index` addresses PAIR space (`local_nodes`).
+    // The junction endpoint became an interior node — release its anchor. The far
+    // endpoint stays an endpoint, so its anchor survives at its new pair index. A
+    // closed result clears everything (anchors live on open-class endpoints only).
+    // `node_index` addresses PAIR space (`local_nodes`).
     let new_anchors: Vec<Anchor> = if rec.closed {
         Vec::new()
     } else {
@@ -208,21 +180,16 @@ pub fn merge_open_stroke_ops(
                 a
             })
             .collect();
-        // Case (ii): the absorbed object's geometry was appended after the
-        // survivor's start-side far end, so its OWN far-endpoint anchors (an
-        // anchor ON that endpoint pointing at a third object) must move with the
-        // geometry onto the survivor's NEW far node (the chain's last index).
-        // `target`/`at` live in the third object's frame, so only `node_index`
-        // remaps — the junction-end anchor of the absorbed object is consumed
-        // and dropped. The start-side survivor's anchors are handled above.
+        // Case (ii): the absorbed object's OWN far-endpoint anchor (pointing at a
+        // third object) moves with its geometry onto the survivor's new far node;
+        // only `node_index` remaps (`target`/`at` live in the third frame). The
+        // absorbed junction-end anchor is consumed and dropped.
         if let Some(index) = absorbed_index {
             let absorbed = &scene.objects[index];
             let b_last = i32::try_from(
                 local_nodes(&absorbed.geometry.path_string).len().checked_sub(1)?,
             )
             .ok()?;
-            // The absorbed object chains junction-first, so its far endpoint
-            // becomes the survivor's last node.
             let b_far_old = if end_hit.as_ref().is_some_and(|b| b.node_last) { 0 } else { b_last };
             kept.extend(absorbed.anchors.iter().filter(|a| a.node_index == b_far_old).cloned().map(
                 |mut a| {
@@ -242,8 +209,8 @@ pub fn merge_open_stroke_ops(
     Some(ops)
 }
 
-/// The single open subpath's nodes of an open-class path-string (§1: exactly
-/// one subpath, not closed, at least two nodes). `None` = not a candidate.
+/// The single open subpath's nodes of an open-class path-string (one subpath, not
+/// closed, >= 2 nodes). `None` = not a candidate.
 fn open_subpath_nodes(d: &str) -> Option<Vec<PathNode>> {
     let subpaths = path_string::parse(d).ok()?;
     if subpaths.len() != 1 || subpaths[0].closed {
@@ -324,8 +291,8 @@ fn nearest_open_endpoint(
 }
 
 /// Rewrite a recognized world-units path-string into `transform`'s local space
-/// (world → inv(T), the same Q=8 round-quantization as the chord deform),
-/// bezier control points mapped ABSOLUTELY like `deform_open_path`.
+/// (world -> inv(T), same Q=8 round-quantization as the chord deform); control
+/// points mapped ABSOLUTELY.
 fn world_d_to_local(d: &str, transform: &Transform3x3) -> Option<String> {
     let subpaths = path_string::parse(d).ok()?;
     let sub = subpaths.into_iter().next()?;
@@ -357,10 +324,6 @@ fn world_d_to_local(d: &str, transform: &Transform3x3) -> Option<String> {
         .collect();
     Some(path_string::serialize(&[SubPath { closed: sub.closed, nodes }]))
 }
-
-// ---------------------------------------------------------------------------
-// Tests — the 3-stroke rect acceptance + the merge decision table.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -412,9 +375,8 @@ mod tests {
         }
     }
 
-    /// Stroke 2 of the 3-stroke rect: the left vertical exists, an ㄱ (top +
-    /// right) releases on its TOP endpoint — case (i): ONE open path via
-    /// edit-geometry on the survivor, no insert, nothing deleted.
+    /// Case (i): a second stroke releasing on an existing open path's endpoint
+    /// chains into ONE open path via edit-geometry; no insert, nothing deleted.
     #[test]
     fn second_stroke_chains_into_the_existing_open_path() {
         let scene = scene_of(vec![open_object("left", "M 0 800 L 0 0", 100.0, 100.0)]);
@@ -429,14 +391,13 @@ mod tests {
             panic!("expected edit-geometry: {ops:?}");
         };
         assert_eq!(id, "left");
-        // Survivor-local (world − translate(100,100), Q=8): the chained ⊓
-        // silhouette, both corners preserved, still OPEN.
+        // Survivor-local (world − translate(100,100), Q=8): both corners preserved,
+        // still OPEN.
         assert_eq!(geometry.path_string, "M 0 800 L 0 0 L 800 0 L 800 800");
     }
 
-    /// THE acceptance: stroke 3 (the bottom bar) lands on BOTH endpoints of
-    /// the chained ⊓ — case (iii) closes the ring and Basic re-recognition
-    /// snaps it to the canonical rect. Three strokes = one rect object.
+    /// Case (iii): a third stroke landing on BOTH endpoints of the chained ⊓
+    /// closes the ring and Basic re-recognition snaps it to the canonical rect.
     #[test]
     fn third_stroke_closes_the_chain_into_a_basic_rect() {
         let mut scene = scene_of(vec![open_object("left", "M 0 800 L 0 0", 100.0, 100.0)]);
@@ -463,8 +424,7 @@ mod tests {
     }
 
     /// Case (iii) on a U: both stroke ends on the SAME object's two endpoints
-    /// close it — and a ring carries no endpoint anchors (DU7=(b)), so the
-    /// rewrite clears the survivor's anchor vector.
+    /// close it; a ring carries no endpoint anchors, so the rewrite clears them.
     #[test]
     fn stroke_across_both_ends_of_a_u_object_closes_it() {
         let mut u = open_object("u", "M 0 0 L 0 800 L 800 800 L 800 0", 0.0, 0.0);
@@ -489,21 +449,18 @@ mod tests {
         assert!(anchors.is_empty(), "a closed ring carries no endpoint anchors");
     }
 
-    /// Outside the endpoint tolerance nothing merges — the caller keeps the
-    /// existing insert path.
     #[test]
     fn release_outside_the_tolerance_does_not_merge() {
         let scene = scene_of(vec![open_object("left", "M 0 800 L 0 0", 100.0, 100.0)]);
         let mut pts = Vec::new();
-        // Start 15.8px from the nearest endpoint (100,100): over the 12px bar.
+        // Start 15.8px from the nearest endpoint: over the 12px bar.
         edge((115.0, 105.0), (215.0, 105.0), 10, &mut pts);
         pts.push((215.0, 105.0));
         assert!(merge_open_stroke_ops(&scene, &pts, RecognizeMode::Basic, TOL).is_none());
     }
 
-    /// Survivor with a non-zero translate: the merged geometry lands in the
-    /// survivor's LOCAL space (world → inv(T_survivor), Q=8) — a collinear
-    /// extension re-fits to one straight line through the survivor's frame.
+    /// Survivor with a non-zero translate: the merged geometry lands in its LOCAL
+    /// space (world -> inv(T_survivor), Q=8).
     #[test]
     fn merged_geometry_is_rewritten_into_the_survivors_local_space() {
         let scene = scene_of(vec![open_object("seg", "M 0 0 L 800 0", 50.0, 30.0)]);
@@ -521,8 +478,8 @@ mod tests {
         assert_eq!(geometry.path_string, "M 0 0 L 1600 0");
     }
 
-    /// The junction endpoint's anchor is RELEASED (that endpoint became an
-    /// interior node); the far endpoint's anchor survives at its new index.
+    /// The junction endpoint's anchor is released (it became interior); the far
+    /// endpoint's anchor survives at its new index.
     #[test]
     fn absorbed_junction_endpoint_anchor_is_released() {
         let far = Anchor { node_index: 0, target: "box".into(), at: LocalPoint { x: 0, y: 0 } };
@@ -545,8 +502,7 @@ mod tests {
         assert_eq!(anchors, &vec![far]);
     }
 
-    /// A stroke that CLOSES BY ITSELF never merges, even released on an
-    /// endpoint — it commits as its own shape through the normal insert path.
+    /// A stroke that closes by itself never merges, even released on an endpoint.
     #[test]
     fn a_self_closed_stroke_never_merges() {
         let scene = scene_of(vec![open_object("seg", "M 0 0 L 800 0", 0.0, 0.0)]);
@@ -560,9 +516,8 @@ mod tests {
         assert!(merge_open_stroke_ops(&scene, &pts, RecognizeMode::Basic, TOL).is_none());
     }
 
-    /// Case (ii): the stroke bridges TWO objects — A + stroke + B chain into
-    /// one path on the start-side survivor; the absorbed B is deleted in the
-    /// same batch.
+    /// Case (ii): a bridging stroke chains A + stroke + B onto the start-side
+    /// survivor; the absorbed B is deleted in the same batch.
     #[test]
     fn bridging_stroke_chains_two_objects_and_deletes_the_absorbed_one() {
         let scene = scene_of(vec![
@@ -583,16 +538,13 @@ mod tests {
         assert_eq!(ops[1], ObjectOp::Delete { id: "b".into() });
     }
 
-    /// Case (ii) anchor transfer: the absorbed object B carries an OUTWARD anchor
-    /// on its FAR endpoint (the non-junction end) pointing at a third object Y.
-    /// B's geometry moves into the survivor, so that anchor must follow onto the
-    /// survivor's new far node — `target`/`at` preserved (they live in Y's frame),
-    /// only `node_index` remapped. Driven through real op-apply.
+    /// Case (ii) anchor transfer: the absorbed B's far-endpoint anchor (pointing at
+    /// a third object Y) follows its geometry onto the survivor's new far node;
+    /// `target`/`at` preserved (Y's frame), only `node_index` remapped.
     #[test]
     fn bridging_transfers_the_absorbed_objects_far_anchor_to_the_survivor() {
-        // B = "M 0 0 L 0 800" at (200,0): node 0 = world (200,0) is the JUNCTION
-        // (the stroke lands there); node 1 = world (200,100) is the FAR endpoint,
-        // and it anchors out to Y.
+        // B at (200,0): node 0 = world (200,0) is the JUNCTION; node 1 = world
+        // (200,100) is the FAR endpoint, anchored out to Y.
         let far = Anchor { node_index: 1, target: "y".into(), at: LocalPoint { x: 48, y: 16 } };
         let mut b = open_object("b", "M 0 0 L 0 800", 200.0, 0.0);
         b.anchors = vec![far.clone()];
@@ -606,17 +558,14 @@ mod tests {
         pts.push((199.0, 1.0));
         let ops =
             merge_open_stroke_ops(&scene, &pts, RecognizeMode::Basic, TOL).expect("merges");
-        // edit + anchor transfer + delete (the start-side survivor "a" had no
-        // anchors, so the only set-anchor authored is the transfer from "b").
         assert_eq!(ops.len(), 3, "edit + anchor transfer + delete: {ops:?}");
         for op in ops {
             apply_object_op(&mut scene, op).expect("merge ops apply");
         }
-        // B is gone; the survivor "a" carries B's far anchor at its NEW far node.
         assert!(scene.objects.iter().all(|o| o.id != "b"), "absorbed B is deleted");
         let survivor = scene.objects.iter().find(|o| o.id == "a").expect("survivor present");
-        // Survivor geometry "M 0 0 L 1600 0 L 1600 800" has 3 nodes; B's far end
-        // is the LAST node (index 2). target/at unchanged from B's original.
+        // Survivor "M 0 0 L 1600 0 L 1600 800" has 3 nodes; B's far end is the last
+        // (index 2), target/at unchanged.
         assert_eq!(
             survivor.anchors,
             vec![Anchor { node_index: 2, target: "y".into(), at: LocalPoint { x: 48, y: 16 } }],

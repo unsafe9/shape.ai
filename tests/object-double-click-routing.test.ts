@@ -1,15 +1,3 @@
-// W3-G1 — live double-click drill-in routing (RA2b + AP3 glue).
-//
-// RA2b makes the core emit `objectDoubleClick` ({ id, hasChildren } | null) on the
-// inputBatch result; AP3 added App.handleObjectDoubleClick + activeContainer but it
-// never fired at runtime because the TS plumbing was missing. This pins the wiring
-// end-to-end through the REAL engine: a fake renderer returns `objectDoubleClick` on
-// a double-click batch, and the engine must read it and emit an `object-double-click`
-// EngineEvent (the event ShapeCanvasHost routes to onObjectDoubleClick). The shell's
-// drill-in vs. edit-text decision is the real `doubleClickAction` App calls, so the
-// branch is exercised, not re-derived. Falsifiable: if the field is dropped anywhere
-// (wasmLoader type / engine read / engine event), no event fires and the test fails.
-
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { ShapeCanvasEngine, type EngineEvent } from "../platforms/web/renderer/engine";
@@ -36,16 +24,12 @@ function obj(id: string, parent: string | undefined): SceneObject {
   } as SceneObject;
 }
 
-// A scene where `frame-1` is a container (has a child) and `rect-1` is a leaf —
-// the same forest the engine's hasChildren signal reflects, so the core decision
-// the shell runs agrees with the renderer-emitted hasChildren bit.
+// `frame-1` is a container (has a child), `rect-1` is a leaf.
 function routingScene(): ObjectScene {
   return { ...emptyObjectScene(), objects: [obj("frame-1", undefined), obj("child", "frame-1"), obj("rect-1", undefined)] };
 }
 
-// A minimal fake renderer whose `inputBatch` returns the supplied objectDoubleClick
-// on a double-click event (and nothing on any other event). Only the methods the
-// engine touches on this path are real; the rest are inert.
+// Returns the supplied objectDoubleClick on a double-click event, nothing otherwise.
 function doubleClickRenderer(signal: RustInputBatchResult["objectDoubleClick"]): RustWebGpuRenderer {
   return {
     resize() {},
@@ -63,8 +47,7 @@ function doubleClickRenderer(signal: RustInputBatchResult["objectDoubleClick"]):
   };
 }
 
-// A canvas stub that records listeners (engine binds them in its constructor) and
-// can dispatch a recorded handler so the test can fire a real `dblclick`.
+// Records the engine's listeners so the test can fire a real dblclick.
 function recordingCanvas(): { canvas: HTMLCanvasElement; fire: (type: string, event: unknown) => void } {
   const listeners = new Map<string, Set<EventListener>>();
   const element = {
@@ -98,8 +81,6 @@ function overlayRoot(): HTMLElement {
   return { append() {} } as unknown as HTMLElement;
 }
 
-// Drive a real dblclick through the engine + fake renderer, returning the
-// object-double-click EngineEvent the engine emitted (or null if none fired).
 function driveDoubleClick(
   signal: RustInputBatchResult["objectDoubleClick"]
 ): Extract<EngineEvent, { type: "object-double-click" }> | null {
@@ -119,13 +100,10 @@ function driveDoubleClick(
     | null;
 }
 
-describe("W3-G1 double-click drill-in routing", () => {
+describe("double-click drill-in routing", () => {
   it("routes a container double-click (hasChildren) to a drill-in", () => {
     const event = driveDoubleClick({ id: "frame-1", hasChildren: true });
-    // The field reached the engine and rode out as the event the host forwards.
     expect(event).toEqual({ type: "object-double-click", id: "frame-1", hasChildren: true });
-    // App.handleObjectDoubleClick runs this exact core decision off the event id: a
-    // container drills in (sets activeContainer to the id), not into text edit.
     expect(core.doubleClickAction(routingScene(), event!.id)).toEqual({ kind: "drill-in-container" });
   });
 

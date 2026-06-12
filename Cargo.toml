@@ -10,17 +10,13 @@ members = [
     "crates/client-runtime",
 ]
 # renderer-wgpu stays standalone: member-izing it would fold its pinned wgpu
-# lockfile into the workspace lock. It depends on the pure renderer-core member by
-# path, which is fine for an excluded crate.
+# lockfile into the workspace lock.
 exclude = [
     "crates/renderer-wgpu",
 ]
 
-# Pointer-width-agnostic discipline for the wasm32+native pure cores (scene-core,
-# storage-core) — see CLAUDE.md Conventions. Opt in per-crate with
-# `[lints] workspace = true`. Surfaces 32-bit address assumptions: width-narrowing
-# casts and raw-pointer `as` coercions. Denied: genuine width conversions use
-# checked `try_from`; intentional truncations carry a scoped `#[allow(.., reason)]`.
+# Pointer-width-agnostic discipline for the pure cores — see CLAUDE.md Conventions.
+# Opt in per-crate with `[lints] workspace = true`; surfaces 32-bit address assumptions.
 [workspace.lints.rust]
 trivial_casts = "deny"
 trivial_numeric_casts = "deny"

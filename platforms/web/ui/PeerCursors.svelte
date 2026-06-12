@@ -1,9 +1,6 @@
 <script lang="ts">
-  // Peer cursor overlay (MG6.2). A lightweight, absolutely-positioned layer over
-  // the canvas surface: each live peer's WORLD-space cursor is projected to this
-  // client's screen via the shared screenToWorld inverse, so peers with different
-  // cameras still point at the same canvas location. Pure presentation — it owns
-  // no presence state; the SceneClient's PeerRegistry feeds it the live set.
+  // Peer cursor overlay: each live peer's WORLD-space cursor is projected to this client's screen, so
+  // peers with different cameras still point at the same canvas location. Owns no presence state.
   import { MousePointer2 } from "lucide-svelte";
   import type { CameraState } from "../shared/geometry";
   import { worldToScreen } from "../renderer/scene";

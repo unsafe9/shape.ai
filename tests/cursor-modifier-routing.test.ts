@@ -1,19 +1,3 @@
-// EN1 — cursor + modifier routing.
-//
-// Pins, at the code level (no GPU/browser):
-//  (1) the gesture bindings the engine routes off are the SINGLE source and stay
-//      equal to the runtime C2 catalog (`verifyGestureBindings` finds no drift);
-//  (2) the pure gesture predicates (pan / additive-select / snap-bypass /
-//      partial-erase / coarse-rotate) classify the held inputs correctly;
-//  (3) coarse-rotate snaps a rotate-delta matrix to the catalog step (15°),
-//      matching RA2c's `rotate_delta_matrix_snapped` semantics shell-side;
-//  (4) the HoverAffordance -> CSS cursor map covers resize-*/rotate/pan AND
-//      styles.css carries the matching cursor for every affordance — so the #4
-//      gap (a hardcoded `cursor: grab` on the input canvas overriding the
-//      affordance cursor) cannot silently return;
-//  (5) the App-level cursorAffordance derivation maps a pointer over a resize
-//      handle / rotate zone to the resize/rotate cursor.
-
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -54,8 +38,8 @@ const mods = (over: Partial<Record<"shiftKey" | "metaKey" | "ctrlKey" | "altKey"
   ...over
 });
 
-describe("gesture bindings are the single source, equal to the C2 catalog", () => {
-  it("every routed binding matches the runtime C2 gesture (no drift)", () => {
+describe("gesture bindings are the single source, equal to the catalog", () => {
+  it("every routed binding matches the runtime gesture (no drift)", () => {
     expect(verifyGestureBindings(gestures)).toEqual([]);
   });
 
@@ -103,8 +87,8 @@ describe("pure gesture predicates route the held inputs", () => {
   });
 });
 
-// Build the same rotate-delta the core returns (rotate_about_3x3) so the test
-// proves the shell snap matches RA2c's semantics from the matrix alone.
+// Build the same rotate-delta the core returns, to compare snap semantics from the
+// matrix alone.
 function rotateAbout(thetaDeg: number, cx: number, cy: number): RenderTransform3x3 {
   const t = (thetaDeg * Math.PI) / 180;
   const c = Math.cos(t);
@@ -120,7 +104,7 @@ function angleOf(m: RenderTransform3x3): number {
   return (Math.atan2(m[1][0], m[0][0]) * 180) / Math.PI;
 }
 
-describe("snapRotateDeltaMatrix (coarse-rotate, RA2c-equivalent)", () => {
+describe("snapRotateDeltaMatrix (coarse-rotate)", () => {
   it("snaps a swept angle to the nearest 15° step", () => {
     const center: [number, number] = [200, 140];
     // Nearest 15° multiple: 22 -> 15, 7 -> 0, -52 -> -45, 38 -> 45.
@@ -134,7 +118,7 @@ describe("snapRotateDeltaMatrix (coarse-rotate, RA2c-equivalent)", () => {
     const cx = 311;
     const cy = -88;
     const snapped = snapRotateDeltaMatrix(rotateAbout(44, cx, cy), 15);
-    // 44° snaps to 45°; rebuilt about (cx,cy) must fix that center point.
+    // Rebuilt about (cx,cy) must fix that center point.
     const fx = snapped[0][0] * cx + snapped[0][1] * cy + snapped[0][2];
     const fy = snapped[1][0] * cx + snapped[1][1] * cy + snapped[1][2];
     expect(fx).toBeCloseTo(cx, 4);
@@ -163,7 +147,7 @@ const ALL_AFFORDANCES: HoverAffordance[] = [
   "rotate"
 ];
 
-describe("HoverAffordance -> CSS cursor map (#4)", () => {
+describe("HoverAffordance -> CSS cursor map", () => {
   it("maps every resize affordance to a resize cursor, rotate to crosshair, pan to grab", () => {
     expect(affordanceToCursor("resize-nw")).toBe("nwse-resize");
     expect(affordanceToCursor("resize-ne")).toBe("nesw-resize");
@@ -186,7 +170,7 @@ describe("HoverAffordance -> CSS cursor map (#4)", () => {
     }
   });
 
-  it("does NOT hardcode a grab cursor on the input canvas (the #4 break)", () => {
+  it("does NOT hardcode a grab cursor on the input canvas", () => {
     // The input canvas must inherit the cursor so the affordance shows through.
     expect(stylesCss).toMatch(/\.renderer-input-canvas\s*\{[^}]*cursor:\s*inherit/s);
     expect(stylesCss).not.toMatch(/\.renderer-input-canvas\s*\{[^}]*cursor:\s*grab/s);
@@ -195,8 +179,6 @@ describe("HoverAffordance -> CSS cursor map (#4)", () => {
 
 describe("cursorAffordance derivation (pointer over a handle)", () => {
   it("a pointer over a resize handle / rotate zone yields the resize/rotate cursor", () => {
-    // The core's hover classification is the input; the derivation passes it
-    // through under the select tool, then the map turns it into the cursor.
     const over = cursorAffordance(false, "select", "resize-se");
     expect(over).toBe("resize-se");
     expect(affordanceToCursor(over!)).toBe("nwse-resize");

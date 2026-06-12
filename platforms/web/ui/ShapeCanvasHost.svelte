@@ -28,13 +28,11 @@
   let overlayRoot: HTMLDivElement;
 
   onMount(() => {
-    // T6.2 §4: the Svelte node only owns the three DOM nodes; the
-    // framework-neutral ShapeCanvasHost owns the engine lifecycle.
+    // The Svelte node owns only the three DOM nodes; ShapeCanvasHost owns the engine lifecycle.
     let disposed = false;
     const host = new ShapeCanvasHost(callbacks);
     void host.mount(inputCanvas, webGpuCanvas, overlayRoot, initialCamera).then(() => {
-      // If the component unmounted while mount() was in flight, host.destroy()
-      // already ran — don't hand a dead host back to the shell.
+      // If the component unmounted while mount() was in flight, host.destroy() already ran — don't hand a dead host back.
       if (disposed) return;
       onHost(host);
     });

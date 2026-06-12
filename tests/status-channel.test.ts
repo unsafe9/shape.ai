@@ -1,20 +1,8 @@
-// AP6 (#19) — transient toast channel state machine.
-//
-// The bottom-center status region carries two notice kinds: persistent hints
-// (held in `status`) and transient action notices (held in this channel, which
-// auto-dismisses after ~2.5s). This drives the pure ToastChannel with a fake
-// injected timer (no real clock) and asserts: a transient message clears itself
-// after the timeout while a persistent one is untouched; superseding a live
-// toast clears the prior timer (no leak); and an explicit dismiss cancels too.
-// Falsifiable: if the toast never marks-dismissed, or a superseded timer is left
-// armed, the assertions below fail.
-
 import { describe, expect, it } from "vitest";
 import { ToastChannel, TOAST_DISMISS_MS, type ToastTimer } from "../platforms/web/runtime/statusChannel";
 
-// A controllable timer: `set` queues a callback under a fresh id; `clear` drops
-// it; `fire` invokes the pending callback for an id (simulating the timeout
-// firing). `pending` lets the test assert no leaked timers remain.
+// Controllable timer: set queues a callback under a fresh id, fire invokes it,
+// pending lets the test assert no leaked timers remain.
 function fakeTimer() {
   const queued = new Map<number, () => void>();
   let nextId = 1;
@@ -71,7 +59,7 @@ describe("ToastChannel — transient auto-dismiss", () => {
     expect(clock.pending()).toBe(0);
   });
 
-  it("uses the ~2.5s D8 default dismiss window", () => {
+  it("uses the ~2.5s default dismiss window", () => {
     const { channel } = makeChannel();
     let ms = -1;
     const probe = new ToastChannel(
@@ -91,11 +79,9 @@ describe("ToastChannel — no timer leaks", () => {
     const { channel, clock, changes } = makeChannel();
     channel.show("Inserted rectangle");
     channel.show("Inserted ellipse");
-    // The first timer must be gone — only the second is armed.
     expect(clock.pending()).toBe(1);
     expect(channel.message).toBe("Inserted ellipse");
     expect(changes).toEqual(["Inserted rectangle", "Inserted ellipse"]);
-    // Firing the remaining timer dismisses the survivor and leaves nothing armed.
     clock.fireAll();
     expect(channel.message).toBeNull();
     expect(clock.pending()).toBe(0);
@@ -121,17 +107,13 @@ describe("ToastChannel — no timer leaks", () => {
 
 describe("ToastChannel — persistent text is independent", () => {
   it("a persistent hint (never routed through the channel) is untouched by the timer", () => {
-    // Persistent text lives in the shell's `status` $state, not here. We model
-    // that separation: a transient toast firing its timer only nulls the toast
-    // channel; a persistent string the test holds is never observed by the
-    // channel and so cannot be cleared by it.
+    // Persistent text lives in the shell's `status` $state, outside this channel,
+    // so a transient toast's timer cannot dismiss it.
     const { channel, clock } = makeChannel();
     const persistent = "Drag to create rectangle";
     channel.show("Inserted rectangle");
     clock.fireAll();
     expect(channel.message).toBeNull();
-    // The persistent hint the shell would still be rendering is wholly outside
-    // this channel — proving the transient timer cannot dismiss persistent text.
     expect(persistent).toBe("Drag to create rectangle");
   });
 });

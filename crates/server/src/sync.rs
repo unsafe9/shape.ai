@@ -1,47 +1,24 @@
-//! Server-authoritative sync primitives (MG4.1, MG4.2) — object-native (OB4.1).
+//! Server-authoritative sync primitives the canvas actor composes to be the
+//! single authority for an ordered, idempotent op stream. Transport- and
+//! storage-agnostic: [`ws`](crate::ws) maps the wire envelope on, and
+//! [`canvas_actor`](crate::canvas_actor) drives it against the object core.
 //!
-//! This module holds the pieces the canvas actor composes to become the single
-//! authority for an ordered, idempotent op stream. It is transport- and
-//! storage-agnostic on purpose: [`ws`](crate::ws) maps the wire envelope onto it
-//! and [`canvas_actor`](crate::canvas_actor) drives it against the object core.
-//!
-//! The primitives, and how they compose with the object op-apply path:
-//!
-//! 1. **opId dedup (MG4.2).** Each client op carries an [`OpId`] (`clientId` +
-//!    `localSeq`). The actor keeps a [`DedupTable`] of seen ids mapped to the ack
-//!    the op originally produced. A replay short-circuits to that stored ack and
-//!    does NOT re-run apply, so the scene and server seq never move twice for one
-//!    logical op (idempotent).
-//!
-//! 2. **journal/checkpoint recovery (MG4.1).** The actor journals every applied op
-//!    as an [`OpEnvelope`] (which records `opId` + `baseRevision`, the "authored
-//!    against" revision) and the [`ObjectStore`](crate::ObjectStore) writes the
-//!    touched objects through region-indexed on every op. On spawn the actor loads
-//!    the object scene from the store and REPLAYS the journal tail
-//!    (`seq > checkpoint.seq`) through the object op-apply path, so ops journaled
-//!    after the last write-through survive a crash.
-//!
-//! 3. **per-property LWW.** The object store's
-//!    [`apply`](crate::ObjectStore::apply) consults a per-canvas
-//!    [`PropertyStore`](shape_scene_core::PropertyStore) keyed by the server's
-//!    monotonic `seq`, so a later op with a *lower* seq cannot clobber a property a
-//!    higher-seq op already won. The actor only stamps the seq; the convergence is
-//!    `apply_object_op_lww` in scene-core (the single op-apply path, P1).
-//!
-//! Fractional ordering is no longer a server concern: the object model carries an
-//! explicit fractional `order` field minted by the caller (shell / object MCP),
-//! so the server never stamps an order key.
+//! - opId dedup: a replayed [`OpId`] short-circuits to its stored ack without
+//!   re-running apply, so the scene and server seq never move twice for one op.
+//! - journal recovery: every applied op is journaled and written through
+//!   region-indexed; on spawn the actor replays the journal tail past the last
+//!   write-through so ops survive a crash.
+//! - per-property LWW: the convergence is `apply_object_op_lww` in scene-core,
+//!   keyed by the server's monotonic `seq`; the actor only stamps the seq.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use shape_scene_core::object::ObjectOp;
 
-/// `(clientId, localSeq)` idempotency key assigned at the transport boundary.
-///
-/// Structurally identical to [`shape_scene_core::OpId`]; redefined here so the
-/// server-crate WS envelope owns its own serde and never couples to scene-core's
-/// granular `WireOp` shape.
+/// `(clientId, localSeq)` idempotency key. Redefined here (vs
+/// [`shape_scene_core::OpId`]) so the WS envelope owns its own serde and never
+/// couples to scene-core's `WireOp` shape.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpId {
@@ -49,9 +26,8 @@ pub struct OpId {
     pub local_seq: i64,
 }
 
-/// One op as it travels over the WS `ops` array: an ENVELOPE around a whole
-/// [`ObjectOp`], stamped with its idempotency key, the revision it was authored
-/// against, and a client clock.
+/// One op on the WS `ops` array: an envelope around a whole [`ObjectOp`] with its
+/// idempotency key, authored-against revision, and client clock.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpEnvelope {
@@ -62,9 +38,7 @@ pub struct OpEnvelope {
     pub op: ObjectOp,
 }
 
-/// The ack an applied op produced: the server seq + scene revision after apply.
-///
-/// Stored per [`OpId`] so a replay returns the ORIGINAL ack without re-applying.
+/// Stored per [`OpId`] so a replay returns the original ack without re-applying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpAck {
@@ -72,11 +46,8 @@ pub struct OpAck {
     pub revision: i64,
 }
 
-/// The durable journal record the actor writes per applied op (MG4.1/MG4.2).
-///
-/// This is the *recovery* record: it carries the exact [`ObjectOp`] to REPLAY,
-/// the server `seq` it was assigned, its `opId` (so dedup state can be rebuilt),
-/// and the `baseRevision` it was authored against.
+/// The recovery record per applied op: the exact [`ObjectOp`] to replay, its
+/// `seq`, `opId` (to rebuild dedup), and authored-against `baseRevision`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JournalEntry {
@@ -84,16 +55,12 @@ pub struct JournalEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_id: Option<OpId>,
     pub base_revision: i64,
-    /// The object op to replay on recovery.
     pub op: ObjectOp,
 }
 
-/// Per-canvas seen-opId table for idempotent dedup (MG4.2).
-///
-/// Maps each applied [`OpId`] to the ack it produced. Bounded for a session by
-/// [`MAX_SEEN_OPS`]; on overflow the oldest-inserted ids are dropped (a replay of
-/// a long-evicted op would re-apply, which is acceptable for a session-scoped
-/// guard — the journal remains the durable record).
+/// Per-canvas seen-opId table. Bounded by [`MAX_SEEN_OPS`]; on overflow the
+/// oldest ids drop (a replay of an evicted op re-applies — acceptable for a
+/// session guard, the journal is the durable record).
 #[derive(Debug, Default)]
 pub struct DedupTable {
     acks: HashMap<OpId, OpAck>,
@@ -101,7 +68,6 @@ pub struct DedupTable {
     order: std::collections::VecDeque<OpId>,
 }
 
-/// How many distinct opIds the in-memory dedup table retains per canvas session.
 pub const MAX_SEEN_OPS: usize = 4096;
 
 impl DedupTable {
@@ -114,8 +80,7 @@ impl DedupTable {
         self.acks.get(op_id).copied()
     }
 
-    /// Record that `op_id` applied and produced `ack`. Idempotent: re-recording
-    /// the same id keeps the original ack and does not reorder eviction.
+    /// Idempotent: re-recording the same id keeps the original ack.
     pub fn record(&mut self, op_id: OpId, ack: OpAck) {
         if self.acks.contains_key(&op_id) {
             return;
@@ -129,7 +94,6 @@ impl DedupTable {
         }
     }
 
-    /// Number of retained opIds (for tests/observability).
     pub fn len(&self) -> usize {
         self.acks.len()
     }
@@ -139,17 +103,11 @@ impl DedupTable {
     }
 }
 
-/// Checkpoint cadence retained for journal-tail recovery framing. With the object
-/// store writing every op through region-indexed, the per-object Records are
-/// always exact-to-the-last-op; the journal still records every op so the dedup
-/// table can be rebuilt from its suffix on recovery.
 pub const CHECKPOINT_INTERVAL: i64 = 32;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- dedup ----------------------------------------------------------------
 
     #[test]
     fn dedup_returns_original_ack_for_replay() {
@@ -161,7 +119,6 @@ mod tests {
         let again = table.seen(&id).expect("op is now seen");
         assert_eq!(again, OpAck { seq: 12, revision: 12 });
 
-        // Re-recording keeps the original ack (idempotent).
         table.record(id.clone(), OpAck { seq: 99, revision: 99 });
         assert_eq!(table.seen(&id).unwrap(), OpAck { seq: 12, revision: 12 });
         assert_eq!(table.len(), 1);

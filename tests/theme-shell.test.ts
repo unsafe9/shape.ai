@@ -1,12 +1,3 @@
-// AP4 (#12c) — theme shell. The dark/light toggle must (a) flip the root
-// `data-theme` attribute (dark-mode CSS), (b) persist the choice, and (c) drive
-// RB1's renderer theme-bit so the canvas + chrome flip together; and the shell's
-// default object styles must reference C1 token names. These pin the pure
-// scene.ts theme helpers plus assert the App.svelte / styles.css wiring without a
-// renderer or a Svelte mount. Falsifiable: a toggle that skips the root attr,
-// persistence, or the renderer setter — or a default-style token ref that drifts
-// off the C1 set — fails the test.
-
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -21,9 +12,8 @@ import {
   type Theme
 } from "../platforms/web/renderer/scene";
 
-// The C1 contract token names (scene-core `object::theme::ALL_TOKENS`). The C1
-// table is not wasm-exported to JS, so the contract is mirrored here; a drift in
-// either direction fails the equality below.
+// Mirror of scene-core `object::theme::ALL_TOKENS` (not wasm-exported to JS); a
+// drift in either direction fails the equality below.
 const C1_TOKEN_NAMES = [
   "canvas-bg",
   "surface",
@@ -51,7 +41,7 @@ function fakeStorage() {
   };
 }
 
-describe("applyDocumentTheme (AP4 toggle)", () => {
+describe("applyDocumentTheme (toggle)", () => {
   it("flips the root data-theme attribute, persists, AND drives the renderer bit", () => {
     const root = fakeRoot();
     const storage = fakeStorage();

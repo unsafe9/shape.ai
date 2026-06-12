@@ -1,43 +1,21 @@
-//! Per-canvas actor (OB4.1): a tokio task that owns one canvas's object scene.
+//! Per-canvas actor: a tokio task that owns one canvas's object scene.
 //!
-//! Each [`CanvasActor`] serializes every edit to one canvas through an mpsc
-//! command channel, so its [`ObjectScene`] is never touched concurrently. Canvas
-//! logic itself is *not* reimplemented here: the actor drives the object store
-//! ([`ObjectStore`]) which calls scene-core's single op-apply path
-//! (`apply_object_op_lww`); the actor only orchestrates the server sequence,
-//! durable journaling, idempotent dedup, and fan-out to subscribers.
+//! Each [`CanvasActor`] serializes every edit through an mpsc command channel, so
+//! its [`ObjectScene`] is never touched concurrently. Canvas logic is not
+//! reimplemented here: the actor drives [`ObjectStore`] (which calls scene-core's
+//! `apply_object_op_lww`) and only orchestrates the server sequence, journaling,
+//! dedup, and fan-out. Storage is shared via one [`RedbAdapter`] behind a `Mutex`,
+//! with every `Record` id namespaced by `canvasId`.
 //!
-//! Storage is shared across canvases via a single [`RedbAdapter`] behind a
-//! `Mutex`; the actor namespaces every `Record` id by `canvasId`. The object
-//! store is given a thin [`SharedRedb`] adapter that locks the shared store on
-//! each operation, so the store's per-canvas working set, per-property LWW gate,
-//! region index, and per-op write-through are all reused unchanged.
+//! Convergence is server-authoritative: the actor stamps a strictly-increasing
+//! `seq` per op (last arrival wins per property). An op that loses the LWW race
+//! for a property applies as a no-op and persists nothing.
 //!
-//! ## Server-authoritative convergence
-//!
-//! The actor serializes every op and stamps a strictly-increasing `seq`, so a
-//! later-arriving op always carries a higher `seq` than an earlier one. The seq
-//! is the authority — last arrival wins per property. The object store's
-//! [`apply`](ObjectStore::apply) consults a per-canvas
-//! [`PropertyStore`](shape_scene_core::PropertyStore) at that `seq`: an op that
-//! lost the LWW race for a property applies as a no-op `Batch` and persists
-//! nothing, leaving the higher-seq winner in place.
-//!
-//! ## Bounded working set
-//!
-//! `self.store` is never the whole canvas in memory: the [`ObjectStore`] holds a
-//! per-canvas resident working set and the complete canvas always lives durably
-//! in the region-indexed [`RedbAdapter`]. Every applied op writes through
-//! immediately (region-indexed), so any object reloaded from the store is
-//! exact-to-the-last-op. The journal records every op for crash recovery of the
-//! in-flight tail.
-//!
-//! ## Feature channel
-//!
-//! Request/response Feature frames (comment upsert, template apply, canvas
-//! switch, export) are lowered to [`ObjectOp`]s by
-//! [`handle_feature`](crate::handle_feature) and pushed through the same op-apply
-//! path, so the Feature channel never grows a second way to mutate the scene.
+//! The working set is bounded: every applied op writes through region-indexed
+//! immediately, so any reloaded object is exact-to-the-last-op; the journal
+//! records every op only to recover the in-flight tail past a crash. Feature
+//! frames are lowered to [`ObjectOp`]s through the same op-apply path, so they
+//! never grow a second way to mutate the scene.
 
 use std::sync::{Arc, Mutex};
 
@@ -53,14 +31,11 @@ use crate::object_feature::{handle_feature, FeatureCtx};
 use crate::object_store::ObjectStore;
 use crate::sync::{DedupTable, JournalEntry, OpAck, OpEnvelope, OpId, MAX_SEEN_OPS};
 
-/// A single shared storage adapter, guarded so concurrent canvas actors can
-/// persist into the same backing store without racing.
 pub type SharedStore = Arc<Mutex<RedbAdapter>>;
 
-/// A thin adapter that delegates [`StorageAdapter`] + [`SpatialStore`] to the
-/// shared [`RedbAdapter`] behind the actor's `Mutex`. Cursor methods collect
-/// under the lock and hand back an owned iterator, so the lock is never held
-/// across the cursor's lifetime.
+/// Delegates [`StorageAdapter`] + [`SpatialStore`] to the shared [`RedbAdapter`]
+/// behind the `Mutex`. Cursor methods collect under the lock and return an owned
+/// iterator, so the lock is never held across the cursor's lifetime.
 pub struct SharedRedb(SharedStore);
 
 impl SharedRedb {
@@ -112,51 +87,39 @@ impl SpatialStore for SharedRedb {
     }
 }
 
-/// Outcome of an [`CanvasCommand::ApplyEnvelope`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum ApplyResult {
-    /// The op applied and was persisted.
     Applied {
-        /// The actor's monotonic server sequence after this apply.
         seq: i64,
-        /// The new scene revision (`scene.scene_version`) after this apply.
         revision: i64,
     },
     /// scene-core rejected the op; nothing was persisted or broadcast.
     Rejected { errors: Vec<String> },
 }
 
-/// What gets fanned out to subscribers when an op is applied.
 #[derive(Clone, Debug)]
 pub struct PatchBroadcast {
-    /// The actor's server sequence assigned to this apply.
     pub seq: i64,
-    /// The object op that was applied.
     pub op: ObjectOp,
-    /// The full object scene after the apply. Whole-scene fan-out is fine here;
-    /// a granular per-op delta is a later refinement.
     pub scene: ObjectScene,
-    /// Who authored this op (the `userId` / `clientId` passed on the write path).
-    /// The WS fan-out skips echoing a broadcast back to its originating
-    /// connection — the originator already applied it optimistically. `None` for
-    /// server-internal ops with no client author.
+    /// Author of this op. The WS fan-out skips echoing back to the originating
+    /// connection, which already applied optimistically. `None` for
+    /// server-internal ops.
     pub author: Option<String>,
 }
 
-/// Commands the actor task accepts over its mpsc channel.
 pub enum CanvasCommand {
     ApplyEnvelope {
         envelope: OpEnvelope,
         actor_user_id: String,
         reply: oneshot::Sender<ApplyResult>,
     },
-    /// Apply a bare op (no envelope/dedup): the object MCP write path and tests.
+    /// Bare op (no envelope/dedup): the object MCP write path and tests.
     ApplyOp {
         op: ObjectOp,
         actor_user_id: String,
         reply: oneshot::Sender<ApplyResult>,
     },
-    /// Lower + apply a Feature request through `handle_feature`.
     Feature {
         request: FeatureRequest,
         actor_user_id: String,
@@ -174,7 +137,6 @@ pub enum CanvasCommand {
     },
 }
 
-/// A clone-able handle to a running [`CanvasActor`].
 #[derive(Clone)]
 pub struct ActorHandle {
     tx: mpsc::Sender<CanvasCommand>,
@@ -182,9 +144,7 @@ pub struct ActorHandle {
 }
 
 impl ActorHandle {
-    /// Apply an op ENVELOPE (MG4.2): carries an `opId` for idempotent dedup, the
-    /// `baseRevision` it was authored against, and the op. A duplicate `opId`
-    /// returns the ORIGINAL ack without re-applying.
+    /// A duplicate `opId` returns the original ack without re-applying.
     pub async fn apply_envelope(&self, envelope: OpEnvelope, user_id: &str) -> ApplyResult {
         let (reply, rx) = oneshot::channel();
         if self
@@ -206,8 +166,7 @@ impl ActorHandle {
         })
     }
 
-    /// Apply a bare [`ObjectOp`] authored by `user_id` (no dedup envelope). Used
-    /// by the object MCP tools and tests.
+    /// Bare [`ObjectOp`] (no dedup envelope): object MCP tools and tests.
     pub async fn apply_op(&self, op: ObjectOp, user_id: &str) -> ApplyResult {
         let (reply, rx) = oneshot::channel();
         if self
@@ -229,8 +188,6 @@ impl ActorHandle {
         })
     }
 
-    /// Lower + apply a Feature request through the single op-apply path, returning
-    /// the Feature response.
     pub async fn feature(&self, request: FeatureRequest, user_id: &str) -> FeatureResponse {
         let (reply, rx) = oneshot::channel();
         if self
@@ -254,7 +211,6 @@ impl ActorHandle {
         })
     }
 
-    /// Snapshot the current object scene.
     pub async fn get_scene(&self) -> ObjectScene {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -264,7 +220,7 @@ impl ActorHandle {
         rx.await.expect("canvas actor dropped reply")
     }
 
-    /// Snapshot the scene filtered to a region window (`None` = whole canvas).
+    /// `None` window = whole canvas.
     pub async fn get_scene_region(&self, window: Option<RegionWindow>) -> ObjectScene {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -274,12 +230,10 @@ impl ActorHandle {
         rx.await.expect("canvas actor dropped reply")
     }
 
-    /// Subscribe to the fan-out of applied ops.
     pub fn subscribe(&self) -> broadcast::Receiver<PatchBroadcast> {
         self.broadcast_tx.subscribe()
     }
 
-    /// Flush + stop the actor task.
     pub async fn shutdown(&self) {
         let (reply, rx) = oneshot::channel();
         if self
@@ -293,34 +247,30 @@ impl ActorHandle {
     }
 }
 
-/// The actor task body: owns one canvas's object store for `canvas_id`.
 pub struct CanvasActor {
     canvas_id: CanvasId,
     store: ObjectStore<SharedRedb>,
     shared: SharedStore,
     /// Monotonic server sequence; bumped once per accepted op.
     seq: i64,
-    /// Seen-opId table for idempotent dedup (MG4.2). Session-scoped + bounded;
-    /// rebuilt from the journal suffix on recovery.
+    /// Seen-opId dedup table; bounded, rebuilt from the journal suffix on recovery.
     dedup: DedupTable,
     rx: mpsc::Receiver<CanvasCommand>,
     broadcast_tx: broadcast::Sender<PatchBroadcast>,
 }
 
-/// A deterministic RFC3339-ish timestamp seam. scene-core stays ambient-time
-/// free, so the actor injects `now`.
+/// Deterministic timestamp seam: scene-core stays ambient-time free, so the
+/// actor injects `now`.
 fn now() -> String {
     "1970-01-01T00:00:00Z".to_string()
 }
 
-/// The storage id of one journal entry (the durable op log).
 fn journal_record_id(canvas_id: &CanvasId, seq: i64) -> String {
     format!("{canvas_id}:journal:{seq}")
 }
 
 impl CanvasActor {
-    /// Spawn the actor task for `canvas_id`, loading durable state from `store`,
-    /// and return a clone-able handle to it.
+    /// Spawn the actor task for `canvas_id`, loading durable state from `store`.
     pub fn spawn(canvas_id: CanvasId, store: SharedStore) -> ActorHandle {
         let (tx, rx) = mpsc::channel(64);
         let (broadcast_tx, _) = broadcast::channel(256);
@@ -379,9 +329,8 @@ impl CanvasActor {
                     let _ = reply.send(scene);
                 }
                 CanvasCommand::GetSceneRegion { window, reply } => {
-                    // A windowed read goes straight to the region index, so it
-                    // covers cold objects without pulling the whole canvas
-                    // resident. The scene-level meta rides the working set.
+                    // A windowed read hits the region index, covering cold objects
+                    // without pulling the whole canvas resident.
                     let objects = self
                         .store
                         .query_region(&self.canvas_id, window)
@@ -395,8 +344,8 @@ impl CanvasActor {
                     let _ = reply.send(scene);
                 }
                 CanvasCommand::Shutdown { reply } => {
-                    // Every op already writes through region-indexed, so a clean
-                    // shutdown is durable without a final checkpoint.
+                    // Every op writes through region-indexed, so shutdown is
+                    // durable without a final checkpoint.
                     let _ = reply.send(());
                     break;
                 }
@@ -404,7 +353,6 @@ impl CanvasActor {
         }
     }
 
-    /// The current scene revision (`scene_version`).
     fn revision(&mut self) -> i64 {
         self.store
             .scene(&self.canvas_id)
@@ -412,9 +360,7 @@ impl CanvasActor {
             .scene_version
     }
 
-    /// Apply an op envelope (MG4.2): dedup by `opId` first, then apply.
-    ///
-    /// A duplicate `opId` is idempotent — it returns the ORIGINAL ack without
+    /// Dedup by `opId` first: a duplicate returns the original ack without
     /// re-running apply, so the scene and server seq do not move twice.
     fn handle_apply_envelope(&mut self, envelope: OpEnvelope, actor_user_id: &str) -> ApplyResult {
         if let Some(ack) = self.dedup.seen(&envelope.op_id) {
@@ -431,11 +377,9 @@ impl CanvasActor {
         )
     }
 
-    /// Apply one op through the object store (LWW at the assigned seq), then (on
-    /// success) record the dedup ack, journal the op, and broadcast.
-    ///
-    /// `base_revision` is journaled as the "authored against" revision. `op_id`
-    /// is `Some` for the envelope path (dedup) and `None` for the bare-op path.
+    /// Apply one op (LWW at the assigned seq), then on success record the dedup
+    /// ack, journal the op, and broadcast. `op_id` is `Some` for the envelope
+    /// path, `None` for the bare-op path.
     fn handle_apply(
         &mut self,
         op: ObjectOp,
@@ -446,8 +390,6 @@ impl CanvasActor {
         let seq = self.seq + 1;
         let seq_u64 = u64::try_from(seq).unwrap_or(u64::MAX);
 
-        // Canvas logic stays in scene-core; the store drives `apply_object_op_lww`
-        // and writes the touched objects through region-indexed.
         match self.store.apply(&self.canvas_id, op.clone(), seq_u64) {
             Ok(_inverse) => {
                 self.seq = seq;
@@ -464,7 +406,6 @@ impl CanvasActor {
             }
         }
 
-        // The journal entry records who authored the op (userId-only identity).
         self.journal(JournalEntry {
             seq,
             op_id: op_id.clone(),
@@ -493,14 +434,10 @@ impl CanvasActor {
         ApplyResult::Applied { seq, revision }
     }
 
-    /// Lower a Feature request to ops via `handle_feature`, then drive each lowered
-    /// op through the actor's apply path (so each is sequenced, persisted, and
-    /// fanned out), and return the Feature response.
+    /// Lower a Feature request to ops via `handle_feature` against a scratch scene,
+    /// then re-drive each lowered op through the real apply path so it is
+    /// sequenced, persisted, and broadcast. A read-only Feature yields no ops.
     fn handle_feature(&mut self, request: FeatureRequest, actor_user_id: &str) -> FeatureResponse {
-        // `handle_feature` mutates a scratch scene to derive the ops; we then
-        // re-drive those ops through the real apply path so they are journaled,
-        // sequenced, and broadcast. A read-only Feature (canvas switch / export)
-        // yields no ops and is answered directly.
         let mut scratch = self
             .store
             .scene(&self.canvas_id)
@@ -516,7 +453,6 @@ impl CanvasActor {
         };
         let (ops, response) = handle_feature(request, &mut scratch, &mut ctx);
 
-        // Re-drive the lowered ops through the real apply path.
         for op in ops {
             let base_revision = self.revision();
             self.handle_apply(op, base_revision, None, actor_user_id);
@@ -524,10 +460,9 @@ impl CanvasActor {
         response
     }
 
-    /// Append `entry` to the durable journal (every op). The object store already
-    /// wrote the touched objects through region-indexed, so the journal is only
-    /// needed to rebuild the dedup table and replay any in-flight tail past a
-    /// crash.
+    /// Append `entry` to the durable journal. Objects are already written through
+    /// region-indexed, so the journal only rebuilds the dedup table and replays
+    /// the in-flight tail past a crash.
     fn journal(&mut self, entry: JournalEntry) {
         let payload = serde_json::to_vec(&entry).expect("journal entry serializes");
         let seq_u64 = u64::try_from(entry.seq).unwrap_or(u64::MAX);
@@ -543,23 +478,20 @@ impl CanvasActor {
     }
 }
 
-/// Recover a canvas: load the object scene from its per-object Records (the object
-/// store hydrates lazily on first access), set the server seq to the canvas
-/// revision, then REPLAY every journal entry with `seq` past the loaded scene's
-/// revision so ops journaled after the last write-through survive a crash. The
-/// dedup table is rebuilt from a bounded journal suffix.
+/// Recover a canvas: hydrate the scene from its per-object Records, set the seq
+/// to the canvas revision, then replay every journal entry past that revision so
+/// ops journaled after the last write-through survive a crash. The dedup table is
+/// rebuilt from a bounded journal suffix.
 ///
-/// Because every op writes through region-indexed, the per-object Records are
-/// exact-to-the-last-op; the journal tail replay is the safety net for the
-/// (normally empty) in-flight window where the journal write landed but a crash
-/// followed. Replaying an already-persisted op is harmless: `apply_object_op_lww`
-/// at the same seq is idempotent (equal-seq writes lose the LWW race).
+/// Per-object Records are exact-to-the-last-op (every op writes through), so the
+/// tail replay only covers the normally-empty window where the journal write
+/// landed but a crash followed. Replay is harmless: `apply_object_op_lww` at the
+/// same seq is idempotent (equal-seq writes lose the LWW race).
 fn recover_durable_state(
     canvas_id: &CanvasId,
     store: &SharedStore,
     object_store: &mut ObjectStore<SharedRedb>,
 ) -> (i64, DedupTable) {
-    // Hydrate the scene (and its working set) from the per-object Records.
     let loaded_revision = object_store
         .scene(canvas_id)
         .expect("scene loads")
@@ -568,9 +500,6 @@ fn recover_durable_state(
     let entries = load_journal(canvas_id, store);
     let mut seq = entries.iter().map(|e| e.seq).max().unwrap_or(0);
 
-    // Replay journal entries whose op is not yet reflected in the loaded scene.
-    // The loaded revision counts winning ops; replaying at the entry's seq is a
-    // no-op when the store already holds the winner (equal/lower seq loses LWW).
     for entry in &entries {
         if entry.seq <= loaded_revision {
             continue;
@@ -586,10 +515,8 @@ fn recover_durable_state(
     (seq, dedup)
 }
 
-/// Rebuild the dedup table from the journal's last [`MAX_SEEN_OPS`] entries, in
-/// seq order, recording each entry's `(opId -> ack)`. The journal is never pruned,
-/// so the suffix is always available; this keeps idempotent re-apply working
-/// across a restart.
+/// Rebuild the dedup table from the journal's last [`MAX_SEEN_OPS`] entries, so
+/// idempotent re-apply keeps working across a restart.
 fn rebuild_dedup_from_suffix(entries: &[JournalEntry]) -> DedupTable {
     let mut dedup = DedupTable::new();
     let start = entries.len().saturating_sub(MAX_SEEN_OPS);
@@ -607,7 +534,7 @@ fn rebuild_dedup_from_suffix(entries: &[JournalEntry]) -> DedupTable {
     dedup
 }
 
-/// Load every journal entry for `canvas_id`, in ascending seq order.
+/// Every journal entry for `canvas_id`, in ascending seq order.
 fn load_journal(canvas_id: &CanvasId, store: &SharedStore) -> Vec<JournalEntry> {
     let store = store.lock().expect("storage mutex poisoned");
     let prefix = format!("{canvas_id}:journal:");
@@ -617,8 +544,7 @@ fn load_journal(canvas_id: &CanvasId, store: &SharedStore) -> Vec<JournalEntry> 
         .into_iter()
         .filter(|id| id.starts_with(&prefix))
         .collect();
-    // Sort by the numeric seq suffix so replay is in true seq order (a lexical
-    // sort of "...:10" vs "...:2" would misorder).
+    // Sort by numeric seq suffix; a lexical sort of "...:10" vs "...:2" misorders.
     ids.sort_by_key(|id| journal_seq_of(id, &prefix));
 
     let mut entries = Vec::with_capacity(ids.len());
@@ -631,7 +557,6 @@ fn load_journal(canvas_id: &CanvasId, store: &SharedStore) -> Vec<JournalEntry> 
     entries
 }
 
-/// Parse the trailing `:journal:{seq}` integer from a journal record id.
 fn journal_seq_of(id: &str, prefix: &str) -> i64 {
     id.strip_prefix(prefix)
         .and_then(|s| s.parse::<i64>().ok())

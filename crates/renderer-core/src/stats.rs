@@ -50,14 +50,11 @@ pub struct WebGpuFrameStats {
     pub group_compaction_count: usize,
     pub group_slot_count: usize,
     pub group_slot_free_count: usize,
-    // FC-09: object draw-path diagnostics, populated when an object scene is loaded.
+    // Object draw-path diagnostics, populated when an object scene is loaded.
     pub object_count: usize,
     pub object_fill_index_count: usize,
     pub object_stroke_vertex_count: usize,
     pub object_draw_count: usize,
-    // FramePlan IR feed accounting: targeted patches applied across canonical
-    // re-feeds vs. feeds that fell back to a full rebuild. The object-path twin of
-    // `dirty_range_write_count` / `full_buffer_rebuild_count`.
     pub object_patch_count: usize,
     pub object_rebuild_count: usize,
     pub backend: String,
@@ -125,8 +122,7 @@ pub struct CoreOverlayRequest {
     pub style: CoreOverlayStyle,
 }
 
-/// Result of a completed drag marquee (C1 / CC2.x). The shell merges `ids` into
-/// its transient `multiSelectIds` set; `rect` is the final world-space marquee
+/// Result of a completed drag marquee: `rect` is the final world-space marquee
 /// rectangle. Emitted only on the pointer-up that ends a marquee drag.
 #[cfg(feature = "wgpu-probe")]
 #[derive(Debug, Serialize)]
@@ -136,14 +132,11 @@ pub struct CoreMarqueeResult {
     pub ids: Vec<String>,
 }
 
-/// W2-04: a cumulative object transform delta. `id` is the transformed object;
-/// `matrix` is a ROW-MAJOR world-space DELTA to PRE-MULTIPLY onto the object's
-/// existing transform (`new = matrix * obj.transform`, homogeneous `(x,y,1)`). It
-/// is cumulative from the FIXED pointer-down anchor (not per-move), so the last
-/// delta of a gesture is the whole transform. `kind` names the gesture
-/// (`"translate"` | `"resize"` | `"rotate"`). The shell composes it
-/// non-destructively for preview and authors one undoable op on pointer-up; the
-/// renderer never mutates the object transform itself.
+/// Cumulative object transform delta. `matrix` is a row-major world-space delta to
+/// pre-multiply onto the existing transform (`new = matrix * obj.transform`,
+/// homogeneous `(x,y,1)`); cumulative from the fixed pointer-down anchor, so the
+/// last delta of a gesture is the whole transform. `kind` is `"translate"` |
+/// `"resize"` | `"rotate"`. The renderer never mutates the object transform itself.
 #[cfg(feature = "wgpu-probe")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,14 +146,10 @@ pub struct ObjectTransformDelta {
     pub kind: &'static str,
 }
 
-/// Anchor-semantics v3 §2b: a live endpoint-drag sample for an OPEN-CLASS
-/// selection. `node_index` is the dragged endpoint in geometry PAIR space (0 or
-/// the LAST coordinate pair — the same space anchors and scene-core
-/// `endpoint_release_ops` address); `(x, y)` is the cumulative pointer WORLD
-/// position. The shell drives the live chord-deform preview
-/// (`setObjectEndpointPreview`) per sample and commits ONE undoable batch on
-/// release via scene-core `endpoint_release_ops` (rebind/unbind included); the
-/// renderer never mutates the geometry itself.
+/// Live endpoint-drag sample for an open-class selection. `node_index` is the
+/// dragged endpoint in geometry pair space (0 or the last coordinate pair, the
+/// space scene-core `endpoint_release_ops` addresses); `(x, y)` is the cumulative
+/// pointer world position. The renderer never mutates the geometry itself.
 #[cfg(feature = "wgpu-probe")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,11 +160,8 @@ pub struct ObjectEndpointDelta {
     pub y: f64,
 }
 
-/// RA2b (D6 Figma hierarchy): result of a double-click that hit an object. The
-/// shell branches on `has_children`: `true` => the object is a container, so drill
-/// in (set it as the active container, AP3); `false` => it is a leaf, so enter
-/// inline text edit. `has_children` is computed from the scene: any object whose
-/// `parent` equals `id` makes this object a parent.
+/// Result of a double-click that hit an object. `has_children` discriminates the
+/// shell branch: true => container (drill in), false => leaf (inline text edit).
 #[cfg(feature = "wgpu-probe")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,9 +170,8 @@ pub struct ObjectDoubleClick {
     pub has_children: bool,
 }
 
-/// W2-06: result of the nearest-outline-point query (anchor snapping for shape
-/// drag-create). The flat `{ snapped, x, y, targetId }` contract W2-07 consumes:
-/// on a hit, `snapped = true`, `(x, y)` is the nearest WORLD point and `target_id`
+/// Result of the nearest-outline-point query (anchor snapping for shape drag-create).
+/// On a hit, `snapped = true`, `(x, y)` is the nearest world point and `target_id`
 /// the object id; on a miss, `snapped = false`, `x = y = 0`, `target_id = None`.
 #[cfg(feature = "wgpu-probe")]
 #[derive(Debug, Serialize)]
@@ -208,21 +193,15 @@ pub struct CoreInputBatchResult {
     pub patches: Vec<RenderScenePatch>,
     pub overlay: Option<CoreOverlayRequest>,
     pub marquee: Option<CoreMarqueeResult>,
-    // FC-07: object-path input results, non-null only when an object scene is loaded
-    // and the corresponding event occurred. The legacy fields above stay populated.
+    // Object-path input results, non-null only when an object scene is loaded and
+    // the corresponding event occurred.
     pub object_selection: Option<String>,
     pub object_transform_delta: Option<ObjectTransformDelta>,
-    // v3 §2b: a live endpoint-drag sample (open-class selections only), emitted
-    // from the same place as `object_transform_delta` but as its own field — an
-    // endpoint drag moves ONE endpoint (chord deform), not the whole transform.
     pub object_endpoint_delta: Option<ObjectEndpointDelta>,
     pub object_marquee_ids: Option<Vec<String>>,
-    // RA2b: non-null only when a double-click hit an object. `has_children`
-    // discriminates the shell branch (drill-in vs text-edit).
     pub object_double_click: Option<ObjectDoubleClick>,
-    // W2-02: stable affordance string ("empty" | "body" | "resize-*" | "rotate")
-    // the shell maps to a cursor. Computed on a no-button hover move; "empty"
-    // otherwise (and outside object mode).
+    // Stable affordance string ("empty" | "body" | "resize-*" | "rotate") the shell
+    // maps to a cursor; "empty" outside object mode.
     pub hover_affordance: String,
 }
 

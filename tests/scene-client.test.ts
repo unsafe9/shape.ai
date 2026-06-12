@@ -1,17 +1,3 @@
-// Transport-backed object scene client tests (OB4.3).
-//
-// These drive `SceneClient` over a MockWebSocket plus an injected manual timer so
-// the coalescing flush is deterministic. They prove the data-layer contract the
-// shell consumes:
-//
-//   - connect() resolves with the welcome ObjectScene snapshot (fresh empty for new);
-//   - an object op applies optimistically (via the wasm core), enqueues to the
-//     outbox as a WireOp, sends it, and is dropped on the server ack;
-//   - a selection-only change produces NO document op (no outbox entry, no `ops`
-//     frame, no revision bump) — it rides presence;
-//   - a feature request rides the single WS feature channel (OB4.5);
-//   - a reconnect welcome reloads the snapshot and replays unacked ops.
-
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { SceneClient } from "../platforms/web/runtime/sceneClient";
@@ -84,9 +70,8 @@ const welcomeFrame = (scene: ObjectScene, seq: number): WelcomeMessage => ({
 
 const insertA: ObjectOp = {
   kind: "insert-object",
-  // fillRule is the canonical scene-core default; spell it out so the WireOp
-  // propDelta round-tripped through the Rust session (which materializes serde
-  // defaults) deep-equals this fixture.
+  // Spell out fillRule so the propDelta round-tripped through the Rust session
+  // (which materializes serde defaults) deep-equals this fixture.
   object: { id: "a", order: "a0", transform: translateTransform(0, 0), geometry: { d: "M 0 0 L 80 0 L 80 40 L 0 40 Z", fillRule: "evenOdd" } }
 };
 
@@ -161,14 +146,13 @@ describe("SceneClient object ops", () => {
     const { errors, opId, inverse } = await client.applyObjectOp(insertA);
     expect(errors).toEqual([]);
     expect(opId).toEqual({ clientId: "c1", localSeq: 1 });
-    // The inverse op is captured (the undo entry, D21).
     expect(inverse).toEqual({ kind: "delete", id: "a" });
 
     // Optimistic local apply happened immediately.
     expect(client.scene?.objects.map((o) => o.id)).toEqual(["a"]);
     expect(scenes.at(-1)?.objects.map((o) => o.id)).toEqual(["a"]);
 
-    // Persisted to the outbox as a WireOp before any send.
+    // Persisted to the outbox before any send.
     expect(await outbox.all()).toHaveLength(1);
     expect(opsFrames(socket)).toHaveLength(0);
 
@@ -204,7 +188,7 @@ describe("SceneClient selection (presence-only)", () => {
   });
 });
 
-describe("SceneClient feature channel (OB4.5)", () => {
+describe("SceneClient feature channel", () => {
   it("sends a feature request on the single WS feature channel", async () => {
     const { client, socket } = await boot();
     client.sendFeature({ feature: "canvasSwitch", canvas_id: "c-ob" });
@@ -230,7 +214,7 @@ describe("SceneClient reconnect", () => {
 
     await client.applyObjectOp(insertA);
     timer.fire();
-    socket.sent.length = 0; // forget the first send
+    socket.sent.length = 0;
 
     const reconnected = emptyObjectScene();
     reconnected.sceneVersion = 5;

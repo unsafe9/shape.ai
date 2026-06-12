@@ -43,13 +43,10 @@ function copyRendererWasm(): Plugin {
   };
 }
 
-// MG-7a: the scene-core op-apply WASM is loaded by sceneCoreWasm.ts via a
-// @vite-ignore'd `./wasm/shape_scene_core.js` import, so (like the renderer wasm)
-// vite does not bundle it — it must sit next to the emitted chunk at runtime. The
-// emitted shell chunk lives under assets/, so the bridge resolves `./wasm/...` to
-// assets/wasm/. We copy the scene-core package into the SAME assets/wasm dir the
-// renderer uses. The package is checked in, so a missing build is a warning (the
-// loader falls back to the TS op-apply), not a hard build failure.
+// The scene-core op-apply WASM is loaded via a @vite-ignore'd `./wasm/...` import,
+// so vite does not bundle it — it must sit next to the emitted assets/ chunk at
+// runtime. Checked in, so a missing build is a warning (loader falls back to TS
+// op-apply), not a hard failure.
 function copySceneCoreWasm(): Plugin {
   return {
     name: "copy-shape-scene-core-wasm",

@@ -1,8 +1,7 @@
-//! Input state machine, hit-test routing, rollback and debug snapshot
-//! (W2-13/S8). Owns the per-batch pointer pipeline (`apply_input_event` and the
-//! object-path `apply_object_pointer_event`), the public `inputBatch`/`hitTest`/
-//! tool + multi-select setters, the overlay/debug queries, and the batch
-//! rollback. `target_arch = "wasm32"` gated.
+//! Input state machine, hit-test routing, rollback, and debug snapshot. Owns the
+//! per-batch pointer pipeline, the public `inputBatch`/`hitTest`/tool + multi-select
+//! setters, the overlay/debug queries, and the batch rollback. `target_arch =
+//! "wasm32"` gated.
 
 use shape_renderer_core::hit_test_object::HoverAffordance;
 use shape_renderer_core::model::{
@@ -75,9 +74,8 @@ impl ShapeWebGpuRenderer {
         serde_wasm(self.overlay_request_for_card(card_id, field))
     }
 
-    /// Set the active pointer tool ("select" | "hand"). Equivalent to a
-    /// `set-tool` inputBatch event but callable as a one-off (tool toggles in the
-    /// shell rarely coincide with a pointer batch). Unknown values are ignored.
+    /// Set the active pointer tool ("select" | "hand"), callable as a one-off
+    /// (equivalent to a `set-tool` inputBatch event). Unknown values are ignored.
     #[wasm_bindgen(js_name = setTool)]
     pub fn set_tool(&mut self, tool: &str) {
         match tool {
@@ -90,10 +88,9 @@ impl ShapeWebGpuRenderer {
         }
     }
 
-    /// Replace the transient multi-select highlight set with `ids` (JSON array of
-    /// strings); an empty array clears it. Equivalent to a `set-multi-select`
-    /// inputBatch event but callable as a one-off, mirroring `setTool`. The
-    /// persisted single-anchor selection is untouched.
+    /// Replace the transient multi-select highlight set with `ids` (an empty array
+    /// clears it), callable as a one-off. The persisted single-anchor selection is
+    /// untouched.
     #[wasm_bindgen(js_name = setMultiSelect)]
     pub fn set_multi_select(&mut self, ids_json: &str) -> Result<(), JsValue> {
         let ids = serde_json::from_str::<Vec<String>>(ids_json)
@@ -102,19 +99,14 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
-    /// W3-G5/#5: flip the live object renderer's light/dark theme bit so the shell's
-    /// dark-mode toggle actually reaches the canvas. Forwards to the live
-    /// [`ObjectRenderer::set_theme`], which re-resolves the canvas clear color +
-    /// token-backed shadow/fill/stroke instance colors against the queue this struct
-    /// owns — a zero-rebake uniform/color refresh, no re-tessellation. The next
-    /// `renderFrame` (the shell's render loop) presents with the new theme: the clear
-    /// color tracks the bit and the rewritten instance colors are already on the GPU.
-    /// No-op when no object scene/renderer is live (matches the optional `?.` call in
-    /// the shell).
+    /// Flip the live object renderer's light/dark theme bit, forwarding to
+    /// [`ObjectRenderer::set_theme`] (a zero-rebake color refresh). The next
+    /// `renderFrame` presents with the new theme. No-op when no object renderer is
+    /// live.
     #[wasm_bindgen(js_name = setObjectTheme)]
     pub fn set_object_theme(&mut self, dark: bool) {
-        // W3-G6/#3: persist the bit FIRST so it survives a `load_object_scene`
-        // re-feed even if no renderer is live yet — the rebuilt renderer reads it.
+        // Persist the bit FIRST so it survives a `load_object_scene` re-feed even if
+        // no renderer is live yet.
         self.object_theme = shape_renderer_core::object_theme::Theme { dark };
         if let Some(renderer) = self.object_renderer.as_mut() {
             renderer.set_theme(&self.queue, dark);
@@ -122,9 +114,8 @@ impl ShapeWebGpuRenderer {
     }
 
 
-    /// Hit-test a screen-space point without mutating selection or camera (CC4.1).
-    /// Returns the picked object (or null) so the shell can show a right-click
-    /// context menu. Mirrors `hitTest` in coreContract.ts.
+    /// Hit-test a screen-space point without mutating selection or camera, returning
+    /// the picked object (or null) for a right-click context menu.
     #[wasm_bindgen(js_name = hitTest)]
     pub fn hit_test(&self, screen_x: f64, screen_y: f64) -> Result<JsValue, JsValue> {
         let hit = self.hit_at_screen(WorldPoint {
@@ -134,9 +125,8 @@ impl ShapeWebGpuRenderer {
         serde_wasm(hit)
     }
 
-    /// FC-08: pure object pick for the right-click context menu. Returns the id of
-    /// the top-most object under the screen point (or null) without mutating
-    /// selection, camera, or drag state.
+    /// The id of the top-most object under the screen point (or null), without
+    /// mutating selection, camera, or drag state.
     #[wasm_bindgen(js_name = hitTestObject)]
     pub fn hit_test_object_at(&self, screen_x: f64, screen_y: f64) -> Option<String> {
         hit_object_in_regions(
@@ -149,12 +139,10 @@ impl ShapeWebGpuRenderer {
         )
     }
 
-    /// RA3 swept erase: every object crossed by the eraser between two consecutive
-    /// SCREEN samples `(prev, curr)` — not just the top-most object at each sample —
-    /// so a fast drag that skips between samples still erases everything the segment
-    /// passes through. Pure pick: no mutation of selection, camera, or drag state.
-    /// Returns the crossed object ids (top-down order) as a JSON array; EN1 (the
-    /// shell eraser) authors the delete ops from the returned ids.
+    /// Swept erase: every object crossed by the eraser between two consecutive SCREEN
+    /// samples `(prev, curr)`, so a fast drag that skips between samples still erases
+    /// everything the segment passes through. Pure pick; returns the crossed ids
+    /// (top-down) as JSON.
     #[wasm_bindgen(js_name = sweptEraseAt)]
     pub fn swept_erase_at(
         &self,
@@ -178,18 +166,11 @@ impl ShapeWebGpuRenderer {
         serde_wasm(ids)
     }
 
-    /// W2-06: nearest point on any object outline to a WORLD query point, for shape
-    /// drag-create anchor snapping (W2-07).
-    ///
-    /// COORD SPACE: `world_x`/`world_y` are WORLD coordinates (NOT screen) — W2-07
-    /// already has the world point under the cursor. `tol_px` is a screen-pixel
-    /// tolerance radius, converted to world via `tol_px / zoom.max(0.025)` (the same
-    /// zoom floor `screen_to_world` uses). `exclude_ids_json` is a JSON array of
-    /// region ids to skip (W3-G6 #6: the transient create-preview / snap-indicator,
-    /// which ride the same feed and would otherwise self-snap under the cursor).
-    /// Returns `{ snapped, x, y, targetId }`: on a hit, `snapped = true` with the
-    /// nearest WORLD point and the object id; otherwise `snapped = false`,
-    /// `x = y = 0`, `targetId = null`.
+    /// Nearest point on any object outline to a WORLD query point, for drag-create
+    /// anchor snapping. `world_x`/`world_y` are WORLD coords; `tol_px` is a screen-
+    /// pixel tolerance converted to world via `tol_px / zoom.max(0.025)`;
+    /// `exclude_ids_json` skips transient preview regions that would self-snap.
+    /// Returns `{ snapped, x, y, targetId }`.
     #[wasm_bindgen(js_name = nearestOutlinePoint)]
     pub fn nearest_outline_point(
         &self,
@@ -287,8 +268,8 @@ impl ShapeWebGpuRenderer {
         self.multi_select = state.multi_select;
         self.last_hit = state.last_hit;
         self.object_scene = state.object_scene;
-        // W3-G9/#5: the bindings graph is derived from `object_scene`; rebuild it from
-        // the restored scene so a rolled-back input batch leaves a consistent graph.
+        // The bindings graph is derived from `object_scene`; rebuild it so a
+        // rolled-back batch leaves a consistent graph.
         self.object_bindings = match &self.object_scene {
             Some(scene) => shape_scene_core::object::move_together::BindingGraph::build(
                 &super::scene_feed::binding_nodes(scene),
@@ -333,12 +314,10 @@ impl ShapeWebGpuRenderer {
     }
 
 
-    // Store the transient multi-select set (renderer-held so it survives reloads),
-    // mirror it into the scene the draw path reads, and rebuild geometry so every
-    // member draws with selection styling. Multi-select changes are discrete user
-    // actions (marquee completion, shift-click), so a full rebuild — the same
-    // fallback the patch path uses — is acceptable and avoids per-kind slot
-    // bookkeeping for a kind-agnostic id set.
+    // Store the multi-select set (renderer-held so it survives reloads), mirror it
+    // into the scene the draw path reads, and rebuild geometry so every member draws
+    // selected. A full rebuild is acceptable for these discrete user actions and
+    // avoids per-kind slot bookkeeping for a kind-agnostic id set.
     fn set_multi_select_ids(&mut self, ids: Vec<String>) {
         if self.multi_select == ids {
             return;
@@ -362,9 +341,8 @@ impl ShapeWebGpuRenderer {
         marquee: &mut Option<CoreMarqueeResult>,
         object_out: &mut ObjectInputOut,
     ) -> Result<(), JsValue> {
-        // FC-07: when an object scene is loaded, pointer events hit-test / drag /
-        // marquee against OBJECTS. Non-pointer events (camera, fit-scene, tool) fall
-        // through to the shared handlers below so pan/zoom/fit still work.
+        // When an object scene is loaded, pointer events hit-test / drag / marquee
+        // against OBJECTS; non-pointer events fall through to the shared handlers.
         if self.object_scene.is_some() {
             match &event {
                 CanvasInputEvent::PointerDown { .. }
@@ -391,9 +369,8 @@ impl ShapeWebGpuRenderer {
                 let next_hit = self.hit_at_screen(screen);
                 self.last_hit = next_hit.clone();
                 *hit = next_hit.clone();
-                // Empty hit under the Select tool starts a marquee instead of
-                // clearing selection. The shell decides whether/how to clear its
-                // own selection from the resulting marquee ids (C1).
+                // Empty hit under Select starts a marquee instead of clearing; the
+                // shell decides how to clear from the resulting marquee ids.
                 let Some(hit_object) = next_hit.clone() else {
                     let world = screen_to_world(screen, &self.camera);
                     self.input_drag = Some(InputDragState::Marquee {
@@ -601,8 +578,8 @@ impl ShapeWebGpuRenderer {
                 }
             }
             CanvasInputEvent::FitScene => {
-                // FC-09: with an object scene loaded, frame the world-space AABB over
-                // all object regions; otherwise fall back to the legacy scene fit.
+                // With an object scene, frame the world AABB over all regions;
+                // otherwise fall back to the legacy scene fit.
                 if self.object_scene.is_some() {
                     if let Some(bounds) = object_regions_world_bounds(&self.object_regions) {
                         self.camera = fit_camera_to_bounds(&bounds, self.width, self.height);
@@ -644,7 +621,7 @@ impl ShapeWebGpuRenderer {
             }
             CanvasInputEvent::ContextPick { screen } => {
                 // Right-click pick: report the hit without mutating selection or
-                // starting a drag, so the shell can open a context menu (CC4.1).
+                // starting a drag, so the shell can open a context menu.
                 let next_hit = self.hit_at_screen(screen);
                 self.last_hit = next_hit.clone();
                 *hit = next_hit;
@@ -653,18 +630,17 @@ impl ShapeWebGpuRenderer {
         Ok(())
     }
 
-    /// FC-07: pointer input against the loaded object scene. Delegates the whole
-    /// state machine to the pure [`step_object_pointer`] so it is unit-testable
-    /// without a GPU device, then mirrors the resulting selection onto the scene.
+    /// Pointer input against the loaded object scene. Delegates the state machine to
+    /// the pure [`step_object_pointer`] (unit-testable without a device), then mirrors
+    /// the resulting selection onto the scene.
     fn apply_object_pointer_event(
         &mut self,
         event: CanvasInputEvent,
         object_out: &mut ObjectInputOut,
     ) -> Result<(), JsValue> {
-        // RA2b (D6): a double-click that hits an object is reported as a branched
-        // signal — the shell drills in on a container, enters text edit on a leaf.
-        // It mutates neither selection nor drag, so it short-circuits the pointer
-        // state machine below.
+        // A double-click that hits an object is a branched signal (drill-in on a
+        // container, text edit on a leaf); it mutates neither selection nor drag, so
+        // it short-circuits the state machine below.
         if let CanvasInputEvent::DoubleClick { screen } = event {
             if let Some(scene) = &self.object_scene {
                 object_out.double_click =
@@ -685,10 +661,9 @@ impl ShapeWebGpuRenderer {
             &mut self.input_drag,
             object_out,
         );
-        // Mirror the picked selection onto the persisted single-anchor selection so
-        // a later draw/debug reads it; the result already carries it for the shell.
-        // An empty Select pointer-down (which starts a marquee) clears it, matching
-        // the legacy clear-on-empty-click invariant.
+        // Mirror the picked selection onto the persisted single-anchor selection. An
+        // empty Select pointer-down (which starts a marquee) clears it, matching the
+        // clear-on-empty-click invariant.
         if let Some(id) = &object_out.selection {
             if let Some(scene) = &mut self.object_scene {
                 scene.selection = Some(id.clone());

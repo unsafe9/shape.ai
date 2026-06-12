@@ -1,15 +1,10 @@
-//! OB1.4 — async, backend-neutral storage surface (D14/D16/D17).
+//! Async, backend-neutral storage surface.
 //!
-//! The async trait is the target signature for the redb cutover: redb is a sync,
-//! single-writer, transactional engine, and a future external DB (FoundationDB /
-//! Postgres) is async — both hide behind this one `await` boundary. The
-//! sync<->async bridge lives at the call site / wasm worker, **never** in the
-//! trait, so swapping the backend is cheap. The legacy sync [`StorageAdapter`]
-//! stays in place until the OB4.2 cutover; this is purely additive.
-//!
-//! [`Record`] stays `{id, kind, version, payload:bytes}` (P5): domain-neutral KV.
-//! Region query is a Morton range scan (see [`crate::morton`]), not SQL (D16).
-//! Pointer-width-agnostic: codes are `u64`, never `usize` on the wire.
+//! Both a sync engine (redb) and a future async DB hide behind this one `await`
+//! boundary. The sync↔async bridge lives at the call site / wasm worker,
+//! **never** in the trait, so swapping the backend stays cheap. Region query is
+//! a Morton range scan (see [`crate::morton`]), not SQL; codes are `u64`, never
+//! `usize`, on the wire.
 
 use crate::error::Result;
 use crate::record::{Record, StoreSnapshot};
@@ -27,9 +22,8 @@ pub struct RegionWindow {
 }
 
 impl RegionWindow {
-    /// The inclusive Morton code range bounding this window (see
-    /// [`crate::morton::morton_range`]). Callers feed it to an ordered range
-    /// scan, then refilter with [`RegionWindow::overlaps`].
+    /// The inclusive Morton code range bounding this window. Callers feed it to
+    /// an ordered range scan, then refilter with [`RegionWindow::overlaps`].
     pub fn morton_range(&self) -> (u64, u64) {
         crate::morton::morton_range(self.min_x, self.min_y, self.max_x, self.max_y)
     }
@@ -43,15 +37,12 @@ impl RegionWindow {
     }
 }
 
-/// Async, backend-neutral KV + region store (D14/D16/D17). Uses RPITIT
-/// (`-> impl Future + Send`); the redb impl is a sync leaf wrapped by the bridge.
-/// `query_region` returns a `Vec<Record>` (bounded by the window) rather than a
-/// boxed stream — object-safe with RPITIT and memory-bounded for windowed reads.
+/// Async, backend-neutral KV + region store. `query_region` returns a window-
+/// bounded `Vec<Record>` (object-safe with RPITIT, memory-bounded).
 pub trait AsyncStorageAdapter {
     /// Persist (insert/overwrite by id).
     fn save(&self, record: Record) -> impl core::future::Future<Output = Result<()>> + Send;
 
-    /// Load by id.
     fn load(&self, id: &str) -> impl core::future::Future<Output = Result<Record>> + Send;
 
     /// Delete by id; returns whether a record was removed.
@@ -60,18 +51,15 @@ pub trait AsyncStorageAdapter {
     /// All ids in deterministic id-sorted order.
     fn list(&self) -> impl core::future::Future<Output = Result<Vec<String>>> + Send;
 
-    /// Full snapshot (small / bundle use; the portable format is unchanged).
     fn snapshot(&self) -> impl core::future::Future<Output = Result<StoreSnapshot>> + Send;
 
-    /// Replace contents with `snapshot`.
     fn restore(
         &self,
         snapshot: StoreSnapshot,
     ) -> impl core::future::Future<Output = Result<()>> + Send;
 
-    /// Upsert a record together with its Morton region key (`None` clears the
-    /// region row, leaving the record un-indexed). The adapter owns the Morton
-    /// encoding; callers never see SQL.
+    /// Upsert a record with its Morton region key (`None` clears the region row,
+    /// leaving the record un-indexed). The adapter owns the Morton encoding.
     fn save_indexed(
         &self,
         record: Record,
@@ -79,8 +67,7 @@ pub trait AsyncStorageAdapter {
     ) -> impl core::future::Future<Output = Result<()>> + Send;
 
     /// Windowed read: records of `canvas_id` whose bbox overlaps `window`
-    /// (`None` = whole canvas), id-sorted. Implementations do a Morton range
-    /// scan + exact bbox-overlap refilter (OB0.1 verdict plan).
+    /// (`None` = whole canvas), id-sorted.
     fn query_region(
         &self,
         canvas_id: &str,

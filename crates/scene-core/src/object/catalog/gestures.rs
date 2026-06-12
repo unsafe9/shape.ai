@@ -1,21 +1,14 @@
 //! The hold-key gesture catalog: the canonical list of press-and-hold input
-//! gestures over the canvas (sibling to the click/shortcut [`commands`]).
+//! gestures (sibling to the click/shortcut [`commands`]), one source for the
+//! gesture ids every shell keys behavior off.
 //!
-//! [`commands`](crate::object::commands) covers discrete click/shortcut actions, but a
-//! second family of inputs are *held*: Space to pan, the middle mouse button to
-//! pan, Shift/Mod to add to the selection, Alt to suppress snapping or erase
-//! partially, and Shift to coarsen rotation. These were undocumented shell
-//! constants; surfacing them here gives every platform shell one source for the
-//! gesture ids it keys behavior off, mirroring `object_command_catalog_json()`.
-//!
-//! These are data-only and pure: no time, randomness, threads, or I/O. The shell
-//! still owns the actual pointer/keyboard wiring; this module only freezes the
-//! ids, the held input each gesture binds, and any numeric parameter.
+//! Data-only and pure (no time/rng/threads/IO). The shell owns the actual
+//! pointer/keyboard wiring; this module freezes the ids, the held input each
+//! gesture binds, and any numeric parameter.
 
 use serde::Serialize;
 
-/// The functional grouping a gesture belongs to. Serialized kebab-case to match
-/// the rest of the wire model.
+/// Serialized kebab-case to match the wire model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ObjectGestureCategory {
@@ -35,8 +28,8 @@ pub enum ObjectGestureCategory {
     Draw,
 }
 
-/// Which physical input must be HELD to engage a gesture. Serialized kebab-case;
-/// `Key`/`Button`/`Modifier` are the three input families the shell distinguishes.
+/// Which physical input must be HELD. The three input families the shell
+/// distinguishes; serialized kebab-case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HoldInput {
@@ -48,10 +41,8 @@ pub enum HoldInput {
     Modifier,
 }
 
-/// The hold-key trigger descriptor: which input family is held, the concrete
-/// token within it, and an optional numeric parameter (e.g. the coarse-rotate
-/// step in degrees). Exactly one of `key`/`button`/`modifier` is populated, the
-/// one matching `input`.
+/// Exactly one of `key`/`button`/`modifier` is populated — the one matching
+/// `input`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HoldTrigger {
@@ -118,12 +109,11 @@ impl ObjectGesture {
     }
 }
 
-/// The full hold-key gesture catalog, in display order grouped by category. The
-/// ids here are FROZEN — downstream shell code keys behavior off them.
+/// In display order grouped by category. The ids are FROZEN — downstream shell
+/// code keys behavior off them.
 pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
     use ObjectGestureCategory::*;
     vec![
-        // Pan — hold to temporarily drag the viewport.
         ObjectGesture::new(
             "pan-space",
             "Pan (Space)",
@@ -138,7 +128,6 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
             HoldTrigger::button("middle"),
             "Hold the middle mouse button to pan the viewport by dragging.",
         ),
-        // Select — hold to add to the current selection instead of replacing it.
         ObjectGesture::new(
             "additive-select-shift",
             "Add to Selection (Shift)",
@@ -153,7 +142,6 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
             HoldTrigger::modifier("Mod"),
             "Hold the primary modifier (Cmd/Ctrl) while selecting to add to the current selection.",
         ),
-        // Snap — hold to suppress snap-to-geometry for free placement.
         ObjectGesture::new(
             "no-snap-alt",
             "Disable Snap (Alt)",
@@ -161,7 +149,6 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
             HoldTrigger::modifier("Alt"),
             "Hold Alt to suppress snapping while moving or inserting.",
         ),
-        // Erase — hold for eraser-style partial erase.
         ObjectGesture::new(
             "partial-erase-alt",
             "Partial Erase (Alt)",
@@ -169,8 +156,6 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
             HoldTrigger::modifier("Alt"),
             "Hold Alt with the erase tool to erase partial geometry instead of whole objects.",
         ),
-        // Transform — rotation snaps to 15° by default; hold Shift to rotate
-        // freely (inverted from the old coarse-on-Shift default).
         ObjectGesture::new(
             "coarse-rotate-shift",
             "Fine Rotate (Shift)",
@@ -178,7 +163,6 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
             HoldTrigger::modifier("Shift").with_degrees(15.0),
             "Rotation snaps to 15-degree steps by default; hold Shift to rotate freely (fine).",
         ),
-        // Anchor — hold to detach an anchored object and move it wholesale (DU4).
         ObjectGesture::new(
             "detach-alt",
             "Detach Anchors (Alt)",
@@ -186,7 +170,6 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
             HoldTrigger::modifier("Alt"),
             "Hold Alt while dragging an anchored object to move it whole, ignoring its anchors and detaching them.",
         ),
-        // Draw — hold to force free-form pen recognition (release snaps to Basic).
         ObjectGesture::new(
             "free-recognize-shift",
             "Free-form Recognition (Shift)",
@@ -197,11 +180,9 @@ pub fn object_gesture_catalog() -> Vec<ObjectGesture> {
     ]
 }
 
-/// The hold-key gesture catalog serialized to JSON — the seam the shell consumes
-/// (`object_gesture_catalog() -> JSON`).
+/// The catalog serialized to JSON — the seam the shell consumes.
 pub fn object_gesture_catalog_json() -> String {
-    // The catalog is statically constructed, so serialization cannot fail; the
-    // `expect` documents that invariant rather than masking a real error.
+    // Statically constructed, so serialization cannot fail.
     serde_json::to_string(&object_gesture_catalog()).expect("object gesture catalog serializes")
 }
 
@@ -236,7 +217,6 @@ mod tests {
             "detach-alt",
             "free-recognize-shift",
         ];
-        // Exactly the 9 ids, each once.
         let ids: Vec<&str> = catalog.iter().map(|g| g.id.as_str()).collect();
         assert_eq!(ids.len(), expected.len(), "catalog must hold exactly 9 gestures");
         let mut seen = HashSet::new();
@@ -306,8 +286,8 @@ mod tests {
         assert_eq!(arr.len(), object_gesture_catalog().len());
     }
 
-    /// Contract snapshot: pin the exact serialized wire shape of the catalog so a
-    /// drift in ids, trigger fields, or the degrees param fails the test.
+    /// Pins the exact serialized wire shape so a drift in ids, trigger fields, or
+    /// the degrees param fails.
     #[test]
     fn catalog_matches_wire_snapshot() {
         let expected = serde_json::json!([
