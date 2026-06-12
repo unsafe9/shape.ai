@@ -55,6 +55,11 @@ pub struct WebGpuFrameStats {
     pub object_fill_index_count: usize,
     pub object_stroke_vertex_count: usize,
     pub object_draw_count: usize,
+    // FramePlan IR feed accounting: targeted patches applied across canonical
+    // re-feeds vs. feeds that fell back to a full rebuild. The object-path twin of
+    // `dirty_range_write_count` / `full_buffer_rebuild_count`.
+    pub object_patch_count: usize,
+    pub object_rebuild_count: usize,
     pub backend: String,
 }
 

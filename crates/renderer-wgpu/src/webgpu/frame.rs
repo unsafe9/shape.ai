@@ -280,6 +280,8 @@ impl ShapeWebGpuRenderer {
                 .as_ref()
                 .map(|r| r.object_count())
                 .unwrap_or(0),
+            object_patch_count: self.object_patch_count,
+            object_rebuild_count: self.object_rebuild_count,
             backend: "rust-wgpu-visible".to_string(),
         })
     }

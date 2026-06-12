@@ -208,7 +208,7 @@ pub struct TextUniform {
 /// megabuffer and the instance record (matrix + color) drawn against them, plus
 /// its stroke vertices and stroke instance. Held by [`ObjectRenderer`] so each
 /// object becomes one indexed fill draw + one stroke draw at record time.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ObjectDraw {
     pub id: String,
     /// Index range into the shared fill megabuffer (`fill_indices`), or an empty

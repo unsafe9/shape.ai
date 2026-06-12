@@ -23,6 +23,7 @@ pub mod curve_lod;
 pub mod hit_test_object;
 pub mod object_pipeline;
 pub mod object_theme;
+pub mod plan;
 #[allow(dead_code)]
 pub mod outline;
 pub mod render_object;
@@ -46,6 +47,14 @@ pub use stats::CoreNearestOutlinePoint;
 pub use object_pipeline::{
     build_scene_geometry, preview_instance_columns, FillInstance, FillVertex, ObjectDraw,
     ObjectMatrixUniform, SceneGeometry, StrokeInstance, StrokeParamsUniform, StrokeVertex,
+};
+
+// FramePlan IR: the platform-neutral, diffable draw-plan contract between this
+// crate (what to draw) and renderer-wgpu (GPU submission). Builder + pure diff.
+#[allow(unused_imports)]
+pub use plan::{
+    build_frame_plan, diff_plans, geometry_revision, pass_order, DrawPass, FramePlan, PlanDiff,
+    PlanEntry, PlanInstance, PlanPatch, ResourceHandle, StyleSlot,
 };
 
 // W3-G8/A real drop-shadow blur. The pure Gaussian-kernel core + tuning constants

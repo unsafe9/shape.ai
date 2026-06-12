@@ -12,6 +12,10 @@ use shape_renderer_core::model::CameraState;
 #[cfg(feature = "wgpu-probe")]
 use shape_renderer_core::object_theme::{resolve_token_f32, Theme};
 #[cfg(feature = "wgpu-probe")]
+use shape_renderer_core::plan::{
+    build_frame_plan, diff_plans, FramePlan, PlanDiff, PlanPatch, StyleSlot,
+};
+#[cfg(feature = "wgpu-probe")]
 use shape_renderer_core::render_object::RenderObjectScene;
 #[cfg(feature = "wgpu-probe")]
 use shape_renderer_core::text_layout::MsdfAtlasPlan;
@@ -537,6 +541,16 @@ pub struct ObjectRenderer {
     shadow_vertex_count: u32,
     stroke_vertex_count: u32,
     text_vertex_count: u32,
+    /// The retained FramePlan IR — the diffable draw-plan contract this renderer
+    /// last uploaded, keyed by per-object [`ResourceHandle`]s. [`apply_plan_diff`]
+    /// diffs a freshly-built plan against this one and patches only what changed
+    /// (transform/style writes, or a single object's geometry re-send) instead of
+    /// reconstructing on every canonical scene re-feed; on a structural change it
+    /// signals a rebuild. The GPU buffers above ARE the plan's geometry store, so
+    /// `self.plan.geometry` mirrors what is currently on the device.
+    ///
+    /// [`apply_plan_diff`]: ObjectRenderer::apply_plan_diff
+    plan: FramePlan,
     /// RB1: the active light/dark theme. Sources the canvas clear color and is
     /// the bit [`ObjectRenderer::set_theme`] flips. Held so token-backed instance
     /// colors re-resolve on a toggle without re-tessellation (P4).
@@ -565,7 +579,11 @@ impl ObjectRenderer {
         pixel_height: f32,
         theme: Theme,
     ) -> Self {
-        let build = build_scene_geometry_themed(scene, theme);
+        // Build the FramePlan IR (the single tessellation entry) and upload from its
+        // geometry store. The plan is retained so a later canonical re-feed diffs
+        // against it instead of reconstructing the whole renderer.
+        let plan = build_frame_plan(scene, theme);
+        let build = &plan.geometry;
 
         let uniform = ObjectMatrixUniform::from_scene(scene, pixel_width, pixel_height);
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -806,7 +824,8 @@ impl ObjectRenderer {
             shadow_vertex_count: build.shadow_vertices.len() as u32,
             stroke_vertex_count: build.stroke_vertices.len() as u32,
             text_vertex_count: build.text_vertices.len() as u32,
-            draws: build.draws,
+            draws: build.draws.clone(),
+            plan,
             theme,
             preview_transforms: Vec::new(),
         }
@@ -815,6 +834,175 @@ impl ObjectRenderer {
     /// Number of objects with recorded draw data.
     pub fn object_count(&self) -> usize {
         self.draws.len()
+    }
+
+    /// The retained FramePlan IR — the diffable contract this renderer last
+    /// uploaded. Exposed so the canonical re-feed can diff a freshly-built plan
+    /// against it (via [`apply_plan_diff`]) and so host tests can inspect the
+    /// handle-keyed cache.
+    ///
+    /// [`apply_plan_diff`]: ObjectRenderer::apply_plan_diff
+    pub fn plan(&self) -> &FramePlan {
+        &self.plan
+    }
+
+    /// IR CONSUMER (the diffable seam): re-feed the canonical object `scene` by
+    /// building its [`FramePlan`], diffing it against the retained plan, and
+    /// applying the targeted [`PlanPatch`]es through the GPU instance/geometry
+    /// write paths — instead of reconstructing the whole renderer on every feed.
+    ///
+    /// - [`PlanPatch::TransformUpdate`] -> the 4-buffer matrix write (fill/stroke/
+    ///   text/shadow), the SAME instance-matrix path the live drag preview uses.
+    /// - [`PlanPatch::StyleUpdate`] -> the per-pass color-slot write, the SAME path
+    ///   the theme toggle uses.
+    /// - [`PlanPatch::GeometryUpdate`] -> a single object's mesh re-send over its
+    ///   existing ranges when size-safe; otherwise the whole diff degrades to a
+    ///   rebuild (the caller reconstructs).
+    /// - [`PlanDiff::Rebuild`] (structural: add/remove/reorder) -> signal a rebuild.
+    ///
+    /// Returns [`PlanApplyStats`]: `patch_count` is the number of targeted patches
+    /// applied this feed; `needs_rebuild` is set when the diff (or an
+    /// unfittable geometry update) requires the caller to reconstruct the renderer.
+    /// When `needs_rebuild` is true the GPU buffers are left untouched, so the
+    /// caller's fresh [`ObjectRenderer::new`] is the single, clean re-upload.
+    pub fn apply_plan_diff(
+        &mut self,
+        queue: &wgpu::Queue,
+        scene: &RenderObjectScene,
+    ) -> PlanApplyStats {
+        let next = build_frame_plan(scene, self.theme);
+        let diff = diff_plans(&self.plan, &next);
+        let patches = match diff {
+            PlanDiff::Rebuild => {
+                return PlanApplyStats {
+                    patch_count: 0,
+                    needs_rebuild: true,
+                };
+            }
+            PlanDiff::Patches(patches) => patches,
+        };
+
+        // A geometry update is only safe in place when the new entry's vertex/index
+        // counts still fill the retained ranges (the `follower_patch_plan` guard).
+        // If ANY geometry update fails that guard, the buffers can't hold the new
+        // mesh, so the whole feed degrades to a rebuild — and we touch nothing,
+        // leaving a clean slate for the caller's `ObjectRenderer::new`.
+        for patch in &patches {
+            if let PlanPatch::GeometryUpdate { index, entry, .. } = patch {
+                let old_draw = &self.plan.entries[*index].draw;
+                if follower_patch_plan(old_draw, &geometry_reexpand(&next, *index)).is_none() {
+                    return PlanApplyStats {
+                        patch_count: 0,
+                        needs_rebuild: true,
+                    };
+                }
+                // The entry's own ranges must equal the retained ones too (same slot).
+                debug_assert_eq!(entry.draw.fill_range, old_draw.fill_range);
+            }
+        }
+
+        let patch_count = patches.len();
+        for patch in &patches {
+            self.apply_patch(queue, &next, patch);
+        }
+        // Adopt the new plan as the retained cache and refresh the mirror state the
+        // render loops read (`draws` + counts). Counts are unchanged by transform/
+        // style patches and by a size-safe geometry patch, but assigning keeps the
+        // mirror exact regardless of which patches ran.
+        self.draws = next.geometry.draws.clone();
+        self.fill_index_count = next.geometry.fill.indices.len() as u32;
+        self.shadow_vertex_count = next.geometry.shadow_vertices.len() as u32;
+        self.stroke_vertex_count = next.geometry.stroke_vertices.len() as u32;
+        self.text_vertex_count = next.geometry.text_vertices.len() as u32;
+        self.plan = next;
+        PlanApplyStats {
+            patch_count,
+            needs_rebuild: false,
+        }
+    }
+
+    /// Apply one [`PlanPatch`] to the GPU buffers. `next` is the freshly-built plan
+    /// the patch came from (the geometry source for a `GeometryUpdate`).
+    fn apply_patch(&mut self, queue: &wgpu::Queue, next: &FramePlan, patch: &PlanPatch) {
+        match patch {
+            PlanPatch::TransformUpdate { index, columns, .. } => {
+                self.write_instance_matrix(queue, *index, columns);
+            }
+            PlanPatch::StyleUpdate {
+                index, slot, color, ..
+            } => {
+                self.write_instance_color(queue, *index, *slot, color);
+            }
+            PlanPatch::GeometryUpdate { index, entry, .. } => {
+                // Re-send ONLY this object's mesh over its existing ranges, then the
+                // new matrix + colors (the re-expand carries vertices; the instance
+                // attributes ride the same per-object slot).
+                let rebuilt = geometry_reexpand(next, *index);
+                let id = entry.handle.object.clone();
+                self.patch_follower_geometry(queue, &id, &rebuilt);
+                let columns = [entry.instance.fill.m0, entry.instance.fill.m1, entry.instance.fill.m2];
+                self.write_instance_matrix(queue, *index, &columns);
+                self.write_instance_color(queue, *index, StyleSlot::Fill, &entry.instance.fill.fill);
+                self.write_instance_color(queue, *index, StyleSlot::Stroke, &entry.instance.stroke.stroke);
+                self.write_instance_color(queue, *index, StyleSlot::Shadow, &entry.instance.shadow.shadow);
+            }
+            PlanPatch::Rebuild => {
+                // diff_plans only returns Rebuild via PlanDiff::Rebuild, handled by the
+                // caller before reaching here; a Rebuild inside a patch list is unreachable.
+                debug_assert!(false, "PlanPatch::Rebuild should never appear inside a patch list");
+            }
+        }
+    }
+
+    /// Write the 36-byte matrix region (`m0,m1,m2` at offset 0) of object `index`'s
+    /// instance in EVERY per-pass instance buffer (fill/stroke/text/shadow), strided
+    /// by [`preview_instance_strides`]. This is the absolute-columns twin of
+    /// [`set_preview_transform`]'s `delta*base` write — same buffers, same offsets —
+    /// so the IR transform patch lands identically to the live drag matrix push.
+    ///
+    /// [`set_preview_transform`]: ObjectRenderer::set_preview_transform
+    fn write_instance_matrix(&self, queue: &wgpu::Queue, index: usize, columns: &[[f32; 3]; 3]) {
+        let bytes = bytemuck::cast_slice(columns);
+        let strides = preview_instance_strides();
+        let buffers = [
+            &self.fill_instance_buffer,
+            &self.stroke_instance_buffer,
+            &self.text_instance_buffer,
+            &self.shadow_instance_buffer,
+        ];
+        for (buffer, stride) in buffers.iter().zip(strides) {
+            queue.write_buffer(buffer, (index as u64) * stride, bytes);
+        }
+    }
+
+    /// Write the 16-byte color slot (past the 36-byte matrix) of object `index`'s
+    /// instance for one pass. The fill/stroke/shadow color sits at struct offset 36;
+    /// the matrix region before it is untouched, mirroring [`set_theme`]'s color
+    /// write exactly.
+    ///
+    /// [`set_theme`]: ObjectRenderer::set_theme
+    fn write_instance_color(
+        &self,
+        queue: &wgpu::Queue,
+        index: usize,
+        slot: StyleSlot,
+        color: &[f32; 4],
+    ) {
+        let (buffer, stride) = match slot {
+            StyleSlot::Fill => (&self.fill_instance_buffer, std::mem::size_of::<FillInstance>()),
+            StyleSlot::Stroke => (
+                &self.stroke_instance_buffer,
+                std::mem::size_of::<StrokeInstance>(),
+            ),
+            StyleSlot::Shadow => (
+                &self.shadow_instance_buffer,
+                std::mem::size_of::<ShadowInstance>(),
+            ),
+        };
+        // The color slot is at offset 36 in all three instance structs (pinned by the
+        // renderer-core layout tests), strictly past the matrix region.
+        let offset = (index * stride + 36) as u64;
+        queue.write_buffer(buffer, offset, bytemuck::cast_slice(color));
     }
 
     /// Rebuild the camera uniform from the live camera + device-pixel viewport and
@@ -891,6 +1079,15 @@ impl ObjectRenderer {
                     bytemuck::cast_slice(&color),
                 );
             }
+        }
+        // Keep the retained FramePlan an accurate diff base: the theme write just
+        // moved instance COLORS on the GPU, so mirror them into the plan's entries
+        // (index-aligned with `self.draws`). Without this a later `apply_plan_diff`
+        // would re-emit redundant style updates against the stale pre-flip colors.
+        for (entry, draw) in self.plan.entries.iter_mut().zip(&self.draws) {
+            entry.instance.fill = draw.fill_instance;
+            entry.instance.stroke = draw.stroke_instance;
+            entry.instance.shadow = draw.shadow_instance;
         }
         self.theme
     }
@@ -1236,6 +1433,52 @@ impl ObjectRenderer {
     }
 }
 
+/// The result of an [`ObjectRenderer::apply_plan_diff`] feed, surfaced so the
+/// frame-stats keep their meaning: `patch_count` is the number of targeted IR
+/// patches applied (the "patch path" counter), and `needs_rebuild` tells the
+/// caller the diff required a full reconstruction (the "rebuild" counter).
+#[cfg(feature = "wgpu-probe")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanApplyStats {
+    pub patch_count: usize,
+    pub needs_rebuild: bool,
+}
+
+/// Slice object `index`'s baked geometry out of a built [`FramePlan`] into a
+/// [`FollowerReexpand`] — the per-object vertex/index payload the in-place patch
+/// path (`patch_follower_geometry`) consumes. The fill indices in the plan's
+/// megabuffer are rebased by the object's vertex base; this rebases them back to
+/// object-LOCAL (0-based) so the patch can re-rebase them onto the live ranges
+/// (matching `reexpand_single_object`'s object-local contract).
+#[cfg(feature = "wgpu-probe")]
+fn geometry_reexpand(plan: &FramePlan, index: usize) -> FollowerReexpand {
+    let geo = &plan.geometry;
+    let draw = &plan.entries[index].draw;
+    let fill_v = draw.fill_vertex_range;
+    let fill_i = draw.fill_range;
+    let stroke = draw.stroke_range;
+    let shadow = draw.shadow_range;
+    let text = draw.text_range;
+
+    let fill_vertices: Vec<FillVertex> = geo.fill.vertices[fill_v.start as usize..fill_v.end as usize]
+        .iter()
+        .zip(&geo.fill_edges[fill_v.start as usize..fill_v.end as usize])
+        .map(|(&position, &edge)| FillVertex { position, edge })
+        .collect();
+    let base = fill_v.start;
+    let fill_indices: Vec<u32> = geo.fill.indices[fill_i.start as usize..fill_i.end as usize]
+        .iter()
+        .map(|&i| i - base)
+        .collect();
+    FollowerReexpand {
+        fill_vertices,
+        fill_indices,
+        stroke_vertices: geo.stroke_vertices[stroke.start as usize..stroke.end as usize].to_vec(),
+        shadow_vertices: geo.shadow_vertices[shadow.start as usize..shadow.end as usize].to_vec(),
+        text_vertices: geo.text_vertices[text.start as usize..text.end as usize].to_vec(),
+    }
+}
+
 /// Create a `VERTEX | COPY_DST` buffer sized for `data` (min 4 bytes so an empty
 /// scene still produces a valid, non-zero-sized buffer handle).
 #[cfg(feature = "wgpu-probe")]
@@ -1304,5 +1547,108 @@ mod tests {
         assert_eq!(std::mem::offset_of!(TextVertex, position), 0);
         assert_eq!(std::mem::offset_of!(TextVertex, uv), 8);
         assert_eq!(std::mem::offset_of!(TextVertex, color), 16);
+    }
+
+    use shape_renderer_core::model::CameraState;
+    use shape_renderer_core::render_object::{
+        RFill, RPaint, RStroke, RStrokeCap, RStrokeJoin, RenderObject,
+    };
+
+    fn rect(id: &str, d: &str) -> RenderObject {
+        RenderObject {
+            id: id.to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            geometry_d: d.to_string(),
+            fill: Some(RFill {
+                paint: RPaint::Solid { color: "#ff0000".to_string() },
+                opacity: 1.0,
+            }),
+            stroke: Some(RStroke {
+                paint: RPaint::Solid { color: "#00ff00".to_string() },
+                width: 4.0,
+                opacity: 1.0,
+                dash: Vec::new(),
+                cap: RStrokeCap::Butt,
+                join: RStrokeJoin::Miter,
+            }),
+            text: None,
+            anchors: Vec::new(),
+            clip: false,
+        }
+    }
+
+    fn scene(objects: Vec<RenderObject>) -> RenderObjectScene {
+        RenderObjectScene {
+            scene_id: "ir".to_string(),
+            camera: CameraState { x: 0.0, y: 0.0, zoom: 1.0 },
+            objects,
+            selection: None,
+            multi_select: Vec::new(),
+        }
+    }
+
+    /// IR GEOMETRY-UPDATE PARITY (host, no GPU): `geometry_reexpand` slices an
+    /// object out of a built `FramePlan` into the EXACT bytes
+    /// `reexpand_single_object` produces for that object — the same payload the
+    /// in-place `patch_follower_geometry` write consumes. Pins that the IR's
+    /// geometry-update path re-sends correct, object-local geometry (fill vertices,
+    /// object-LOCAL rebased indices, stroke/shadow/text vertices) for a NON-first
+    /// object, where the megabuffer index rebase is load-bearing. FAILS if the slice
+    /// math or the index un-rebase drifts.
+    #[test]
+    fn geometry_reexpand_slices_match_reexpand_single_object() {
+        // Two objects so object index 1 has a non-zero megabuffer vertex base — the
+        // case where slicing + un-rebasing the indices actually matters.
+        let s = scene(vec![
+            rect("a", "M0 0 L800 0 L800 800 L0 800 Z"),
+            rect("b", "M0 0 L640 0 L640 640 L0 640 Z"),
+        ]);
+        let plan = build_frame_plan(&s, Theme::light());
+
+        for index in [0usize, 1usize] {
+            let sliced = geometry_reexpand(&plan, index);
+            let oracle = reexpand_single_object(
+                &s.objects[index],
+                Theme::light(),
+                s.camera.clone(),
+            );
+            assert_eq!(sliced.fill_vertices, oracle.fill_vertices, "fill verts parity (obj {index})");
+            assert_eq!(sliced.fill_indices, oracle.fill_indices, "object-local indices parity (obj {index})");
+            assert_eq!(sliced.stroke_vertices, oracle.stroke_vertices, "stroke parity (obj {index})");
+            assert_eq!(sliced.shadow_vertices, oracle.shadow_vertices, "shadow parity (obj {index})");
+            assert_eq!(sliced.text_vertices, oracle.text_vertices, "text parity (obj {index})");
+        }
+
+        // The sliced geometry, paired with the plan's draw record, is size-safe to
+        // patch in place (the contract `apply_plan_diff`'s geometry route relies on).
+        let plan_b = &plan.entries[1].draw;
+        assert!(
+            follower_patch_plan(plan_b, &geometry_reexpand(&plan, 1)).is_some(),
+            "a plan slice fills its own object's ranges exactly"
+        );
+    }
+
+    /// IR INDEX UN-REBASE: object 1's indices in the merged megabuffer are rebased
+    /// by its vertex base, so a naive slice would carry merged (too-large) indices.
+    /// `geometry_reexpand` must return them object-LOCAL (0-based), so the max index
+    /// is below the object's own vertex count. FAILS if the un-rebase is dropped (the
+    /// patch would then write merged indices over a 0-based range — corruption).
+    #[test]
+    fn geometry_reexpand_returns_object_local_indices() {
+        let s = scene(vec![
+            rect("a", "M0 0 L800 0 L800 800 L0 800 Z"),
+            rect("b", "M0 0 L640 0 L640 640 L0 640 Z"),
+        ]);
+        let plan = build_frame_plan(&s, Theme::light());
+        let sliced = geometry_reexpand(&plan, 1);
+        assert!(!sliced.fill_indices.is_empty(), "object b fills");
+        let max_index = *sliced.fill_indices.iter().max().unwrap();
+        assert!(
+            (max_index as usize) < sliced.fill_vertices.len(),
+            "indices are object-local (0-based), max {max_index} < {} verts",
+            sliced.fill_vertices.len()
+        );
     }
 }

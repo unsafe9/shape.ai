@@ -398,6 +398,15 @@ pub struct ShapeWebGpuRenderer {
     // None the legacy 2D path stays authoritative.
     object_scene: Option<RenderObjectScene>,
     object_regions: Vec<ObjectRegion>,
+    // FramePlan IR feed accounting (object path). A canonical re-feed
+    // (`load_object_scene`) diffs the freshly-built plan against the renderer's
+    // retained one and applies targeted patches; `object_patch_count` accumulates
+    // those patches, `object_rebuild_count` counts the feeds that fell back to a
+    // full `ObjectRenderer::new` (first feed, or a structural / unfittable diff).
+    // These keep the patch-vs-rebuild frame-stats meaningful for the object path,
+    // mirroring the legacy `dirty_range_write_count` / `full_buffer_rebuild_count`.
+    object_patch_count: usize,
+    object_rebuild_count: usize,
     // v3 §2b/§3: ids whose GPU-baked GEOMETRY currently deviates from canonical
     // because a live chord deform patched it (a non-translate preview on an
     // open-class moved member, or an endpoint drag). GPU-only transient state,

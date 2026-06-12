@@ -62,6 +62,11 @@ export type RustWebGpuFrameStats = {
   objectFillIndexCount?: number | null;
   objectStrokeVertexCount?: number | null;
   objectDrawCount?: number | null;
+  // FramePlan IR feed accounting: targeted patches applied across canonical
+  // re-feeds vs. feeds that fell back to a full rebuild. Nullable for the same
+  // forward-compat reason as the object-draw diagnostics above.
+  objectPatchCount?: number | null;
+  objectRebuildCount?: number | null;
   backend: string;
 };
 

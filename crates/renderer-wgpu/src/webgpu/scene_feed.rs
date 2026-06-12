@@ -78,21 +78,48 @@ impl ShapeWebGpuRenderer {
                 self.config.format,
             ));
         }
-        let pipeline = self.object_pipeline.as_ref().unwrap();
-        let renderer = ObjectRenderer::new(
-            &self.device,
-            &self.queue,
-            pipeline,
-            &scene,
-            self.width as f32,
-            self.height as f32,
-            // W3-G6/#3: build in the PERSISTED theme so the dark canvas-bg survives
-            // every re-feed (pan/move/create). The bit is owned by the wrapper
-            // (`self.object_theme`, set by `set_object_theme`), not the per-scene
-            // renderer that this re-feed throws away — so the clear stays dark with
-            // zero extra GPU work (no post-build `set_theme` call needed).
-            self.object_theme,
-        );
+        // FramePlan IR consumer: when a compatible renderer already exists, DIFF the
+        // freshly-built plan against its retained one and apply targeted patches
+        // (transform/style writes, or a single object's geometry re-send) instead of
+        // reconstructing every buffer — the canonical re-feed (pan/move/recolor/edit)
+        // is now O(changed objects), not O(scene). A structural change or an
+        // unfittable geometry update falls back to a full `ObjectRenderer::new`.
+        // The renderer's live theme is kept in lockstep with the persisted
+        // `object_theme` (via `set_object_theme` -> `set_theme`), so the diff base is
+        // the right theme; if they ever diverge we reconstruct to stay correct.
+        let theme_matches = self
+            .object_renderer
+            .as_ref()
+            .map(|r| r.theme().dark == self.object_theme.dark)
+            .unwrap_or(false);
+        let patched = if theme_matches {
+            self.object_renderer
+                .as_mut()
+                .map(|renderer| renderer.apply_plan_diff(&self.queue, &scene))
+                .filter(|stats| !stats.needs_rebuild)
+        } else {
+            None
+        };
+        if let Some(stats) = patched {
+            self.object_patch_count += stats.patch_count;
+        } else {
+            // First feed, structural change, theme divergence, or an unfittable
+            // geometry update: rebuild the renderer in the PERSISTED theme so the
+            // dark canvas-bg survives every re-feed (W3-G6/#3 — the bit is owned by
+            // the wrapper, not the per-scene renderer this throws away).
+            let pipeline = self.object_pipeline.as_ref().unwrap();
+            self.object_renderer = Some(ObjectRenderer::new(
+                &self.device,
+                &self.queue,
+                pipeline,
+                &scene,
+                self.width as f32,
+                self.height as f32,
+                self.object_theme,
+            ));
+            self.object_rebuild_count += 1;
+        }
+        let renderer = self.object_renderer.as_ref().unwrap();
         let counts = ObjectSceneLoadResult {
             objects: scene.objects.len(),
             fill_indices: renderer.fill_index_count() as usize,
@@ -113,7 +140,7 @@ impl ShapeWebGpuRenderer {
         self.preview_deformed.clear();
         self.endpoint_preview = None;
         self.object_scene = Some(scene);
-        self.object_renderer = Some(renderer);
+        // The renderer is already in place (patched or rebuilt above).
         serde_wasm(counts)
     }
 
