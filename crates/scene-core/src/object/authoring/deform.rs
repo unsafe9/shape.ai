@@ -312,7 +312,15 @@ pub fn endpoint_release_ops(
                     node_index,
                     target: target.id.clone(),
                     at: LocalPoint {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "quantize to integer local units: .round() then narrow, the canonical de/quantize semantic shared across binding sites"
+                        )]
                         x: (tx * UNITS_PER_PX).round() as i32,
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "quantize to integer local units: .round() then narrow, the canonical de/quantize semantic shared across binding sites"
+                        )]
                         y: (ty * UNITS_PER_PX).round() as i32,
                     },
                 });

@@ -219,7 +219,15 @@ fn reproject_node_local_quantized(
     let (wx, wy) = apply_affine(&affine_of(target_transform), lx, ly);
     let inv = invert_affine(&affine_of(follower_transform));
     let (fx, fy) = apply_affine(&inv, wx, wy);
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "quantize to integer local units: .round() then narrow, the canonical de/quantize semantic (step 4 of the doc comment above)"
+    )]
     let qx = (fx * UNITS_PER_PX).round() as i64;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "quantize to integer local units: .round() then narrow, the canonical de/quantize semantic (step 4 of the doc comment above)"
+    )]
     let qy = (fy * UNITS_PER_PX).round() as i64;
     (qx, qy)
 }
@@ -560,7 +568,15 @@ pub fn synthesize_create_anchors(
     let inv = invert_affine(&affine_of(&target.transform));
     let (lx, ly) = apply_affine(&inv, endpoint_x, endpoint_y);
     let at = LocalPoint {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "quantize to integer local units: .round() then narrow, the canonical de/quantize semantic shared across binding sites"
+        )]
         x: (lx * UNITS_PER_PX).round() as i32,
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "quantize to integer local units: .round() then narrow, the canonical de/quantize semantic shared across binding sites"
+        )]
         y: (ly * UNITS_PER_PX).round() as i32,
     };
     Some(vec![Anchor {
@@ -623,7 +639,15 @@ mod tests {
         // Start at world (40,30); snapped endpoint at (endpoint_x, endpoint_y).
         let start_lx = 40 * Q;
         let start_ly = 30 * Q;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "fixture endpoints are small whole numbers; truncate-toward-zero is the intended quantization here"
+        )]
         let end_lx = (endpoint_x as i32) * Q;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "fixture endpoints are small whole numbers; truncate-toward-zero is the intended quantization here"
+        )]
         let end_ly = (endpoint_y as i32) * Q;
         let mut o = Object::new(
             "edge-1",

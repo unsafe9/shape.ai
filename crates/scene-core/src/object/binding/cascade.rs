@@ -496,7 +496,15 @@ mod tests {
         use crate::object::anchor_follow::synthesize_create_anchors;
         let start_lx = 40 * Q;
         let start_ly = 30 * Q;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "fixture endpoints are small whole numbers; truncate-toward-zero is the intended quantization here"
+        )]
         let end_lx = (endpoint_x as i32) * Q;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "fixture endpoints are small whole numbers; truncate-toward-zero is the intended quantization here"
+        )]
         let end_ly = (endpoint_y as i32) * Q;
         let mut o = Object::new(
             "edge",
