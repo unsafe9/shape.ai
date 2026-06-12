@@ -1805,6 +1805,7 @@ mod tests {
         // The wasm wrapper's persisted bit (`ShapeWebGpuRenderer::object_theme`),
         // initialized light like the real constructor.
         let mut persisted = Theme::light();
+        assert!(!persisted.dark, "wrapper starts on the light bit");
 
         // `set_object_theme(true)` persists the dark bit FIRST (input.rs).
         persisted = Theme { dark: true };

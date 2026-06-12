@@ -192,7 +192,7 @@ export interface DocumentShellState {
    *
    * @see ./shared/object `ObjectSelection`
    */
-  selection: unknown; // typed as SceneSelection in App.svelte
+  selection: unknown; // typed as ObjectSelection in App.svelte
 }
 
 /**
