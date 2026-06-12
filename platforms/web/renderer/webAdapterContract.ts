@@ -52,13 +52,11 @@ import type {
   RustWebGpuProbeReport,
   RustWebGpuRenderer,
   RustCanvasInputEvent,
-  RustInputBatchResult,
-  RustDebugSnapshot
+  RustInputBatchResult
 } from "../bridge/wasmLoader";
 
 import type {
   RenderObjectScene,
-  SceneSelection,
   HitResult,
   DomOverlayRequest,
   FrameStats,
@@ -81,10 +79,8 @@ export type {
   RustWebGpuRenderer,
   RustCanvasInputEvent,
   RustInputBatchResult,
-  RustDebugSnapshot,
   RenderObjectScene,
   ObjectOp,
-  SceneSelection,
   HitResult,
   DomOverlayRequest,
   FrameStats,
@@ -363,13 +359,6 @@ export type WebAdapterDiagnosticsContract = {
    * `EngineEvent { type: "stats" }` after every `renderFrame()` call.
    */
   readonly lastFrameStats: FrameStats | null;
-
-  /**
-   * Latest raw debug snapshot from the Rust core.
-   * Null when `RustWebGpuRenderer` is unavailable.
-   * Accessible via `ShapeCanvasEngine.debugSnapshot()`.
-   */
-  readonly lastDebugSnapshot: RustDebugSnapshot | null;
 };
 
 // ─── Surface 7 — Shell integration API ───────────────────────────────────────
@@ -403,12 +392,6 @@ export type WebAdapterShellContract = {
    * render view; `activeTagIds` controls which objects are visible.
    */
   loadObjectScene(scene: RenderObjectScene, activeTagIds: string[]): void;
-
-  /**
-   * Synchronise the selection highlight without re-loading the scene.
-   * No-ops when the selection is already identical to the current scene.
-   */
-  syncSelection(selection: SceneSelection): void;
 
   /**
    * Teleport the camera to an exact state.

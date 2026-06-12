@@ -52,8 +52,6 @@ const TRANSLATE_40_30: Transform3x3 = [
 function translateDragRenderer(): RustWebGpuRenderer {
   return {
     resize() {},
-    loadScene() {},
-    applyPatchBatch() {},
     renderFrame() {
       return { backend: "test" } as unknown as ReturnType<RustWebGpuRenderer["renderFrame"]>;
     },
@@ -62,29 +60,7 @@ function translateDragRenderer(): RustWebGpuRenderer {
       const isMove = events.some((e) => e.kind === "pointer-move");
       return {
         camera: CAMERA,
-        hit: null,
-        selection: { kind: "canvas" },
-        patches: [],
-        overlay: null,
         objectTransformDelta: isMove ? { id: LINE_ID, matrix: TRANSLATE_40_30, kind: "translate" } : null
-      };
-    },
-    overlayRequest() {
-      return null;
-    },
-    debugSnapshot() {
-      return {
-        camera: CAMERA,
-        selection: { kind: "canvas" },
-        selectionWorldRect: null,
-        selectionScreenRect: null,
-        lastHit: null,
-        totalGroups: 0,
-        totalCards: 0,
-        totalEdges: 0,
-        patchUpdateCount: 0,
-        dirtyRangeWriteCount: 0,
-        fullBufferRebuildCount: 0
       };
     }
   } as unknown as RustWebGpuRenderer;

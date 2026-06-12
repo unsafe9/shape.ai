@@ -1,24 +1,15 @@
 import {
-  applyScenePatch,
   screenToWorld,
   type CameraState,
-  type DomOverlayRequest,
   type FrameStats,
-  type HitResult,
   type RenderTransform3x3,
-  type ScenePatch,
-  type SceneSelection,
-  type SceneSnapshot,
   type WorldPoint,
   type WorldRect
 } from "./scene";
 import type {
   HoverAffordance,
   RustCanvasInputEvent,
-  RustDebugSnapshot,
-  RustHitResult,
   RustInputBatchResult,
-  RustMarqueeResult,
   RustWebGpuFrameStats,
   RustWebGpuRenderer
 } from "../bridge/wasmLoader";
@@ -74,18 +65,6 @@ export function createMoveEmission(intent: { dragActive: boolean }): "hover" | "
 
 export type EngineEvent =
   | { type: "stats"; stats: FrameStats }
-  // T2.2: `additive` carries the shift/meta modifier held at pick time so the shell
-  // can toggle the hit into a transient multi-select set instead of replacing it.
-  | { type: "selection"; hit: HitResult | null; additive: boolean }
-  | { type: "patch"; patch: ScenePatch; errors: string[] }
-  | { type: "overlay"; request: DomOverlayRequest | null }
-  | { type: "gesture"; active: boolean }
-  // CC2.3: emitted on the pointer-up that ends a marquee drag. ids = node ids
-  // first, then group ids, whose world AABB intersects the final rect. The shell
-  // merges them into its transient multiSelectIds set.
-  | { type: "marquee"; rect: WorldRect; ids: string[] }
-  // CC4.1: right-click pick result, for the context menu. Does not change selection.
-  | { type: "context-pick"; hit: HitResult | null; screen: WorldPoint }
   // FC-08: object-path input results. `object-select` rides the pointer-down that
   // picked an object; `object-transform-preview` rides each pointer-move during an
   // object drag (a non-destructive preview the shell composes onto the scene); it
@@ -187,31 +166,24 @@ export class ShapeCanvasEngine {
   private canvas: HTMLCanvasElement;
   private overlayRoot: HTMLElement;
   private onEvent: (event: EngineEvent) => void;
-  private snapshot: SceneSnapshot | null = null;
   private camera: CameraState = { x: 0, y: 0, zoom: 1 };
   private dpr = 1;
   private width = 1;
   private height = 1;
   private running = false;
   private raf = 0;
-  private activeOverlay: HTMLTextAreaElement | null = null;
-  private activeOverlayRequest: DomOverlayRequest | null = null;
   private inputBatchSize = 0;
   private boundaryCalls = 0;
   private rustBoundaryCalls = 0;
   private lastWebGpuFrame: RustWebGpuFrameStats | null = null;
-  private lastDebugSnapshot: RustDebugSnapshot | null = null;
   private backend: string;
   private webGpuRenderer: RustWebGpuRenderer | null;
   private webGpuUnavailableNotified = false;
   private mouseDragActive = false;
   private mouseFallbackTarget: EventTarget | null = null;
-  private inputGestureActive = false;
-  // T2.2: shift/meta held at the most recent pointer/mouse-down; consumed by the
-  // selection event so the shell can build a transient multi-select set.
+  // W2-03: shift/meta held at the most recent pointer/mouse-down; consumed by the
+  // object-select event so the shell can build a transient multi-select set.
   private lastPointerAdditive = false;
-  private deferredScene: SceneSnapshot | null = null;
-  private deferredSceneRaf = 0;
   // FC-11: the locally-tracked active tool. When "draw", pointer/mouse handlers
   // emit draw phases instead of the renderer select/marquee input path.
   private activeTool: ActiveTool = "select";
@@ -278,23 +250,6 @@ export class ShapeCanvasEngine {
     this.bindInput();
   }
 
-  loadScene(snapshot: SceneSnapshot) {
-    if (this.inputGestureActive) {
-      this.deferredScene = snapshot;
-      return;
-    }
-    this.loadSceneNow(snapshot);
-  }
-
-  private loadSceneNow(snapshot: SceneSnapshot) {
-    this.deferredScene = null;
-    this.snapshot = snapshot;
-    this.camera = snapshot.camera;
-    this.syncWebGpuScene(snapshot);
-    this.boundaryCalls += 1;
-    this.onEvent({ type: "stats", stats: this.renderFrame(performance.now()) });
-  }
-
   start() {
     if (this.running) return;
     this.running = true;
@@ -310,13 +265,8 @@ export class ShapeCanvasEngine {
   stop() {
     this.running = false;
     if (this.raf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.raf);
-    if (this.deferredSceneRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.deferredSceneRaf);
     this.raf = 0;
-    this.deferredSceneRaf = 0;
-    this.inputGestureActive = false;
-    this.deferredScene = null;
     this.unbindInput();
-    this.removeOverlay(false);
   }
 
   resize(width: number, height: number, dpr = window.devicePixelRatio || 1) {
@@ -330,12 +280,10 @@ export class ShapeCanvasEngine {
       this.rustBoundaryCalls += 1;
     }
     this.boundaryCalls += 1;
-    this.updateOverlayPosition();
   }
 
   fitScene() {
     this.sendInputBatch([{ kind: "fit-scene" }]);
-    this.updateOverlayPosition();
   }
 
   // W2-03/W2-07/W2-08: set the active pointer tool ("select" | "draw" | "create" |
@@ -421,102 +369,20 @@ export class ShapeCanvasEngine {
     this.sendInputBatch([{ kind: "set-multi-select", ids }]);
   }
 
-  // CC4.1: pure hit-test for the right-click context menu. Prefers the direct
-  // wasm hitTest (no mutation); falls back to a context-pick input event whose
-  // result.hit is surfaced without changing selection.
-  contextPick(screen: WorldPoint): HitResult | null {
-    if (!this.webGpuRenderer) return null;
-    let hit: HitResult | null = null;
-    if (typeof this.webGpuRenderer.hitTest === "function") {
-      try {
-        hit = rustHitToEngineHit(this.webGpuRenderer.hitTest(screen.x, screen.y));
-        this.rustBoundaryCalls += 1;
-      } catch (error) {
-        this.onEvent({
-          type: "status",
-          message: error instanceof Error ? `Rust hitTest failed: ${error.message}` : "Rust hitTest failed"
-        });
-        hit = null;
-      }
-    } else {
-      const result = this.sendInputBatch([{ kind: "context-pick", screen }]);
-      hit = rustHitToEngineHit(result?.hit ?? null);
-    }
-    this.onEvent({ type: "context-pick", hit, screen });
-    return hit;
-  }
-
   wheelAtScreen(screen: WorldPoint, deltaY: number) {
     this.sendInputBatch([{ kind: "wheel", screen, deltaY }]);
-    this.updateOverlayPosition();
   }
 
   focusBounds(bounds: WorldRect, options: FocusBoundsOptions = {}) {
     this.sendInputBatch([{ kind: "focus-bounds", bounds, ...options }]);
-    this.updateOverlayPosition();
   }
 
   setCamera(camera: CameraState) {
     this.sendInputBatch([{ kind: "set-camera", camera }]);
-    this.updateOverlayPosition();
   }
 
   getCamera(): CameraState {
     return this.camera;
-  }
-
-  getSnapshot(): SceneSnapshot | null {
-    return this.snapshot;
-  }
-
-  debugSnapshot(): RustDebugSnapshot | null {
-    return this.updateDebugSnapshot();
-  }
-
-  applyPatch(patch: ScenePatch): string[] {
-    return this.applyPatchBatch([patch]);
-  }
-
-  applyPatchBatch(patches: ScenePatch[]): string[] {
-    if (!this.snapshot) return ["No scene loaded"];
-    const errors = this.applyPatchBatchInRust(patches);
-    if (errors.length > 0) {
-      for (const patch of patches) this.onEvent({ type: "patch", patch, errors });
-      return errors;
-    }
-    this.mirrorAcceptedPatches(patches, false);
-    this.boundaryCalls += 1;
-    for (const patch of patches) this.onEvent({ type: "patch", patch, errors: [] });
-    this.onEvent({ type: "stats", stats: this.renderFrame(performance.now()) });
-    return [];
-  }
-
-  syncSelection(selection: SceneSelection): string[] {
-    if (!this.snapshot || selectionEqual(this.snapshot.selection, selection)) return [];
-    const patch: ScenePatch = { kind: "select", selection };
-    const errors = this.applyPatchBatchInRust([patch]);
-    if (errors.length > 0) return errors;
-    this.mirrorAcceptedPatches([patch], false);
-    this.boundaryCalls += 1;
-    this.onEvent({ type: "stats", stats: this.renderFrame(performance.now()) });
-    return [];
-  }
-
-  beginTextEdit(hit: HitResult): DomOverlayRequest | null {
-    if (hit.kind !== "text" || !hit.field) return null;
-    const request = this.requestOverlay(hit.id, hit.field);
-    if (!request) return null;
-    this.mountOverlay(request);
-    this.onEvent({ type: "overlay", request });
-    return request;
-  }
-
-  commitTextEdit() {
-    if (!this.activeOverlay || !this.activeOverlayRequest) return;
-    const { id, field } = this.activeOverlayRequest.target;
-    const value = this.activeOverlay.value;
-    this.removeOverlay(true);
-    this.applyPatch({ kind: "edit-card-text", id, field, value });
   }
 
   renderFrame(now: number): FrameStats {
@@ -525,7 +391,6 @@ export class ShapeCanvasEngine {
       try {
         this.lastWebGpuFrame = this.webGpuRenderer.renderFrame();
         this.rustBoundaryCalls += 1;
-        this.updateDebugSnapshot();
       } catch (error) {
         this.onEvent({
           type: "status",
@@ -537,16 +402,14 @@ export class ShapeCanvasEngine {
       this.onEvent({ type: "status", message: "WebGPU renderer unavailable: no TypeScript canvas fallback is installed." });
       this.webGpuUnavailableNotified = true;
     }
-    if (!this.snapshot) return this.emptyStats(start);
 
-    this.updateOverlayPosition();
     const renderMs = performance.now() - start;
     const stats: FrameStats = {
       frameMs: renderMs,
       renderMs,
-      totalGroups: this.snapshot.groups.length,
-      totalCards: this.snapshot.cards.length,
-      totalEdges: this.snapshot.edges.length,
+      totalGroups: this.lastWebGpuFrame?.totalGroups ?? 0,
+      totalCards: this.lastWebGpuFrame?.totalCards ?? 0,
+      totalEdges: this.lastWebGpuFrame?.totalEdges ?? 0,
       visibleGroups: this.lastWebGpuFrame?.visibleGroupCount ?? 0,
       visibleCards: this.lastWebGpuFrame?.visibleCardCount ?? 0,
       visibleEdges: this.lastWebGpuFrame?.visibleEdgeCount ?? 0,
@@ -598,17 +461,17 @@ export class ShapeCanvasEngine {
       rustObjectFillIndices: this.lastWebGpuFrame?.objectFillIndexCount ?? null,
       rustObjectStrokeVertices: this.lastWebGpuFrame?.objectStrokeVertexCount ?? null,
       rustObjectDraws: this.lastWebGpuFrame?.objectDrawCount ?? null,
-      rustCameraX: this.lastDebugSnapshot?.camera.x ?? null,
-      rustCameraY: this.lastDebugSnapshot?.camera.y ?? null,
-      rustCameraZoom: this.lastDebugSnapshot?.camera.zoom ?? null,
-      rustSelectionKind: this.lastDebugSnapshot?.selection.kind ?? null,
-      rustSelectionId: debugSelectionId(this.lastDebugSnapshot?.selection ?? null),
-      rustLastHitKind: this.lastDebugSnapshot?.lastHit?.kind ?? null,
-      rustLastHitId: this.lastDebugSnapshot?.lastHit?.id ?? null,
-      rustLastHitField: this.lastDebugSnapshot?.lastHit?.field ?? null,
-      rustLastHitPort: this.lastDebugSnapshot?.lastHit?.port ?? null,
-      rustLastHitScreenX: this.lastDebugSnapshot?.lastHit?.screenX ?? null,
-      rustLastHitScreenY: this.lastDebugSnapshot?.lastHit?.screenY ?? null
+      rustCameraX: this.camera.x,
+      rustCameraY: this.camera.y,
+      rustCameraZoom: this.camera.zoom,
+      rustSelectionKind: null,
+      rustSelectionId: null,
+      rustLastHitKind: null,
+      rustLastHitId: null,
+      rustLastHitField: null,
+      rustLastHitPort: null,
+      rustLastHitScreenX: null,
+      rustLastHitScreenY: null
     };
     this.inputBatchSize = 0;
     return stats;
@@ -665,7 +528,6 @@ export class ShapeCanvasEngine {
     // EN1: additive-select (C2 `additive-select-shift`/`-mod`) — Shift or the
     // platform primary modifier (Cmd/Ctrl) held at pick time, via the single source.
     this.lastPointerAdditive = isAdditiveSelect(event, detectMac());
-    this.beginInputGesture();
     const screen = this.eventPoint(event);
     this.sendInputBatch([{ kind: "pointer-down", pointerId: event.pointerId, screen }]);
     this.canvas.setPointerCapture(event.pointerId);
@@ -753,7 +615,6 @@ export class ShapeCanvasEngine {
     } catch {
       // Pointer capture may already be released after cancellation.
     }
-    this.finishInputGesture();
   };
 
   private onPointerCancel = (event: PointerEvent) => {
@@ -792,7 +653,6 @@ export class ShapeCanvasEngine {
     this.objectDrag = null;
     this.cancelEndpointDrag();
     this.disarmPanGesture();
-    this.finishInputGesture();
   };
 
   private onMouseDown = (event: MouseEvent) => {
@@ -829,7 +689,6 @@ export class ShapeCanvasEngine {
     // EN1: additive-select (C2 `additive-select-shift`/`-mod`) — Shift or the
     // platform primary modifier (Cmd/Ctrl) held at pick time, via the single source.
     this.lastPointerAdditive = isAdditiveSelect(event, detectMac());
-    this.beginInputGesture();
     this.mouseDragActive = true;
     this.bindMouseFallbackMove();
     this.sendInputBatch([{ kind: "pointer-down", pointerId: MOUSE_POINTER_ID, screen: this.eventPoint(event) }]);
@@ -886,7 +745,6 @@ export class ShapeCanvasEngine {
     this.commitObjectDrag();
     this.commitEndpointDrag();
     this.disarmPanGesture();
-    this.finishInputGesture();
   };
 
   // W3-G9 (#3)/v3 §4: the always-on create/draw-tool hover mousemove. A bare mouse
@@ -906,77 +764,7 @@ export class ShapeCanvasEngine {
   private onWheel = (event: WheelEvent) => {
     event.preventDefault();
     this.sendInputBatch([{ kind: "wheel", screen: this.eventPoint(event), deltaY: event.deltaY }]);
-    this.updateOverlayPosition();
   };
-
-  private mountOverlay(request: DomOverlayRequest) {
-    this.removeOverlay(false);
-    const textarea = document.createElement("textarea");
-    textarea.className = "renderer-edit-overlay";
-    textarea.value = request.value;
-    textarea.autocomplete = "off";
-    textarea.spellcheck = true;
-    textarea.addEventListener("keydown", (event) => {
-      if (event.isComposing) return;
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-        event.preventDefault();
-        this.commitTextEdit();
-        return;
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        this.removeOverlay(false);
-      }
-    });
-    textarea.addEventListener("blur", () => this.commitTextEdit());
-    this.overlayRoot.append(textarea);
-    this.activeOverlay = textarea;
-    this.activeOverlayRequest = request;
-    this.updateOverlayPosition();
-    textarea.focus();
-    textarea.select();
-  }
-
-  private removeOverlay(committed: boolean) {
-    const overlay = this.activeOverlay;
-    if (!overlay) return;
-    this.activeOverlay = null;
-    this.activeOverlayRequest = null;
-    overlay.remove();
-    this.onEvent({ type: "overlay", request: null });
-    if (!committed) this.onEvent({ type: "status", message: "Text edit cancelled" });
-  }
-
-  private updateOverlayPosition() {
-    if (!this.activeOverlay || !this.activeOverlayRequest) return;
-    const request = this.requestOverlay(this.activeOverlayRequest.target.id, this.activeOverlayRequest.target.field);
-    if (request) this.activeOverlayRequest = request;
-    const screenRect = this.activeOverlayRequest.screenRect;
-    const overlayStyle = this.activeOverlayRequest.style;
-    this.activeOverlay.style.left = `${screenRect.x}px`;
-    this.activeOverlay.style.top = `${screenRect.y}px`;
-    this.activeOverlay.style.width = `${screenRect.width}px`;
-    this.activeOverlay.style.height = `${screenRect.height}px`;
-    this.activeOverlay.style.fontFamily = overlayStyle.fontFamily;
-    this.activeOverlay.style.fontSize = `${overlayStyle.fontSize}px`;
-    this.activeOverlay.style.fontWeight = `${overlayStyle.fontWeight}`;
-    this.activeOverlay.style.lineHeight = `${overlayStyle.lineHeight}px`;
-    this.activeOverlay.style.letterSpacing = `${overlayStyle.letterSpacing}px`;
-    this.activeOverlay.style.padding = `${overlayStyle.paddingY}px ${overlayStyle.paddingX}px`;
-    this.activeOverlay.style.color = overlayStyle.textColor;
-    this.activeOverlay.style.background = overlayStyle.backgroundColor;
-    this.activeOverlay.style.border = `${overlayStyle.borderWidth}px solid ${overlayStyle.borderColor}`;
-    this.activeOverlay.style.borderRadius = `${overlayStyle.borderRadius}px`;
-    this.activeOverlay.style.outline = `${overlayStyle.focusRingWidth}px solid ${overlayStyle.focusRingColor}`;
-    this.activeOverlay.style.boxShadow = overlayStyle.boxShadow;
-    this.activeOverlay.style.caretColor = overlayStyle.caretColor;
-    this.activeOverlay.style.overflowX = overlayStyle.overflowX;
-    this.activeOverlay.style.overflowY = overlayStyle.overflowY;
-    this.activeOverlay.style.setProperty("accent-color", overlayStyle.accentColor);
-    this.activeOverlay.style.setProperty("--renderer-edit-selection-bg", overlayStyle.selectionBackgroundColor);
-    this.activeOverlay.dataset.overlayState = overlayStyle.state;
-    this.activeOverlay.dataset.maxLines = String(overlayStyle.maxLines);
-  }
 
   private eventPoint(event: MouseEvent | PointerEvent | WheelEvent): WorldPoint {
     const rect = this.canvas.getBoundingClientRect();
@@ -1013,126 +801,6 @@ export class ShapeCanvasEngine {
     this.mouseDragActive = false;
   }
 
-  private beginInputGesture() {
-    if (!this.inputGestureActive) this.onEvent({ type: "gesture", active: true });
-    this.inputGestureActive = true;
-    if (this.deferredSceneRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.deferredSceneRaf);
-    this.deferredSceneRaf = 0;
-  }
-
-  private finishInputGesture() {
-    if (this.inputGestureActive) this.onEvent({ type: "gesture", active: false });
-    this.inputGestureActive = false;
-    this.flushDeferredSceneSoon();
-  }
-
-  private flushDeferredSceneSoon() {
-    if (!this.deferredScene || this.deferredSceneRaf) return;
-    const flush = () => {
-      this.deferredSceneRaf = 0;
-      if (this.inputGestureActive || !this.deferredScene) return;
-      this.loadSceneNow(this.deferredScene);
-    };
-    if (typeof requestAnimationFrame === "function") {
-      this.deferredSceneRaf = requestAnimationFrame(flush);
-    } else {
-      flush();
-    }
-  }
-
-  private emptyStats(start: number): FrameStats {
-    return {
-      frameMs: performance.now() - start,
-      renderMs: performance.now() - start,
-      totalGroups: 0,
-      totalCards: 0,
-      totalEdges: 0,
-      visibleGroups: 0,
-      visibleCards: 0,
-      visibleEdges: 0,
-      cacheHits: 0,
-      cacheMisses: 0,
-      boundaryCalls: this.boundaryCalls,
-      inputBatchSize: this.inputBatchSize,
-      memoryBytes: readMemoryBytes(),
-      backend: this.backend,
-      drawBackend: "rust-wgpu-visible",
-      webGpuRendererAvailable: Boolean(this.webGpuRenderer),
-      rustBoundaryCalls: this.rustBoundaryCalls,
-      rustFrameCards: this.lastWebGpuFrame?.totalCards ?? null,
-      rustFrameEdges: this.lastWebGpuFrame?.totalEdges ?? null,
-      rustGpuVertices: this.lastWebGpuFrame?.vertexCount ?? null,
-      rustDrawnVertices: this.lastWebGpuFrame?.drawnVertexCount ?? null,
-      rustDrawRanges: this.lastWebGpuFrame?.drawRangeCount ?? null,
-      rustTextGlyphs: this.lastWebGpuFrame?.textGlyphCount ?? null,
-      rustFallbackGlyphs: this.lastWebGpuFrame?.fallbackTextGlyphCount ?? null,
-      rustCjkGlyphs: this.lastWebGpuFrame?.cjkTextGlyphCount ?? null,
-      rustFontFallbackRuns: this.lastWebGpuFrame?.fontFallbackRunCount ?? null,
-      rustMissingGlyphs: this.lastWebGpuFrame?.missingTextGlyphCount ?? null,
-      rustTextAtlasOverflowGlyphs: this.lastWebGpuFrame?.textAtlasOverflowGlyphCount ?? null,
-      rustTextMissingRasterGlyphs: this.lastWebGpuFrame?.textMissingRasterGlyphCount ?? null,
-      rustTextAtlasGlyphs: this.lastWebGpuFrame?.textAtlasGlyphCount ?? null,
-      rustTextRasterCacheHits: this.lastWebGpuFrame?.textRasterCacheHits ?? null,
-      rustTextRasterCacheMisses: this.lastWebGpuFrame?.textRasterCacheMisses ?? null,
-      rustTextLayoutCacheHits: this.lastWebGpuFrame?.textLayoutCacheHits ?? null,
-      rustTextLayoutCacheMisses: this.lastWebGpuFrame?.textLayoutCacheMisses ?? null,
-      rustStyleTokens: this.lastWebGpuFrame?.styleTokenCount ?? null,
-      rustPatchUpdates: this.lastWebGpuFrame?.patchUpdateCount ?? null,
-      rustDirtyWrites: this.lastWebGpuFrame?.dirtyRangeWriteCount ?? null,
-      rustFullRebuilds: this.lastWebGpuFrame?.fullBufferRebuildCount ?? null,
-      rustVertexTruncations: this.lastWebGpuFrame?.vertexTruncationCount ?? null,
-      rustTruncatedVertices: this.lastWebGpuFrame?.truncatedVertexCount ?? null,
-      rustEdgeCapacityGrows: this.lastWebGpuFrame?.edgeCapacityGrowCount ?? null,
-      rustEdgeCompactions: this.lastWebGpuFrame?.edgeCompactionCount ?? null,
-      rustEdgeSlots: this.lastWebGpuFrame?.edgeSlotCount ?? null,
-      rustFreeEdgeSlots: this.lastWebGpuFrame?.edgeSlotFreeCount ?? null,
-      rustCardCapacityGrows: this.lastWebGpuFrame?.cardCapacityGrowCount ?? null,
-      rustCardCompactions: this.lastWebGpuFrame?.cardCompactionCount ?? null,
-      rustCardSlots: this.lastWebGpuFrame?.cardSlotCount ?? null,
-      rustFreeCardSlots: this.lastWebGpuFrame?.cardSlotFreeCount ?? null,
-      rustGroupCapacityGrows: this.lastWebGpuFrame?.groupCapacityGrowCount ?? null,
-      rustGroupCompactions: this.lastWebGpuFrame?.groupCompactionCount ?? null,
-      rustGroupSlots: this.lastWebGpuFrame?.groupSlotCount ?? null,
-      rustFreeGroupSlots: this.lastWebGpuFrame?.groupSlotFreeCount ?? null,
-      rustObjectCount: this.lastWebGpuFrame?.objectCount ?? null,
-      rustObjectFillIndices: this.lastWebGpuFrame?.objectFillIndexCount ?? null,
-      rustObjectStrokeVertices: this.lastWebGpuFrame?.objectStrokeVertexCount ?? null,
-      rustObjectDraws: this.lastWebGpuFrame?.objectDrawCount ?? null,
-      rustCameraX: this.lastDebugSnapshot?.camera.x ?? null,
-      rustCameraY: this.lastDebugSnapshot?.camera.y ?? null,
-      rustCameraZoom: this.lastDebugSnapshot?.camera.zoom ?? null,
-      rustSelectionKind: this.lastDebugSnapshot?.selection.kind ?? null,
-      rustSelectionId: debugSelectionId(this.lastDebugSnapshot?.selection ?? null),
-      rustLastHitKind: this.lastDebugSnapshot?.lastHit?.kind ?? null,
-      rustLastHitId: this.lastDebugSnapshot?.lastHit?.id ?? null,
-      rustLastHitField: this.lastDebugSnapshot?.lastHit?.field ?? null,
-      rustLastHitPort: this.lastDebugSnapshot?.lastHit?.port ?? null,
-      rustLastHitScreenX: this.lastDebugSnapshot?.lastHit?.screenX ?? null,
-      rustLastHitScreenY: this.lastDebugSnapshot?.lastHit?.screenY ?? null
-    };
-  }
-
-  private syncWebGpuScene(snapshot: SceneSnapshot) {
-    if (!this.webGpuRenderer) return;
-    this.webGpuRenderer.loadScene(JSON.stringify(snapshot));
-    this.camera = snapshot.camera;
-    this.rustBoundaryCalls += 1;
-    this.updateDebugSnapshot();
-  }
-
-  private applyPatchBatchInRust(patches: ScenePatch[]): string[] {
-    if (!this.webGpuRenderer) return ["WebGPU renderer unavailable"];
-    try {
-      this.webGpuRenderer.applyPatchBatch(JSON.stringify(patches));
-      this.rustBoundaryCalls += 1;
-      this.updateDebugSnapshot();
-      return [];
-    } catch (error) {
-      const message = error instanceof Error ? `Rust patch batch failed: ${error.message}` : "Rust patch batch failed";
-      this.onEvent({ type: "status", message });
-      return [message];
-    }
-  }
 
   private sendInputBatch(events: RustCanvasInputEvent[]): RustInputBatchResult | null {
     if (!this.webGpuRenderer) {
@@ -1149,7 +817,6 @@ export class ShapeCanvasEngine {
       this.rustBoundaryCalls += 1;
       this.camera = result.camera;
       this.processInputResult(result);
-      this.updateOverlayPosition();
       this.onEvent({ type: "stats", stats: this.renderFrame(performance.now()) });
       return result;
     } catch (error) {
@@ -1162,20 +829,6 @@ export class ShapeCanvasEngine {
   }
 
   private processInputResult(result: RustInputBatchResult) {
-    const hit = rustHitToEngineHit(result.hit);
-    if (result.patches.some((patch) => patch.kind === "select")) {
-      this.onEvent({ type: "selection", hit, additive: this.lastPointerAdditive });
-    }
-    this.mirrorAcceptedPatches(result.patches, true);
-    if (result.overlay) {
-      this.mountOverlay(result.overlay);
-      this.onEvent({ type: "overlay", request: result.overlay });
-    }
-    // CC2.3: a marquee result rides the pointer-up that ends the drag. Forward
-    // the intersected ids so the shell merges them into multiSelectIds.
-    const marquee = marqueeFromResult(result);
-    if (marquee) this.onEvent({ type: "marquee", rect: marquee.rect, ids: marquee.ids });
-
     // FC-08: object-path input results. An object pick on pointer-down starts a
     // remembered drag; each move delta updates it and previews; an empty-start
     // marquee forwards its ids. The commit op is authored on pointer-up.
@@ -1421,97 +1074,6 @@ export class ShapeCanvasEngine {
     }
   }
 
-  private mirrorAcceptedPatches(patches: ScenePatch[], emitPatchEvents: boolean) {
-    if (!this.snapshot) return;
-    for (const patch of patches) {
-      this.snapshot = applyScenePatch(this.snapshot, patch);
-      if (emitPatchEvents && patch.kind !== "select") this.onEvent({ type: "patch", patch, errors: [] });
-    }
-  }
-
-  private requestOverlay(id: string, field: "title" | "summary" | "detail"): DomOverlayRequest | null {
-    if (!this.webGpuRenderer) return null;
-    try {
-      const request = this.webGpuRenderer.overlayRequest(id, field);
-      this.rustBoundaryCalls += 1;
-      return request;
-    } catch (error) {
-      this.onEvent({
-        type: "status",
-        message: error instanceof Error ? `Rust overlay request failed: ${error.message}` : "Rust overlay request failed"
-      });
-      return null;
-    }
-  }
-
-  private updateDebugSnapshot(): RustDebugSnapshot | null {
-    if (!this.webGpuRenderer) return null;
-    try {
-      this.lastDebugSnapshot = this.webGpuRenderer.debugSnapshot();
-      this.camera = this.lastDebugSnapshot.camera;
-      this.rustBoundaryCalls += 1;
-      return this.lastDebugSnapshot;
-    } catch (error) {
-      this.onEvent({
-        type: "status",
-        message: error instanceof Error ? `Rust debug snapshot failed: ${error.message}` : "Rust debug snapshot failed"
-      });
-      return null;
-    }
-  }
-}
-
-// CC2.3: read the marquee result defensively — a wasm build that predates the
-// field returns it as undefined, which must behave like "no marquee".
-function marqueeFromResult(result: RustInputBatchResult): RustMarqueeResult | null {
-  const marquee = result.marquee;
-  if (!marquee) return null;
-  return { rect: marquee.rect, ids: marquee.ids };
-}
-
-function rustHitToEngineHit(hit: RustHitResult | null): HitResult | null {
-  if (!hit) return null;
-  const world = { x: hit.worldX, y: hit.worldY };
-  const screen = { x: hit.screenX, y: hit.screenY };
-  if (hit.kind === "port" && (hit.port === "source" || hit.port === "target")) {
-    return { kind: "port", id: hit.id, groupId: hit.groupId ?? undefined, port: hit.port, world, screen };
-  }
-  if (hit.kind === "text" && (hit.field === "title" || hit.field === "summary" || hit.field === "detail")) {
-    return { kind: "text", id: hit.id, groupId: hit.groupId ?? undefined, field: hit.field, world, screen };
-  }
-  if (hit.kind === "card" || hit.kind === "edge" || hit.kind === "group") {
-    return { kind: hit.kind, id: hit.id, groupId: hit.groupId ?? undefined, world, screen };
-  }
-  return null;
-}
-
-function debugSelectionId(selection: SceneSelection | null): string | null {
-  if (!selection || selection.kind === "canvas") return null;
-  // The renderer/core only ever receives the single-anchor form; a `multi`
-  // selection is down-projected before it reaches the engine, but handle it
-  // defensively by reporting its primary id.
-  if (selection.kind === "multi") return selection.ids[0] ?? null;
-  return selection.id;
-}
-
-function selectionEqual(left: SceneSelection, right: SceneSelection): boolean {
-  if (left.kind !== right.kind) return false;
-  switch (left.kind) {
-    case "canvas":
-      return true;
-    case "group":
-      return right.kind === "group" && left.id === right.id;
-    case "node":
-      return right.kind === "node" && left.id === right.id;
-    case "edge":
-      return right.kind === "edge" && left.id === right.id;
-    case "multi":
-      return (
-        right.kind === "multi" &&
-        left.ids.length === right.ids.length &&
-        left.ids.every((id, index) => id === right.ids[index])
-      );
-  }
 }
 
 // W2-05: the row-major identity transform and an exact-equality check, used to

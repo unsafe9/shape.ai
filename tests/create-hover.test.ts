@@ -16,7 +16,6 @@ import { buildFeedScene, canonicalizeHoverSnap } from "../platforms/web/controll
 import { THEME_DEFAULT_COLOR } from "../platforms/web/controller/objectPrimitives";
 import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../platforms/web/shared/object";
 import type {
-  RustDebugSnapshot,
   RustInputBatchResult,
   RustWebGpuFrameStats,
   RustWebGpuRenderer
@@ -45,31 +44,11 @@ function mockRenderer(camera: { x: number; y: number; zoom: number }): RustWebGp
   const frame = emptyFrameStats();
   return {
     resize() {},
-    loadScene() {},
-    applyPatchBatch() {},
     renderFrame() {
       return frame;
     },
     inputBatch(): RustInputBatchResult {
-      return { camera, hit: null, selection: { kind: "canvas" }, patches: [], overlay: null };
-    },
-    overlayRequest() {
-      return null;
-    },
-    debugSnapshot(): RustDebugSnapshot {
-      return {
-        camera,
-        selection: { kind: "canvas" },
-        selectionWorldRect: null,
-        selectionScreenRect: null,
-        lastHit: null,
-        totalGroups: 0,
-        totalCards: 0,
-        totalEdges: 0,
-        patchUpdateCount: 0,
-        dirtyRangeWriteCount: 0,
-        fullBufferRebuildCount: 0
-      };
+      return { camera };
     },
     nearestOutlinePoint(worldX: number, worldY: number, tolPx: number, zoom: number, excludeIdsJson: string) {
       const tolWorld = tolPx / Math.max(0.025, zoom);

@@ -28,8 +28,6 @@ const CAMERA: CameraState = { x: 0, y: 0, zoom: 1 };
 function marqueeRenderer(ids: string[]): RustWebGpuRenderer {
   return {
     resize() {},
-    loadScene() {},
-    applyPatchBatch() {},
     renderFrame() {
       return { backend: "test" } as unknown as ReturnType<RustWebGpuRenderer["renderFrame"]>;
     },
@@ -38,30 +36,8 @@ function marqueeRenderer(ids: string[]): RustWebGpuRenderer {
       const isUp = events.some((e) => e.kind === "pointer-up");
       return {
         camera: CAMERA,
-        hit: null,
-        selection: { kind: "canvas" },
-        patches: [],
-        overlay: null,
         // The empty-start marquee result rides the pointer-up batch.
         objectMarqueeIds: isUp ? ids : null
-      };
-    },
-    overlayRequest() {
-      return null;
-    },
-    debugSnapshot() {
-      return {
-        camera: CAMERA,
-        selection: { kind: "canvas" },
-        selectionWorldRect: null,
-        selectionScreenRect: null,
-        lastHit: null,
-        totalGroups: 0,
-        totalCards: 0,
-        totalEdges: 0,
-        patchUpdateCount: 0,
-        dirtyRangeWriteCount: 0,
-        fullBufferRebuildCount: 0
       };
     }
   } as unknown as RustWebGpuRenderer;

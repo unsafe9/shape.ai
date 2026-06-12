@@ -49,8 +49,6 @@ function routingScene(): ObjectScene {
 function doubleClickRenderer(signal: RustInputBatchResult["objectDoubleClick"]): RustWebGpuRenderer {
   return {
     resize() {},
-    loadScene() {},
-    applyPatchBatch() {},
     renderFrame() {
       return { backend: "test" } as unknown as ReturnType<RustWebGpuRenderer["renderFrame"]>;
     },
@@ -59,29 +57,7 @@ function doubleClickRenderer(signal: RustInputBatchResult["objectDoubleClick"]):
       const isDoubleClick = events.some((e) => e.kind === "double-click");
       return {
         camera: CAMERA,
-        hit: null,
-        selection: { kind: "canvas" },
-        patches: [],
-        overlay: null,
         objectDoubleClick: isDoubleClick ? signal : null
-      };
-    },
-    overlayRequest() {
-      return null;
-    },
-    debugSnapshot() {
-      return {
-        camera: CAMERA,
-        selection: { kind: "canvas" },
-        selectionWorldRect: null,
-        selectionScreenRect: null,
-        lastHit: null,
-        totalGroups: 0,
-        totalCards: 0,
-        totalEdges: 0,
-        patchUpdateCount: 0,
-        dirtyRangeWriteCount: 0,
-        fullBufferRebuildCount: 0
       };
     }
   };

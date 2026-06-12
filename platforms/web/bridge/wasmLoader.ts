@@ -1,4 +1,4 @@
-import type { CameraState, DomOverlayRequest, RenderTransform3x3, ScenePatch, SceneSelection, WorldRect, WorldPoint } from "../renderer/scene";
+import type { CameraState, RenderTransform3x3, WorldRect, WorldPoint } from "../renderer/scene";
 
 export type RustCoreStatus = {
   available: boolean;
@@ -65,18 +65,6 @@ export type RustWebGpuFrameStats = {
   backend: string;
 };
 
-export type RustHitResult = {
-  id: string;
-  kind: string;
-  groupId?: string | null;
-  field?: string | null;
-  port?: string | null;
-  worldX: number;
-  worldY: number;
-  screenX: number;
-  screenY: number;
-};
-
 export type RustCanvasInputEvent =
   | { kind: "pointer-down"; pointerId: number; screen: WorldPoint }
   | { kind: "pointer-move"; pointerId: number; screen: WorldPoint }
@@ -95,13 +83,6 @@ export type RustCanvasInputEvent =
   // CC4.1: right-click pick — populates result.hit without mutating selection.
   | { kind: "context-pick"; screen: WorldPoint };
 
-// CC2.3: a marquee result is non-null only on the pointer-up that ends a
-// marquee drag. ids = node ids first, then group ids, whose world AABB
-// intersects the final rect; the shell merges them into multiSelectIds.
-export type RustMarqueeResult = {
-  rect: WorldRect;
-  ids: string[];
-};
 
 // W2-04: a cumulative object transform delta. `matrix` is a ROW-MAJOR world-space
 // delta to PRE-MULTIPLY onto the object's existing transform (newWorld = matrix *
@@ -129,13 +110,6 @@ export type RustObjectEndpointDelta = {
 
 export type RustInputBatchResult = {
   camera: CameraState;
-  hit: RustHitResult | null;
-  selection: SceneSelection;
-  patches: ScenePatch[];
-  overlay: DomOverlayRequest | null;
-  // CC2.3: optional so a wasm build (or test mock) predating the field still
-  // typechecks; the engine reads it defensively as "no marquee".
-  marquee?: RustMarqueeResult | null;
   // FC-07: object-path input results, optional/non-null only when an object scene
   // is loaded and the matching event occurred.
   objectSelection?: string | null;
@@ -167,20 +141,6 @@ export type HoverAffordance =
   | "resize-sw"
   | "resize-w"
   | "rotate";
-
-export type RustDebugSnapshot = {
-  camera: CameraState;
-  selection: SceneSelection;
-  selectionWorldRect: WorldRect | null;
-  selectionScreenRect: WorldRect | null;
-  lastHit: RustHitResult | null;
-  totalGroups: number;
-  totalCards: number;
-  totalEdges: number;
-  patchUpdateCount: number;
-  dirtyRangeWriteCount: number;
-  fullBufferRebuildCount: number;
-};
 
 export type RustWebGpuProbeReport = {
   supported: boolean;
@@ -214,8 +174,6 @@ export type RustCreateWebGpuRenderer = (
 
 export type RustWebGpuRenderer = {
   resize(width: number, height: number, devicePixelRatio: number): void;
-  loadScene(sceneJson: string): void;
-  applyPatchBatch(patchesJson: string): void;
   renderFrame(): RustWebGpuFrameStats;
   // OB-4 object draw path. `loadObjectScene` builds + uploads the object geometry
   // for a `RenderObjectScene` JSON and returns `{ objects, fillIndices,
@@ -240,14 +198,10 @@ export type RustWebGpuRenderer = {
   setObjectEndpointPreview?(id: string, nodeIndex: number, worldX: number, worldY: number): void;
   clearObjectEndpointPreview?(id: string): void;
   inputBatch(eventsJson: string): RustInputBatchResult;
-  overlayRequest(cardId: string, field: string): DomOverlayRequest | null;
-  debugSnapshot(): RustDebugSnapshot;
-  // CC1.4/CC4.1: optional so a wasm build (or test mock) predating these methods
-  // still satisfies the type; the engine feature-detects before calling.
-  // setTool sets the active pointer tool ("select" | "hand"; unknown ignored);
-  // hitTest is a pure pick (no mutation) for the right-click context menu.
+  // CC1.4: optional so a wasm build (or test mock) predating it still satisfies the
+  // type; the engine feature-detects before calling. setTool sets the active pointer
+  // tool ("select" | "hand"; unknown ignored).
   setTool?(tool: string): void;
-  hitTest?(screenX: number, screenY: number): RustHitResult | null;
   // FC-08: pure object pick for the right-click context menu — returns the id of
   // the top-most object under the screen point (no mutation). Optional so a wasm
   // build predating it is treated as "no object" by the engine.

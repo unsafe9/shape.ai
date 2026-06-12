@@ -12,7 +12,6 @@ import { ShapeCanvasEngine, type EngineEvent } from "../platforms/web/renderer/e
 import { canonicalizeCreateSnap } from "../platforms/web/controller/interactions";
 import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../platforms/web/shared/object";
 import type {
-  RustDebugSnapshot,
   RustInputBatchResult,
   RustWebGpuFrameStats,
   RustWebGpuRenderer
@@ -30,31 +29,11 @@ function mockRenderer(camera: { x: number; y: number; zoom: number }): RustWebGp
   const frame = emptyFrameStats();
   return {
     resize() {},
-    loadScene() {},
-    applyPatchBatch() {},
     renderFrame() {
       return frame;
     },
     inputBatch(): RustInputBatchResult {
-      return { camera, hit: null, selection: { kind: "canvas" }, patches: [], overlay: null };
-    },
-    overlayRequest() {
-      return null;
-    },
-    debugSnapshot(): RustDebugSnapshot {
-      return {
-        camera,
-        selection: { kind: "canvas" },
-        selectionWorldRect: null,
-        selectionScreenRect: null,
-        lastHit: null,
-        totalGroups: 0,
-        totalCards: 0,
-        totalEdges: 0,
-        patchUpdateCount: 0,
-        dirtyRangeWriteCount: 0,
-        fullBufferRebuildCount: 0
-      };
+      return { camera };
     },
     // The real W2-06 contract: WORLD query in, snapped WORLD point + targetId out.
     // `tolPx` is converted to world via the camera zoom, exactly like the renderer.

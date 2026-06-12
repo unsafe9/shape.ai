@@ -57,8 +57,6 @@ function endpointRenderer(samples: Array<{ nodeIndex: number; x: number; y: numb
   let moveIndex = 0;
   const renderer = {
     resize() {},
-    loadScene() {},
-    applyPatchBatch() {},
     renderFrame() {
       return { backend: "test" } as unknown as ReturnType<RustWebGpuRenderer["renderFrame"]>;
     },
@@ -68,29 +66,7 @@ function endpointRenderer(samples: Array<{ nodeIndex: number; x: number; y: numb
       const sample = isMove ? samples[Math.min(moveIndex++, samples.length - 1)] : null;
       return {
         camera: CAMERA,
-        hit: null,
-        selection: { kind: "canvas" },
-        patches: [],
-        overlay: null,
         objectEndpointDelta: sample ? { id: LINE_ID, ...sample } : null
-      };
-    },
-    overlayRequest() {
-      return null;
-    },
-    debugSnapshot() {
-      return {
-        camera: CAMERA,
-        selection: { kind: "canvas" },
-        selectionWorldRect: null,
-        selectionScreenRect: null,
-        lastHit: null,
-        totalGroups: 0,
-        totalCards: 0,
-        totalEdges: 0,
-        patchUpdateCount: 0,
-        dirtyRangeWriteCount: 0,
-        fullBufferRebuildCount: 0
       };
     },
     nearestOutlinePoint(worldX: number, worldY: number, tolPx: number, zoom: number, excludeIdsJson: string) {
