@@ -37,12 +37,14 @@ impl Config {
     }
 }
 
-/// `<repo>/dist/client`, resolved relative to this crate at compile time so it
-/// works regardless of cwd.
+/// `<repo>/platforms/web/dist/client` (the web shell's Vite output), resolved
+/// relative to this crate at compile time so it works regardless of cwd.
 fn default_client_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
+        .join("platforms")
+        .join("web")
         .join("dist")
         .join("client")
 }

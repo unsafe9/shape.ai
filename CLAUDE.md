@@ -57,13 +57,14 @@ including in tests: tests must drive the real core.
 
 ## Commands
 
-Run cargo/wasm-pack through `scripts/renderer-toolchain.sh` — the pinned toolchain
-is otherwise not on `PATH`.
+The web shell owns its build toolchain: `platforms/web/package.json` holds every
+`npm run …` (vite, the wasm/types steps whose output lands under
+`platforms/web/`), invoked from that dir. Rust stays pure cargo through
+`scripts/renderer-toolchain.sh` (the pinned toolchain is otherwise not on
+`PATH`). The root `Makefile` is the authoritative source for cross-cutting
+combos — see it and `platforms/web/package.json` rather than enumerating here.
 
-- `npm run build` — build the client (wasm + vite)
-- `cargo run -p shape_server` — serve the app on :8787
-- `npm run dev` — iterative client against a running server
-- `npm run types:gen` — regenerate the TS wire types from the scene-core serde
-  surface (ts-rs, dev-only `ts-gen` feature); `npm run types:check` fails on drift
-  and runs in the `test:unit` pre-step
-- `cargo test --workspace` · `npm run test:unit` — test gates
+- Web: `cd platforms/web && npm run <build|dev|test:unit|typecheck|types:gen>`
+- Rust: `scripts/renderer-toolchain.sh cargo test --workspace`;
+  `cargo run -p shape_server` serves the built SPA on :8787
+- Combos: `make build`, `make test`, `make check-wasm`, `make serve`, `make web`

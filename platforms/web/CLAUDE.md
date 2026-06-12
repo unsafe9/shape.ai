@@ -2,6 +2,11 @@
 
 The four shell jobs (see `../CLAUDE.md`), realized in TypeScript + Svelte.
 
+The web build toolchain lives here (`package.json`, vite/svelte/vitest configs,
+`tsconfig.json`, `index.html`, `tests/`) and is invoked from this dir:
+`cd platforms/web && npm run …`. Cross-cutting combos go through the root
+`Makefile`.
+
 Allowed here: DOM/pointer/keyboard event translation, IME composition,
 clipboard, and the injected seams the wasm core needs from a browser — timers
 and id/seq generators handed in at construction. Everything else routes into the

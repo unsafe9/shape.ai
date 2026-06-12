@@ -77,24 +77,27 @@ The stack is one Rust workspace plus a thin Svelte shell:
 
 ## Local Development
 
-Build the client (Rust → WASM for scene-core and the renderer, then the Vite
-bundle), then run the native server:
+The web shell owns its build toolchain under `platforms/web/` (`package.json`,
+vite/svelte/vitest, `tsconfig.json`, `tests/`); Rust stays pure cargo. Build the
+client (Rust → WASM for scene-core and the renderer, then the Vite bundle), then
+run the native server:
 
 ```bash
-npm install
-npm run build
+cd platforms/web && npm install && npm run build && cd -
+make build                          # same, via the root Makefile
 cargo run -p shape_server
 ```
 
 `npm run build` runs `scene:wasm:build` + `renderer:wasm:build` + `vite build`,
-emitting the SPA to `dist/client/`. The server serves that directory statically
-and listens on `http://127.0.0.1:8787`.
+emitting the SPA to `platforms/web/dist/client/`, which is the server's default
+client dir — `cargo run -p shape_server` serves it on `http://127.0.0.1:8787`
+with no extra config.
 
 For iterative frontend work, run the Vite dev server against a running backend:
 
 ```bash
-cargo run -p shape_server   # backend on :8787
-npm run dev                 # Vite client on :5173
+make serve                          # backend on :8787  (cargo run -p shape_server)
+make web                            # Vite client on :5173  (cd platforms/web && npm run dev)
 ```
 
 Canonical scene data is stored per-object in `.local/shape.sqlite`, and exported
@@ -105,7 +108,8 @@ Useful environment variables:
 - `SHAPE_AI_HOST`: server host, default `127.0.0.1`
 - `SHAPE_AI_PORT`: server port, default `8787`
 - `SHAPE_AI_DATA_DIR`: local storage root, default `.local`
-- `SHAPE_AI_CLIENT_DIR`: pre-built client assets to serve, default `dist/client`
+- `SHAPE_AI_CLIENT_DIR`: pre-built client assets to serve, default
+  `platforms/web/dist/client` (the Vite build output)
 
 ## API
 
@@ -179,7 +183,9 @@ Exports can target `group`, `node`, `edge`, or `selection` scope.
 scripts/renderer-toolchain.sh cargo test --workspace
 scripts/renderer-toolchain.sh cargo check -p shape_scene_core --target wasm32-unknown-unknown
 scripts/renderer-toolchain.sh cargo check -p shape_storage_core --target wasm32-unknown-unknown
-npm run typecheck
-npm run test:unit
-npm run build
+scripts/renderer-toolchain.sh cargo check -p shape_client_runtime --target wasm32-unknown-unknown
+cd platforms/web && npm run typecheck && npm run test:unit && npm run build
 ```
+
+The root `Makefile` bundles these: `make test` (cargo + web unit), `make
+check-wasm` (the three wasm32 checks), `make build`, `make test-renderer`.

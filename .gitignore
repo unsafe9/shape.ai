@@ -4,7 +4,10 @@ node_modules
 .local/
 .claude/
 bun.lock
+platforms/web/node_modules
+platforms/web/dist/
 platforms/web/bridge/wasm
+platforms/web/coverage
 .renderer-toolchains/
 
 # Workspace + crate build artifacts
