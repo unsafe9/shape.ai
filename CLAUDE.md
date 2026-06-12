@@ -57,14 +57,11 @@ including in tests: tests must drive the real core.
 
 ## Commands
 
-The web shell owns its build toolchain: `platforms/web/package.json` holds every
-`npm run …` (vite, the wasm/types steps whose output lands under
-`platforms/web/`), invoked from that dir. Rust stays pure cargo through
-`scripts/renderer-toolchain.sh` (the pinned toolchain is otherwise not on
-`PATH`). The root `Makefile` is the authoritative source for cross-cutting
-combos — see it and `platforms/web/package.json` rather than enumerating here.
-
-- Web: `cd platforms/web && npm run <build|dev|test:unit|typecheck|types:gen>`
-- Rust: `scripts/renderer-toolchain.sh cargo test --workspace`;
-  `cargo run -p shape_server` serves the built SPA on :8787
-- Combos: `make build`, `make test`, `make check-wasm`, `make serve`, `make web`
+The web shell owns its build toolchain (`platforms/web/package.json`, run from
+that dir); Rust goes through `scripts/renderer-toolchain.sh` (the pinned
+toolchain is otherwise not on `PATH`); the root `Makefile` wraps every
+cross-cutting combo and running the app. Prefer the wrapper to the command it
+wraps — serve, build, and test through `make` (read it and
+`platforms/web/package.json` for the exact targets), and reach for a raw
+`cargo`/`npm` invocation only for a one-off no target covers, never as a
+shortcut past a target that already exists.
