@@ -198,6 +198,67 @@ fn rebases_on_snapshot_replays_unacked_ops_and_converges() {
     assert_eq!(engine.outbox_len(), 0);
 }
 
+#[test]
+fn offline_author_reflects_in_scene_and_undo_uses_core_inverse() {
+    // C1: with NO transport flush driven (the offline / pre-connect path), the
+    // engine — which IS the one Rust core both server and client run — still owns
+    // the scene and the undo inverse. The shell never re-implements either offline.
+    let (mut engine, mut now) = boot();
+
+    engine.author(insert(rect("a", "a0")), &now.next()).unwrap();
+    // The authored move lands in the core's optimistic scene with no round-trip.
+    let res = engine.author(move_op("a", 25.0, 25.0), &now.next()).unwrap();
+    assert_eq!(object_transform(engine.scene(), "a"), Some(translate(25.0, 25.0)));
+
+    // The inverse the core captured restores the pre-move transform — applying it
+    // (the undo) through the SAME core op-apply must revert the scene. If the shell
+    // had owned undo with its own apply, this inverse would be absent/wrong.
+    let inverse = res.inverse.expect("move captures an inverse");
+    engine.author(inverse, &now.next()).unwrap();
+    assert_eq!(object_transform(engine.scene(), "a"), Some(translate(0.0, 0.0)));
+}
+
+#[test]
+fn coincidental_peer_transform_does_not_settle_until_ack_lands() {
+    // C2: a coincidentally-equal peer transform arriving BEFORE the real ack must
+    // NOT report the (object,transform) preview as settled — only the ack (which
+    // releases transient ownership) settles it. This is the exact case a shell-side
+    // transform-value compare gets wrong: the values match, so it would clear the
+    // preview early and snap the object back when the still-pending local op's
+    // optimistic state is reconciled.
+    let (mut engine, mut now) = boot();
+    engine.author(insert(rect("a", "a0")), &now.next()).unwrap();
+
+    let res = engine.author(move_op("a", 50.0, 50.0), &now.next()).unwrap();
+    assert_eq!(engine.owned_key_set(), vec!["a:transform".to_string()]);
+
+    // A peer's remote move to the SAME position arrives before our ack. It is
+    // dropped by transient ownership (we still own the key) and settles nothing.
+    assert!(!engine.apply_remote(move_op("a", 50.0, 50.0)));
+    assert!(
+        engine.take_settled_keys().is_empty(),
+        "a coincidentally-equal peer write must not settle the preview before the ack"
+    );
+
+    // The real ack releases ownership and reports the key as settled exactly once.
+    engine.on_ack(&[res.op_id.unwrap()], Some(2)).unwrap();
+    assert_eq!(engine.take_settled_keys(), vec!["a:transform".to_string()]);
+    // Drained: a second read reports nothing.
+    assert!(engine.take_settled_keys().is_empty());
+}
+
+#[test]
+fn reject_settles_the_owned_key() {
+    // A rejected op also releases ownership, so its key settles too (the shell must
+    // clear the rejected preview just as it clears an acked one).
+    let (mut engine, mut now) = boot();
+    engine.author(insert(rect("a", "a0")), &now.next()).unwrap();
+    let res = engine.author(move_op("a", 9.0, 9.0), &now.next()).unwrap();
+
+    engine.on_rejected(&[res.op_id.unwrap()]).unwrap();
+    assert_eq!(engine.take_settled_keys(), vec!["a:transform".to_string()]);
+}
+
 fn text_object_value(value: &str) -> Option<shape_scene_core::object::model::Text> {
     use shape_scene_core::object::model::{Text, TextRun};
     Some(Text {

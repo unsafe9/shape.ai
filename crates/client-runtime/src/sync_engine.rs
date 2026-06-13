@@ -118,6 +118,11 @@ pub struct SyncEngine<T: EngineTransport, S: OutboxStore> {
     ownership: HashMap<String, i64>,
     /// `op_id` key -> the keys that op owns, released on ack/reject.
     op_owned_keys: HashMap<String, Vec<String>>,
+    /// `(object,field)` keys whose LAST unacked write just settled (ack/reject
+    /// released ownership), buffered until the shell drains them. This is the
+    /// authoritative "this preview is now safe to clear" signal — settling is
+    /// driven by the ack/reject event, never by comparing transform values.
+    settled_keys: Vec<String>,
 }
 
 impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
@@ -142,6 +147,7 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
             timer_armed: false,
             ownership: HashMap::new(),
             op_owned_keys: HashMap::new(),
+            settled_keys: Vec::new(),
         }
     }
 
@@ -165,6 +171,15 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
         let mut keys: Vec<String> = self.ownership.keys().cloned().collect();
         keys.sort();
         keys
+    }
+
+    /// Drain the `(object,field)` keys that settled since the last drain — every
+    /// key whose last unacked write was released by an ack/reject. The shell
+    /// clears the matching optimistic preview off THIS signal, never off a
+    /// transform-value compare (a coincidentally-equal peer write does not
+    /// settle a key, so it is never reported here until the real ack lands).
+    pub fn take_settled_keys(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.settled_keys)
     }
 
     /// True while the shell's coalescing timer must stay armed (a flush is due).
@@ -349,6 +364,9 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
             let count = self.ownership.get(&k).copied().unwrap_or(0) - 1;
             if count <= 0 {
                 self.ownership.remove(&k);
+                // The last unacked write on this key is gone: the optimistic
+                // preview the shell is holding can now safely clear.
+                self.settled_keys.push(k);
             } else {
                 self.ownership.insert(k, count);
             }

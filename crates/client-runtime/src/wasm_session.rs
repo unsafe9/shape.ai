@@ -251,6 +251,14 @@ impl WasmSession {
         ok_json(&self.engine.owned_key_set())
     }
 
+    /// Drain the `(object,field)` keys that SETTLED since the last drain (an
+    /// ack/reject released the last unacked write) as `string[]` JSON. The shell
+    /// clears the matching optimistic preview off this signal — it is told which
+    /// previews settled, instead of value-comparing a committed transform.
+    pub fn take_settled_keys(&mut self) -> String {
+        ok_json(&self.engine.take_settled_keys())
+    }
+
     // --- peer presence registry ----------------------------------------------
 
     /// Ingest one presence `payload_json` frame, stamping `now_ms`. Returns
