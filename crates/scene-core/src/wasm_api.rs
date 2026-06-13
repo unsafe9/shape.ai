@@ -283,8 +283,9 @@ pub fn split_subpath_at(geometry_json: &str, x: i32, y: i32, radius: i32) -> Str
 /// A WORLD touch point (`wx`/`wy`, logical px) cuts the stroke; the core maps it
 /// into the object's local quantized space (inverse-affine + quantize, owned by
 /// `world_to_local_quantized` — no inverse-affine math in the shell), then cuts.
-/// Returns the whole op batch: `[]` on a miss (or a singular transform), `[delete]`
-/// when the cut empties the object, else `[edit-geometry, ...follower-reprojection]`.
+/// Returns the whole op batch: `[]` on a miss, `[delete]` when the cut empties the
+/// object or the transform is singular (can't map the touch), else
+/// `[edit-geometry, ...follower-reprojection]`.
 /// `radius` is the object-local quantized erase tolerance.
 #[wasm_bindgen]
 pub fn partial_erase_ops(scene_json: &str, id: &str, wx: f64, wy: f64, radius: i32) -> String {
@@ -296,7 +297,9 @@ pub fn partial_erase_ops(scene_json: &str, id: &str, wx: f64, wy: f64, radius: i
         return ok_json(&Vec::<ObjectOp>::new());
     };
     let Some((x, y)) = world_to_local_quantized(object, wx, wy) else {
-        return ok_json(&Vec::<ObjectOp>::new()); // singular transform: nothing to cut
+        // Singular transform: can't map the touch to cut, so fall back to deleting
+        // the whole object (parity with the shell's old det=0 path).
+        return ok_json(&vec![ObjectOp::Delete { id: id.into() }]);
     };
     let mut geometry = object.geometry.clone();
     if let Err(e) = geometry.ensure_parsed() {

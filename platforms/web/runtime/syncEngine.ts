@@ -114,6 +114,7 @@ export class SyncEngine {
       this.session.on_ack(JSON.stringify(result.opIds), result.revision ?? -1)
     ) as OpId[];
     await this.outbox.remove(removed);
+    this.emitScene();
   }
 
   // Reconcile a rejected op: drop it from the outbox and release its ownership. The optimistic write
@@ -121,6 +122,7 @@ export class SyncEngine {
   async onRejected(opIds: OpId[]): Promise<void> {
     const removed = JSON.parse(this.session.on_rejected(JSON.stringify(opIds))) as OpId[];
     await this.outbox.remove(removed);
+    this.emitScene();
   }
 
   // Reconnect reconcile: reset the local base to a fresh `welcome` snapshot, then REPLAY every persisted

@@ -712,8 +712,10 @@ export class ShapeCanvasEngine {
   }
 
   // The world point under a pointer event, un-projected through the LIVE core camera (the renderer's
-  // own screen_to_world). The shell keeps no TS affine; without a live renderer this degrades to the
-  // raw screen point (the emit paths it feeds are no-ops anyway when the renderer is absent).
+  // own screen_to_world). The shell keeps no TS affine; when the core projection is unavailable
+  // (no renderer, or a wasm build predating screenToWorld) this degrades to the raw screen point, so
+  // only non-committing previews may use it — committing paths must bail on a null projection (see
+  // emitCreate/emitDraw/emitErase), or they would persist geometry at the wrong place under pan/zoom.
   private eventWorld(event: MouseEvent | PointerEvent): WorldPoint {
     const screen = this.eventPoint(event);
     return this.projectScreenToWorld(screen) ?? screen;
@@ -856,7 +858,14 @@ export class ShapeCanvasEngine {
   // draw tool is active). Carries the outline snap probe so the shell can seed anchors, but `world` stays
   // the RAW pointer — recognition normalizes the silhouette, so mid-stroke samples must not be pulled onto an edge.
   private emitDraw(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
-    const world = this.eventWorld(event);
+    const screen = this.eventPoint(event);
+    const projected = this.projectScreenToWorld(screen);
+    // `end` commits the recognized stroke into the core at these world points. Without a live core
+    // projection the only world available is the raw screen pixel, which would persist the stroke at
+    // the wrong place under a panned/zoomed camera — drop the commit instead (mirrors `emitCreate`).
+    // Non-committing phases keep the harmless screen-point fallback.
+    if (phase === "end" && projected === null) return;
+    const world = projected ?? screen;
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(world) : null;
     this.onEvent({
       type: "draw",
@@ -869,7 +878,14 @@ export class ShapeCanvasEngine {
   // Emit a create phase with the dragged corner in world space. The corner snaps to the nearest outline
   // anchor within tolerance unless Alt is held. The snap query is the core path, so geometry truth stays in Rust.
   private emitCreate(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
-    const raw = this.eventWorld(event);
+    const screen = this.eventPoint(event);
+    const projected = this.projectScreenToWorld(screen);
+    // `end` commits a sized primitive into the core at this world point. Without a live core projection
+    // the only world available is the raw screen pixel, which would persist the object at the wrong place
+    // under a panned/zoomed camera — drop the commit instead (the renderer-backed erase path is already
+    // implicitly gated the same way). Non-committing phases keep the harmless screen-point fallback.
+    if (phase === "end" && projected === null) return;
+    const raw = projected ?? screen;
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(raw) : null;
     const world = snap ? { x: snap.x, y: snap.y } : raw;
     this.onEvent({ type: "create", phase, world, snapped: snap !== null, targetId: snap?.targetId ?? null });
@@ -890,7 +906,11 @@ export class ShapeCanvasEngine {
     const screen = this.eventPoint(event);
     const id = this.objectHitTest(screen);
     if (!id) return;
-    const world = this.eventWorld(event);
+    // The erase touch commits a cut into the core at this world point. Without a live core projection
+    // the only world available is the raw screen pixel, which would cut at the wrong place under a
+    // panned/zoomed camera — drop the touch instead (mirrors emitCreate's commit guard).
+    const world = this.projectScreenToWorld(screen);
+    if (world === null) return;
     this.onEvent({ type: "erase", id, world, partial: isPartialErase(event) });
   }
 
@@ -906,7 +926,10 @@ export class ShapeCanvasEngine {
       this.emitErase(event);
       return;
     }
-    const world = this.eventWorld(event);
+    // Same commit guard as emitErase: a null core projection means the raw screen pixel is all we have,
+    // which would cut at the wrong world location under pan/zoom — drop the swept touches.
+    const world = this.projectScreenToWorld(curr);
+    if (world === null) return;
     const partial = isPartialErase(event);
     for (const id of ids) this.onEvent({ type: "erase", id, world, partial });
   }

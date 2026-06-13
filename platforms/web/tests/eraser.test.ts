@@ -84,4 +84,22 @@ describe("(3) the widened partialEraseOps takes a WORLD touch (the shell's inver
     const ops = core.partialEraseOps(scene, "draw-1", 9999, 9999, radius);
     expect(ops).toEqual([]);
   });
+
+  it("a singular (det=0) transform deletes the whole object, not a silent no-op", () => {
+    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0", "free");
+    // Collapse the x-axis: det = 0, so the world touch cannot map into local space.
+    // The cut falls back to deleting the whole object (parity with the old shell det=0 path),
+    // distinct from the [] a genuine touch-miss returns.
+    const singular = {
+      ...stroke,
+      transform: [[0, 0, 0], [0, 1, 0], [0, 0, 1]] as [
+        [number, number, number],
+        [number, number, number],
+        [number, number, number]
+      ]
+    };
+    const scene = { ...emptyObjectScene(), objects: [singular] };
+    const ops = core.partialEraseOps(scene, "draw-1", 80, 0, radius);
+    expect(ops).toEqual([{ kind: "delete", id: "draw-1" }]);
+  });
 });

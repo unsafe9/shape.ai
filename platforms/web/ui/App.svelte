@@ -249,7 +249,7 @@
       // the GPU matrix holds the previewed position until commitClientScene sees the transform land.
       const wasConnected = sceneClientReady && sceneClient !== null;
       // pendingCommit is keyed on the dragged `id`, so read ITS composed transform — not allOps[0], which under a multi cascade may be another member.
-      const rootTransform = draggedRootTransform(allOps, id, src.transform);
+      const rootTransform = draggedRootTransform(allOps, id);
       if (wasConnected && rootTransform) pendingCommit = { id, transform: rootTransform };
       authorOp(op, true, (ok) => {
         if (!ok) {

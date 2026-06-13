@@ -259,6 +259,54 @@ fn reject_settles_the_owned_key() {
     assert_eq!(engine.take_settled_keys(), vec!["a:transform".to_string()]);
 }
 
+#[test]
+fn identical_text_commit_is_a_noop_and_authors_nothing() {
+    // A re-committed unchanged text edit is a whole-op no-op (op-apply returns an
+    // empty-Batch inverse). On the connected path it must author NOTHING — no
+    // `${id}:text` ownership, no outbox row, no wire envelope — so it can't gate
+    // or clobber a concurrent peer text edit during the round-trip. This is the
+    // core-side replacement for the deleted TS shell dedup; if `author` stops
+    // suppressing the empty-Batch case, every assertion below breaks.
+    let (mut engine, mut now) = boot();
+    engine.author(insert(rect("a", "a0")), &now.next()).unwrap();
+
+    // A REAL text change: ownership taken, outbox grows, an envelope is enqueued.
+    let res = engine.author(text_op("a", "hello"), &now.next()).unwrap();
+    assert!(res.op_id.is_some(), "a real text change authors an op");
+    assert_eq!(object_text(engine.scene(), "a").as_deref(), Some("hello"));
+    assert_eq!(engine.owned_key_set(), vec!["a:text".to_string()]);
+    let outbox_after_real = engine.outbox_len();
+    assert_eq!(outbox_after_real, 2, "insert + the real text op are in the outbox");
+    engine.flush();
+    let envelopes_after_real = engine.transport().flat().len();
+    assert_eq!(envelopes_after_real, 2, "insert + the real text op went on the wire");
+
+    // The IDENTICAL text commit: op-apply changes nothing, so author suppresses
+    // it. No new ownership key, no new outbox row, no new wire envelope, and the
+    // local scene is byte-for-byte unchanged.
+    let scene_before_noop = engine.scene().clone();
+    let noop = engine.author(text_op("a", "hello"), &now.next()).unwrap();
+
+    assert!(noop.op_id.is_none(), "a no-op text commit mints no op_id");
+    assert_eq!(engine.scene(), &scene_before_noop, "the local scene is unchanged");
+    assert_eq!(
+        engine.owned_key_set(),
+        vec!["a:text".to_string()],
+        "no NEW ownership key — only the real op's `a:text` remains"
+    );
+    assert_eq!(
+        engine.outbox_len(),
+        outbox_after_real,
+        "no new outbox entry was appended for the no-op"
+    );
+    engine.flush();
+    assert_eq!(
+        engine.transport().flat().len(),
+        envelopes_after_real,
+        "no new transport envelope was enqueued for the no-op"
+    );
+}
+
 fn text_object_value(value: &str) -> Option<shape_scene_core::object::model::Text> {
     use shape_scene_core::object::model::{Text, TextRun};
     Some(Text {

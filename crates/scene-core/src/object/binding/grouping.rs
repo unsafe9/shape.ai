@@ -4,11 +4,11 @@
 
 use crate::fractional::{generate_n_keys_between, next_order_key};
 use crate::object::model::{
-    FillRule, Geometry, Object, ObjectId, ObjectScene, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
+    FillRule, Geometry, Object, ObjectId, ObjectScene, Transform3x3,
 };
 use crate::object::op::ObjectOp;
 use crate::object::primitives::rect_path;
-use crate::object::region::{OutlineDeriver, StubOutlineDeriver};
+use crate::object::region::object_world_aabb;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -48,30 +48,8 @@ pub fn pop_out_op(scene: &ObjectScene, id: &str) -> Option<ObjectOp> {
     })
 }
 
-/// The world-space AABB (logical px) of `object`: its local region bounds
-/// (quantized) mapped to px, then each corner pushed through its transform. The
-/// transform may rotate/skew/perspective, so all four corners are projected and
-/// the min/max taken. `None` when no region derives (empty geometry).
-fn world_aabb(object: &Object, deriver: &impl OutlineDeriver) -> Option<(f64, f64, f64, f64)> {
-    let bounds = deriver.derive_region(&object.geometry, 1).ok()?.bounds;
-    let q = f64::from(GEOMETRY_QUANTUM_PER_PX);
-    let (lx0, ly0) = (f64::from(bounds.min_x) / q, f64::from(bounds.min_y) / q);
-    let (lx1, ly1) = (f64::from(bounds.max_x) / q, f64::from(bounds.max_y) / q);
-    let corners = [(lx0, ly0), (lx1, ly0), (lx1, ly1), (lx0, ly1)];
-    let mut it = corners.iter().map(|&(x, y)| object.transform.apply_point(x, y));
-    let (mut min_x, mut min_y) = it.next()?;
-    let (mut max_x, mut max_y) = (min_x, min_y);
-    for (wx, wy) in it {
-        min_x = min_x.min(wx);
-        min_y = min_y.min(wy);
-        max_x = max_x.max(wx);
-        max_y = max_y.max(wy);
-    }
-    Some((min_x, min_y, max_x, max_y))
-}
-
 /// Author the ops grouping `ids` under a freshly minted frame `frame_id`: an
-/// `insert-object` for the frame (a clipped rect sized + placed to the children's
+/// `insert-object` for the frame (a non-clipping rect sized + placed to the children's
 /// union WORLD-AABB), then one `reparent` per child re-homing it into the frame.
 ///
 /// The frame's geometry is a `rect_path` in object-local px; the world placement
@@ -82,8 +60,6 @@ fn world_aabb(object: &Object, deriver: &impl OutlineDeriver) -> Option<(f64, f6
 /// `None` when fewer than two known children resolve, or no member yields a
 /// derivable region (no AABB to frame).
 pub fn group_ops(scene: &ObjectScene, ids: &[ObjectId], frame_id: &str) -> Option<Vec<ObjectOp>> {
-    let deriver = StubOutlineDeriver;
-
     // Members that exist, in canonical paint order (fractional `order`, ties by
     // id) so the minted child keys preserve their relative stacking.
     let mut members: Vec<&Object> =
@@ -93,10 +69,14 @@ pub fn group_ops(scene: &ObjectScene, ids: &[ObjectId], frame_id: &str) -> Optio
     }
     members.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
 
-    // Union world-AABB over every member with a derivable region.
+    // Union world-AABB over every member with a derivable region. Uses the same
+    // control-point-inclusive world-AABB notion as `object_world_aabb` (the
+    // surviving selection/overlay semantic) so the frame sizes/places to the
+    // transformed-node extents, not the anchor-only region bounds.
     let mut union: Option<(f64, f64, f64, f64)> = None;
     for m in &members {
-        if let Some((x0, y0, x1, y1)) = world_aabb(m, &deriver) {
+        if let Some(b) = object_world_aabb(m) {
+            let (x0, y0, x1, y1) = (b.min_x, b.min_y, b.max_x, b.max_y);
             union = Some(match union {
                 None => (x0, y0, x1, y1),
                 Some((ux0, uy0, ux1, uy1)) => {
@@ -107,7 +87,7 @@ pub fn group_ops(scene: &ObjectScene, ids: &[ObjectId], frame_id: &str) -> Optio
     }
     let (min_x, min_y, max_x, max_y) = union?;
 
-    // The frame: a clipped rect of the union span, translated to its min corner.
+    // The frame: a non-clipping rect of the union span, translated to its min corner.
     let mut geometry = Geometry {
         path_string: rect_path(max_x - min_x, max_y - min_y),
         fill_rule: FillRule::NonZero,
@@ -116,7 +96,7 @@ pub fn group_ops(scene: &ObjectScene, ids: &[ObjectId], frame_id: &str) -> Optio
     let _ = geometry.parse();
     let mut frame = Object::new(frame_id.to_string(), next_order_key(scene), geometry);
     frame.transform = Transform3x3::translate(min_x, min_y);
-    frame.clip = Some(true);
+    frame.clip = Some(false);
 
     let mut ops = vec![ObjectOp::InsertObject { object: frame }];
 
@@ -162,7 +142,9 @@ pub fn ungroup_ops(scene: &ObjectScene, frame_id: &str) -> Option<Vec<ObjectOp>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::model::{FillRule, Geometry, Object, PathNode, SubPath};
+    use crate::object::model::{
+        FillRule, Geometry, Object, PathNode, SubPath, GEOMETRY_QUANTUM_PER_PX,
+    };
 
     fn obj(id: &str, parent: Option<&str>, order: &str) -> Object {
         let geometry = Geometry::from_subpaths(
@@ -313,7 +295,7 @@ mod tests {
         // Placed at the union min corner via a pure-translation transform.
         assert_eq!(frame.transform.m[0][2], 10.0);
         assert_eq!(frame.transform.m[1][2], 10.0);
-        assert_eq!(frame.clip, Some(true));
+        assert_eq!(frame.clip, Some(false));
         // A wrong AABB would shift the corner or resize the rect; pin both.
     }
 

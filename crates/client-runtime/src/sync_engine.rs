@@ -239,6 +239,19 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
             }
         };
 
+        // An empty-Batch inverse means the op changed nothing (apply was a
+        // no-op) — the same predicate the kernel returns and `UndoStack::record`
+        // skips on. Author NOTHING: no `(object,field)` ownership, no outbox row,
+        // no wire envelope. The local scene already equals `next` (unchanged), so
+        // a no-op text commit can't grab `${id}:text` and gate a peer's edit.
+        if matches!(&inverse, ObjectOp::Batch { ops } if ops.is_empty()) {
+            return Ok(AuthorResult {
+                errors: Vec::new(),
+                op_id: None,
+                inverse: Some(inverse),
+            });
+        }
+
         let local_seq = self.outbox.next_local_seq()?;
         let entry = wire_op(&op, &self.client_id, local_seq, self.base_revision, ts);
         let op_id = entry.op_id.clone();

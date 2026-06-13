@@ -75,14 +75,15 @@ export function commitBodyDrag(
 }
 
 // The dragged `id`'s composed transform from the cascade — its set-transform op (a multi cascade may
-// put another member or a follow op first), falling back to its current transform. Drives the snap-back guard.
+// put another member or a follow op first). Null when the cascade authored no set-transform for `id`
+// (e.g. an anchored body drag emitting only edit-geometry): there is no `${id}:transform` key to ever
+// settle, so the caller must NOT seed a transform pendingCommit. Drives the snap-back guard.
 export function draggedRootTransform(
   allOps: ObjectOp[],
-  id: string,
-  fallback: SceneObject["transform"]
-): SceneObject["transform"] {
+  id: string
+): SceneObject["transform"] | null {
   const op = allOps.find((o) => o.kind === "set-transform" && o.id === id);
-  return op?.kind === "set-transform" ? op.transform : fallback;
+  return op?.kind === "set-transform" ? op.transform : null;
 }
 
 // Honor an endpoint-drag snap only onto a REAL, OTHER canonical object (not the dragged id, not a
