@@ -187,38 +187,6 @@ export type FrameStats = {
   rustLastHitScreenY: number | null;
 };
 
-export function rectsIntersect(a: WorldRect, b: WorldRect): boolean {
-  return a.x <= b.x + b.width && a.x + a.width >= b.x && a.y <= b.y + b.height && a.y + a.height >= b.y;
-}
-
-export function pointInRect(point: WorldPoint, rect: WorldRect): boolean {
-  return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
-}
-
-export function screenToWorld(point: WorldPoint, camera: CameraState): WorldPoint {
-  return {
-    x: (point.x - camera.x) / camera.zoom,
-    y: (point.y - camera.y) / camera.zoom
-  };
-}
-
-export function worldToScreen(point: WorldPoint, camera: CameraState): WorldPoint {
-  return {
-    x: point.x * camera.zoom + camera.x,
-    y: point.y * camera.zoom + camera.y
-  };
-}
-
-export function worldRectToScreen(rect: WorldRect, camera: CameraState): WorldRect {
-  const topLeft = worldToScreen(rect, camera);
-  return {
-    x: topLeft.x,
-    y: topLeft.y,
-    width: rect.width * camera.zoom,
-    height: rect.height * camera.zoom
-  };
-}
-
 export function truncateText(value: string, maxLength: number): string {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, Math.max(0, maxLength - 1))}…`;

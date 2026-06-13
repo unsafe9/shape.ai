@@ -1,6 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { objectSceneToRenderObjectScene } from "../controller/canvasHost";
 import { textOverlayScreenRect, type DragSpan } from "../controller/objectPrimitives";
 import { isPanIntent, shouldQuerySnap } from "../renderer/engine";
 import type { RenderTransform3x3 } from "../renderer/scene";
@@ -95,39 +94,6 @@ describe("(a) freehandToObject lowers a stroke to an insert-able open-path objec
     expect((object.stroke as Stroke).width).toBe(PEN.widthPx * GEOMETRY_QUANTUM_PER_PX);
     // Position lives in the transform, not the geometry.
     expect(object.transform).toBeDefined();
-  });
-});
-
-describe("(b) objectSceneToRenderObjectScene projects a heterogeneous scene", () => {
-  it("produces a well-formed feed (de-quantized strokes, text preserved)", () => {
-    const rectangle = core.buildPrimitive("rectangle", { x: 0, y: 0 }, "rect-1", "a0");
-    // The text primitive is style-less; set text explicitly to verify the projection
-    // preserves text runs.
-    const note: SceneObject = { ...core.buildPrimitive("text", { x: 400, y: 0 }, "note-1", "a1"), text: { runs: [{ text: "Note", bold: false, italic: false }], align: "start", valign: "top" } };
-    const freehand = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a2", "free");
-
-    const scene: ObjectScene = { ...emptyObjectScene(), objects: [rectangle, note, freehand] };
-    const projected = objectSceneToRenderObjectScene(scene, { x: 0, y: 0, zoom: 1 }, { kind: "canvas" }, "test-scene");
-
-    const objects = projected.objects as Array<Record<string, unknown>>;
-    expect(objects).toHaveLength(3);
-    // Field renaming: geometry.d -> geometryD on every projected object.
-    for (const projectedObject of objects) {
-      expect(typeof projectedObject.geometryD).toBe("string");
-      expect((projectedObject.geometryD as string).length).toBeGreaterThan(0);
-    }
-
-    // Stroke widths are de-quantized to logical px in the feed.
-    const projectedRect = objects.find((o) => o.id === "rect-1")!;
-    const sourceRectWidth = (rectangle.stroke as Stroke).width;
-    expect((projectedRect.stroke as { width: number }).width).toBe(sourceRectWidth / GEOMETRY_QUANTUM_PER_PX);
-
-    const projectedDraw = objects.find((o) => o.id === "draw-1")!;
-    expect((projectedDraw.stroke as { width: number }).width).toBe(PEN.widthPx);
-
-    const projectedNote = objects.find((o) => o.id === "note-1")!;
-    const noteText = projectedNote.text as { runs: Array<{ text: string }> } | null;
-    expect(noteText?.runs?.[0]?.text).toBe("Note");
   });
 });
 
@@ -304,10 +270,49 @@ describe("(h) inline text: borderless primitive + set-text + overlay placement",
     expect(undone.scene.objects[0].text).toBeUndefined();
   });
 
-  it("places the inline overlay over the text object's screen bbox (worldToScreen)", () => {
+  it("committing identical text records NO undo entry; committing changed text records a real set-text", () => {
+    // commitTextEdit drops the shell dedup and authors set-text unconditionally, leaning on the core: an
+    // identical set-text applies nothing and its empty-Batch inverse is skipped by UndoStack.record. Drive
+    // the REAL core exactly as authorOp does (apply, then record forward+inverse when there is an inverse).
+    const text = core.buildPrimitive("text", { x: 90, y: 40 }, "note-1", "a0");
+    const setText = (value: string): ObjectOp => ({
+      kind: "set-text",
+      id: "note-1",
+      text: { runs: [{ text: value, bold: false, italic: false }], align: "start", valign: "top" }
+    });
+    const undo = core.createUndoStack("tester");
+
+    let scene = core.applyObjectOp(emptyObjectScene(), { kind: "insert-object", object: text }).scene;
+
+    // Seed "Hello": a real edit with a real inverse -> a recorded undo entry.
+    const first = core.applyObjectOp(scene, setText("Hello"));
+    expect(first.inverse?.kind).toBe("set-text");
+    if (first.inverse) undo.record(setText("Hello"), first.inverse);
+    scene = first.scene;
+    expect(undo.canUndo()).toBe(true);
+
+    // Commit the SAME text: empty-Batch inverse, unchanged scene, and record() skips it -> still ONE entry.
+    const same = core.applyObjectOp(scene, setText("Hello"));
+    expect(same.errors).toEqual([]);
+    expect(same.inverse).toEqual({ kind: "batch", ops: [] });
+    expect(same.scene.objects[0].text?.runs[0]?.text).toBe("Hello");
+    if (same.inverse) undo.record(setText("Hello"), same.inverse);
+    scene = same.scene;
+
+    // Undo once pops the single real "Hello" entry; nothing left to undo (the no-op never recorded).
+    const back = undo.undo();
+    expect(back?.kind).toBe("set-text");
+    const undone = core.applyObjectOp(scene, back!);
+    expect(undone.scene.objects[0].text).toBeUndefined();
+    undo.noteUndoApplied(undone.inverse!);
+    expect(undo.canUndo()).toBe(false);
+  });
+
+  it("places the inline overlay over the text object's screen bbox (core world AABB + projection)", () => {
     // 180x80 text rect anchored so its top-left lands at world (100, 200).
     const text = core.buildPrimitive("text", { x: 100 + 90, y: 200 + 40 }, "note-1", "a0");
-    const rect = textOverlayScreenRect(text, { x: 50, y: 30, zoom: 2 });
+    const project = (world: { x: number; y: number }) => ({ x: world.x * 2 + 50, y: world.y * 2 + 30 });
+    const rect = textOverlayScreenRect(core.objectWorldAabb(text), project);
     expect(rect).not.toBeNull();
     expect(rect?.x).toBeCloseTo(100 * 2 + 50);
     expect(rect?.y).toBeCloseTo(200 * 2 + 30);

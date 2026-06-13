@@ -53,7 +53,7 @@ export class SyncEngine {
   private readonly clearTimer: (handle: unknown) => void;
 
   private timer: unknown = null;
-  private sceneListeners = new Set<(scene: ObjectScene) => void>();
+  private sceneListeners = new Set<(scene: ObjectScene, settledKeys: string[]) => void>();
 
   constructor(initialScene: ObjectScene, opts: SyncEngineOptions) {
     this.outbox = opts.outbox;
@@ -80,8 +80,10 @@ export class SyncEngine {
     return new Set(JSON.parse(this.session.owned_key_set()) as string[]);
   }
 
-  // Subscribe to optimistic scene updates; returns an unsubscribe.
-  onScene(cb: (scene: ObjectScene) => void): () => void {
+  // Subscribe to optimistic scene updates. The second arg is the `(object,field)` keys whose preview
+  // SETTLED with this update — an ack/reject released the last unacked write. The shell clears its
+  // optimistic preview off these keys, never off a transform-value compare. Returns an unsubscribe.
+  onScene(cb: (scene: ObjectScene, settledKeys: string[]) => void): () => void {
     this.sceneListeners.add(cb);
     return () => this.sceneListeners.delete(cb);
   }
@@ -161,6 +163,8 @@ export class SyncEngine {
   private emitScene(): void {
     if (this.sceneListeners.size === 0) return;
     const scene = this.getScene();
-    for (const cb of this.sceneListeners) cb(scene);
+    // Settled keys are produced only by an ack/reject release; an author/remote emit drains an empty set.
+    const settledKeys = JSON.parse(this.session.take_settled_keys()) as string[];
+    for (const cb of this.sceneListeners) cb(scene, settledKeys);
   }
 }

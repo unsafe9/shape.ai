@@ -6,7 +6,7 @@
 // is built through the CPU `buildObjectSceneGeometry` entry, with `ShapeCanvasEngine` keeping the loop alive.
 
 import type { CameraState } from "../shared/geometry";
-import { GEOMETRY_QUANTUM_PER_PX, type ObjectScene, type ObjectSelection, type Stroke } from "../shared/object";
+import type { ObjectScene, ObjectSelection } from "../shared/object";
 import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions, type TransformKind } from "../renderer/engine";
 import type { FrameStats, RenderTransform3x3, WorldRect } from "../renderer/scene";
 import { loadRustCore, type HoverAffordance, type RustCoreStatus, type RustWebGpuRenderer } from "../bridge/wasmLoader";
@@ -83,56 +83,9 @@ const initialRustStatus: RustCoreStatus = {
   detail: "Checking generated Rust/WASM package.",
   probeWebGpu: null,
   createWebGpuRenderer: null,
-  buildObjectSceneGeometry: null
+  buildObjectSceneGeometry: null,
+  projectObjectScene: null
 };
-
-// Object scene -> renderer-core RenderObjectScene projection: pure field renaming, no domain op-apply.
-
-const IDENTITY_3X3: [[number, number, number], [number, number, number], [number, number, number]] = [
-  [1, 0, 0],
-  [0, 1, 0],
-  [0, 0, 1]
-];
-
-// Project an `ObjectScene` to the renderer-core `RenderObjectScene` JSON shape.
-export function objectSceneToRenderObjectScene(
-  scene: ObjectScene,
-  camera: CameraState,
-  selection: ObjectSelection,
-  sceneId: string
-): Record<string, unknown> {
-  return {
-    sceneId,
-    camera,
-    selection: selection.kind === "object" ? selection.id : null,
-    multiSelect: selection.kind === "multi" ? selection.ids : [],
-    objects: scene.objects.map((object) => ({
-      id: object.id,
-      parent: object.parent ?? null,
-      order: object.order,
-      transform: object.transform ?? IDENTITY_3X3,
-      geometryD: object.geometry.d ?? "",
-      fill: object.fill ?? null,
-      stroke: projectStroke(object.stroke ?? undefined),
-      text: object.text ?? null,
-      // Anchors must reach the core so `Bindings::build` inverts them into Reproject edges and a moved
-      // target reprojects its followers LIVE during the drag; dropping them leaves the graph anchor-free.
-      anchors: object.anchors ?? [],
-      clip: object.clip ?? false
-    }))
-  };
-}
-
-// The model stores stroke width and dash run lengths QUANTIZED (GEOMETRY_QUANTUM_PER_PX per px), but
-// the renderer treats `RStroke.width`/`dash` as logical px, so convert width and each dash entry.
-function projectStroke(stroke: Stroke | undefined): Record<string, unknown> | null {
-  if (!stroke) return null;
-  return {
-    ...stroke,
-    width: stroke.width / GEOMETRY_QUANTUM_PER_PX,
-    ...(stroke.dash ? { dash: stroke.dash.map((d) => d / GEOMETRY_QUANTUM_PER_PX) } : {})
-  };
-}
 
 // The Svelte shell provides the three DOM nodes through mount(), reads camera/stats/health through
 // callbacks, and pushes the object scene through `loadObjectScene`.
@@ -258,8 +211,15 @@ export class ShapeCanvasHost {
   loadObjectScene(scene: ObjectScene, selection: ObjectSelection, collectGeometry = false): ObjectGeometryBuild {
     this.lastObjectScene = scene;
     this.lastSelection = selection;
-    const json = JSON.stringify(
-      objectSceneToRenderObjectScene(scene, this.camera, selection, `object-scene-v${scene.sceneVersion}`)
+    // The core owns the projection (identity default / selection flatten / stroke de-quant); the shell
+    // passes scene + live camera/selection JSON straight through and feeds the returned wire to the renderer.
+    const project = this.rustStatus.projectObjectScene;
+    if (!project) return null;
+    const json = project(
+      JSON.stringify(scene),
+      JSON.stringify(this.camera),
+      JSON.stringify(selection),
+      `object-scene-v${scene.sceneVersion}`
     );
     this.uploadObjectSceneToRenderer(json);
     // The CPU geometry build is diagnostics-only (the live GPU upload above already tessellates +
@@ -415,6 +375,18 @@ export class ShapeCanvasHost {
   // Pure object pick (no mutation) at canvas-local screen coords, used by the right-click context menu.
   hitTestObjectAt(screenX: number, screenY: number): string | null {
     return this.engine?.objectHitTest({ x: screenX, y: screenY }) ?? null;
+  }
+
+  // Project a SCREEN point to WORLD through the LIVE core camera (no TS affine in the shell). Null when
+  // the renderer is not yet live.
+  projectScreenToWorld(screen: { x: number; y: number }): { x: number; y: number } | null {
+    return this.engine?.projectScreenToWorld(screen) ?? null;
+  }
+
+  // Project a WORLD point to SCREEN through the LIVE core camera (inverse of the above). Null when the
+  // renderer is not yet live.
+  projectWorldToScreen(world: { x: number; y: number }): { x: number; y: number } | null {
+    return this.engine?.projectWorldToScreen(world) ?? null;
   }
 
   private emitHealth(): void {

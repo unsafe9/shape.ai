@@ -101,32 +101,3 @@ export function emptyObjectScene(updatedAt = new Date(0).toISOString()): ObjectS
     updatedAt
   };
 }
-
-// The primary target id of an op (rides `WireOp.objectId`).
-export function opPrimaryTargetId(op: ObjectOp): string {
-  switch (op.kind) {
-    case "insert-object":
-      return op.object.id;
-    case "merge":
-      return op.into ?? op.ids[0] ?? "";
-    case "batch":
-      return op.ops.length > 0 ? opPrimaryTargetId(op.ops[0]) : "";
-    case "delete":
-    case "edit-geometry":
-    case "set-transform":
-    case "set-style":
-    case "set-text":
-    case "set-anchor":
-    case "set-layout":
-    case "set-clip":
-    case "add-comment":
-    case "set-comments":
-    case "set-tags":
-    case "reparent":
-    case "reorder":
-    case "split":
-      return op.id;
-    default:
-      return "";
-  }
-}

@@ -6,16 +6,18 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../bridge/sceneCoreWasm";
-import { MERGE_ENDPOINT_TOLERANCE_PX, synthesizeReleaseAnchors } from "../controller/objectPrimitives";
 import { GEOMETRY_QUANTUM_PER_PX, type Object as SceneObject, type ObjectOp, type ObjectScene } from "../shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 
 let core: SceneCore;
+// The merge-endpoint radius now lives ONLY in scene-core; read it through the core like the shell does.
+let MERGE_ENDPOINT_TOLERANCE_PX: number;
 
 beforeAll(async () => {
   await ensureSceneCore();
   core = await loadSceneCore();
+  MERGE_ENDPOINT_TOLERANCE_PX = core.createThresholds().mergeEndpointTolerancePx;
 });
 
 const PEN = { color: "#1f2933", widthPx: 2 };
@@ -91,7 +93,7 @@ describe("freehand release merges into a nearby open endpoint (merge-first branc
     // Fall-through: recognize + insert + release anchors.
     const object = core.freehandToObject(stroke, PEN.color, PEN.widthPx, "draw-2", "a2", "basic");
     expect(core.isOpenClassD(object.geometry.d ?? "")).toBe(true);
-    const anchors = synthesizeReleaseAnchors(core, objects, object, [
+    const anchors = core.synthesizeCreateAnchorsBoth(sceneOf(objects), object, [
       null,
       { target: "rect-b", at: { x: 500, y: 30 } }
     ]);

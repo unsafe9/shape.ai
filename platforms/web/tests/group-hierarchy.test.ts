@@ -4,13 +4,11 @@ import { emptyObjectScene, type Object as SceneObject, type ObjectScene, type Ob
 import {
   CANVAS_MENU,
   OBJECT_MENU,
-  buildGroupOps,
   popOutPickEnabled,
   resolveContextMenuItems,
   resolveDoubleClick,
   ungroupPickEnabled
 } from "../controller/interactions";
-import { rectPathQuantized } from "../controller/transforms";
 
 let core: SceneCore;
 
@@ -91,13 +89,47 @@ describe("controller group/hierarchy wiring", () => {
     } as SceneObject;
   }
 
-  it("buildGroupOps groups 1+ objects — one child grouped under a fresh frame is valid", () => {
-    // A SINGLE object groups under a fresh frame (the `< 1` guard, not `< 2`).
-    const one = geoObj("a", 100, 100);
-    const { ops, frameId } = buildGroupOps(["a"], [one], { minX: 100, minY: 100, maxX: 180, maxY: 140 }, "frame-1", "z0", rectPathQuantized);
+  it("groupOps groups 2+ objects — insert a fresh frame, then reparent each child under it", () => {
+    const scene = sceneOf([geoObj("a", 100, 100), geoObj("b", 220, 100)]);
+    const ops = core.groupOps(scene, ["a", "b"], "frame-1")!;
     expect(ops[0]).toMatchObject({ kind: "insert-object", object: { id: "frame-1" } });
-    expect(ops.slice(1)).toEqual([{ kind: "reparent", id: "a", parent: "frame-1", order: "a0" }]);
-    expect(frameId).toBe("frame-1");
+    expect(ops.slice(1)).toEqual([
+      { kind: "reparent", id: "a", parent: "frame-1", order: "a0" },
+      { kind: "reparent", id: "b", parent: "frame-1", order: "a1" }
+    ]);
+  });
+
+  it("groupOps requires 2+ known members — a single member yields null (the core-owned contract)", () => {
+    const scene = sceneOf([geoObj("a", 100, 100)]);
+    expect(core.groupOps(scene, ["a"], "frame-1")).toBeNull();
+  });
+
+  it("duplicateOps clones at the canonical +40/+40 offset with core-minted ids + fractional order keys", () => {
+    // The App duplicateSelection routes ids through duplicateOps(scene, ids, idPrefix, 0) — the core owns
+    // the offset, the fresh `{idPrefix}-{n}` ids, and the order keys (no shell `~` minting).
+    const scene = sceneOf([geoObj("a", 100, 100), geoObj("b", 200, 50)]);
+    const ops = core.duplicateOps(scene, ["a", "b"], "dup-xyz", 0);
+    expect(ops.map((o) => (o.kind === "insert-object" ? o.object.id : ""))).toEqual(["dup-xyz-0", "dup-xyz-1"]);
+    const first = ops[0];
+    if (first.kind !== "insert-object") throw new Error("expected insert-object");
+    // +40/+40 down-right of the source's (100, 100) translate.
+    expect([first.object.transform![0][2], first.object.transform![1][2]]).toEqual([140, 140]);
+    // Order keys are real fractional keys (no `~` suffix the shell used to mint).
+    expect(ops.every((o) => o.kind === "insert-object" && !o.object.order.includes("~"))).toBe(true);
+  });
+
+  it("reorderStepOps swaps a single object's order with its flat-order neighbor (2-op swap, or null at the extent)", () => {
+    // The App reorderStep routes through reorderStepOps(scene, id, dir) — the core authors the swap.
+    const scene = sceneOf([
+      { ...geoObj("a", 0, 0), order: "a0" } as SceneObject,
+      { ...geoObj("b", 0, 0), order: "a1" } as SceneObject
+    ]);
+    expect(core.reorderStepOps(scene, "a", "forward")).toEqual([
+      { kind: "reorder", id: "a", order: "a1" },
+      { kind: "reorder", id: "b", order: "a0" }
+    ]);
+    // The top object has no forward neighbor — null, not a malformed swap.
+    expect(core.reorderStepOps(scene, "b", "forward")).toBeNull();
   });
 
   it("resolveDoubleClick branches through the core drill-in decision (container vs leaf)", () => {

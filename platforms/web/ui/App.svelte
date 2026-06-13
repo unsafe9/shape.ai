@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import { BrainCircuit, Loader2, Copy, Trash2, Group as GroupIcon, Ungroup, MessageSquarePlus, LayoutTemplate, Sun, Moon } from "lucide-svelte";
-  import { screenToWorld, applyDocumentTheme, readStoredTheme, type Theme } from "../renderer/scene";
+  import { applyDocumentTheme, readStoredTheme, type Theme } from "../renderer/scene";
   import type { CameraState } from "../shared/geometry";
   import {
     emptyObjectScene,
     GEOMETRY_QUANTUM_PER_PX,
+    translateTransform,
     type Object as SceneObject,
     type ObjectOp,
     type ObjectScene,
@@ -26,24 +27,23 @@
   import type { HoverAffordance } from "../bridge/wasmLoader";
   import {
     loadSceneCore,
+    ensureSceneCore,
+    createWasmSession,
     type ObjectCommand,
     type ObjectGesture,
+    type CreateThresholds,
     type SceneCore,
-    type UndoStack
+    type UndoStack,
+    type WasmSession
   } from "../bridge/sceneCoreWasm";
   import { createShortcutDispatcher } from "../controller/shortcuts";
   import { isFreeRecognizeHold } from "../controller/gestureBindings";
   import { ToastChannel } from "../runtime/statusChannel";
   import {
-    MIN_DRAG_EXTENT_PX,
     textOverlayScreenRect,
     THEME_DEFAULT_COLOR,
     type DragSpan,
-    type CreateSnap,
-    resolveCreateRelease,
-    synthesizeReleaseAnchors,
-    CREATE_ANCHOR_REUSE_TOLERANCE_PX,
-    MERGE_ENDPOINT_TOLERANCE_PX
+    type CreateSnap
   } from "../controller/objectPrimitives";
   import {
     routeSelectObject,
@@ -56,7 +56,6 @@
     canonicalizeHoverSnap,
     buildInsertPrimitive,
     buildColorApplyOp,
-    buildGroupOps,
     resolveDoubleClick,
     ungroupPickEnabled as ungroupPickEnabledOf,
     popOutPickEnabled as popOutPickEnabledOf,
@@ -66,14 +65,6 @@
     type ContextMenuEntry
   } from "../controller/interactions";
   import { isDragCreateShape, type DragCreateShape, type PrimitiveKindId } from "../controller/toolbar";
-  import {
-    transformOrigin,
-    transformsEqual,
-    shiftTransform,
-    worldToObjectLocalQuantized,
-    unionWorldAabb,
-    rectPathQuantized
-  } from "../controller/transforms";
   import {
     isDiagnosticsOnlyStatus,
     wsBaseUrl as wsBaseUrlOf,
@@ -87,8 +78,15 @@
   import TemplatePopup, { type TemplatePopupItem } from "./TemplatePopup.svelte";
   import PeerCursors from "./PeerCursors.svelte";
 
-  // Canonical object scene.
+  // Render-only mirror of the core's scene. The Rust core (the offline `session` pre-connect, the
+  // SceneClient engine once connected) is the single source of truth; this is written ONCE per frame
+  // inside commitClientScene and is never assigned or mutated anywhere else.
   let scene = $state<ObjectScene>(emptyObjectScene());
+
+  // The core session that owns author/apply + scene() on the OFFLINE / pre-connect path, so the core —
+  // not the shell — is the source of truth even before a transport connects. Once connected, authoring
+  // routes through `sceneClient` (which owns its own engine); this offline session then sits idle.
+  let session: WasmSession | null = null;
 
   let selection = $state<ObjectSelection>({ kind: "canvas" });
 
@@ -183,6 +181,9 @@
   let sceneCore: SceneCore | null = null;
   let commandCatalog = $state<ObjectCommand[]>([]);
   let gestureCatalog = $state<ObjectGesture[]>([]);
+  // The create-gesture screen-px thresholds, read from scene-core at bootstrap so the shell keeps no
+  // literal copy. Null until the core loads; the create/draw paths gate on `sceneCore` before using them.
+  let createThresholds: CreateThresholds | null = null;
   let canvases = $state<CanvasSummary[]>([]);
   let connectionStatus = $state<ConnectionStatus>("offline");
   let canvasBusy = $state(false);
@@ -199,7 +200,14 @@
   // The inline text-edit overlay rect, recomputed when the edited object, its transform, or the camera
   // changes (so the overlay tracks the object under pan/zoom). Null when not editing or the path is gone.
   const textEditObject = $derived(textEdit ? scene.objects.find((o) => o.id === textEdit.id) ?? null : null);
-  const textEditRect = $derived(textEditObject ? textOverlayScreenRect(textEditObject, camera) : null);
+  const textEditRect = $derived(
+    textEditObject && sceneCore
+      ? textOverlayScreenRect(sceneCore.objectWorldAabb(textEditObject), (world) => {
+          void camera;
+          return host?.projectWorldToScreen(world) ?? null;
+        })
+      : null
+  );
 
   const readyState = $derived(rendererHealth?.state ?? "wasm-unavailable");
   const rendererDetail = $derived(rendererHealth?.detail ?? "Detecting Rust/WASM package.");
@@ -210,7 +218,7 @@
   // transform of an EXISTING object no longer rebuilds this — it's pushed straight to the GPU instance
   // matrix). A new object bakes once per geometry change since it has no instance to update.
   const feedScene = $derived(
-    buildFeedSceneOf(scene, drawPoints, createKind, createDrag, createHoverSnap, nextOrderKey, selectedColor, penWidthPx)
+    buildFeedSceneOf(sceneCore, scene, drawPoints, createKind, createDrag, createHoverSnap, nextOrderKey, selectedColor, penWidthPx)
   );
 
   const hostCallbacks: ShapeCanvasHostCallbacks = {
@@ -289,11 +297,19 @@
   async function bootstrapSceneCore(): Promise<void> {
     try {
       sceneCore = await loadSceneCore();
+      // loadSceneCore initialized the wasm; build the offline session so the core owns author/scene()
+      // pre-connect too. The shell mirror is seeded from the session's scene, never a shell-held copy.
+      await ensureSceneCore();
+      session = createWasmSession({ welcomeScene: emptyObjectScene(), clientId: clientIdentity() });
+      commitClientScene(JSON.parse(session.scene()) as ObjectScene, []);
       commandCatalog = sceneCore.objectCommandCatalog();
       gestureCatalog = sceneCore.objectGestureCatalog();
+      createThresholds = sceneCore.createThresholds();
       undoStack = sceneCore.createUndoStack(userIdentity());
     } catch {
       sceneCore = null;
+      session = null;
+      createThresholds = null;
     }
   }
 
@@ -312,12 +328,13 @@
 
   // Windowed replica: re-aim the data-layer window at the camera viewport.
   $effect(() => {
-    const cam = camera;
+    void camera;
     if (!sceneClientReady || !sceneClient) return;
     const rect = canvasWrap?.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) return;
-    const topLeft = screenToWorld({ x: 0, y: 0 }, cam);
-    const bottomRight = screenToWorld({ x: rect.width, y: rect.height }, cam);
+    const topLeft = host?.projectScreenToWorld({ x: 0, y: 0 });
+    const bottomRight = host?.projectScreenToWorld({ x: rect.width, y: rect.height });
+    if (!topLeft || !bottomRight) return;
     sceneClient.setViewport({ x: topLeft.x, y: topLeft.y, width: bottomRight.x - topLeft.x, height: bottomRight.y - topLeft.y });
   });
 
@@ -389,12 +406,13 @@
       sceneClient = client;
       sceneClientReady = true;
       connectionStatus = client.connectionStatus;
-      client.onScene((next) => commitClientScene(next));
+      client.onScene((next, settledKeys) => commitClientScene(next, settledKeys));
       client.onStatus((next) => (connectionStatus = next));
       client.onPeers((next) => (peers = next));
       client.onFeature((response) => handleFeatureResponse(response));
-      scene = welcome;
       selection = validSelection(welcome, welcome.selection);
+      // The connected engine is now authoritative; seed the mirror through the single write path.
+      commitClientScene(welcome, []);
       void loadCanvases();
     } catch (error) {
       client.close();
@@ -417,8 +435,9 @@
     try {
       const welcome = await sceneClient.switchCanvas(nextCanvasId);
       canvasId = nextCanvasId;
-      scene = welcome;
       selection = validSelection(welcome, welcome.selection);
+      // The reconnected engine is authoritative for the new canvas; seed the mirror via the one write path.
+      commitClientScene(welcome, []);
       // A switched canvas starts a fresh undo history.
       if (sceneCore) undoStack = sceneCore.createUndoStack(userIdentity());
     } catch (error) {
@@ -465,15 +484,17 @@
     }
   }
 
-  // Adopt an engine-driven scene update (acked/remote), keeping selection valid.
-  function commitClientScene(next: ObjectScene): void {
+  // Adopt a core-driven scene update (offline author, acked, or remote), keeping selection valid. This
+  // is the ONE place `scene` is assigned. `settledKeys` are the `(object,field)` previews the core TOLD
+  // us settled (an ack/reject released the last unacked write); we clear the optimistic preview off that
+  // signal — never a transform-value compare, which a coincidentally-equal peer write would trip early.
+  function commitClientScene(next: ObjectScene, settledKeys: string[]): void {
     scene = next;
     selection = validSelection(next, selection);
-    // The `scene = next` above already rebaked at the committed transform; clear pendingCommit (and
-    // defensively revert any residual preview) once the canonical transform lands or the object is gone.
     if (pendingCommit) {
       const committed = next.objects.find((o) => o.id === pendingCommit!.id);
-      if (!committed || transformsEqual(committed.transform, pendingCommit.transform)) {
+      // Clear when the object is gone OR the core reports this object's transform preview settled.
+      if (!committed || settledKeys.includes(`${pendingCommit.id}:transform`)) {
         host?.clearObjectPreview(pendingCommit.id);
         pendingCommit = null;
       }
@@ -503,15 +524,20 @@
   // clears redo. An undo/redo replay is NOT undoable (the core stack drives those via its own handshake).
   function authorOp(op: ObjectOp, undoable = true, onSettled?: (ok: boolean) => void): void {
     if (!sceneClientReady || !sceneClient) {
-      // Pre-connect: apply optimistically through the core only, no wire.
-      if (sceneCore) {
-        const applied = sceneCore.applyObjectOp(scene, op);
-        if (applied.errors.length > 0) status = applied.errors.join("; ");
+      // Pre-connect / offline: author through the SAME core session that owns the connected path, so the
+      // core (not the shell) applies the op and owns the scene + undo inverse even with no transport.
+      if (session) {
+        const result = JSON.parse(session.author(JSON.stringify(op), new Date().toISOString())) as {
+          errors: string[];
+          inverse?: ObjectOp | null;
+        };
+        if (result.errors.length > 0) status = result.errors.join("; ");
         else {
-          scene = applied.scene;
-          if (undoable && applied.inverse) undoStack?.record(op, applied.inverse);
+          // The op applied inside the core; mirror its scene through the one write path (no settle, offline).
+          commitClientScene(JSON.parse(session.scene()) as ObjectScene, []);
+          if (undoable && result.inverse) undoStack?.record(op, result.inverse);
         }
-        onSettled?.(applied.errors.length === 0);
+        onSettled?.(result.errors.length === 0);
       } else {
         onSettled?.(false);
       }
@@ -567,9 +593,10 @@
     }
   }
 
+  // The order key for a NEW object landing on top — minted by the core's fractional indexing. Pre-load
+  // (sceneCore null) falls back to a monotonic key above the current max so the early feed still stacks.
   function nextOrderKey(): string {
-    // Order keys sort by plain string Ord; append a char after the current max so a new object lands on
-    // top. The wasm core owns true fractional keys; this shell-side monotonic key is only the insertion position.
+    if (sceneCore) return sceneCore.nextOrderKey(scene);
     const maxOrder = scene.objects.reduce((max, o) => (o.order > max ? o.order : max), "a0");
     return `${maxOrder}~`;
   }
@@ -581,7 +608,7 @@
   function viewportCenterWorld(): { x: number; y: number } {
     const rect = canvasWrap?.getBoundingClientRect();
     if (!rect) return { x: 120, y: 120 };
-    return screenToWorld({ x: rect.width / 2, y: rect.height / 2 }, camera);
+    return host?.projectScreenToWorld({ x: rect.width / 2, y: rect.height / 2 }) ?? { x: 120, y: 120 };
   }
 
   // Rect/ellipse/line ARM drag-create (sized by a pointer down-drag-up). A context-menu insert passes an
@@ -623,7 +650,7 @@
   function handleCreate(phase: "start" | "move" | "end" | "cancel", world: { x: number; y: number }, snappedIn: boolean, targetIdIn: string | null): void {
     const kind = createKind;
     if (!kind) return;
-    if (phase === "end" && !sceneCore) return;
+    if (phase === "end" && (!sceneCore || !createThresholds)) return;
     // The snap query runs against the renderer's loaded regions, which include the TRANSIENT preview
     // (rides the same feed); its corner under the cursor self-snaps. Honor a snap ONLY when its target
     // is a real canonical object, so the ring + anchor fire on a real edge, never on the preview itself.
@@ -661,10 +688,10 @@
       return;
     }
     // Commit a sized primitive (or a default at a click). A release that missed the snap reuses the gesture's last snap when it landed near it.
-    const resolved = resolveCreateRelease(
+    const resolved = sceneCore.resolveCreateRelease(
       { end: world, snapped, target: targetId },
       createDrag.lastSnap,
-      CREATE_ANCHOR_REUSE_TOLERANCE_PX / camera.zoom
+      createThresholds.createAnchorReuseTolerancePx / camera.zoom
     );
     const startSnap = createDrag.startSnap;
     const span: DragSpan = { start: createDrag.span.start, end: resolved.end };
@@ -672,16 +699,17 @@
     createDrag = null;
     const dx = Math.abs(span.end.x - span.start.x);
     const dy = Math.abs(span.end.y - span.start.y);
-    const tooSmall = kind === "line" ? dx < MIN_DRAG_EXTENT_PX && dy < MIN_DRAG_EXTENT_PX : dx < MIN_DRAG_EXTENT_PX || dy < MIN_DRAG_EXTENT_PX;
+    const minExtent = createThresholds.minDragExtentPx;
+    const tooSmall = kind === "line" ? dx < minExtent && dy < minExtent : dx < minExtent || dy < minExtent;
     const object = tooSmall
       ? sceneCore.buildPrimitive(kind, span.start, freshId(kind), nextOrderKey(), selectedColor)
       : sceneCore.buildPrimitiveFromDrag(kind, span, freshId(kind), nextOrderKey(), selectedColor);
     // A snapped drag-create binds the snapped CORNER(s) to the target's outline with a persistent anchor.
     // BOTH ends count (start drawn FROM an edge, end drawn TO one), each binding the nearest node, which
     // then reprojects through the target's transform so the object moves WITH the target. (Alt-create = no
-    // anchor.) Same synthesizeReleaseAnchors the freehand pen uses — one release-anchor source for both tools.
+    // anchor.) Same core synthesizeCreateAnchorsBoth the freehand pen uses — one release-anchor source for both tools.
     if (!tooSmall && sceneCore) {
-      const anchors = synthesizeReleaseAnchors(sceneCore, scene.objects, object, [
+      const anchors = sceneCore.synthesizeCreateAnchorsBoth(scene, object, [
         startSnap ? { target: startSnap.target, at: span.start } : null,
         snapTarget ? { target: snapTarget, at: span.end } : null
       ]);
@@ -745,16 +773,22 @@
     // Resolve the release against the gesture's last snap (near-miss still anchors), then commit the recognized stroke (>=2 points have extent).
     const startSnap = drawSnap?.start ?? null;
     const recognizeMode = freeRecognitionHeld ? "free" : "basic";
-    const resolved = resolveCreateRelease(
+    if (!sceneCore || !createThresholds) {
+      drawSnap = null;
+      createHoverSnap = null;
+      drawPoints = null;
+      return;
+    }
+    const resolved = sceneCore.resolveCreateRelease(
       { end: canon ? canon.at : world, snapped: canon !== null, target: canon?.target ?? null },
       drawSnap?.last ?? null,
-      CREATE_ANCHOR_REUSE_TOLERANCE_PX / camera.zoom
+      createThresholds.createAnchorReuseTolerancePx / camera.zoom
     );
     drawSnap = null;
     createHoverSnap = null;
     const points = [...drawPoints, resolved.end];
     drawPoints = null;
-    if (points.length < 2 || !sceneCore) return;
+    if (points.length < 2) return;
     // Multi-stroke merge, PRIORITY over insert + anchoring: a stroke end landing on an open-class
     // object's endpoint chains the stroke into it (edit-geometry on the survivor, no insert). Every
     // judgment lives in the core; the shell only branches on the returned ops. Null = no merge.
@@ -762,7 +796,7 @@
       scene,
       points,
       recognizeMode,
-      MERGE_ENDPOINT_TOLERANCE_PX / camera.zoom
+      createThresholds.mergeEndpointTolerancePx / camera.zoom
     );
     if (mergeOps && mergeOps.length > 0) {
       authorOp(mergeOps.length === 1 ? mergeOps[0] : { kind: "batch", ops: mergeOps });
@@ -777,7 +811,7 @@
     if (selectedColor === THEME_DEFAULT_COLOR && object.stroke) object.stroke.paint = previewPaint(selectedColor);
     // An OPEN recognition authors endpoint anchors through the same release path as drag-create; a CLOSED recognition never anchors.
     if (sceneCore.isOpenClassD(object.geometry.d)) {
-      const anchors = synthesizeReleaseAnchors(sceneCore, scene.objects, object, [
+      const anchors = sceneCore.synthesizeCreateAnchorsBoth(scene, object, [
         startSnap ? { target: startSnap.target, at: startSnap.at } : null,
         resolved.target ? { target: resolved.target, at: resolved.end } : null
       ]);
@@ -799,14 +833,10 @@
       if (selection.kind === "object" && selection.id === id) selectObject({ kind: "canvas" });
       return;
     }
-    const local = worldToObjectLocalQuantized(target, world);
-    if (!local) {
-      authorOp({ kind: "delete", id });
-      return;
-    }
-    // The core returns the WHOLE op batch: [] on a miss, [delete] when the cut empties the object, else
-    // [edit-geometry, ...followers]. The shell authors the result and owns the UI follow-up (clearing a stale selection).
-    const ops = sceneCore.partialEraseOps(scene, id, local.x, local.y, ERASE_RADIUS_QUANTIZED);
+    // The core maps the WORLD touch into object-local quantized space (inverse-affine + quantize) and
+    // returns the WHOLE op batch: [] on a miss / singular transform, [delete] when the cut empties the
+    // object, else [edit-geometry, ...followers]. The shell authors the result and owns the UI follow-up.
+    const ops = sceneCore.partialEraseOps(scene, id, world.x, world.y, ERASE_RADIUS_QUANTIZED);
     if (ops.length === 0) return; // touch missed: stroke left whole
     authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops });
     if (ops.some((op) => op.kind === "delete") && selection.kind === "object" && selection.id === id) {
@@ -824,35 +854,24 @@
   }
 
   function duplicateSelection(): void {
+    if (!sceneCore) return;
     const ids = currentSelectionIds();
-    const ops: ObjectOp[] = [];
-    let order = nextOrderKey();
-    for (const id of ids) {
-      const src = scene.objects.find((o) => o.id === id);
-      if (!src) continue;
-      const clone: SceneObject = {
-        ...src,
-        id: freshId("dup"),
-        order,
-        transform: shiftTransform(src.transform, 40, 40)
-      };
-      order = `${order}~`;
-      ops.push({ kind: "insert-object", object: clone });
-    }
+    // The core mints fresh ids (`{idPrefix}-{n}`), fresh fractional order keys above the scene top, and
+    // the canonical +40/+40 offset. A unique idPrefix per gesture keeps the per-call `-n` ids globally unique.
+    const ops = sceneCore.duplicateOps(scene, ids, freshId("dup"), 0);
     if (ops.length === 0) return;
     authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops });
     showToast("Duplicated selection");
   }
 
-  // Reparent the selected objects under a fresh frame object: a rect sized to their union world-AABB,
-  // positioned at the AABB's top-left. Children transforms are world-absolute, so they reparent unchanged.
+  // Reparent the selected objects under a fresh frame object: the core sizes a clipped rect frame to
+  // their union world-AABB and reparents each child under it. Null when fewer than two members resolve.
   function groupSelection(): void {
+    if (!sceneCore) return;
     const ids = currentSelectionIds();
-    // Group works on 1+ objects — a single object under a fresh container is a valid one-child frame.
-    if (ids.length < 1) return;
-    const objects = ids.map((id) => scene.objects.find((o) => o.id === id)).filter((o): o is SceneObject => Boolean(o));
-    const bounds = unionWorldAabb(objects);
-    const { ops, frameId } = buildGroupOps(ids, objects, bounds, freshId("frame"), nextOrderKey(), rectPathQuantized);
+    const frameId = freshId("frame");
+    const ops = sceneCore.groupOps(scene, ids, frameId);
+    if (!ops) return;
     authorOp({ kind: "batch", ops });
     selection = { kind: "object", id: frameId };
     persistSelection(selection);
@@ -860,13 +879,12 @@
   }
 
   // Ungroup reparents children out of the frame, then deletes the now-empty frame in the SAME batch op.
+  // The core authors both halves; only a container (has children) ungroups, so a leaf is never dissolved.
   function ungroupSelection(): void {
-    if (selection.kind !== "object") return;
-    const id = selection.id;
-    const children = scene.objects.filter((o) => o.parent === id);
-    if (children.length === 0) return;
-    const ops: ObjectOp[] = children.map((child) => ({ kind: "reparent", id: child.id, order: child.order }));
-    ops.push({ kind: "delete", id });
+    if (selection.kind !== "object" || !sceneCore) return;
+    if (!sceneCore.hasChildren(scene, selection.id)) return;
+    const ops = sceneCore.ungroupOps(scene, selection.id);
+    if (!ops) return;
     authorOp({ kind: "batch", ops });
     selection = { kind: "canvas" };
     persistSelection(selection);
@@ -882,14 +900,14 @@
     showToast("Popped out one level");
   }
 
+  // Nudge the selection by (dx, dy) through the SAME core path a body drag commits: moveOpsForPick
+  // derives the MoveRoots from selection + picked id in-core, so the nudge cascades to a parent's subtree
+  // and follows anchors, exactly like an equal-delta drag (unlike the old independent per-id translate).
   function nudgeSelection(dx: number, dy: number): void {
+    if (!sceneCore) return;
     const ids = currentSelectionIds();
-    const ops: ObjectOp[] = [];
-    for (const id of ids) {
-      const src = scene.objects.find((o) => o.id === id);
-      if (!src) continue;
-      ops.push({ kind: "set-transform", id, transform: shiftTransform(src.transform, dx, dy) });
-    }
+    if (ids.length === 0) return;
+    const ops = sceneCore.moveOpsForPick(scene, selection, ids[0], translateTransform(dx, dy));
     if (ops.length === 0) return;
     authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops });
   }
@@ -903,7 +921,8 @@
   }
 
   // True single-step reorder: swap the selected object's order with its next-higher ("forward") or
-  // next-lower ("backward") neighbor. Single selection only (a multi-set has no well-defined neighbor).
+  // next-lower ("backward") neighbor over the flat scene order. Single selection only (a multi-set has no
+  // well-defined neighbor); the core authors the 2-op swap, or null when there is no neighbor that way.
   function reorderStep(direction: "forward" | "backward"): void {
     const ids = currentSelectionIds();
     if (ids.length !== 1) {
@@ -911,33 +930,23 @@
       reorderSelection(direction === "forward" ? "front" : "back");
       return;
     }
-    const id = ids[0];
-    const sorted = [...scene.objects].sort((a, b) => (a.order < b.order ? -1 : a.order > b.order ? 1 : 0));
-    const index = sorted.findIndex((o) => o.id === id);
-    if (index < 0) return;
-    const neighborIndex = direction === "forward" ? index + 1 : index - 1;
-    const neighbor = sorted[neighborIndex];
-    if (!neighbor) return;
-    const self = sorted[index];
-    authorOp({
-      kind: "batch",
-      ops: [
-        { kind: "reorder", id: self.id, order: neighbor.order },
-        { kind: "reorder", id: neighbor.id, order: self.order }
-      ]
-    });
+    if (!sceneCore) return;
+    const ops = sceneCore.reorderStepOps(scene, ids[0], direction);
+    if (!ops) return;
+    authorOp(ops.length === 1 ? ops[0] : { kind: "batch", ops });
   }
 
+  // The order key for a NEW object landing at the back — minted by the core's fractional indexing. Pre-load
+  // (sceneCore null) falls back to a short ascii key below the current min.
   function backOrderKey(): string {
+    if (sceneCore) return sceneCore.backOrderKey(scene);
     const minOrder = scene.objects.reduce((min, o) => (o.order < min ? o.order : min), "z");
-    // A short ascii key below "a" so it sorts before the current min (lands at the back).
     return minOrder > "0" ? "0" : `0${minOrder}`;
   }
 
   function selectAll(): void {
-    const ids = scene.objects.map((o) => o.id);
-    if (ids.length === 0) return;
-    selection = ids.length === 1 ? { kind: "object", id: ids[0] } : { kind: "multi", ids };
+    if (!sceneCore) return;
+    selection = sceneCore.selectAll(scene);
     persistSelection(selection);
   }
 
@@ -976,16 +985,13 @@
     textEdit = { id, value: object?.text?.runs?.[0]?.text ?? "" };
   }
 
-  // Commit the in-progress inline edit as a set-text op (only when the text changed),
-  // then dismiss the overlay. Called on blur or Enter.
+  // Commit the in-progress inline edit as a set-text op, then dismiss the overlay. Called on blur
+  // or Enter. An unchanged commit degrades to a no-op in the core (identical set-text applies nothing
+  // and its empty-Batch inverse is skipped by the undo stack), so no shell-side dedup is needed.
   function commitTextEdit(): void {
     const edit = textEdit;
     textEdit = null;
     if (!edit) return;
-    const object = scene.objects.find((o) => o.id === edit.id);
-    if (!object) return;
-    const current = object.text?.runs?.[0]?.text ?? "";
-    if (edit.value === current) return;
     authorOp({ kind: "set-text", id: edit.id, text: { runs: [{ text: edit.value }] } });
   }
 
@@ -1040,15 +1046,10 @@
   }
 
   function templateAnchor(): { x: number; y: number } {
-    if (scene.objects.length === 0) return viewportCenterWorld();
-    let maxX = -Infinity;
-    let minY = Infinity;
-    for (const object of scene.objects) {
-      const [tx, ty] = transformOrigin(object.transform);
-      maxX = Math.max(maxX, tx);
-      minY = Math.min(minY, ty);
-    }
-    return { x: Number.isFinite(maxX) ? maxX + 240 : 120, y: Number.isFinite(minY) ? minY : 120 };
+    // The core places the anchor right of the right-most object; pass only the empty-scene viewport fallback.
+    const fallback = viewportCenterWorld();
+    if (!sceneCore) return fallback;
+    return sceneCore.templateAnchor(scene, fallback);
   }
 
   // ----- comments / export (feature frames) -------------------------------
@@ -1097,15 +1098,9 @@
   }
 
   function validSelection(currentScene: ObjectScene, currentSelection: ObjectSelection): ObjectSelection {
-    if (currentSelection.kind === "canvas") return currentSelection;
-    if (currentSelection.kind === "object") {
-      return currentScene.objects.some((o) => o.id === currentSelection.id) ? currentSelection : { kind: "canvas" };
-    }
-    // multi: keep only live ids; collapse to object/canvas as the set shrinks.
-    const live = currentSelection.ids.filter((id) => currentScene.objects.some((o) => o.id === id));
-    if (live.length >= 2) return { kind: "multi", ids: live };
-    if (live.length === 1) return { kind: "object", id: live[0] };
-    return { kind: "canvas" };
+    // The core owns the prune/collapse rule; pre-core (sceneCore null) keeps the selection as-is.
+    if (!sceneCore) return currentSelection;
+    return sceneCore.validSelection(currentScene, currentSelection);
   }
 
   function handleEscape(): void {
@@ -1201,7 +1196,8 @@
     pendingContextScreen = null;
     if (!canvasWrap || !anchor) return;
     const rect = canvasWrap.getBoundingClientRect();
-    const world = screenToWorld({ x: anchor.clientX - rect.left, y: anchor.clientY - rect.top }, camera);
+    const world = host?.projectScreenToWorld({ x: anchor.clientX - rect.left, y: anchor.clientY - rect.top });
+    if (!world) return;
     contextMenu = { selection: picked, x: anchor.clientX, y: anchor.clientY, world };
   }
 
@@ -1311,9 +1307,10 @@
     if (now - lastCursorSentAt < CURSOR_THROTTLE_MS) return;
     lastCursorSentAt = now;
     const rect = canvasWrap.getBoundingClientRect();
-    const cursor = screenToWorld({ x: event.clientX - rect.left, y: event.clientY - rect.top }, camera);
-    const topLeft = screenToWorld({ x: 0, y: 0 }, camera);
-    const bottomRight = screenToWorld({ x: rect.width, y: rect.height }, camera);
+    const cursor = host?.projectScreenToWorld({ x: event.clientX - rect.left, y: event.clientY - rect.top });
+    const topLeft = host?.projectScreenToWorld({ x: 0, y: 0 });
+    const bottomRight = host?.projectScreenToWorld({ x: rect.width, y: rect.height });
+    if (!cursor || !topLeft || !bottomRight) return;
     sceneClient.sendCursor(cursor, { x: topLeft.x, y: topLeft.y, width: bottomRight.x - topLeft.x, height: bottomRight.y - topLeft.y });
   }
 
@@ -1340,7 +1337,7 @@
           <BrainCircuit size={28} />
           <span>shape.ai</span>
         </div>
-        <PeerCursors {peers} {camera} />
+        <PeerCursors {peers} projectWorldToScreen={(world) => { void camera; return host?.projectWorldToScreen(world) ?? null; }} />
 
         <Toolbar
           {activeTool}

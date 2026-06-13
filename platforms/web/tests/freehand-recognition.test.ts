@@ -1,7 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../bridge/sceneCoreWasm";
-import { synthesizeReleaseAnchors } from "../controller/objectPrimitives";
-import { GEOMETRY_QUANTUM_PER_PX, type Object as SceneObject } from "../shared/object";
+import { GEOMETRY_QUANTUM_PER_PX, type Object as SceneObject, type ObjectScene } from "../shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 
@@ -13,6 +12,10 @@ beforeAll(async () => {
 });
 
 const PEN = { color: "#1f2933", widthPx: 2 };
+
+function sceneOf(objects: SceneObject[]): ObjectScene {
+  return { sceneVersion: 1, objects, tags: [], selection: { kind: "canvas" }, updatedAt: "" };
+}
 
 function targetRect(id: string, tx: number, ty: number): SceneObject {
   return core.buildPrimitiveFromDrag("rectangle", { start: { x: tx, y: ty }, end: { x: tx + 100, y: ty + 60 } }, id, "a0");
@@ -76,14 +79,14 @@ describe("(1) freehandToObject recognizes the pen-up stroke", () => {
 });
 
 describe("(2) freehand release anchoring (open results, both corners)", () => {
-  it("binds BOTH stroke endpoints to their snapped targets via synthesizeReleaseAnchors", () => {
+  it("binds BOTH stroke endpoints to their snapped targets via core synthesizeCreateAnchorsBoth", () => {
     // rect-a spans x in [200,300], rect-b x in [500,600]; stroke drawn edge-to-edge.
     const rectA = targetRect("rect-a", 200, 0);
     const rectB = targetRect("rect-b", 500, 0);
     const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2", "free");
     expect(core.isOpenClassD((stroke.geometry.d ?? ""))).toBe(true);
 
-    const anchors = synthesizeReleaseAnchors(core, [rectA, rectB], stroke, [
+    const anchors = core.synthesizeCreateAnchorsBoth(sceneOf([rectA, rectB]), stroke, [
       { target: "rect-a", at: { x: 300, y: 30 } },
       { target: "rect-b", at: { x: 500, y: 30 } }
     ]);
@@ -101,7 +104,7 @@ describe("(2) freehand release anchoring (open results, both corners)", () => {
   it("skips null corners and corners whose target left the scene", () => {
     const rectA = targetRect("rect-a", 200, 0);
     const stroke = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 500, y: 30 }), PEN.color, PEN.widthPx, "draw-1", "a2", "free");
-    const anchors = synthesizeReleaseAnchors(core, [rectA], stroke, [
+    const anchors = core.synthesizeCreateAnchorsBoth(sceneOf([rectA]), stroke, [
       null,
       { target: "rect-gone", at: { x: 500, y: 30 } } // stale release target
     ]);
@@ -113,7 +116,7 @@ describe("(2) freehand release anchoring (open results, both corners)", () => {
     // both corners resolve to the same node and only the first binding survives.
     const rectA = targetRect("rect-a", 200, 0);
     const tap = core.freehandToObject(strokeAlong({ x: 300, y: 30 }, { x: 300, y: 30 }), PEN.color, PEN.widthPx, "draw-4", "a2", "free");
-    const anchors = synthesizeReleaseAnchors(core, [rectA], tap, [
+    const anchors = core.synthesizeCreateAnchorsBoth(sceneOf([rectA]), tap, [
       { target: "rect-a", at: { x: 300, y: 30 } },
       { target: "rect-a", at: { x: 300, y: 30 } }
     ]);

@@ -65,3 +65,23 @@ describe("(2) partial erase cuts the touched subpath into two open pieces", () =
     expect(cut).toBeNull();
   });
 });
+
+describe("(3) the widened partialEraseOps takes a WORLD touch (the shell's inverse-affine moved in-core)", () => {
+  const radius = 24 * GEOMETRY_QUANTUM_PER_PX;
+
+  it("cuts at the world touch and returns an edit-geometry batch (no shell-side world->local mapping)", () => {
+    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0", "free");
+    const scene = { ...emptyObjectScene(), objects: [stroke] };
+    // ORIGIN is (0,0), the transform is identity, so the world touch equals the interior node at (80, 0).
+    const ops = core.partialEraseOps(scene, "draw-1", 80, 0, radius);
+    expect(ops.length).toBeGreaterThan(0);
+    expect(ops[0].kind).toBe("edit-geometry");
+  });
+
+  it("a world touch that misses every node returns [] (stroke left whole)", () => {
+    const stroke = core.freehandToObject(STROKE_POINTS, PEN.color, PEN.widthPx, "draw-1", "a0", "free");
+    const scene = { ...emptyObjectScene(), objects: [stroke] };
+    const ops = core.partialEraseOps(scene, "draw-1", 9999, 9999, radius);
+    expect(ops).toEqual([]);
+  });
+});

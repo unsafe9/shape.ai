@@ -13,9 +13,10 @@ import {
   verifyGestureBindings
 } from "../controller/gestureBindings";
 import { AFFORDANCE_CURSOR, affordanceToCursor, cursorAffordance } from "../controller/cursor";
-import { isPanIntent, shouldQuerySnap, snapRotateDeltaMatrix } from "../renderer/engine";
-import type { HoverAffordance } from "../bridge/wasmLoader";
-import type { RenderTransform3x3 } from "../renderer/scene";
+import { isPanIntent, ShapeCanvasEngine, shouldQuerySnap, type EngineEvent } from "../renderer/engine";
+import * as engineModule from "../renderer/engine";
+import type { HoverAffordance, RustInputBatchResult, RustWebGpuRenderer } from "../bridge/wasmLoader";
+import type { RenderTransform3x3, CameraState } from "../renderer/scene";
 
 let gestures: ObjectGesture[];
 
@@ -87,49 +88,125 @@ describe("pure gesture predicates route the held inputs", () => {
   });
 });
 
-// Build the same rotate-delta the core returns, to compare snap semantics from the
-// matrix alone.
-function rotateAbout(thetaDeg: number, cx: number, cy: number): RenderTransform3x3 {
-  const t = (thetaDeg * Math.PI) / 180;
-  const c = Math.cos(t);
-  const s = Math.sin(t);
-  return [
-    [c, -s, cx - c * cx + s * cy],
-    [s, c, cy - s * cx - c * cy],
-    [0, 0, 1]
-  ];
-}
-
 function angleOf(m: RenderTransform3x3): number {
   return (Math.atan2(m[1][0], m[0][0]) * 180) / Math.PI;
 }
 
-describe("snapRotateDeltaMatrix (coarse-rotate)", () => {
-  it("snaps a swept angle to the nearest 15° step", () => {
-    const center: [number, number] = [200, 140];
-    // Nearest 15° multiple: 22 -> 15, 7 -> 0, -52 -> -45, 38 -> 45.
-    expect(angleOf(snapRotateDeltaMatrix(rotateAbout(22, ...center), 15))).toBeCloseTo(15, 5);
-    expect(angleOf(snapRotateDeltaMatrix(rotateAbout(7, ...center), 15))).toBeCloseTo(0, 5);
-    expect(angleOf(snapRotateDeltaMatrix(rotateAbout(-52, ...center), 15))).toBeCloseTo(-45, 5);
-    expect(angleOf(snapRotateDeltaMatrix(rotateAbout(38, ...center), 15))).toBeCloseTo(45, 5);
+const SNAPPED_15: RenderTransform3x3 = (() => {
+  const t = (15 * Math.PI) / 180;
+  const c = Math.cos(t);
+  const s = Math.sin(t);
+  return [
+    [c, -s, 0],
+    [s, c, 0],
+    [0, 0, 1]
+  ];
+})();
+
+const ROTATE_CAMERA: CameraState = { x: 0, y: 0, zoom: 1 };
+
+// A renderer stub that snaps the rotate delta in-core exactly when coarse-rotate is active (the real
+// behavior, proven by the Rust `coarse_rotate_drag_emits_snapped_delta_in_core` test), and records the
+// setCoarseRotate calls the engine pushes off the mirrored predicate.
+function rotateDragRenderer(): { renderer: RustWebGpuRenderer; coarseCalls: boolean[] } {
+  const coarseCalls: boolean[] = [];
+  let coarse = false;
+  const renderer = {
+    resize() {},
+    renderFrame() {
+      return { backend: "test" } as unknown as ReturnType<RustWebGpuRenderer["renderFrame"]>;
+    },
+    setCoarseRotate(active: boolean) {
+      coarse = active;
+      coarseCalls.push(active);
+    },
+    setObjectPreviewTransform() {},
+    inputBatch(eventsJson: string): RustInputBatchResult {
+      const events = JSON.parse(eventsJson) as Array<{ kind: string }>;
+      const isMove = events.some((e) => e.kind === "pointer-move");
+      // The core only emits the snapped 15° delta when coarse-rotate is active.
+      const matrix = coarse ? SNAPPED_15 : ([[1, 0, 0], [0, 1, 0], [0, 0, 1]] as RenderTransform3x3);
+      return {
+        camera: ROTATE_CAMERA,
+        objectTransformDelta: isMove ? { id: "obj-1", matrix, kind: "rotate" } : null
+      };
+    }
+  } as unknown as RustWebGpuRenderer;
+  return { renderer, coarseCalls };
+}
+
+function recordingCanvas(): { canvas: HTMLCanvasElement; fire: (type: string, event: unknown) => void } {
+  const listeners = new Map<string, Set<EventListener>>();
+  const element = {
+    width: 0,
+    height: 0,
+    addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+      if (typeof listener !== "function") return;
+      const set = listeners.get(type) ?? new Set();
+      set.add(listener);
+      listeners.set(type, set);
+    },
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+      if (typeof listener !== "function") return;
+      listeners.get(type)?.delete(listener);
+    },
+    setPointerCapture() {},
+    releasePointerCapture() {},
+    getBoundingClientRect() {
+      return { left: 0, top: 0, width: 800, height: 600 };
+    }
+  };
+  return {
+    canvas: element as unknown as HTMLCanvasElement,
+    fire: (type, event) => {
+      for (const listener of listeners.get(type) ?? []) listener(event as Event);
+    }
+  };
+}
+
+function driveRotateDrag(shiftHeld: boolean): {
+  commit: Extract<EngineEvent, { type: "object-transform-commit" }> | null;
+  coarseCalls: boolean[];
+} {
+  const events: EngineEvent[] = [];
+  const { canvas, fire } = recordingCanvas();
+  const { renderer, coarseCalls } = rotateDragRenderer();
+  // eslint-disable-next-line no-new
+  new ShapeCanvasEngine({
+    canvas,
+    overlayRoot: { append() {} } as unknown as HTMLElement,
+    backend: "test",
+    webGpuRenderer: renderer,
+    onEvent: (event) => events.push(event)
+  });
+  const base = { pointerId: 7, pointerType: "pen", shiftKey: shiftHeld, altKey: false, metaKey: false, ctrlKey: false };
+  fire("pointerdown", { ...base, button: 0, clientX: 10, clientY: 10, preventDefault() {} });
+  fire("pointermove", { ...base, clientX: 60, clientY: 40, preventDefault() {} });
+  fire("pointerup", { ...base, clientX: 60, clientY: 40, preventDefault() {} });
+  const commit = (events.find((e) => e.type === "object-transform-commit") ?? null) as
+    | Extract<EngineEvent, { type: "object-transform-commit" }>
+    | null;
+  return { commit, coarseCalls };
+}
+
+describe("coarse-rotate is core-driven (no shell matrix decomposition)", () => {
+  it("the engine exports no snapRotateDeltaMatrix (the shell never decomposes the rotate matrix)", () => {
+    expect((engineModule as Record<string, unknown>).snapRotateDeltaMatrix).toBeUndefined();
   });
 
-  it("rotates about the SAME center it recovered from the matrix", () => {
-    const cx = 311;
-    const cy = -88;
-    const snapped = snapRotateDeltaMatrix(rotateAbout(44, cx, cy), 15);
-    // Rebuilt about (cx,cy) must fix that center point.
-    const fx = snapped[0][0] * cx + snapped[0][1] * cy + snapped[0][2];
-    const fy = snapped[1][0] * cx + snapped[1][1] * cy + snapped[1][2];
-    expect(fx).toBeCloseTo(cx, 4);
-    expect(fy).toBeCloseTo(cy, 4);
-    expect(angleOf(snapped)).toBeCloseTo(45, 6);
+  it("drives setCoarseRotate(true) off the mirrored predicate when Shift is NOT held (coarse by default)", () => {
+    const { commit, coarseCalls } = driveRotateDrag(false);
+    // Inverted predicate: no Shift => coarse active.
+    expect(coarseCalls.at(-1)).toBe(true);
+    // The committed transform carries the core's already-snapped 15° angle, consumed verbatim.
+    expect(commit).not.toBeNull();
+    expect(commit!.kind).toBe("rotate");
+    expect(angleOf(commit!.matrix)).toBeCloseTo(15, 5);
   });
 
-  it("leaves an exact-multiple sweep unchanged", () => {
-    const m = rotateAbout(90, 50, 50);
-    const snapped = snapRotateDeltaMatrix(m, 15);
-    expect(angleOf(snapped)).toBeCloseTo(90, 6);
+  it("drives setCoarseRotate(false) when Shift IS held (free rotation), so the core does not snap", () => {
+    const { coarseCalls } = driveRotateDrag(true);
+    expect(coarseCalls.at(-1)).toBe(false);
   });
 });
 

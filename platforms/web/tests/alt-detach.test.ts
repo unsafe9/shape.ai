@@ -5,7 +5,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { ShapeCanvasEngine, type EngineEvent } from "../renderer/engine";
-import { altDetachOps } from "../controller/objectPrimitives";
 import { commitBodyDrag, isDetachableBodyDrag } from "../controller/interactions";
 import type { ObjectSelection } from "../shared/object";
 import { GESTURE_BINDINGS, GESTURE_DETACH_ALT, isDetachDrag } from "../controller/gestureBindings";
@@ -148,9 +147,9 @@ function anchoredScene(): ObjectScene {
   };
 }
 
-describe("altDetachOps composition (the App onTransformCommit detach branch)", () => {
+describe("core detachMoveOps (the App onTransformCommit detach branch)", () => {
   it("authors set-anchor [] + a WHOLE SetTransform translate (no chord deform)", () => {
-    const ops = altDetachOps(core, anchoredScene(), LINE_ID, TRANSLATE_40_30);
+    const ops = core.detachMoveOps(anchoredScene(), LINE_ID, TRANSLATE_40_30);
     expect(ops[0]).toEqual({ kind: "set-anchor", id: LINE_ID, anchors: [] });
     const transform = ops.find((o) => o.kind === "set-transform" && o.id === LINE_ID);
     expect(transform).toBeDefined();
@@ -190,12 +189,13 @@ describe("commitBodyDrag detach branch (the App onTransformCommit decision)", ()
     const scene = anchoredScene();
     const line = scene.objects.find((o) => o.id === LINE_ID)!;
     const rect = scene.objects.find((o) => o.id === TARGET_ID)!;
-    const single = { kind: "single", id: LINE_ID } as const;
-    expect(isDetachableBodyDrag(core, line, single, "translate", true)).toBe(true);
-    expect(isDetachableBodyDrag(core, line, single, "rotate", true)).toBe(false);
-    expect(isDetachableBodyDrag(core, line, single, "translate", false)).toBe(false);
+    const single: ObjectSelection = { kind: "object", id: LINE_ID };
+    expect(isDetachableBodyDrag(core, line, single, LINE_ID, "translate", true)).toBe(true);
+    expect(isDetachableBodyDrag(core, line, single, LINE_ID, "rotate", true)).toBe(false);
+    expect(isDetachableBodyDrag(core, line, single, LINE_ID, "translate", false)).toBe(false);
     // Closed-class object (the rect) is not detachable even with anchors held.
-    expect(isDetachableBodyDrag(core, { ...rect, anchors: [{ nodeIndex: 0, target: LINE_ID, at: { x: 0, y: 0 } }] }, single, "translate", true)).toBe(false);
-    expect(isDetachableBodyDrag(core, line, { kind: "multi", ids: [LINE_ID, TARGET_ID] }, "translate", true)).toBe(false);
+    expect(isDetachableBodyDrag(core, { ...rect, anchors: [{ nodeIndex: 0, target: LINE_ID, at: { x: 0, y: 0 } }] }, single, LINE_ID, "translate", true)).toBe(false);
+    // A Multi drag anchored on a member (the whole-set move) is never a single-root detach.
+    expect(isDetachableBodyDrag(core, line, { kind: "multi", ids: [LINE_ID, TARGET_ID] }, LINE_ID, "translate", true)).toBe(false);
   });
 });

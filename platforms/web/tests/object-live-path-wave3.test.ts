@@ -1,6 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { objectSceneToRenderObjectScene } from "../controller/canvasHost";
 import { type DragSpan } from "../controller/objectPrimitives";
 import { applyDocumentTheme } from "../renderer/scene";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../bridge/sceneCoreWasm";
@@ -162,17 +161,12 @@ describe("wave-3 live paths compose through one shared scene", () => {
     expect(shell.byId("frame-1")).toBeUndefined();
     expect(shell.byId("rect-1")?.parent).toBeUndefined();
 
-    // (E) a borderless text primitive takes a set-text op; the projected feed carries
-    // the runs the renderer shapes into glyph quads.
+    // (E) a borderless text primitive takes a set-text op carrying the runs the renderer shapes into glyph quads.
     const note = core.buildPrimitive("text", { x: 700, y: 100 }, "note-1", "a3");
     expect(note.text).toBeUndefined();
     shell.author({ kind: "insert-object", object: note });
     shell.author({ kind: "set-text", id: "note-1", text: { runs: [{ text: "Live", bold: false, italic: false }], align: "start", valign: "top" } });
     expect(shell.byId("note-1")?.text?.runs[0]?.text).toBe("Live");
-    const feed = objectSceneToRenderObjectScene(shell.scene, { x: 0, y: 0, zoom: 1 }, shell.selection, "ig1");
-    const feedNote = (feed.objects as Array<Record<string, unknown>>).find((o) => o.id === "note-1")!;
-    expect((feedNote.text as { runs: Array<{ text: string }> }).runs[0].text).toBe("Live");
-    expect(typeof feedNote.geometryD).toBe("string");
 
     // (F) a rotate-handle delta composes onto the rect's transform and lands as ONE
     // undoable set-transform (the preview is the commit).
@@ -199,16 +193,6 @@ describe("wave-3 live paths compose through one shared scene", () => {
     shell.author({ kind: "insert-object", object: edge });
     shell.author({ kind: "set-anchor", id: "edge-1", anchors: anchors! });
     expect(shell.byId("edge-1")?.anchors?.[0].target).toBe("ell-1");
-    // Regression: the wire projection MUST carry each object's anchors, or the core's
-    // bindings graph has zero anchor edges and a moved target never reprojects its
-    // follower live. Fails if objectSceneToRenderObjectScene omits anchors again.
-    const anchorFeed = objectSceneToRenderObjectScene(shell.scene, { x: 0, y: 0, zoom: 1 }, shell.selection, "ig1-anchor");
-    const feedEdge = (anchorFeed.objects as Array<Record<string, unknown>>).find((o) => o.id === "edge-1")!;
-    const feedAnchors = feedEdge.anchors as Array<{ nodeIndex: number; target: string; at: { x: number; y: number } }>;
-    expect(feedAnchors).toHaveLength(1);
-    expect(feedAnchors[0].target).toBe("ell-1");
-    expect(typeof feedAnchors[0].nodeIndex).toBe("number");
-    expect(typeof feedAnchors[0].at.x).toBe("number");
     // Move-together: a set-transform on the target must reproject the bound node so it
     // tracks the +200/+60 delta. worldNode1 is the anchored endpoint before vs after.
     const worldNode1 = (obj: SceneObject): { x: number; y: number } => {

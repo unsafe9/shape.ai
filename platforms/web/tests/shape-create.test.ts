@@ -1,8 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   type DragSpan,
-  type CreateSnap,
-  resolveCreateRelease
+  type CreateSnap
 } from "../controller/objectPrimitives";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../bridge/sceneCoreWasm";
 import { isDragCreateShape } from "../controller/toolbar";
@@ -11,12 +10,13 @@ import { GEOMETRY_QUANTUM_PER_PX } from "../shared/object";
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 
+let core: SceneCore;
+beforeAll(async () => {
+  await ensureSceneCore();
+  core = await loadSceneCore();
+});
+
 describe("sceneCore.buildPrimitiveFromDrag (bbox sizing)", () => {
-  let core: SceneCore;
-  beforeAll(async () => {
-    await ensureSceneCore();
-    core = await loadSceneCore();
-  });
 
   it("sizes a rectangle to the normalized drag bbox and positions it at the top-left", () => {
     const span: DragSpan = { start: { x: 100, y: 200 }, end: { x: 260, y: 300 } };
@@ -95,7 +95,7 @@ describe("resolveCreateRelease (anchor-on-release reuse)", () => {
   const lastSnap: CreateSnap = { at: { x: 200, y: 30 }, target: "rect-a" };
 
   it("honors the release-time snap when it hit (no reuse needed)", () => {
-    const r = resolveCreateRelease(
+    const r = core.resolveCreateRelease(
       { end: { x: 201, y: 31 }, snapped: true, target: "rect-a" },
       null,
       24
@@ -106,7 +106,7 @@ describe("resolveCreateRelease (anchor-on-release reuse)", () => {
   it("reuses the gesture's last snap when the release MISSED but landed within tolerance", () => {
     // Release missed the 8px snap but is ~6.4 world units from the last snap, inside
     // tolerance 24, so the endpoint is pulled onto the edge point.
-    const r = resolveCreateRelease(
+    const r = core.resolveCreateRelease(
       { end: { x: 205, y: 33 }, snapped: false, target: null },
       lastSnap,
       24
@@ -115,7 +115,7 @@ describe("resolveCreateRelease (anchor-on-release reuse)", () => {
   });
 
   it("does NOT reuse when the release missed and is FAR from the last snap (deliberate empty release)", () => {
-    const r = resolveCreateRelease(
+    const r = core.resolveCreateRelease(
       { end: { x: 400, y: 400 }, snapped: false, target: null },
       lastSnap,
       24
@@ -124,7 +124,7 @@ describe("resolveCreateRelease (anchor-on-release reuse)", () => {
   });
 
   it("authors nothing when the gesture never snapped and the release missed", () => {
-    const r = resolveCreateRelease(
+    const r = core.resolveCreateRelease(
       { end: { x: 50, y: 50 }, snapped: false, target: null },
       null,
       24
@@ -133,17 +133,30 @@ describe("resolveCreateRelease (anchor-on-release reuse)", () => {
   });
 
   it("reuse boundary is the tolerance radius (just inside = reuse, just outside = drop)", () => {
-    const justInside = resolveCreateRelease(
+    const justInside = core.resolveCreateRelease(
       { end: { x: 200 + 23, y: 30 }, snapped: false, target: null },
       lastSnap,
       24
     );
     expect(justInside.target).toBe("rect-a");
-    const justOutside = resolveCreateRelease(
+    const justOutside = core.resolveCreateRelease(
       { end: { x: 200 + 25, y: 30 }, snapped: false, target: null },
       lastSnap,
       24
     );
     expect(justOutside.target).toBeNull();
+  });
+});
+
+describe("createThresholds (the screen-px thresholds the shell reads from the core, holds no copy)", () => {
+  it("exposes the recognize consts so the shell divides them by zoom instead of holding a literal", () => {
+    // Pins the bridge to the core values (recognize::MIN_DRAG_EXTENT_PX / CREATE_ANCHOR_REUSE_TOLERANCE_PX /
+    // MERGE_ENDPOINT_TOLERANCE_PX). Fails if the shell drifts back to its own threshold copy or the
+    // export decouples from the core consts.
+    expect(core.createThresholds()).toEqual({
+      minDragExtentPx: 4,
+      createAnchorReuseTolerancePx: 24,
+      mergeEndpointTolerancePx: 12
+    });
   });
 });

@@ -81,7 +81,7 @@ export class SceneClient {
   private windowState: WasmWindow | null = null;
   private viewportTimer: unknown = null;
 
-  private readonly sceneListeners = new Set<(scene: ObjectScene) => void>();
+  private readonly sceneListeners = new Set<(scene: ObjectScene, settledKeys: string[]) => void>();
   private readonly patchListeners = new Set<(patch: PatchMessage) => void>();
   private readonly featureListeners = new Set<(response: FeatureResponse) => void>();
   private readonly statusListeners = new Set<(status: ConnectionStatus) => void>();
@@ -157,7 +157,7 @@ export class SceneClient {
 
     this.detachEngine = transport.attachEngine(engine);
 
-    this.offEnginePatch = engine.onScene((scene) => this.emitScene(scene));
+    this.offEnginePatch = engine.onScene((scene, settledKeys) => this.emitScene(scene, settledKeys));
     this.offTransportPatch = transport.onPatch((patch) => this.emitPatch(patch));
     this.offTransportFeature = transport.onFeature((frame) => this.emitFeature(frame));
     this.offTransportStatus = transport.onStatus((status) => this.emitStatus(status));
@@ -264,8 +264,10 @@ export class SceneClient {
     return this.peers.list();
   }
 
-  // Subscribe to optimistic scene updates; returns an unsubscribe.
-  onScene(cb: (scene: ObjectScene) => void): Unsubscribe {
+  // Subscribe to optimistic scene updates. The second arg is the `(object,field)` keys whose preview
+  // SETTLED with this update (an ack/reject released the last unacked write); the shell clears its
+  // optimistic preview off these, not a value compare. Returns an unsubscribe.
+  onScene(cb: (scene: ObjectScene, settledKeys: string[]) => void): Unsubscribe {
     this.sceneListeners.add(cb);
     return () => this.sceneListeners.delete(cb);
   }
@@ -372,8 +374,8 @@ export class SceneClient {
     if (added || expired) this.emitPeers();
   }
 
-  private emitScene(scene: ObjectScene): void {
-    for (const cb of this.sceneListeners) cb(scene);
+  private emitScene(scene: ObjectScene, settledKeys: string[]): void {
+    for (const cb of this.sceneListeners) cb(scene, settledKeys);
   }
 
   private emitPatch(patch: PatchMessage): void {

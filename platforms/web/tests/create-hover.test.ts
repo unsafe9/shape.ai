@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { ShapeCanvasEngine, createMoveEmission, type EngineEvent } from "../renderer/engine";
 import { buildFeedScene, canonicalizeHoverSnap } from "../controller/interactions";
 import { THEME_DEFAULT_COLOR } from "../controller/objectPrimitives";
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../bridge/sceneCoreWasm";
 import { emptyObjectScene, type Object as SceneObject, type ObjectScene } from "../shared/object";
 import type {
   RustInputBatchResult,
@@ -36,6 +37,10 @@ function mockRenderer(camera: { x: number; y: number; zoom: number }): RustWebGp
     },
     inputBatch(): RustInputBatchResult {
       return { camera };
+    },
+    // The core's screen→world un-projection over the live camera (the engine emits world via this bridge).
+    screenToWorld(screenX: number, screenY: number) {
+      return { x: (screenX - camera.x) / camera.zoom, y: (screenY - camera.y) / camera.zoom };
     },
     nearestOutlinePoint(worldX: number, worldY: number, tolPx: number, zoom: number, excludeIdsJson: string) {
       const tolWorld = tolPx / Math.max(0.025, zoom);
@@ -193,11 +198,16 @@ describe("canonicalizeHoverSnap (handleCreateHover)", () => {
 // A hover snap with no drag in progress appends one snap-indicator ring; a drag's
 // own preview takes over so the ring is never doubled.
 describe("buildFeedScene renders the persistent hover ring", () => {
+  let core: SceneCore;
+  beforeAll(async () => {
+    await ensureSceneCore();
+    core = await loadSceneCore();
+  });
   const base = sceneOf(["rect-1"]);
   const order = () => "z0";
 
   it("appends a snap-indicator ring from the hover snap when no drag is in progress", () => {
-    const feed = buildFeedScene(base, null, null, null, { at: { x: 200, y: 200 }, target: "rect-1" }, order, THEME_DEFAULT_COLOR, 2);
+    const feed = buildFeedScene(core, base, null, null, null, { at: { x: 200, y: 200 }, target: "rect-1" }, order, THEME_DEFAULT_COLOR, 2);
     const added = feed.objects.filter((o) => !base.objects.some((b) => b.id === o.id));
     expect(added.map((o) => o.id)).toEqual(["create-snap-indicator"]);
   });
@@ -206,6 +216,7 @@ describe("buildFeedScene renders the persistent hover ring", () => {
     // A drag's own preview/snap-indicator takes over: the standalone hover ring is
     // suppressed (the else-if branch), so only the drag preview objects are added.
     const feed = buildFeedScene(
+      core,
       base,
       null,
       "rectangle",
@@ -221,8 +232,39 @@ describe("buildFeedScene renders the persistent hover ring", () => {
   });
 
   it("leaves the feed untouched when there is no pen / drag / hover", () => {
-    const feed = buildFeedScene(base, null, null, null, null, order, THEME_DEFAULT_COLOR, 2);
+    const feed = buildFeedScene(core, base, null, null, null, null, order, THEME_DEFAULT_COLOR, 2);
     expect(feed).toBe(base);
+  });
+
+  it("sources the create-preview + snap-ring geometry from the core, not TS", () => {
+    // FALSIFIABLE: the feed objects' geometry.d must equal the core's build_primitive_from_drag d for the
+    // SAME span/kind — proving the shell no longer computes the path/kappa in TS but routes to the core.
+    // Reintroducing a TS-computed path (different rounding/representation) fails this.
+    const previewSpan = { start: { x: 3, y: 7 }, end: { x: 91, y: 44 } };
+    for (const kind of ["line", "rectangle", "ellipse"] as const) {
+      const feed = buildFeedScene(
+        core,
+        base,
+        null,
+        kind,
+        { span: previewSpan, snapped: true },
+        null,
+        order,
+        THEME_DEFAULT_COLOR,
+        2
+      );
+      const preview = feed.objects.find((o) => o.id === "create-preview")!;
+      const corePreview = core.buildPrimitiveFromDrag(kind, previewSpan, "create-preview", "z0", THEME_DEFAULT_COLOR);
+      expect(preview.geometry.d).toBe(corePreview.geometry.d);
+      expect(preview.transform).toEqual(corePreview.transform);
+
+      const ring = feed.objects.find((o) => o.id === "create-snap-indicator")!;
+      const r = 5;
+      const ringSpan = { start: { x: previewSpan.end.x - r, y: previewSpan.end.y - r }, end: { x: previewSpan.end.x + r, y: previewSpan.end.y + r } };
+      const coreRing = core.buildPrimitiveFromDrag("ellipse", ringSpan, "create-snap-indicator", "z0", "#ff3b6b");
+      expect(ring.geometry.d).toBe(coreRing.geometry.d);
+      expect(ring.transform).toEqual(coreRing.transform);
+    }
   });
 });
 

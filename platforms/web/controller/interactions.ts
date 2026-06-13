@@ -13,8 +13,8 @@ import {
   type Paint,
   type Transform3x3
 } from "../shared/object";
-import type { MoveRoots, ObjectCommand, SceneCore } from "../bridge/sceneCoreWasm";
-import { THEME_DEFAULT_COLOR, altDetachOps, type DragSpan } from "./objectPrimitives";
+import type { ObjectCommand, SceneCore } from "../bridge/sceneCoreWasm";
+import { THEME_DEFAULT_COLOR, type DragSpan } from "./objectPrimitives";
 import type { DragCreateShape, PrimitiveKindId } from "./toolbar";
 
 // A plain pick on a member of the current Multi keeps the Multi (so a group-drag never collapses to
@@ -32,36 +32,32 @@ export function routeMarquee(ids: string[]): ObjectSelection {
   return { kind: "canvas" };
 }
 
-// A Multi drag anchored on the picked `id` moves EVERY member; otherwise the dragged single root
-// cascades to its own subtree.
-export function moveRootsFor(selection: ObjectSelection, id: string): MoveRoots {
-  return selection.kind === "multi" && selection.ids.includes(id)
-    ? { kind: "multi", ids: selection.ids }
-    : { kind: "single", id };
-}
-
 // An Alt-held BODY translate of an anchored open-class single object is detachable (moves whole,
-// clears its anchors). The class judgment is the core's; only single-root translate body drags qualify.
+// clears its anchors). The class judgment is the core's; only single-root translate body drags qualify —
+// a Multi drag anchored on a member (the whole-set move) is never a detach.
 export function isDetachableBodyDrag(
   core: Pick<SceneCore, "isOpenClassD">,
   src: SceneObject,
-  roots: MoveRoots,
+  selection: ObjectSelection,
+  id: string,
   kind: string,
   detach: boolean
 ): boolean {
+  const singleRoot = !(selection.kind === "multi" && selection.ids.includes(id));
   return (
     detach &&
     kind === "translate" &&
-    roots.kind === "single" &&
+    singleRoot &&
     (src.anchors?.length ?? 0) > 0 &&
     core.isOpenClassD(src.geometry.d ?? "")
   );
 }
 
 // The commit ops for a body drag — the Alt-detach composition when detachable, else the core's
-// combined cascade + anchor-follow moveOps — collapsed to a single ObjectOp (one op stays bare; many batch).
+// combined cascade + anchor-follow moveOpsForPick (which derives the MoveRoots from selection + picked
+// id in-core) — collapsed to a single ObjectOp (one op stays bare; many batch).
 export function commitBodyDrag(
-  core: Pick<SceneCore, "isOpenClassD" | "moveOps">,
+  core: Pick<SceneCore, "isOpenClassD" | "detachMoveOps" | "moveOpsForPick">,
   scene: ObjectScene,
   selection: ObjectSelection,
   id: string,
@@ -70,11 +66,10 @@ export function commitBodyDrag(
   detach: boolean
 ): { op: ObjectOp; allOps: ObjectOp[] } {
   const src = scene.objects.find((o) => o.id === id);
-  const roots = moveRootsFor(selection, id);
   const allOps =
-    src && isDetachableBodyDrag(core, src, roots, kind, detach)
-      ? altDetachOps(core, scene, id, matrix)
-      : core.moveOps(scene, roots, matrix);
+    src && isDetachableBodyDrag(core, src, selection, id, kind, detach)
+      ? core.detachMoveOps(scene, id, matrix)
+      : core.moveOpsForPick(scene, selection, id, matrix);
   const op: ObjectOp = allOps.length === 1 ? allOps[0] : { kind: "batch", ops: allOps };
   return { op, allOps };
 }
@@ -164,36 +159,6 @@ export function buildColorApplyOp(
   const object = scene.objects.find((o) => o.id === selection.id);
   if (!object) return null;
   return core.buildSetStyleOp(object, color);
-}
-
-// The batch grouping `ids` under a fresh frame — insert a rect frame sized to the children's union
-// world-AABB, then reparent each child under it (world-absolute transforms reparent unchanged).
-// `bounds` is the union AABB (null = degenerate 1x1 at origin).
-export function buildGroupOps(
-  ids: string[],
-  objects: SceneObject[],
-  bounds: { minX: number; minY: number; maxX: number; maxY: number } | null,
-  frameId: string,
-  frameOrder: string,
-  rectPath: (w: number, h: number) => string
-): { ops: ObjectOp[]; frameId: string } {
-  const frame: SceneObject = {
-    id: frameId,
-    order: frameOrder,
-    transform: bounds ? translateTransform(bounds.minX, bounds.minY) : translateTransform(0, 0),
-    geometry: {
-      d: rectPath(bounds ? bounds.maxX - bounds.minX : 1, bounds ? bounds.maxY - bounds.minY : 1),
-      fillRule: "nonZero"
-    },
-    clip: false
-  };
-  const ops: ObjectOp[] = [{ kind: "insert-object", object: frame }];
-  let order = "a0";
-  for (const id of ids) {
-    ops.push({ kind: "reparent", id, parent: frame.id, order });
-    order = `${order}~`;
-  }
-  return { ops, frameId: frame.id };
 }
 
 // The double-click action — the core's container-vs-leaf decision for the signal's object; null signal is a no-op.
@@ -330,75 +295,43 @@ export function drawPreviewObject(
   };
 }
 
-// The transient rubber-band for one drag-create frame. Mirrors the core's build_primitive_from_drag
-// geometry (line corner-to-corner; closed kinds to the normalized bbox) cheaply in TS so the
-// per-frame preview never crosses the FFI boundary.
+// The transient rubber-band for one drag-create frame. The GEOMETRY (path + transform) comes from the
+// core's build_primitive_from_drag — the same per-frame build the commit uses — so the preview never
+// diverges from the committed object. The shell keeps only the transient id and overrides the paint to
+// the preview appearance (no fill; a 2px butt/miter stroke painted via previewPaint), discarding the
+// core primitive's default fill/stroke style.
 export function createPreviewObject(
+  core: Pick<SceneCore, "buildPrimitiveFromDrag">,
   kind: DragCreateShape,
   span: DragSpan,
   order: string,
   selectedColor: string
 ): SceneObject {
-  let d: string;
-  let tx: number;
-  let ty: number;
-  if (kind === "line") {
-    d = `M 0 0 L ${q(span.end.x - span.start.x)} ${q(span.end.y - span.start.y)}`;
-    tx = span.start.x;
-    ty = span.start.y;
-  } else {
-    const w = Math.abs(span.end.x - span.start.x);
-    const h = Math.abs(span.end.y - span.start.y);
-    d = kind === "ellipse" ? previewEllipsePath(w, h) : `M 0 0 L ${q(w)} 0 L ${q(w)} ${q(h)} L 0 ${q(h)} Z`;
-    tx = Math.min(span.start.x, span.end.x);
-    ty = Math.min(span.start.y, span.end.y);
-  }
+  const built = core.buildPrimitiveFromDrag(kind, span, "create-preview", order, selectedColor);
   return {
-    id: "create-preview",
-    order,
-    transform: translateTransform(tx, ty),
-    geometry: { d, fillRule: "nonZero" },
+    ...built,
+    fill: null,
     stroke: { paint: previewPaint(selectedColor), width: 2 * GEOMETRY_QUANTUM_PER_PX, opacity: 1, cap: "butt", join: "miter" }
   };
 }
 
-// The four-cubic ellipse rubber-band path (kappa 0.5523), object-local quantized. Preview only; the committed ellipse is built by the core.
-function previewEllipsePath(w: number, h: number): string {
-  const cx = q(w / 2);
-  const cy = q(h / 2);
-  const kx = Math.round(q(w / 2) * 0.5523);
-  const ky = Math.round(q(h / 2) * 0.5523);
-  return [
-    `M 0 ${cy}`,
-    `C 0 ${cy - ky} ${cx - kx} 0 ${cx} 0`,
-    `C ${cx + kx} 0 ${q(w)} ${cy - ky} ${q(w)} ${cy}`,
-    `C ${q(w)} ${cy + ky} ${cx + kx} ${q(h)} ${cx} ${q(h)}`,
-    `C ${cx - kx} ${q(h)} 0 ${cy + ky} 0 ${cy}`,
-    "Z"
-  ].join(" ");
-}
-
-// A small ring drawn at a snapped corner so the user sees the snap — a world-px ellipse (identity
-// transform, so local==world), built in TS (NOT op-apply).
-export function snapIndicatorObject(at: { x: number; y: number }, order: string): SceneObject {
-  const r = 5;
-  const k = r * 0.5523;
-  const cx = at.x;
-  const cy = at.y;
-  const d = [
-    `M ${q(cx - r)} ${q(cy)}`,
-    `C ${q(cx - r)} ${q(cy - k)} ${q(cx - k)} ${q(cy - r)} ${q(cx)} ${q(cy - r)}`,
-    `C ${q(cx + k)} ${q(cy - r)} ${q(cx + r)} ${q(cy - k)} ${q(cx + r)} ${q(cy)}`,
-    `C ${q(cx + r)} ${q(cy + k)} ${q(cx + k)} ${q(cy + r)} ${q(cx)} ${q(cy + r)}`,
-    `C ${q(cx - k)} ${q(cy + r)} ${q(cx - r)} ${q(cy + k)} ${q(cx - r)} ${q(cy)}`,
-    "Z"
-  ].join(" ");
+// A small ring drawn at a snapped corner so the user sees the snap. Its geometry is the core's ellipse
+// over a 10x10 bbox centered on `at` (r=5), so the kappa-Bezier math lives only in the core; the shell
+// keeps the transient id and the ring appearance (no fill; a 2px round/round #ff3b6b stroke).
+const SNAP_RING_RADIUS = 5;
+const SNAP_RING_COLOR = "#ff3b6b";
+export function snapIndicatorObject(
+  core: Pick<SceneCore, "buildPrimitiveFromDrag">,
+  at: { x: number; y: number },
+  order: string
+): SceneObject {
+  const r = SNAP_RING_RADIUS;
+  const span: DragSpan = { start: { x: at.x - r, y: at.y - r }, end: { x: at.x + r, y: at.y + r } };
+  const built = core.buildPrimitiveFromDrag("ellipse", span, "create-snap-indicator", order, SNAP_RING_COLOR);
   return {
-    id: "create-snap-indicator",
-    order,
-    transform: translateTransform(0, 0),
-    geometry: { d, fillRule: "nonZero" },
-    stroke: { paint: { kind: "solid", color: "#ff3b6b" }, width: 2 * GEOMETRY_QUANTUM_PER_PX, opacity: 1, cap: "round", join: "round" }
+    ...built,
+    fill: null,
+    stroke: { paint: { kind: "solid", color: SNAP_RING_COLOR }, width: 2 * GEOMETRY_QUANTUM_PER_PX, opacity: 1, cap: "round", join: "round" }
   };
 }
 
@@ -406,6 +339,7 @@ export function snapIndicatorObject(at: { x: number; y: number }, order: string)
 // drag-create rubber-band + snap indicator, or the persistent pre-drag hover ring when no drag is
 // in progress). Never mutates the canonical scene nor runs op-apply. The order factory puts every preview on top.
 export function buildFeedScene(
+  core: Pick<SceneCore, "buildPrimitiveFromDrag"> | null,
   source: ObjectScene,
   pen: { x: number; y: number }[] | null,
   create: DragCreateShape | null,
@@ -418,13 +352,15 @@ export function buildFeedScene(
   let feed = source;
   const preview = pen && pen.length >= 1 ? drawPreviewObject(pen, nextOrder(), selectedColor, penWidthPx) : null;
   if (preview) feed = { ...feed, objects: [...feed.objects, preview] };
-  if (create && createState) {
-    const extra: SceneObject[] = [createPreviewObject(create, createState.span, nextOrder(), selectedColor)];
-    if (createState.snapped) extra.push(snapIndicatorObject(createState.span.end, nextOrder()));
+  // The drag-create preview + snap ring source their geometry from the core; pre-load (core null) the
+  // create path cannot commit anyway, so the transient feed simply omits them until the core is ready.
+  if (core && create && createState) {
+    const extra: SceneObject[] = [createPreviewObject(core, create, createState.span, nextOrder(), selectedColor)];
+    if (createState.snapped) extra.push(snapIndicatorObject(core, createState.span.end, nextOrder()));
     feed = { ...feed, objects: [...feed.objects, ...extra] };
-  } else if (hoverSnap) {
+  } else if (core && hoverSnap) {
     // No drag in progress — render the persistent pre-drag anchor ring at the hovered edge.
-    feed = { ...feed, objects: [...feed.objects, snapIndicatorObject(hoverSnap.at, nextOrder())] };
+    feed = { ...feed, objects: [...feed.objects, snapIndicatorObject(core, hoverSnap.at, nextOrder())] };
   }
   return feed;
 }

@@ -1,5 +1,4 @@
 import {
-  screenToWorld,
   type CameraState,
   type FrameStats,
   type RenderTransform3x3,
@@ -14,7 +13,6 @@ import type {
   RustWebGpuRenderer
 } from "../bridge/wasmLoader";
 import {
-  COARSE_ROTATE_SNAP_DEG,
   isAdditiveSelect,
   isCoarseRotate,
   isDetachDrag,
@@ -157,8 +155,10 @@ export class ShapeCanvasEngine {
   // The previous eraser sample's screen point, so each move runs the swept hit-test over (prev -> curr)
   // and erases every crossed object — a fast drag that skips between samples still erases the whole path.
   private lastEraseScreen: WorldPoint | null = null;
-  // Shift held at the latest event; a rotate delta with Shift held re-snaps to the catalog step (15°).
+  // Shift held at the latest event; drives the core's coarse-rotate mode bit (inverted: Shift = free).
   private shiftHeld = false;
+  // The last coarse-rotate active bit pushed to the core, so syncCoarseRotate skips redundant boundary calls.
+  private coarseRotatePushed: boolean | null = null;
   // Alt held at the latest event. Two gestures read it outside a handler: the endpoint-drag release-snap
   // bypass (processInputResult) and the transform-commit detach bit (commitObjectDrag).
   private altHeld = false;
@@ -285,6 +285,36 @@ export class ShapeCanvasEngine {
       return;
     }
     this.sendInputBatch([{ kind: "set-multi-select", ids }]);
+  }
+
+  // Push the coarse-rotate modifier (e.g. Shift held) as a renderer-held mode bit; the core's rotate
+  // drag arm snaps the swept delta in-core. Prefers the direct wasm method, falls back to a
+  // set-coarse-rotate input event. The shell never decomposes/rebuilds the rotate matrix.
+  setCoarseRotate(active: boolean) {
+    if (!this.webGpuRenderer) return;
+    if (typeof this.webGpuRenderer.setCoarseRotate === "function") {
+      try {
+        this.webGpuRenderer.setCoarseRotate(active);
+        this.rustBoundaryCalls += 1;
+      } catch (error) {
+        this.onEvent({
+          type: "status",
+          message: error instanceof Error ? `Rust setCoarseRotate failed: ${error.message}` : "Rust setCoarseRotate failed"
+        });
+      }
+      return;
+    }
+    this.sendInputBatch([{ kind: "set-coarse-rotate", active }]);
+  }
+
+  // Push the coarse-rotate mode bit derived from the latest Shift state through the sanctioned mirrored
+  // predicate (inverted: coarse by default, Shift = free). The core then emits the 15°-snapped rotate
+  // delta directly, so the shell never decomposes the matrix. Skips redundant pushes (idempotent).
+  private syncCoarseRotate() {
+    const active = !isCoarseRotate({ shiftKey: this.shiftHeld });
+    if (active === this.coarseRotatePushed) return;
+    this.coarseRotatePushed = active;
+    this.setCoarseRotate(active);
   }
 
   wheelAtScreen(screen: WorldPoint, deltaY: number) {
@@ -421,6 +451,7 @@ export class ShapeCanvasEngine {
     if (isMousePointerEvent(event)) return;
     this.shiftHeld = event.shiftKey;
     this.altHeld = event.altKey;
+    this.syncCoarseRotate();
     // Space-hold pans even under the draw tool; arm the core pan path first.
     const pan = isPanIntent({ spaceHeld: this.spaceHeld, button: event.button });
     if (this.activeTool === "draw" && !pan) {
@@ -453,6 +484,7 @@ export class ShapeCanvasEngine {
     if (isMousePointerEvent(event)) return;
     this.shiftHeld = event.shiftKey;
     this.altHeld = event.altKey;
+    this.syncCoarseRotate();
     // A Space-armed pan stays on the pan path for the whole gesture, even under the draw tool.
     if (this.activeTool === "draw" && !this.panGestureActive) {
       // A move with no stroke in progress is a bare hover — emit the anchor-ring snap probe instead of a stroke sample.
@@ -570,6 +602,7 @@ export class ShapeCanvasEngine {
   private onMouseDown = (event: MouseEvent) => {
     this.shiftHeld = event.shiftKey;
     this.altHeld = event.altKey;
+    this.syncCoarseRotate();
     // Left (0) drives select/draw; middle (1) is a pan gesture; right (2) is the context menu (shell-handled) — ignore here.
     const pan = isPanIntent({ spaceHeld: this.spaceHeld, button: event.button });
     if (event.button !== 0 && !pan) return;
@@ -608,6 +641,7 @@ export class ShapeCanvasEngine {
     event.preventDefault();
     this.shiftHeld = event.shiftKey;
     this.altHeld = event.altKey;
+    this.syncCoarseRotate();
     if (this.activeTool === "draw" && !this.panGestureActive) {
       this.emitDraw("move", event);
       return;
@@ -677,6 +711,14 @@ export class ShapeCanvasEngine {
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   }
 
+  // The world point under a pointer event, un-projected through the LIVE core camera (the renderer's
+  // own screen_to_world). The shell keeps no TS affine; without a live renderer this degrades to the
+  // raw screen point (the emit paths it feeds are no-ops anyway when the renderer is absent).
+  private eventWorld(event: MouseEvent | PointerEvent): WorldPoint {
+    const screen = this.eventPoint(event);
+    return this.projectScreenToWorld(screen) ?? screen;
+  }
+
   // Bind/unbind the always-on create-tool hover mousemove (a bare hover has no other move source). Idempotent.
   private bindCreateHoverMove() {
     if (this.createHoverTarget) return;
@@ -739,13 +781,9 @@ export class ShapeCanvasEngine {
       this.onEvent({ type: "object-select", id: result.objectSelection, additive: this.lastPointerAdditive });
     }
     if (result.objectTransformDelta) {
-      const { id, kind } = result.objectTransformDelta;
-      // Coarse-rotate (inverted): a rotate with no Shift snaps to the catalog step (15°); Shift inverts
-      // to free rotation. Applied to the returned matrix (extract swept angle + center, re-snap, rebuild).
-      const matrix =
-        kind === "rotate" && !isCoarseRotate({ shiftKey: this.shiftHeld })
-          ? snapRotateDeltaMatrix(result.objectTransformDelta.matrix, COARSE_ROTATE_SNAP_DEG)
-          : result.objectTransformDelta.matrix;
+      const { id, kind, matrix } = result.objectTransformDelta;
+      // The core already snaps the swept rotate delta when coarse-rotate is active (driven via
+      // setCoarseRotate off the mirrored predicate), so the shell consumes the matrix as-is.
       this.objectDrag = { id, matrix, kind };
       // Drag zero-rebake: push the delta straight to the GPU instance matrix (no Svelte round-trip, no
       // re-tessellation). The preview event still rides through for the shell's commit/snap-back bookkeeping.
@@ -818,7 +856,7 @@ export class ShapeCanvasEngine {
   // draw tool is active). Carries the outline snap probe so the shell can seed anchors, but `world` stays
   // the RAW pointer — recognition normalizes the silhouette, so mid-stroke samples must not be pulled onto an edge.
   private emitDraw(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
-    const world = screenToWorld(this.eventPoint(event), this.camera);
+    const world = this.eventWorld(event);
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(world) : null;
     this.onEvent({
       type: "draw",
@@ -831,7 +869,7 @@ export class ShapeCanvasEngine {
   // Emit a create phase with the dragged corner in world space. The corner snaps to the nearest outline
   // anchor within tolerance unless Alt is held. The snap query is the core path, so geometry truth stays in Rust.
   private emitCreate(phase: "start" | "move" | "end" | "cancel", event: MouseEvent | PointerEvent) {
-    const raw = screenToWorld(this.eventPoint(event), this.camera);
+    const raw = this.eventWorld(event);
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase }) ? this.querySnap(raw) : null;
     const world = snap ? { x: snap.x, y: snap.y } : raw;
     this.onEvent({ type: "create", phase, world, snapped: snap !== null, targetId: snap?.targetId ?? null });
@@ -840,7 +878,7 @@ export class ShapeCanvasEngine {
   // Emit a HOVER snap probe for a bare create-tool move. Runs the same outline snap query as the drag
   // move so the anchor ring shows where the next create would anchor. `phase: "move"` so a held Alt suppresses the query.
   private emitCreateHover(event: MouseEvent | PointerEvent) {
-    const raw = screenToWorld(this.eventPoint(event), this.camera);
+    const raw = this.eventWorld(event);
     const snap = shouldQuerySnap({ altHeld: event.altKey, phase: "move" }) ? this.querySnap(raw) : null;
     const world = snap ? { x: snap.x, y: snap.y } : raw;
     this.onEvent({ type: "create-hover", world, snapped: snap !== null, targetId: snap?.targetId ?? null });
@@ -852,7 +890,7 @@ export class ShapeCanvasEngine {
     const screen = this.eventPoint(event);
     const id = this.objectHitTest(screen);
     if (!id) return;
-    const world = screenToWorld(screen, this.camera);
+    const world = this.eventWorld(event);
     this.onEvent({ type: "erase", id, world, partial: isPartialErase(event) });
   }
 
@@ -868,7 +906,7 @@ export class ShapeCanvasEngine {
       this.emitErase(event);
       return;
     }
-    const world = screenToWorld(curr, this.camera);
+    const world = this.eventWorld(event);
     const partial = isPartialErase(event);
     for (const id of ids) this.onEvent({ type: "erase", id, world, partial });
   }
@@ -929,6 +967,43 @@ export class ShapeCanvasEngine {
     }
   }
 
+  // Project a WORLD point to SCREEN space through the LIVE core camera so the shell never recomputes
+  // the transform from a mirrored CameraState (the shell holds no TS affine). Feature-detected: a wasm
+  // build predating `worldToScreen` returns null and the caller skips the projection.
+  projectWorldToScreen(world: WorldPoint): WorldPoint | null {
+    const renderer = this.webGpuRenderer;
+    if (!renderer || typeof renderer.worldToScreen !== "function") return null;
+    try {
+      const screen = renderer.worldToScreen(world.x, world.y) as WorldPoint;
+      this.rustBoundaryCalls += 1;
+      return screen;
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust worldToScreen failed: ${error.message}` : "Rust worldToScreen failed"
+      });
+      return null;
+    }
+  }
+
+  // Un-project a SCREEN point to WORLD space through the LIVE core camera (exact inverse of
+  // `projectWorldToScreen`). Feature-detected like above.
+  projectScreenToWorld(screen: WorldPoint): WorldPoint | null {
+    const renderer = this.webGpuRenderer;
+    if (!renderer || typeof renderer.screenToWorld !== "function") return null;
+    try {
+      const world = renderer.screenToWorld(screen.x, screen.y) as WorldPoint;
+      this.rustBoundaryCalls += 1;
+      return world;
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust screenToWorld failed: ${error.message}` : "Rust screenToWorld failed"
+      });
+      return null;
+    }
+  }
+
 }
 
 // Row-major identity transform + exact-equality check, used to seed the remembered drag and detect a
@@ -941,33 +1016,6 @@ const IDENTITY_MATRIX: RenderTransform3x3 = [
 
 function isIdentityMatrix(m: RenderTransform3x3): boolean {
   return m.every((row, i) => row.every((v, j) => v === IDENTITY_MATRIX[i][j]));
-}
-
-// Re-quantize a core-returned rotate-delta matrix to the nearest `snapDeg` step. The core builds the
-// delta as `rotate_about_3x3(theta, cx, cy)`, so the swept angle is `theta = atan2(s, c)` and the center
-// solves `(I - R) c = t`. A zero-angle delta and a singular `I - R` (theta == 0) return the matrix unchanged.
-export function snapRotateDeltaMatrix(m: RenderTransform3x3, snapDeg: number): RenderTransform3x3 {
-  const cos = m[0][0];
-  const sin = m[1][0];
-  const theta = Math.atan2(sin, cos);
-  const step = (snapDeg * Math.PI) / 180;
-  const snapped = Math.round(theta / step) * step;
-  // (I - R) c = t, with R = [[cos,-sin],[sin,cos]] and t the translation column.
-  // det(I - R) = (1-cos)^2 + sin^2 = 2(1-cos); zero only at theta == 0.
-  const det = 2 * (1 - cos);
-  if (Math.abs(det) < 1e-12) return m;
-  const tx = m[0][2];
-  const ty = m[1][2];
-  // c = (I - R)^-1 t; (I - R) = [[1-cos, sin],[-sin, 1-cos]].
-  const cx = ((1 - cos) * tx - sin * ty) / det;
-  const cy = (sin * tx + (1 - cos) * ty) / det;
-  const sc = Math.sin(snapped);
-  const cc = Math.cos(snapped);
-  return [
-    [cc, -sc, cx - cc * cx + sc * cy],
-    [sc, cc, cy - sc * cx - cc * cy],
-    [0, 0, 1]
-  ];
 }
 
 function readMemoryBytes(): number | null {

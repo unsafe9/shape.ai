@@ -214,4 +214,36 @@ describe("controller selection-UX wiring", () => {
       expect(setTransformIds(allOps).sort()).toEqual(["c1", "frame"]);
     });
   });
+
+  // The App nudgeSelection now routes through moveOpsForPick, the SAME core path commitBodyDrag's
+  // non-detach branch uses. A keyboard nudge must therefore produce the SAME op set as an equal-delta
+  // body drag — cascading to a parent's subtree, unlike the old independent per-id translate loop.
+  describe("nudge == drag of an equal delta (moveOpsForPick parity)", () => {
+    let core: SceneCore;
+    beforeAll(async () => {
+      core = await loadSceneCore();
+    });
+
+    it("a nudge on a parent cascades to its subtree, matching the equal-delta body drag op set", () => {
+      const scene = sceneOf([obj("frame", undefined, 0, 0), obj("c1", "frame", 10, 10), obj("c2", "frame", 30, 40)]);
+      const selection: ObjectSelection = { kind: "object", id: "frame" };
+      // The shell nudge: moveOpsForPick(scene, selection, ids[0], translate(dx, dy)).
+      const nudge = core.moveOpsForPick(scene, selection, "frame", translateDelta(8, 0));
+      const { allOps: drag } = commitBodyDrag(core, scene, selection, "frame", translateDelta(8, 0), "translate", false);
+      // Identical op set — proving the nudge rides the same cascade path as the drag.
+      expect(nudge).toEqual(drag);
+      // Falsifiable against the OLD per-id loop, which only touched the selected id (no cascade).
+      expect(setTransformIds(nudge)).toEqual(["frame", "c1", "c2"]);
+      expect(originOf(nudge, "c1")).toEqual([18, 10]);
+    });
+
+    it("a multi nudge moves every member, matching the equal-delta multi drag op set", () => {
+      const scene = sceneOf([obj("a", undefined, 100, 100), obj("b", undefined, 300, 50), obj("c", undefined, 500, 500)]);
+      const selection: ObjectSelection = { kind: "multi", ids: ["a", "b"] };
+      const nudge = core.moveOpsForPick(scene, selection, "a", translateDelta(0, 8));
+      const { allOps: drag } = commitBodyDrag(core, scene, selection, "a", translateDelta(0, 8), "translate", false);
+      expect(nudge).toEqual(drag);
+      expect(setTransformIds(nudge)).toEqual(["a", "b"]);
+    });
+  });
 });

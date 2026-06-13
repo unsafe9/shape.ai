@@ -1,19 +1,19 @@
 <script lang="ts">
   // Peer cursor overlay: each live peer's WORLD-space cursor is projected to this client's screen, so
-  // peers with different cameras still point at the same canvas location. Owns no presence state.
+  // peers with different cameras still point at the same canvas location. Owns no presence state and no
+  // projection math — the host projects through the LIVE core camera; a null projection drops the cursor.
   import { MousePointer2 } from "lucide-svelte";
-  import type { CameraState } from "../shared/geometry";
-  import { worldToScreen } from "../renderer/scene";
+  import type { WorldPoint } from "../shared/geometry";
   import type { PeerPresence } from "../runtime/peers";
 
   type Props = {
     peers: PeerPresence[];
-    camera: CameraState;
+    projectWorldToScreen: (world: WorldPoint) => WorldPoint | null;
   };
 
-  let { peers, camera }: Props = $props();
+  let { peers, projectWorldToScreen }: Props = $props();
 
-  // Only peers with a known cursor are drawn; each is projected to screen px.
+  // Only peers with a known cursor the core can project to screen are drawn.
   const placed = $derived(
     peers
       .filter((peer) => peer.cursor !== null)
@@ -21,8 +21,9 @@
         userId: peer.userId,
         color: peer.color,
         label: peerLabel(peer.userId),
-        screen: worldToScreen(peer.cursor!, camera)
+        screen: projectWorldToScreen(peer.cursor!)
       }))
+      .filter((peer): peer is typeof peer & { screen: WorldPoint } => peer.screen !== null)
   );
 
   // A short, human-ish label for the cursor flag from the userId.

@@ -2,14 +2,21 @@
 // of the engine as one object-marquee event, and onMarquee (ids >= 2 -> multi) must
 // form a >= 2 Multi from them.
 
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
+import { ensureSceneCore, loadSceneCore, type SceneCore } from "../bridge/sceneCoreWasm";
 import { ShapeCanvasEngine, type EngineEvent } from "../renderer/engine";
 import type { RustInputBatchResult, RustWebGpuRenderer } from "../bridge/wasmLoader";
 import type { CameraState } from "../renderer/scene";
 import type { Object as SceneObject, ObjectScene, ObjectSelection } from "../shared/object";
 
 const CAMERA: CameraState = { x: 0, y: 0, zoom: 1 };
+
+let core: SceneCore;
+beforeAll(async () => {
+  await ensureSceneCore();
+  core = await loadSceneCore();
+});
 
 // Returns the supplied marquee ids on the pointer-up batch (an empty-start marquee
 // rides the up); other events return an empty object-path result.
@@ -95,25 +102,12 @@ function sceneWith(ids: string[]): ObjectScene {
   return { sceneId: "s", sceneVersion: 1, objects } as unknown as ObjectScene;
 }
 
-// Mirrors App.svelte's validSelection: keep only live ids, collapse the kind as the
-// set shrinks. Kept in lockstep with the App's collapse rule.
-function validSelection(scene: ObjectScene, sel: ObjectSelection): ObjectSelection {
-  if (sel.kind === "canvas") return sel;
-  if (sel.kind === "object") {
-    return scene.objects.some((o) => o.id === sel.id) ? sel : { kind: "canvas" };
-  }
-  const live = sel.ids.filter((id) => scene.objects.some((o) => o.id === id));
-  if (live.length >= 2) return { kind: "multi", ids: live };
-  if (live.length === 1) return { kind: "object", id: live[0] };
-  return { kind: "canvas" };
-}
-
 // App.onMarquee rule: >= 2 ids -> Multi, exactly 1 -> single object, 0 -> canvas,
-// then validated against the live scene.
+// then validated through the REAL core's collapse rule (sceneCore.validSelection), exactly as the App does.
 function marqueeSelection(scene: ObjectScene, ids: string[]): ObjectSelection {
   const next: ObjectSelection =
     ids.length >= 2 ? { kind: "multi", ids } : ids.length === 1 ? { kind: "object", id: ids[0] } : { kind: "canvas" };
-  return validSelection(scene, next);
+  return core.validSelection(scene, next);
 }
 
 describe("marquee multi-select routing", () => {

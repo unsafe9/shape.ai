@@ -25,6 +25,10 @@ function mockRenderer(camera: { x: number; y: number; zoom: number }): RustWebGp
     inputBatch(): RustInputBatchResult {
       return { camera };
     },
+    // The core's screen→world un-projection over the live camera (the engine emits world via this bridge).
+    screenToWorld(screenX: number, screenY: number) {
+      return { x: (screenX - camera.x) / camera.zoom, y: (screenY - camera.y) / camera.zoom };
+    },
     // WORLD query in, snapped WORLD point + targetId out; tolPx -> world via zoom.
     nearestOutlinePoint(worldX: number, worldY: number, tolPx: number, zoom: number, excludeIdsJson: string) {
       const tolWorld = tolPx / Math.max(0.025, zoom);
