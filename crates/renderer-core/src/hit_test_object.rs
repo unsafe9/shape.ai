@@ -291,6 +291,10 @@ pub fn rotate_delta_matrix(
     rotate_about_3x3(a_now - a_start, center.0, center.1)
 }
 
+/// Coarse-rotate increment (degrees): the swept rotate delta snaps to multiples of
+/// this when the coarse-rotate gesture is active. Single source for the renderer.
+pub const ROTATE_SNAP_DEG: f64 = 15.0;
+
 /// Round `theta` (radians) to the nearest multiple of `snap_deg` (degrees).
 pub fn snap_angle(theta: f64, snap_deg: f64) -> f64 {
     let step = snap_deg.to_radians();

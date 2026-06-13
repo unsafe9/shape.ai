@@ -406,6 +406,7 @@ impl ShapeWebGpuRenderer {
             group_compaction_count: 0,
             input_drag: None,
             active_tool: ActiveTool::default(),
+            coarse_rotate: false,
             multi_select: Vec::new(),
             last_hit: None,
             last_lod_tiers: HashMap::new(),

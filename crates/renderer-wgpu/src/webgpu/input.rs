@@ -88,6 +88,14 @@ impl ShapeWebGpuRenderer {
         }
     }
 
+    /// Set the coarse-rotate modifier (e.g. Shift held), callable as a one-off
+    /// (equivalent to a `set-coarse-rotate` inputBatch event). While active, a
+    /// rotate-handle drag snaps its swept delta to fixed increments.
+    #[wasm_bindgen(js_name = setCoarseRotate)]
+    pub fn set_coarse_rotate(&mut self, active: bool) {
+        self.coarse_rotate = active;
+    }
+
     /// Replace the transient multi-select highlight set with `ids` (an empty array
     /// clears it), callable as a one-off. The persisted single-anchor selection is
     /// untouched.
@@ -123,6 +131,35 @@ impl ShapeWebGpuRenderer {
             y: screen_y,
         });
         serde_wasm(hit)
+    }
+
+    /// Project a WORLD point to SCREEN space through the LIVE core camera, so the
+    /// shell never recomputes the transform from a mirrored `CameraState`. Exact
+    /// inverse of [`Self::screen_to_world`] (same clamped zoom). Returns `{ x, y }`.
+    #[wasm_bindgen(js_name = worldToScreen)]
+    pub fn world_to_screen(&self, world_x: f64, world_y: f64) -> Result<JsValue, JsValue> {
+        let screen = world_to_screen(
+            WorldPoint {
+                x: world_x,
+                y: world_y,
+            },
+            &self.camera,
+        );
+        serde_wasm(screen)
+    }
+
+    /// Un-project a SCREEN point to WORLD space through the LIVE core camera. Exact
+    /// inverse of [`Self::world_to_screen`] (same clamped zoom). Returns `{ x, y }`.
+    #[wasm_bindgen(js_name = screenToWorld)]
+    pub fn screen_to_world(&self, screen_x: f64, screen_y: f64) -> Result<JsValue, JsValue> {
+        let world = screen_to_world(
+            WorldPoint {
+                x: screen_x,
+                y: screen_y,
+            },
+            &self.camera,
+        );
+        serde_wasm(world)
     }
 
     /// The id of the top-most object under the screen point (or null), without
@@ -252,6 +289,7 @@ impl ShapeWebGpuRenderer {
             camera: self.camera.clone(),
             input_drag: self.input_drag.clone(),
             active_tool: self.active_tool,
+            coarse_rotate: self.coarse_rotate,
             multi_select: self.multi_select.clone(),
             last_hit: self.last_hit.clone(),
             text_layout_cache: self.text_layout_cache.clone(),
@@ -265,6 +303,7 @@ impl ShapeWebGpuRenderer {
         self.camera = state.camera;
         self.input_drag = state.input_drag;
         self.active_tool = state.active_tool;
+        self.coarse_rotate = state.coarse_rotate;
         self.multi_select = state.multi_select;
         self.last_hit = state.last_hit;
         self.object_scene = state.object_scene;
@@ -616,6 +655,11 @@ impl ShapeWebGpuRenderer {
                 // new tool starts from a clean pointer state.
                 self.input_drag = None;
             }
+            CanvasInputEvent::SetCoarseRotate { active } => {
+                // Mode bit, not drag-clearing: toggling it mid-rotate engages snapping
+                // on the next move without abandoning the in-flight gesture.
+                self.coarse_rotate = active;
+            }
             CanvasInputEvent::SetMultiSelect { ids } => {
                 self.set_multi_select_ids(ids);
             }
@@ -656,6 +700,7 @@ impl ShapeWebGpuRenderer {
             &event,
             &self.object_regions,
             self.active_tool,
+            self.coarse_rotate,
             selection.as_deref(),
             &mut self.camera,
             &mut self.input_drag,

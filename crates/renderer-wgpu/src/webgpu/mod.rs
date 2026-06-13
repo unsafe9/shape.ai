@@ -302,6 +302,7 @@ struct RendererRollbackState {
     camera: CameraState,
     input_drag: Option<InputDragState>,
     active_tool: ActiveTool,
+    coarse_rotate: bool,
     multi_select: Vec<String>,
     last_hit: Option<CoreHitResult>,
     text_layout_cache: TextLayoutCache,
@@ -362,6 +363,9 @@ pub struct ShapeWebGpuRenderer {
     group_compaction_count: usize,
     input_drag: Option<InputDragState>,
     active_tool: ActiveTool,
+    // Coarse-rotate modifier (e.g. Shift held). Renderer-held mode bit; the rotate
+    // drag arm reads it live so snapping engages/disengages mid-gesture.
+    coarse_rotate: bool,
     // Transient multi-select highlight set, renderer-held (like `active_tool`) so it
     // survives a `load_scene` rebuild, then mirrored into the scene the draw path
     // reads. Never serialized.

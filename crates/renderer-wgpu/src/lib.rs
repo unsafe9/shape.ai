@@ -69,6 +69,33 @@ struct ObjectGeometrySummary {
     draws: usize,
 }
 
+/// Project a canonical `ObjectScene` (JSON) into the renderer-core
+/// `RenderObjectScene` (JSON) through the core's `from_object_scene` — the same
+/// identity-default / selection-flatten / stroke-de-quant the shell hand-built in
+/// TS. `camera_json`/`selection_json` are the live (transient) camera + selection
+/// the shell drives; `scene_id` is the renderer's stable scene tag. Returns the
+/// projected JSON string the visible-renderer `loadObjectScene` consumes.
+#[wasm_bindgen(js_name = projectObjectScene)]
+pub fn project_object_scene(
+    scene_json: &str,
+    camera_json: &str,
+    selection_json: &str,
+    scene_id: &str,
+) -> Result<String, JsValue> {
+    let scene: shape_scene_core::object::model::ObjectScene = serde_json::from_str(scene_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid object scene: {e}")))?;
+    let camera: shape_renderer_core::model::CameraState = serde_json::from_str(camera_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid camera: {e}")))?;
+    let selection: shape_scene_core::object::model::ObjectSelection =
+        serde_json::from_str(selection_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid selection: {e}")))?;
+    let projected = shape_renderer_core::RenderObjectScene::from_object_scene(
+        &scene, camera, &selection, scene_id,
+    );
+    serde_json::to_string(&projected)
+        .map_err(|e| JsValue::from_str(&format!("projection serialization failed: {e}")))
+}
+
 #[cfg(not(feature = "wgpu-probe"))]
 #[wasm_bindgen(js_name = probeWebGpu)]
 pub fn probe_web_gpu(

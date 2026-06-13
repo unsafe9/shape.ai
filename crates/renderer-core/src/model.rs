@@ -470,6 +470,12 @@ pub enum CanvasInputEvent {
     SetTool {
         tool: ActiveTool,
     },
+    // Coarse-rotate modifier (e.g. Shift held): while active, a rotate-handle drag
+    // snaps its swept delta to fixed increments. A mode bit, not per-event, so it can
+    // toggle live mid-drag without a synthetic pointer event.
+    SetCoarseRotate {
+        active: bool,
+    },
     // Replace the transient multi-select set; an empty list clears it. The persisted
     // single-anchor selection is unaffected.
     SetMultiSelect {

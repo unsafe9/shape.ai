@@ -11,8 +11,9 @@ use shape_renderer_core::model::{
     SceneSelection, SceneShadowLayerToken, SceneSnapshot, SceneStyleToken, WorldPoint, WorldRect,
 };
 use shape_renderer_core::hit_test_object::{
-    hit_test_object_or_bbox, resize_delta_matrix, rotate_delta_matrix, swept_segment_hits_object,
-    translate_3x3, HoverAffordance, ScreenRect, SelectionHandles,
+    hit_test_object_or_bbox, resize_delta_matrix, rotate_delta_matrix_snapped,
+    swept_segment_hits_object, translate_3x3, HoverAffordance, ScreenRect, SelectionHandles,
+    ROTATE_SNAP_DEG,
 };
 use shape_renderer_core::outline::{derive_region, parse_path_string};
 use shape_renderer_core::render_object::{RenderObject, RenderObjectScene};
@@ -1830,6 +1831,19 @@ pub(crate) fn screen_to_world(point: WorldPoint, camera: &CameraState) -> WorldP
     }
 }
 
+/// World -> screen projection through the LIVE core camera, the exact inverse of
+/// [`screen_to_world`] (same clamped `zoom`). The shell calls this instead of
+/// recomputing the transform from a mirrored `CameraState`, so projection and
+/// inverse-projection share one source of truth.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn world_to_screen(point: WorldPoint, camera: &CameraState) -> WorldPoint {
+    let zoom = camera.zoom.max(0.025);
+    WorldPoint {
+        x: point.x * zoom + camera.x,
+        y: point.y * zoom + camera.y,
+    }
+}
+
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn world_rect_to_screen_rect(rect: &WorldRect, camera: &CameraState) -> WorldRect {
     WorldRect {
@@ -2294,13 +2308,16 @@ pub(crate) fn hover_affordance_at(
 ///   the pointer-down WORLD point.
 /// - PointerDown, empty: start a Marquee drag.
 /// - PointerMove on Pan: update `camera`. On Object: emit a CUMULATIVE delta from
-///   the fixed anchor. On Marquee: extend the rect.
+///   the fixed anchor. On Marquee: extend the rect. On Rotate with `coarse_rotate`:
+///   the swept delta is snapped IN-CORE to the nearest [`ROTATE_SNAP_DEG`] increment
+///   so the shell never decomposes/rebuilds the matrix.
 /// - PointerUp on Marquee: AABB-test regions into `marquee_ids`; any drag clears.
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn step_object_pointer(
     event: &CanvasInputEvent,
     regions: &[ObjectRegion],
     active_tool: ActiveTool,
+    coarse_rotate: bool,
     selection: Option<&str>,
     camera: &mut CameraState,
     input_drag: &mut Option<InputDragState>,
@@ -2465,14 +2482,17 @@ pub(crate) fn step_object_pointer(
                     start,
                     center,
                 } if drag_pointer_id == pointer_id => {
-                    // Rotation about the bbox center from the anchor angle.
+                    // Rotation about the bbox center from the anchor angle. Coarse mode
+                    // snaps the swept delta IN-CORE so the shell never rebuilds the matrix.
                     let world_now = screen_to_world(screen, camera);
+                    let snap = coarse_rotate.then_some(ROTATE_SNAP_DEG);
                     object_out.transform_delta = Some(ObjectTransformDelta {
                         id: object_id,
-                        matrix: rotate_delta_matrix(
+                        matrix: rotate_delta_matrix_snapped(
                             (center.x, center.y),
                             (world_now.x, world_now.y),
                             (start.x, start.y),
+                            snap,
                         ),
                         kind: "rotate",
                     });
@@ -3561,6 +3581,48 @@ mod tests {
     }
 
     #[test]
+    fn world_to_screen_inverts_screen_to_world_under_pan_and_zoom() {
+        let camera = CameraState {
+            x: 37.5,
+            y: -112.25,
+            zoom: 1.875,
+        };
+        for &(sx, sy) in &[
+            (0.0, 0.0),
+            (260.0, 180.0),
+            (-413.0, 642.0),
+            (1280.0, 720.0),
+        ] {
+            let screen = WorldPoint { x: sx, y: sy };
+            let round_trip = world_to_screen(screen_to_world(screen, &camera), &camera);
+            assert!(
+                (round_trip.x - screen.x).abs() < 1e-9 && (round_trip.y - screen.y).abs() < 1e-9,
+                "screen round-trip drifted: {screen:?} -> {round_trip:?}"
+            );
+
+            let world = WorldPoint { x: sx, y: sy };
+            let world_round_trip = screen_to_world(world_to_screen(world, &camera), &camera);
+            assert!(
+                (world_round_trip.x - world.x).abs() < 1e-9
+                    && (world_round_trip.y - world.y).abs() < 1e-9,
+                "world round-trip drifted: {world:?} -> {world_round_trip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn world_to_screen_applies_pan_and_zoom() {
+        let camera = CameraState {
+            x: 100.0,
+            y: -40.0,
+            zoom: 2.0,
+        };
+        let screen = world_to_screen(WorldPoint { x: 30.0, y: 25.0 }, &camera);
+        assert!((screen.x - 160.0).abs() < 1e-9);
+        assert!((screen.y - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn focus_bounds_centers_target_with_renderer_camera_math() {
         let bounds = WorldRect {
             x: 100.0,
@@ -4250,6 +4312,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             None,
             &mut camera,
             &mut drag,
@@ -4269,6 +4332,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             None,
             &mut camera,
             &mut drag,
@@ -4293,6 +4357,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             None,
             &mut camera,
             &mut drag,
@@ -4321,6 +4386,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             None,
             &mut camera,
             &mut drag,
@@ -4338,6 +4404,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             None,
             &mut camera,
             &mut drag,
@@ -4362,18 +4429,18 @@ mod tests {
         // Down bottom-right of "near" on empty space.
         step_object_pointer(
             &CanvasInputEvent::PointerDown { pointer_id: 4, screen: WorldPoint { x: 15.0, y: 15.0 } },
-            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
         );
         assert!(matches!(drag, Some(InputDragState::Marquee { .. })));
         // Move toward top-left through an intermediate point (real drags emit moves).
         step_object_pointer(
             &CanvasInputEvent::PointerMove { pointer_id: 4, screen: WorldPoint { x: 5.0, y: 5.0 } },
-            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
         );
         // Up at (-5,-5): reversed rect [-5,15]² covers "near" only.
         step_object_pointer(
             &CanvasInputEvent::PointerUp { pointer_id: 4, screen: WorldPoint { x: -5.0, y: -5.0 }, edge_id: None },
-            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
         );
         assert_eq!(out.marquee_ids, Some(vec!["near".to_string()]));
     }
@@ -4398,7 +4465,7 @@ mod tests {
         // Down on empty canvas -> must start a Marquee, not an Object drag.
         step_object_pointer(
             &CanvasInputEvent::PointerDown { pointer_id: 7, screen: WorldPoint { x: -5.0, y: -5.0 } },
-            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
         );
         assert!(matches!(drag, Some(InputDragState::Marquee { .. })),
             "empty-canvas down starts a Marquee, not an Object move");
@@ -4407,12 +4474,12 @@ mod tests {
         // Drag across both bodies (the move only grows the live overlay).
         step_object_pointer(
             &CanvasInputEvent::PointerMove { pointer_id: 7, screen: WorldPoint { x: 55.0, y: 25.0 } },
-            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
         );
         // Up at (55,25): rect [-5,55] x [-5,25] (anchor + up corner) covers BOTH.
         step_object_pointer(
             &CanvasInputEvent::PointerUp { pointer_id: 7, screen: WorldPoint { x: 55.0, y: 25.0 }, edge_id: None },
-            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
         );
         let mut ids = out.marquee_ids.take().expect("pointer-up on a Marquee yields ids");
         ids.sort();
@@ -4456,7 +4523,7 @@ mod tests {
         let mut out = ObjectInputOut::default();
         step_object_pointer(
             &CanvasInputEvent::PointerDown { pointer_id: 8, screen: WorldPoint { x: 5.0, y: 15.0 } },
-            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
         );
         assert!(matches!(drag, Some(InputDragState::Marquee { .. })),
             "notch down starts a Marquee, not an Object move");
@@ -4485,11 +4552,11 @@ mod tests {
         // Down on empty space then a move grows an in-flight marquee.
         step_object_pointer(
             &CanvasInputEvent::PointerDown { pointer_id: 5, screen: WorldPoint { x: -20.0, y: -20.0 } },
-            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
         );
         step_object_pointer(
             &CanvasInputEvent::PointerMove { pointer_id: 5, screen: WorldPoint { x: 30.0, y: 30.0 } },
-            &regions, ActiveTool::Select, None, &mut camera, &mut drag, &mut out,
+            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
         );
         assert!(matches!(drag, Some(InputDragState::Marquee { .. })));
         // The shared source the object pass draws must produce a full overlay
@@ -4573,6 +4640,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -4594,6 +4662,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -4957,6 +5026,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -4976,6 +5046,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -4997,6 +5068,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             Some("o1"),
             &mut camera,
             &mut drag2,
@@ -5004,6 +5076,90 @@ mod tests {
         );
         assert!(matches!(drag2, Some(InputDragState::Rotate { .. })));
         assert!(out2.selection.is_none());
+    }
+
+    #[test]
+    fn coarse_rotate_drag_emits_snapped_delta_in_core() {
+        use shape_renderer_core::hit_test_object::{
+            rotate_delta_matrix_snapped, ROTATE_SNAP_DEG,
+        };
+
+        // 20px rect at origin selected; identity camera => screen == world. Grab the
+        // rotate zone, then move with the coarse-rotate bit set: the emitted matrix
+        // must be the IN-CORE 15deg-snapped delta, so the shell never rebuilds it.
+        let scene = object_scene(vec![rect_object("o1", 0.0, 0.0, 20)]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown {
+                pointer_id: 9,
+                screen: WorldPoint {
+                    x: 10.0,
+                    y: 0.0 - shape_renderer_core::hit_test_object::ROTATE_ZONE_OFFSET_PX,
+                },
+            },
+            &regions,
+            ActiveTool::Select,
+            true,
+            Some("o1"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        let (center, start) = match &drag {
+            Some(InputDragState::Rotate { center, start, .. }) => (*center, *start),
+            _ => panic!("rotate-zone grab must start a Rotate drag"),
+        };
+
+        // A move point chosen so the raw swept delta is NOT a 15deg multiple. We assert
+        // the emitted matrix equals the snapped core result AND differs from the
+        // unsnapped one — the falsifier: a shell-side raw rotate would match unsnapped.
+        let world_now = WorldPoint { x: 60.0, y: 35.0 };
+        step_object_pointer(
+            &CanvasInputEvent::PointerMove {
+                pointer_id: 9,
+                screen: world_now,
+            },
+            &regions,
+            ActiveTool::Select,
+            true,
+            Some("o1"),
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        let delta = out.transform_delta.take().expect("rotate move emits a delta");
+        assert_eq!(delta.kind, "rotate");
+
+        let snapped = rotate_delta_matrix_snapped(
+            (center.x, center.y),
+            (world_now.x, world_now.y),
+            (start.x, start.y),
+            Some(ROTATE_SNAP_DEG),
+        );
+        let unsnapped = rotate_delta_matrix_snapped(
+            (center.x, center.y),
+            (world_now.x, world_now.y),
+            (start.x, start.y),
+            None,
+        );
+        let close = |a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]| {
+            a.iter().zip(b).all(|(ra, rb)| {
+                ra.iter().zip(rb).all(|(x, y)| (x - y).abs() < 1e-9)
+            })
+        };
+        assert!(
+            close(&delta.matrix, &snapped),
+            "coarse-rotate must emit the 15deg-snapped delta, got {:?}",
+            delta.matrix
+        );
+        assert!(
+            !close(&snapped, &unsnapped),
+            "test point must produce a non-15deg raw angle so snapping is observable"
+        );
     }
 
     // ----- open-class endpoint handles ---------------
@@ -5170,6 +5326,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             Some("l"),
             &mut camera,
             &mut drag,
@@ -5189,6 +5346,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             Some("l"),
             &mut camera,
             &mut drag,
@@ -5209,6 +5367,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             Some("l"),
             &mut camera,
             &mut drag,
@@ -5224,6 +5383,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Select,
+            false,
             Some("l"),
             &mut camera,
             &mut drag,
@@ -5286,6 +5446,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Hand,
+            false,
             None,
             &mut camera,
             &mut drag,
@@ -5301,6 +5462,7 @@ mod tests {
             },
             &regions,
             ActiveTool::Hand,
+            false,
             None,
             &mut camera,
             &mut drag,

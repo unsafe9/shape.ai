@@ -8,6 +8,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use shape_scene_core::object::model::{
+    self, GEOMETRY_QUANTUM_PER_PX, Object, ObjectScene, ObjectSelection,
+};
+
 use crate::model::CameraState;
 
 /// Quantization units per logical pixel for object-local geometry coords (1/8 px).
@@ -199,6 +203,136 @@ pub struct RenderObjectScene {
     /// wire (`multiSelect`), so it must deserialize; the draw path reads it.
     #[serde(default, rename = "multiSelect")]
     pub multi_select: Vec<String>,
+}
+
+impl RenderObjectScene {
+    /// Project a canonical [`ObjectScene`] into the renderer-core view. Owns the
+    /// identity-transform default, the selection/multi-select flattening, the
+    /// anchors/clip defaults, and the stroke-width/dash de-quantization the shell
+    /// hand-built in TS. `selection` is the live (transient) selection the shell
+    /// drives, not `scene.selection`. `scene_id` is the renderer's stable scene
+    /// tag (`object-scene-v{scene_version}` in the shell).
+    pub fn from_object_scene(
+        scene: &ObjectScene,
+        camera: CameraState,
+        selection: &ObjectSelection,
+        scene_id: impl Into<String>,
+    ) -> Self {
+        let (selection, multi_select) = match selection {
+            ObjectSelection::Object { id } => (Some(id.clone()), Vec::new()),
+            ObjectSelection::Multi { ids } => (None, ids.clone()),
+            ObjectSelection::Canvas => (None, Vec::new()),
+        };
+        RenderObjectScene {
+            scene_id: scene_id.into(),
+            camera,
+            objects: scene.objects.iter().map(render_object_from).collect(),
+            selection,
+            multi_select,
+        }
+    }
+}
+
+/// De-quantize a quantized geometry length into logical px (matches the shell's
+/// `/ GEOMETRY_QUANTUM_PER_PX`).
+fn dequantize(quantized: i32) -> f64 {
+    f64::from(quantized) / f64::from(GEOMETRY_QUANTUM_PER_PX)
+}
+
+fn render_object_from(object: &Object) -> RenderObject {
+    RenderObject {
+        id: object.id.clone(),
+        parent: object.parent.clone(),
+        order: object.order.clone(),
+        transform: object.transform.m,
+        geometry_d: object.geometry.path_string.clone(),
+        fill: object.fill.as_ref().map(rfill_from),
+        stroke: object.stroke.as_ref().map(rstroke_from),
+        text: object.text.as_ref().map(rtext_from),
+        anchors: object.anchors.iter().map(ranchor_from).collect(),
+        clip: object.clip.unwrap_or(false),
+    }
+}
+
+fn rpaint_from(paint: &model::Paint) -> RPaint {
+    match paint {
+        model::Paint::Solid { color } => RPaint::Solid { color: color.clone() },
+        model::Paint::Gradient { stops, angle } => RPaint::Gradient {
+            stops: stops
+                .iter()
+                .map(|s| RGradientStop { offset: s.offset, color: s.color.clone() })
+                .collect(),
+            angle: *angle,
+        },
+        model::Paint::Image { content_ref } => {
+            RPaint::Image { content_ref: content_ref.clone() }
+        }
+        model::Paint::Token { name } => RPaint::Token { name: name.clone() },
+    }
+}
+
+fn rfill_from(fill: &model::Fill) -> RFill {
+    RFill { paint: rpaint_from(&fill.paint), opacity: fill.opacity }
+}
+
+/// Stroke width and dash run lengths are stored quantized in the model; the
+/// renderer treats `RStroke.width`/`dash` as logical px, so de-quantize both —
+/// the lone style field the renderer does not de-quantize at draw time.
+fn rstroke_from(stroke: &model::Stroke) -> RStroke {
+    RStroke {
+        paint: rpaint_from(&stroke.paint),
+        width: dequantize(stroke.width),
+        opacity: stroke.opacity,
+        dash: stroke.dash.iter().map(|d| dequantize(*d)).collect(),
+        cap: match stroke.cap {
+            model::LineCap::Butt => RStrokeCap::Butt,
+            model::LineCap::Round => RStrokeCap::Round,
+            model::LineCap::Square => RStrokeCap::Square,
+        },
+        join: match stroke.join {
+            model::LineJoin::Miter => RStrokeJoin::Miter,
+            model::LineJoin::Round => RStrokeJoin::Round,
+            model::LineJoin::Bevel => RStrokeJoin::Bevel,
+        },
+    }
+}
+
+fn rtext_from(text: &model::Text) -> RText {
+    RText {
+        runs: text
+            .runs
+            .iter()
+            .map(|run| RTextRun {
+                text: run.text.clone(),
+                // Absent color/size in the model resolve to the same structural
+                // defaults the renderer's serde fills in for the raw passthrough.
+                color: run.color.clone().unwrap_or_else(default_text_color),
+                size: run.size.map(f64::from).unwrap_or_else(default_text_size),
+                bold: run.bold,
+                italic: run.italic,
+                font: run.font.clone().unwrap_or_default(),
+            })
+            .collect(),
+        align: match text.align {
+            model::TextAlign::Start => RTextAlign::Start,
+            model::TextAlign::Center => RTextAlign::Center,
+            model::TextAlign::End => RTextAlign::End,
+            model::TextAlign::Justify => RTextAlign::Justify,
+        },
+        valign: match text.valign {
+            model::TextVAlign::Top => RTextValign::Top,
+            model::TextVAlign::Middle => RTextValign::Middle,
+            model::TextVAlign::Bottom => RTextValign::Bottom,
+        },
+    }
+}
+
+fn ranchor_from(anchor: &model::Anchor) -> RAnchor {
+    RAnchor {
+        node_index: usize::try_from(anchor.node_index).unwrap_or(0),
+        target: anchor.target.clone(),
+        at: RLocalPoint { x: f64::from(anchor.at.x), y: f64::from(anchor.at.y) },
+    }
 }
 
 /// A geometry node in object-local quantized i32 coords. Handles are stored
@@ -681,5 +815,120 @@ mod tests {
         let scene: RenderObjectScene =
             serde_json::from_str(json).expect("scene with multiSelect deserializes");
         assert_eq!(scene.multi_select, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // Golden: `from_object_scene` must emit the BYTE-IDENTICAL `RenderObjectScene`
+    // wire the shell's TS `objectSceneToRenderObjectScene` produced — identity
+    // transform default, selection/multiSelect flatten, anchors/clip defaults, and
+    // stroke width/dash de-quantized to logical px (the lone style field the
+    // renderer does not de-quantize at draw time).
+    #[test]
+    fn from_object_scene_matches_ts_projection_wire() {
+        // Canonical model scene: quantized stroke (width 24 q -> 3px, dash 16/8 q ->
+        // 2/1px), a text run WITHOUT color/size (must resolve to renderer defaults),
+        // an anchor, clip true, and an object with NO transform (identity default).
+        let scene_json = r##"{
+            "sceneVersion": 7,
+            "objects": [
+                {
+                    "id": "o1",
+                    "order": "a0",
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" },
+                    "stroke": {
+                        "paint": { "kind": "solid", "color": "#283644" },
+                        "width": 24,
+                        "dash": [16, 8],
+                        "cap": "round",
+                        "join": "bevel"
+                    },
+                    "text": { "runs": [{ "text": "Note" }], "align": "center", "valign": "bottom" },
+                    "anchors": [{ "nodeIndex": 2, "target": "o2", "at": { "x": 10, "y": 20 } }],
+                    "clip": true
+                }
+            ]
+        }"##;
+        let scene: ObjectScene =
+            serde_json::from_str(scene_json).expect("canonical model scene deserializes");
+
+        let selection = ObjectSelection::Multi {
+            ids: vec!["o1".to_string(), "o2".to_string()],
+        };
+        let camera = CameraState { x: 5.0, y: -3.0, zoom: 2.0 };
+        let projected = RenderObjectScene::from_object_scene(
+            &scene,
+            camera,
+            &selection,
+            format!("object-scene-v{}", scene.scene_version),
+        );
+
+        // The exact wire the TS projection emits: identity transform, geometryD,
+        // stroke in logical px, text run defaulted (color #111111, size 16*8=128),
+        // anchor with f64 `at`, clip true, and the Multi selection flattened to
+        // `selection: null` + `multiSelect: [...]`.
+        let expected: serde_json::Value = serde_json::json!({
+            "sceneId": "object-scene-v7",
+            "camera": { "x": 5.0, "y": -3.0, "zoom": 2.0 },
+            "selection": null,
+            "multiSelect": ["o1", "o2"],
+            "objects": [
+                {
+                    "id": "o1",
+                    "parent": null,
+                    "order": "a0",
+                    "transform": [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]],
+                    "geometryD": "M 0 0 L 80 0 L 80 40 L 0 40 Z",
+                    "fill": null,
+                    "stroke": {
+                        "paint": { "kind": "solid", "color": "#283644" },
+                        "width": 3.0,
+                        "opacity": 1.0,
+                        "dash": [2.0, 1.0],
+                        "cap": "round",
+                        "join": "bevel"
+                    },
+                    "text": {
+                        "runs": [{
+                            "text": "Note",
+                            "color": "#111111",
+                            "size": 128.0,
+                            "bold": false,
+                            "italic": false,
+                            "font": ""
+                        }],
+                        "align": "center",
+                        "valign": "bottom"
+                    },
+                    "anchors": [{ "nodeIndex": 2, "target": "o2", "at": { "x": 10.0, "y": 20.0 } }],
+                    "clip": true
+                }
+            ]
+        });
+
+        let actual = serde_json::to_value(&projected).expect("projected scene serializes");
+        assert_eq!(actual, expected);
+        // Stroke is the load-bearing de-quant: prove logical px, not raw quantized.
+        assert_eq!(projected.objects[0].stroke.as_ref().unwrap().width, 3.0);
+    }
+
+    // Selection flatten: a single-object selection becomes `selection: Some(id)` with
+    // an empty multiSelect; Canvas becomes neither.
+    #[test]
+    fn from_object_scene_flattens_selection_variants() {
+        let scene: ObjectScene = serde_json::from_str(r##"{ "objects": [] }"##).unwrap();
+        let cam = CameraState { x: 0.0, y: 0.0, zoom: 1.0 };
+
+        let single = RenderObjectScene::from_object_scene(
+            &scene,
+            cam.clone(),
+            &ObjectSelection::Object { id: "o9".to_string() },
+            "s",
+        );
+        assert_eq!(single.selection.as_deref(), Some("o9"));
+        assert!(single.multi_select.is_empty());
+
+        let canvas =
+            RenderObjectScene::from_object_scene(&scene, cam, &ObjectSelection::Canvas, "s");
+        assert_eq!(canvas.selection, None);
+        assert!(canvas.multi_select.is_empty());
     }
 }
