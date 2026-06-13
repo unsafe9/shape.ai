@@ -8,7 +8,14 @@
 // these wrappers re-throw as a typed Error. Domain failures (unknown id, invalid patch)
 // are NOT thrown: they ride the `errors: string[]` field of the result.
 
-import type { Anchor, Object as SceneObject, ObjectOp, ObjectScene, Transform3x3 } from "../shared/object";
+import type {
+  Anchor,
+  Object as SceneObject,
+  ObjectOp,
+  ObjectScene,
+  ObjectSelection,
+  Transform3x3
+} from "../shared/object";
 import type { DragSpan } from "../controller/objectPrimitives";
 import type { PrimitiveKindId } from "../controller/toolbar";
 
@@ -57,6 +64,18 @@ export type DoubleClickAction = { kind: "drill-in-container" } | { kind: "edit-l
 // `"free"` runs the full pipeline with polygon + silhouette fallbacks.
 export type RecognizeMode = "basic" | "free";
 
+// Single-step z-order move over the flat scene order: toward the front or the back.
+export type ReorderDirection = "forward" | "backward";
+
+// The create-gesture SCREEN-px thresholds owned only by scene-core (recognize): the
+// click-vs-drag extent, the release anchor-reuse radius, and the stroke merge-endpoint
+// radius. The shell reads them once and divides each by zoom; it holds no literal copy.
+export type CreateThresholds = {
+  minDragExtentPx: number;
+  createAnchorReuseTolerancePx: number;
+  mergeEndpointTolerancePx: number;
+};
+
 // Shape of the generated wasm-pack module. Declared locally (matching wasmLoader.ts) so
 // this file does not statically import the gitignored build artifact's types; the dynamic
 // import is `@vite-ignore`d. Built `--target web`, exposing both an async `default`
@@ -68,6 +87,11 @@ type SceneCoreModule = {
   derive_region: (geometryJson: string, flatness: number) => string;
   object_command_catalog: () => string;
   object_gesture_catalog: () => string;
+  template_anchor: (
+    sceneJson: string,
+    fallbackX: number,
+    fallbackY: number
+  ) => string;
   build_object_template: (
     templateId: string,
     anchorX: number,
@@ -109,14 +133,30 @@ type SceneCoreModule = {
     tolerancePx: number
   ) => string;
   split_subpath_at: (geometryJson: string, x: number, y: number, radius: number) => string;
-  partial_erase_ops: (sceneJson: string, id: string, x: number, y: number, radius: number) => string;
+  partial_erase_ops: (sceneJson: string, id: string, wx: number, wy: number, radius: number) => string;
+  object_world_aabb: (objectJson: string) => string;
   anchor_follow_ops: (sceneJson: string, transformOpsJson: string) => string;
   move_ops: (sceneJson: string, rootsJson: string, deltaJson: string) => string;
+  move_ops_for_pick: (sceneJson: string, selectionJson: string, id: string, deltaJson: string) => string;
+  valid_selection: (sceneJson: string, selectionJson: string) => string;
+  select_all: (sceneJson: string) => string;
+  duplicate_ops: (sceneJson: string, idsJson: string, idPrefix: string, orderSeed: number) => string;
+  detach_move_ops: (sceneJson: string, id: string, deltaJson: string) => string;
   synthesize_create_anchors: (
     createdJson: string,
     targetJson: string,
     endpointX: number,
     endpointY: number
+  ) => string;
+  synthesize_create_anchors_both: (
+    sceneJson: string,
+    createdJson: string,
+    cornersJson: string
+  ) => string;
+  resolve_create_release: (
+    releaseJson: string,
+    lastSnapJson: string,
+    toleranceWorld: number
   ) => string;
   endpoint_release_ops: (
     sceneJson: string,
@@ -131,6 +171,13 @@ type SceneCoreModule = {
   has_children: (sceneJson: string, id: string) => string;
   ungroup_enabled: (sceneJson: string, selectedId: string) => string;
   double_click_action: (sceneJson: string, id: string) => string;
+  group_ops: (sceneJson: string, idsJson: string, frameId: string) => string;
+  ungroup_ops: (sceneJson: string, frameId: string) => string;
+  create_thresholds: () => string;
+  next_order_key: (sceneJson: string) => string;
+  back_order_key: (sceneJson: string) => string;
+  key_between: (a: string, b: string) => string;
+  reorder_step_ops: (sceneJson: string, id: string, direction: string) => string;
   WasmUndoStack: new (actorId: string) => WasmUndoStack;
   WasmSession: new (
     welcomeSceneJson: string,
@@ -159,6 +206,7 @@ type WasmSession = {
   flush_armed: () => boolean;
   outbox_len: () => number;
   owned_key_set: () => string;
+  take_settled_keys: () => string;
   ingest_presence: (payloadJson: string, nowMs: number) => string;
   expire_peers: (nowMs: number) => string;
   peers: () => string;
@@ -221,6 +269,12 @@ export type SceneCore = {
   deriveRegion(geometry: SceneObject["geometry"], flatness: number): DerivedRegion;
   objectCommandCatalog(): ObjectCommand[];
   objectGestureCatalog(): ObjectGesture[];
+  // Where a new template should land: `gap` right of the right-most object's transform origin and
+  // top-aligned, or `fallback` (the shell's viewport center) when the scene is empty.
+  templateAnchor(
+    scene: ObjectScene,
+    fallback: { x: number; y: number }
+  ): { x: number; y: number };
   buildObjectTemplate(
     templateId: string,
     anchorX: number,
@@ -278,11 +332,15 @@ export type SceneCore = {
     y: number,
     radius: number
   ): SceneObject["geometry"] | null;
-  // Cut the stroke at an object-local quantized touch and return the WHOLE op batch — `[]` on a miss,
-  // `[delete]` when the cut empties the object, else `[edit-geometry, ...follower-reprojection]`
-  // (a reshape re-projects anchored followers onto the new outline, chained). `moveOps` /
-  // `endpointReleaseOps` fold the same follow into their own batches.
-  partialEraseOps(scene: ObjectScene, id: string, x: number, y: number, radius: number): ObjectOp[];
+  // Cut the stroke at a WORLD touch point (logical px) and return the WHOLE op batch — `[]` on a miss
+  // (or a singular transform), `[delete]` when the cut empties the object, else
+  // `[edit-geometry, ...follower-reprojection]` (a reshape re-projects anchored followers onto the new
+  // outline, chained). The core maps world → object-local quantized internally (no inverse-affine in TS).
+  // `radius` is the object-local quantized erase tolerance. `moveOps` / `endpointReleaseOps` fold the same follow.
+  partialEraseOps(scene: ObjectScene, id: string, wx: number, wy: number, radius: number): ObjectOp[];
+  // The world-space AABB (logical px) of an object: its geometry nodes carried through the transform,
+  // min/max'd. The geometry half of the shell's world-bbox math. Null when the object has no geometry nodes.
+  objectWorldAabb(object: SceneObject): { minX: number; minY: number; maxX: number; maxY: number } | null;
   // Commit-time anchor-follow ops for an arbitrary committed batch (`set-transform` moves a target,
   // `edit-geometry` reshapes one): the chord-deform ops making every anchored follower track its
   // target (chained). The standalone entry; the op-authoring bridges already fold this in. `[]` when nothing follows.
@@ -291,6 +349,24 @@ export type SceneCore = {
   // (dragged subtree, or every multi member + subtree, deduped) FOLLOWED BY the anchor-follow
   // `edit-geometry` ops, as ONE batch (cascade BEFORE follow). `delta` is the world-space gesture matrix.
   moveOps(scene: ObjectScene, roots: MoveRoots, delta: Transform3x3): ObjectOp[];
+  // The body-drag commit ops, deriving the MoveRoots from the live `selection` + picked `id` in-core
+  // (a Multi-on-member drag moves the whole set; otherwise the picked single root cascades its subtree).
+  // The shell stops branching the drag-root policy in TS. Cascade BEFORE follow, same as `moveOps`.
+  moveOpsForPick(scene: ObjectScene, selection: ObjectSelection, id: string, delta: Transform3x3): ObjectOp[];
+  // Reconcile `selection` against the scene: drop ids no longer present and collapse the kind
+  // (>=2 live -> multi, 1 -> object, 0 -> canvas). The single source of truth for the collapse rule.
+  validSelection(scene: ObjectScene, selection: ObjectSelection): ObjectSelection;
+  // Select every object, collapsed by the same rule: empty -> canvas, one -> object, otherwise multi.
+  selectAll(scene: ObjectScene): ObjectSelection;
+  // The insert-object ops cloning each id in `ids` with a fresh id (`{idPrefix}-{n}`, indexed from
+  // `orderSeed`) and a fresh fractional order key, offset by the canonical duplicate translate (+40/+40).
+  // Unknown ids are skipped; `[]` when nothing resolves.
+  duplicateOps(scene: ObjectScene, ids: string[], idPrefix: string, orderSeed: number): ObjectOp[];
+  // Alt-detach commit ops for an Alt-held body drag of an anchored open-class object: a set-anchor clearing
+  // its anchors, THEN the single-root move ops computed against the scene with that object's anchors already
+  // cleared (so the move keeps the 0-rebake whole-object translate, not an anchor-follow reprojection).
+  // `[]` when `id` is not in the scene.
+  detachMoveOps(scene: ObjectScene, id: string, delta: Transform3x3): ObjectOp[];
   // Synthesize the persistent anchor(s) binding `created`'s endpoint node to `target` on a snapped
   // drag-create, or null when no anchor should be authored (target is the created object, or no node / no snap).
   synthesizeCreateAnchors(
@@ -298,6 +374,24 @@ export type SceneCore = {
     target: SceneObject,
     endpoint: { x: number; y: number }
   ): Anchor[] | null;
+  // Release-time anchor authoring for BOTH gesture corners (shape drag-create AND the freehand pen):
+  // each non-null corner binds `created`'s nearest node to its snapped target's outline, deduped to
+  // ONE anchor per node (first wins). A null corner, a corner whose target left the scene, or a
+  // degenerate tap (corners collapsing onto one node) binds at most one anchor. The (possibly empty) set.
+  synthesizeCreateAnchorsBoth(
+    scene: ObjectScene,
+    created: SceneObject,
+    corners: ReadonlyArray<{ target: string; at: { x: number; y: number } } | null>
+  ): Anchor[];
+  // Resolve a shape drag-create RELEASE to its final endpoint + anchor target: honor the release's own
+  // snap, else reuse `lastSnap` when the release landed within `toleranceWorld` (WORLD units) by squared
+  // distance, so a near-miss release still binds. `target` null = author no anchor. The reuse radius lives
+  // in core (CREATE_ANCHOR_REUSE_TOLERANCE_PX); the caller passes it / zoom as `toleranceWorld`.
+  resolveCreateRelease(
+    release: { end: { x: number; y: number }; snapped: boolean; target: string | null },
+    lastSnap: { at: { x: number; y: number }; target: string } | null,
+    toleranceWorld: number
+  ): { end: { x: number; y: number }; target: string | null };
   // Commit ops of an endpoint-drag release on an open-class object: one chord-deform `edit-geometry`
   // moving the endpoint (`nodeIndex`, 0 or last) to the world-px release point, plus the `set-anchor`
   // whole-vector rewrite — rebound to `snap.targetId` (at `snap.at`, defaulting to the release point)
@@ -316,6 +410,26 @@ export type SceneCore = {
   // True only when a non-null `selectedId` is a container (has children).
   ungroupEnabled(scene: ObjectScene, selectedId: string | null): boolean;
   doubleClickAction(scene: ObjectScene, id: string): DoubleClickAction;
+  // The ops grouping `ids` under a new frame `frameId`: an insert-object for a clipped frame sized +
+  // placed to the children's union world-AABB, then one reparent per child re-homing it into the frame.
+  // Null when fewer than two known members resolve or no member yields a derivable region.
+  groupOps(scene: ObjectScene, ids: string[], frameId: string): ObjectOp[] | null;
+  // The ops dissolving the container `frameId`: one reparent per child re-homing it to the frame's parent
+  // (grandparent or canvas root), then a delete of the empty frame. Null when `frameId` is unknown.
+  ungroupOps(scene: ObjectScene, frameId: string): ObjectOp[] | null;
+  // The create-gesture screen-px thresholds (recognize), read once at init so the shell holds no
+  // literal copy. Each is divided by the live zoom before it crosses back into a core call.
+  createThresholds(): CreateThresholds;
+  // The order key for a NEW object landing on top, minted through fractional indexing (strictly above
+  // the scene's max order; the canonical first key on an empty scene). The shell never invents an order key.
+  nextOrderKey(scene: ObjectScene): string;
+  // The order key for a NEW object landing at the back (strictly below the scene's min order).
+  backOrderKey(scene: ObjectScene): string;
+  // A key strictly between `a` and `b` (null = open end). Throws when a bound is malformed or `a >= b`.
+  keyBetween(a: string | null, b: string | null): string;
+  // The 2-op `reorder` swap stepping `id` one place toward the front/back over the flat scene order,
+  // or null when `id` is unknown or has no neighbor in that direction (already at the relevant extent).
+  reorderStepOps(scene: ObjectScene, id: string, direction: ReorderDirection): ObjectOp[] | null;
   createUndoStack(actorId: string): UndoStack;
 };
 
@@ -399,6 +513,13 @@ export async function loadSceneCore(): Promise<SceneCore> {
         mod.object_gesture_catalog()
       );
     },
+    templateAnchor(scene, fallback) {
+      const [x, y] = parseBridge<[number, number]>(
+        "template_anchor",
+        mod.template_anchor(JSON.stringify(scene), fallback.x, fallback.y)
+      );
+      return { x, y };
+    },
     buildObjectTemplate(templateId, anchorX, anchorY, idPrefix) {
       return parseBridge<SceneObject[]>(
         "build_object_template",
@@ -468,11 +589,22 @@ export async function loadSceneCore(): Promise<SceneCore> {
       }
       return value as SceneObject["geometry"];
     },
-    partialEraseOps(scene, id, x, y, radius) {
+    partialEraseOps(scene, id, wx, wy, radius) {
       return parseBridge<ObjectOp[]>(
         "partial_erase_ops",
-        mod.partial_erase_ops(JSON.stringify(scene), id, x, y, radius)
+        mod.partial_erase_ops(JSON.stringify(scene), id, wx, wy, radius)
       );
+    },
+    objectWorldAabb(object) {
+      // A node-less object comes back as `{error}`; treat as null (no bbox), not a throw.
+      const raw = mod.object_world_aabb(JSON.stringify(object));
+      const value = JSON.parse(raw) as
+        | { minX: number; minY: number; maxX: number; maxY: number }
+        | { error: string };
+      if (value && typeof value === "object" && "error" in value && typeof value.error === "string") {
+        return null;
+      }
+      return value as { minX: number; minY: number; maxX: number; maxY: number };
     },
     anchorFollowOps(scene, ops) {
       return parseBridge<ObjectOp[]>(
@@ -486,6 +618,33 @@ export async function loadSceneCore(): Promise<SceneCore> {
         mod.move_ops(JSON.stringify(scene), JSON.stringify(roots), JSON.stringify(delta))
       );
     },
+    moveOpsForPick(scene, selection, id, delta) {
+      return parseBridge<ObjectOp[]>(
+        "move_ops_for_pick",
+        mod.move_ops_for_pick(JSON.stringify(scene), JSON.stringify(selection), id, JSON.stringify(delta))
+      );
+    },
+    validSelection(scene, selection) {
+      return parseBridge<ObjectSelection>(
+        "valid_selection",
+        mod.valid_selection(JSON.stringify(scene), JSON.stringify(selection))
+      );
+    },
+    selectAll(scene) {
+      return parseBridge<ObjectSelection>("select_all", mod.select_all(JSON.stringify(scene)));
+    },
+    duplicateOps(scene, ids, idPrefix, orderSeed) {
+      return parseBridge<ObjectOp[]>(
+        "duplicate_ops",
+        mod.duplicate_ops(JSON.stringify(scene), JSON.stringify(ids), idPrefix, orderSeed)
+      );
+    },
+    detachMoveOps(scene, id, delta) {
+      return parseBridge<ObjectOp[]>(
+        "detach_move_ops",
+        mod.detach_move_ops(JSON.stringify(scene), id, JSON.stringify(delta))
+      );
+    },
     synthesizeCreateAnchors(created, target, endpoint) {
       return parseBridge<Anchor[] | null>(
         "synthesize_create_anchors",
@@ -496,6 +655,33 @@ export async function loadSceneCore(): Promise<SceneCore> {
           endpoint.y
         )
       );
+    },
+    synthesizeCreateAnchorsBoth(scene, created, corners) {
+      const wire = corners.map((c) => (c ? { target: c.target, x: c.at.x, y: c.at.y } : null));
+      return parseBridge<Anchor[]>(
+        "synthesize_create_anchors_both",
+        mod.synthesize_create_anchors_both(
+          JSON.stringify(scene),
+          JSON.stringify(created),
+          JSON.stringify(wire)
+        )
+      );
+    },
+    resolveCreateRelease(release, lastSnap, toleranceWorld) {
+      const resolved = parseBridge<{ end: [number, number]; target: string | null }>(
+        "resolve_create_release",
+        mod.resolve_create_release(
+          JSON.stringify({
+            x: release.end.x,
+            y: release.end.y,
+            snapped: release.snapped,
+            target: release.target ?? ""
+          }),
+          lastSnap ? JSON.stringify({ x: lastSnap.at.x, y: lastSnap.at.y, target: lastSnap.target }) : "",
+          toleranceWorld
+        )
+      );
+      return { end: { x: resolved.end[0], y: resolved.end[1] }, target: resolved.target };
     },
     endpointReleaseOps(scene, id, nodeIndex, newPoint, snap) {
       return parseBridge<ObjectOp[]>(
@@ -527,6 +713,36 @@ export async function loadSceneCore(): Promise<SceneCore> {
       return parseBridge<DoubleClickAction>(
         "double_click_action",
         mod.double_click_action(JSON.stringify(scene), id)
+      );
+    },
+    groupOps(scene, ids, frameId) {
+      return parseBridge<ObjectOp[] | null>(
+        "group_ops",
+        mod.group_ops(JSON.stringify(scene), JSON.stringify(ids), frameId)
+      );
+    },
+    ungroupOps(scene, frameId) {
+      return parseBridge<ObjectOp[] | null>(
+        "ungroup_ops",
+        mod.ungroup_ops(JSON.stringify(scene), frameId)
+      );
+    },
+    createThresholds() {
+      return parseBridge<CreateThresholds>("create_thresholds", mod.create_thresholds());
+    },
+    nextOrderKey(scene) {
+      return parseBridge<string>("next_order_key", mod.next_order_key(JSON.stringify(scene)));
+    },
+    backOrderKey(scene) {
+      return parseBridge<string>("back_order_key", mod.back_order_key(JSON.stringify(scene)));
+    },
+    keyBetween(a, b) {
+      return parseBridge<string>("key_between", mod.key_between(a ?? "", b ?? ""));
+    },
+    reorderStepOps(scene, id, direction) {
+      return parseBridge<ObjectOp[] | null>(
+        "reorder_step_ops",
+        mod.reorder_step_ops(JSON.stringify(scene), id, direction)
       );
     },
     createUndoStack(actorId) {

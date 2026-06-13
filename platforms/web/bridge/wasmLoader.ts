@@ -7,6 +7,12 @@ export type RustCoreStatus = {
   probeWebGpu: RustWebGpuProbe | null;
   createWebGpuRenderer: RustCreateWebGpuRenderer | null;
   buildObjectSceneGeometry: ((sceneJson: string) => unknown) | null;
+  // Project a canonical ObjectScene (JSON) to the renderer-core RenderObjectScene
+  // (JSON) through the Rust core — the single owner of the identity default /
+  // selection flatten / stroke de-quant. Returns the projected JSON string.
+  projectObjectScene:
+    | ((sceneJson: string, cameraJson: string, selectionJson: string, sceneId: string) => string)
+    | null;
 };
 
 export type RustWebGpuFrameStats = {
@@ -70,6 +76,8 @@ export type RustCanvasInputEvent =
   | { kind: "focus-bounds"; bounds: WorldRect; screen?: WorldPoint; zoom?: number; padding?: WorldPoint; minZoom?: number; maxZoom?: number }
   | { kind: "set-camera"; camera: CameraState }
   | { kind: "set-tool"; tool: "select" | "hand" }
+  // Coarse-rotate modifier (e.g. Shift held); while active a rotate-handle drag snaps its swept delta in-core.
+  | { kind: "set-coarse-rotate"; active: boolean }
   // Empty clears the transient multi-select highlight; the persisted single-anchor selection is untouched.
   | { kind: "set-multi-select"; ids: string[] }
   // Right-click pick — populates result.hit without mutating selection.
@@ -173,6 +181,8 @@ export type RustWebGpuRenderer = {
   inputBatch(eventsJson: string): RustInputBatchResult;
   // Sets the active pointer tool ("select" | "hand"; unknown ignored).
   setTool?(tool: string): void;
+  // Sets the coarse-rotate modifier; while active a rotate-handle drag snaps its swept delta in-core.
+  setCoarseRotate?(active: boolean): void;
   // Pure object pick for the right-click context menu — top-most object id under the screen point, no mutation.
   hitTestObject?(screenX: number, screenY: number): string | null;
   // Pure swept erase pick — every object crossed between two consecutive SCREEN samples (prev -> curr),
@@ -189,6 +199,11 @@ export type RustWebGpuRenderer = {
     zoom: number,
     excludeIdsJson: string
   ): { snapped: boolean; x: number; y: number; targetId: string | null };
+  // Project a WORLD point to SCREEN through the LIVE core camera (inverse of `screenToWorld`); the shell
+  // calls this instead of recomputing the transform from a mirrored CameraState.
+  worldToScreen?(worldX: number, worldY: number): { x: number; y: number };
+  // Un-project a SCREEN point to WORLD through the LIVE core camera (inverse of `worldToScreen`).
+  screenToWorld?(screenX: number, screenY: number): { x: number; y: number };
   // Replace the transient multi-select highlight set (JSON array of ids).
   setMultiSelect?(idsJson: string): void;
   // Theme-bit: flip the renderer dark/light. Re-resolves token-backed instance colors and writes ONLY the color slot (zero rebake).
@@ -205,6 +220,12 @@ type RustCoreModule = {
   probeWebGpu?: RustWebGpuProbe;
   ShapeWebGpuRenderer?: RustWebGpuRendererClass;
   buildObjectSceneGeometry?: (sceneJson: string) => unknown;
+  projectObjectScene?: (
+    sceneJson: string,
+    cameraJson: string,
+    selectionJson: string,
+    sceneId: string
+  ) => string;
 };
 
 export async function loadRustCore(): Promise<RustCoreStatus> {
@@ -226,7 +247,9 @@ export async function loadRustCore(): Promise<RustCoreStatus> {
       probeWebGpu: typeof wasmModule.probeWebGpu === "function" ? wasmModule.probeWebGpu : null,
       createWebGpuRenderer: wasmModule.ShapeWebGpuRenderer.create.bind(wasmModule.ShapeWebGpuRenderer),
       buildObjectSceneGeometry:
-        typeof wasmModule.buildObjectSceneGeometry === "function" ? wasmModule.buildObjectSceneGeometry : null
+        typeof wasmModule.buildObjectSceneGeometry === "function" ? wasmModule.buildObjectSceneGeometry : null,
+      projectObjectScene:
+        typeof wasmModule.projectObjectScene === "function" ? wasmModule.projectObjectScene : null
     };
   } catch (error) {
     return {
@@ -235,7 +258,8 @@ export async function loadRustCore(): Promise<RustCoreStatus> {
       detail: error instanceof Error ? error.message : "Rust/WASM package has not been built yet.",
       probeWebGpu: null,
       createWebGpuRenderer: null,
-      buildObjectSceneGeometry: null
+      buildObjectSceneGeometry: null,
+      projectObjectScene: null
     };
   }
 }
