@@ -310,6 +310,18 @@ impl<T: EngineTransport, S: OutboxStore> SyncEngine<T, S> {
     /// from them. The snapshot is authoritative for everything NOT under a
     /// surviving unacked write.
     pub fn reconcile_snapshot(&mut self, snapshot: ObjectScene) -> Result<(), OutboxError> {
+        // A welcome whose `scene_version` predates our last server-confirmed
+        // revision is STALE: a windowed subscribe (pan/zoom) can race a just-acked
+        // local mutation and return a snapshot generated before it landed. Adopting
+        // it would regress acked state — e.g. resurrect a deleted object whose
+        // Delete already left the outbox on ack, so the outbox replay below has
+        // nothing left to re-remove it. `base_revision` advances only via `on_ack`
+        // (server-assigned revisions) and this reconcile, so a legitimate reconnect
+        // or window snapshot is always `>= base_revision`; only a racy stale welcome
+        // falls below it. Ignore it — the server's current snapshot follows.
+        if snapshot.scene_version < self.base_revision {
+            return Ok(());
+        }
         self.base_revision = snapshot.scene_version;
         self.scene = snapshot;
         self.ownership.clear();

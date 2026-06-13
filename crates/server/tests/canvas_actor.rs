@@ -445,6 +445,42 @@ async fn get_scene_region_filters_to_window() {
     assert_eq!(a.scene_version, full.scene_version, "windowed snapshot reports the true revision");
 }
 
+/// Repro: deleting an object that was created in a PRIOR session (persisted, then
+/// the actor shut down) and reloaded cold by a fresh actor must STICK — including
+/// in the WINDOWED region-index read a viewport change triggers, not just the
+/// full-scene read. The region row was written by the prior session; the cold
+/// delete must drop it too.
+#[tokio::test]
+async fn delete_of_reloaded_old_object_is_gone_from_windowed_region_query() {
+    // Session 1: create + persist an object at world origin, then shut down clean.
+    let (handle, store) = spawn_actor("c-old-delete");
+    handle.apply_op(object_at("old", "a0", 0.0, 0.0), "user-1").await;
+    handle.shutdown().await;
+
+    // Session 2: a fresh actor reloads "old" cold from the per-object Record
+    // (this is the "old object" condition — never inserted in THIS session's
+    // working scene), then deletes it.
+    let reborn = CanvasActor::spawn(CanvasId::from("c-old-delete"), std::sync::Arc::clone(&store));
+    let del = reborn.apply_op(ObjectOp::Delete { id: "old".into() }, "user-1").await;
+    assert!(matches!(del, ApplyResult::Applied { .. }), "delete applies, got {del:?}");
+
+    // The full-scene path (load_scene over the main table) must show it gone.
+    let full = reborn.get_scene().await;
+    assert!(full.get("old").is_none(), "deleted old object absent from full scene");
+
+    // The windowed region read (what a zoom/pan issues) must ALSO show it gone.
+    // A window over the object's position would resurrect it if the durable
+    // region index row survived the cold delete.
+    let window = RegionWindow { min_x: -50.0, min_y: -50.0, max_x: 50.0, max_y: 50.0 };
+    let windowed = reborn.get_scene_region(Some(window)).await;
+    assert!(
+        windowed.get("old").is_none(),
+        "deleted old object must not reappear in the windowed region query; \
+         got objects {:?}",
+        windowed.objects.iter().map(|o| o.id.as_str()).collect::<Vec<_>>()
+    );
+}
+
 use shape_scene_core::object::{Comment, FeatureRequest, FeatureResponse};
 
 #[tokio::test]

@@ -307,6 +307,122 @@ fn identical_text_commit_is_a_noop_and_authors_nothing() {
     );
 }
 
+#[test]
+fn deleting_an_old_object_then_reconciling_a_stale_windowed_welcome_must_not_resurrect_it() {
+    // Repro of the reported bug: an OLD object (created in a prior session, so it
+    // exists in the server's welcome snapshot but is NOT represented by any client
+    // outbox entry) is deleted; the delete is authored, sent, and ACKED (dropped
+    // from the outbox). Then a viewport change triggers a windowed `subscribe`,
+    // and the server answers with a welcome whose snapshot was captured BEFORE the
+    // delete landed (the subscribe and the delete-ack race on the wire / coalescing
+    // delays the delete past the immediately-fired subscribe). reconcile_snapshot
+    // must NOT bring the deleted object back.
+    //
+    // Contrast with a NEW object (next test): its insert+delete are both
+    // client-authored, so the snapshot never carries it — which is exactly why
+    // new objects delete fine while old ones come back.
+    let outbox = InMemoryOutboxStore::new();
+    let mut now = FixedNow::new();
+
+    // Boot from a welcome that already contains the old object (prior session).
+    let mut welcome = empty_scene();
+    welcome.objects.push(rect("old", "a0"));
+    welcome.scene_version = 7;
+    let mut engine = SyncEngine::new(welcome.clone(), "c1", outbox, CaptureTransport::new(), None);
+    assert_eq!(object_ids(engine.scene()), vec!["old"]);
+
+    // Delete the old object: optimistic local remove + outbox row.
+    let del = engine
+        .author(ObjectOp::Delete { id: "old".into() }, &now.next())
+        .unwrap();
+    assert_eq!(object_ids(engine.scene()), Vec::<String>::new(), "deleted locally");
+    assert_eq!(engine.outbox_len(), 1);
+
+    // The server applies the delete and ACKs it; the client drops the outbox row.
+    engine.on_ack(&[del.op_id.clone().unwrap()], Some(8)).unwrap();
+    assert_eq!(engine.outbox_len(), 0, "delete acked, outbox empty");
+
+    // A viewport change triggers a windowed `subscribe`. The welcome the server
+    // returns was captured at the pre-delete revision (it still carries "old").
+    // The outbox no longer holds the delete to replay on top.
+    engine.reconcile_snapshot(welcome).unwrap();
+
+    assert_eq!(
+        object_ids(engine.scene()),
+        Vec::<String>::new(),
+        "a deleted-and-acked old object must NOT reappear after reconciling a stale \
+         windowed welcome; it resurrected"
+    );
+}
+
+#[test]
+fn deleting_a_new_object_then_reconciling_a_stale_welcome_stays_deleted() {
+    // Contrast: a NEW object (inserted THIS session) deleted and both ops acked.
+    // The server's snapshot never carries it (the server applied both insert and
+    // delete), so reconcile cannot resurrect it — which is why new objects stay
+    // deleted while old ones (above) come back. This passes today; it pins the
+    // asymmetry so a fix to the old-object case must not regress it.
+    let outbox = InMemoryOutboxStore::new();
+    let mut now = FixedNow::new();
+    let mut engine = SyncEngine::new(empty_scene(), "c1", outbox, CaptureTransport::new(), None);
+
+    engine.author(insert(rect("new", "a0")), &now.next()).unwrap();
+    engine.on_ack(&[op_id("c1", 1)], Some(1)).unwrap();
+    let del = engine
+        .author(ObjectOp::Delete { id: "new".into() }, &now.next())
+        .unwrap();
+    engine.on_ack(&[del.op_id.clone().unwrap()], Some(2)).unwrap();
+    assert_eq!(engine.outbox_len(), 0);
+
+    // The server's welcome reflects the post-delete scene: "new" is absent.
+    let mut welcome = empty_scene();
+    welcome.scene_version = 2;
+    engine.reconcile_snapshot(welcome).unwrap();
+
+    assert_eq!(
+        object_ids(engine.scene()),
+        Vec::<String>::new(),
+        "a new object's delete sticks (the snapshot never carried it)"
+    );
+}
+
+#[test]
+fn a_stale_welcome_is_ignored_but_a_subsequent_current_welcome_is_still_adopted() {
+    // The staleness guard must skip ONLY the regressing welcome, not wedge reconcile:
+    // after a stale welcome is ignored (keeping an acked delete), the server's NEXT
+    // current welcome (scene_version >= base) must be adopted normally, loading its
+    // windowed object set. This pins that the guard is strictly `<` (a same/greater
+    // revision still adopts) so windowed pans and reconnects keep working.
+    let outbox = InMemoryOutboxStore::new();
+    let mut now = FixedNow::new();
+
+    let mut welcome = empty_scene();
+    welcome.objects.push(rect("old", "a0"));
+    welcome.scene_version = 7;
+    let mut engine = SyncEngine::new(welcome.clone(), "c1", outbox, CaptureTransport::new(), None);
+
+    let del = engine
+        .author(ObjectOp::Delete { id: "old".into() }, &now.next())
+        .unwrap();
+    engine.on_ack(&[del.op_id.clone().unwrap()], Some(8)).unwrap();
+
+    // Stale windowed welcome (rev 7 < base 8): ignored, the delete stands.
+    engine.reconcile_snapshot(welcome).unwrap();
+    assert_eq!(object_ids(engine.scene()), Vec::<String>::new(), "stale welcome ignored");
+
+    // A current welcome (rev 8) the pan reveals: "old" is gone server-side and a
+    // sibling "other" is now in view. It must be adopted: "other" loads, "old" stays gone.
+    let mut current = empty_scene();
+    current.objects.push(rect("other", "a1"));
+    current.scene_version = 8;
+    engine.reconcile_snapshot(current).unwrap();
+    assert_eq!(
+        object_ids(engine.scene()),
+        vec!["other"],
+        "a current welcome (>= base) is still adopted after a stale one was skipped"
+    );
+}
+
 fn text_object_value(value: &str) -> Option<shape_scene_core::object::model::Text> {
     use shape_scene_core::object::model::{Text, TextRun};
     Some(Text {
