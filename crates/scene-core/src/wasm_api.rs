@@ -36,21 +36,33 @@ fn parse<T: serde::de::DeserializeOwned>(label: &str, json: &str) -> Result<T, S
 // The web client runs the SAME object op-apply / region / templates as the server.
 use crate::object::anchor_follow::{
     geometry_follow_ops as geometry_follow_ops_pure,
+    resolve_create_release as resolve_create_release_pure,
     synthesize_create_anchors as synthesize_create_anchors_pure,
+    synthesize_create_anchors_both as synthesize_create_anchors_both_pure, CreateRelease,
+    CreateSnap,
 };
 use crate::object::deform::{
     endpoint_release_ops as endpoint_release_ops_pure, is_open_class_d as is_open_class_d_pure,
 };
 use crate::object::apply::apply_object_op as apply_object_op_pure;
 use crate::object::cascade::{move_ops as move_ops_pure, MoveRoots};
-use crate::object::model::Transform3x3;
+use crate::object::edit::{
+    detach_move_ops as detach_move_ops_pure, duplicate_ops as duplicate_ops_pure,
+    move_ops_for_pick as move_ops_for_pick_pure,
+};
+use crate::object::model::{ObjectSelection, Transform3x3};
+use crate::object::selection::{select_all as select_all_pure, valid_selection as valid_selection_pure};
 use crate::object::commands::object_command_catalog_json;
 use crate::object::gestures::object_gesture_catalog_json;
 use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush};
-use crate::object::recognize::{recognize_stroke_object, RecognizeMode};
+use crate::object::recognize::{
+    recognize_stroke_object, RecognizeMode, CREATE_ANCHOR_REUSE_TOLERANCE_PX,
+    MERGE_ENDPOINT_TOLERANCE_PX, MIN_DRAG_EXTENT_PX,
+};
 use crate::object::grouping::{
-    double_click_action as double_click_action_pure, has_children as has_children_pure,
-    pop_out_op as pop_out_op_pure, ungroup_enabled as ungroup_enabled_pure,
+    double_click_action as double_click_action_pure, group_ops as group_ops_pure,
+    has_children as has_children_pure, pop_out_op as pop_out_op_pure,
+    ungroup_enabled as ungroup_enabled_pure, ungroup_ops as ungroup_ops_pure,
 };
 use crate::object::merge::merge_open_stroke_ops as merge_open_stroke_ops_pure;
 use crate::object::model::{Geometry, Object, ObjectScene};
@@ -60,10 +72,19 @@ use crate::object::primitives::{
     build_primitive_from_drag as build_primitive_from_drag_pure,
     build_set_style_op as build_set_style_op_pure, DragSpan, PrimitiveKind,
 };
-use crate::object::region::{OutlineDeriver, StubOutlineDeriver};
-use crate::object::templates::build_template as build_template_pure;
+use crate::object::region::{
+    object_world_aabb as object_world_aabb_pure, world_to_local_quantized, OutlineDeriver,
+    StubOutlineDeriver,
+};
+use crate::object::templates::{
+    build_template as build_template_pure, template_anchor as template_anchor_pure,
+};
 use crate::object::undo::UndoStack;
-use crate::fractional::generate_key_between;
+use crate::fractional::{
+    back_order_key as back_order_key_pure, generate_key_between, key_between as key_between_pure,
+    next_order_key as next_order_key_pure, reorder_step_ops as reorder_step_ops_pure,
+    ReorderDirection,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -127,6 +148,20 @@ pub fn object_command_catalog() -> String {
 #[wasm_bindgen]
 pub fn object_gesture_catalog() -> String {
     object_gesture_catalog_json()
+}
+
+/// Where a new template should land: `[x, y]` world px, `gap_px` right of the
+/// right-most object's transform origin and top-aligned, or `[fallback_x,
+/// fallback_y]` when the scene is empty. The shell passes its viewport center as
+/// the fallback.
+#[wasm_bindgen]
+pub fn template_anchor(scene_json: &str, fallback_x: f64, fallback_y: f64) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (x, y) = template_anchor_pure(&scene, fallback_x, fallback_y);
+    ok_json(&[x, y])
 }
 
 /// A template recipe of inline-styled objects; the shell sends these as a
@@ -245,17 +280,23 @@ pub fn split_subpath_at(geometry_json: &str, x: i32, y: i32, radius: i32) -> Str
     }
 }
 
-/// The object-local quantized touch cuts the stroke; returns the whole op batch:
-/// `[]` on a miss, `[delete]` when the cut empties the object, else
-/// `[edit-geometry, ...follower-reprojection]`.
+/// A WORLD touch point (`wx`/`wy`, logical px) cuts the stroke; the core maps it
+/// into the object's local quantized space (inverse-affine + quantize, owned by
+/// `world_to_local_quantized` — no inverse-affine math in the shell), then cuts.
+/// Returns the whole op batch: `[]` on a miss (or a singular transform), `[delete]`
+/// when the cut empties the object, else `[edit-geometry, ...follower-reprojection]`.
+/// `radius` is the object-local quantized erase tolerance.
 #[wasm_bindgen]
-pub fn partial_erase_ops(scene_json: &str, id: &str, x: i32, y: i32, radius: i32) -> String {
+pub fn partial_erase_ops(scene_json: &str, id: &str, wx: f64, wy: f64, radius: i32) -> String {
     let scene: ObjectScene = match parse("scene", scene_json) {
         Ok(v) => v,
         Err(e) => return e,
     };
     let Some(object) = scene.objects.iter().find(|o| o.id == id) else {
         return ok_json(&Vec::<ObjectOp>::new());
+    };
+    let Some((x, y)) = world_to_local_quantized(object, wx, wy) else {
+        return ok_json(&Vec::<ObjectOp>::new()); // singular transform: nothing to cut
     };
     let mut geometry = object.geometry.clone();
     if let Err(e) = geometry.ensure_parsed() {
@@ -271,6 +312,22 @@ pub fn partial_erase_ops(scene_json: &str, id: &str, x: i32, y: i32, radius: i32
     let mut ops = vec![edit.clone()];
     ops.extend(geometry_follow_ops_pure(&StubOutlineDeriver, &scene, std::slice::from_ref(&edit)));
     ok_json(&ops)
+}
+
+/// The world-space AABB (logical px) of an object: its geometry nodes carried
+/// through the transform, min/max'd. This is the geometry half of the shell's old
+/// `unionWorldAabb`/text-overlay rect — `{minX,minY,maxX,maxY}`, or `{error}` when
+/// the geometry has no nodes or the input is malformed.
+#[wasm_bindgen]
+pub fn object_world_aabb(object_json: &str) -> String {
+    let object: Object = match parse("object", object_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match object_world_aabb_pure(&object) {
+        Some(aabb) => ok_json(&aabb),
+        None => error_json("object has no geometry nodes"),
+    }
 }
 
 /// A basic primitive centered on a world anchor, in the toolbar `color` (empty =
@@ -380,6 +437,93 @@ pub fn move_ops(scene_json: &str, roots_json: &str, delta_json: &str) -> String 
     ok_json(&move_ops_pure(&scene, &roots.into(), &delta))
 }
 
+/// The body-drag commit ops, deriving the [`MoveRoots`] from the live
+/// `selection` + picked `id` in-core (a Multi-on-member drag moves the whole
+/// set; otherwise the picked single root cascades its subtree). `selection_json`
+/// is the `ObjectSelection` wire shape (`{kind:"multi",ids}` / `{kind:"object",id}`
+/// / `{kind:"canvas"}`); `delta_json` is the world-space gesture matrix. Cascade
+/// before follow, same as [`move_ops`].
+#[wasm_bindgen]
+pub fn move_ops_for_pick(scene_json: &str, selection_json: &str, id: &str, delta_json: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let selection: ObjectSelection = match parse("selection", selection_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let delta: Transform3x3 = match parse("delta", delta_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&move_ops_for_pick_pure(&scene, &selection, id, &delta))
+}
+
+/// Reconcile `selection_json` against the scene: drop ids no longer present and
+/// collapse the kind (`>=2 live -> multi`, `1 -> object`, `0 -> canvas`). Returns
+/// the canonical `ObjectSelection` wire shape. The single source of truth for the
+/// collapse rule the shell mirrored in TS.
+#[wasm_bindgen]
+pub fn valid_selection(scene_json: &str, selection_json: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let selection: ObjectSelection = match parse("selection", selection_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&valid_selection_pure(&scene, &selection))
+}
+
+/// Select every object in the scene, collapsed by the same rule as
+/// [`valid_selection`]: empty -> `canvas`, one -> `object`, otherwise `multi`.
+#[wasm_bindgen]
+pub fn select_all(scene_json: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&select_all_pure(&scene))
+}
+
+/// The `insert-object` ops cloning each id in `ids_json` (a JSON string array)
+/// with a fresh id (`{id_prefix}-{n}`, indexed from `order_seed`) and a fresh
+/// fractional order key, offset by the canonical duplicate translate. Unknown
+/// ids are skipped; `[]` when nothing resolves.
+#[wasm_bindgen]
+pub fn duplicate_ops(scene_json: &str, ids_json: &str, id_prefix: &str, order_seed: u32) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ids: Vec<String> = match parse("ids", ids_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&duplicate_ops_pure(&scene, &ids, id_prefix, order_seed))
+}
+
+/// Alt-detach commit ops for an Alt-held body drag of an anchored open-class
+/// object: a `set-anchor` clearing its anchors, THEN the single-root
+/// [`move_ops`] computed against the scene with that object's anchors already
+/// cleared (so the move keeps the 0-rebake whole-object translate, not an
+/// anchor-follow reprojection). `delta_json` is the world-space gesture matrix.
+/// `[]` when `id` is not in the scene.
+#[wasm_bindgen]
+pub fn detach_move_ops(scene_json: &str, id: &str, delta_json: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let delta: Transform3x3 = match parse("delta", delta_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&detach_move_ops_pure(&scene, id, &delta))
+}
+
 /// Drag-create anchoring: binds `created`'s node nearest the snapped world
 /// endpoint to `target`; `at` is the snap world point in the target's LOCAL
 /// quantized space. `null` when no anchor should be authored.
@@ -400,6 +544,108 @@ pub fn synthesize_create_anchors(
     };
     let anchors = synthesize_create_anchors_pure(&created, &target, endpoint_x, endpoint_y);
     ok_json(&anchors)
+}
+
+/// A create gesture corner on the wire: a snapped `target` id plus the snap world
+/// point `{x,y}`, or `null` for an unsnapped corner.
+#[derive(Deserialize)]
+struct CornerWire {
+    target: String,
+    x: f64,
+    y: f64,
+}
+
+/// Release-time anchor authoring for BOTH gesture corners (shape drag-create AND
+/// the freehand pen): each corner binds `created`'s nearest node to its snapped
+/// target's outline, deduped to ONE anchor per node (first wins). `corners_json` is
+/// a 2-element JSON array of `{target,x,y}` | `null`. A null corner or a stale
+/// target authors nothing; a degenerate tap whose corners collapse onto one node
+/// binds at most one anchor. Returns the (possibly empty) anchor array.
+#[wasm_bindgen]
+pub fn synthesize_create_anchors_both(
+    scene_json: &str,
+    created_json: &str,
+    corners_json: &str,
+) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let created: Object = match parse("created", created_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let corners: Vec<Option<CornerWire>> = match parse("corners", corners_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let corners: Vec<Option<(String, f64, f64)>> = corners
+        .into_iter()
+        .map(|c| c.map(|c| (c.target, c.x, c.y)))
+        .collect();
+    let anchors = synthesize_create_anchors_both_pure(&scene, &created, &corners);
+    ok_json(&anchors)
+}
+
+/// A create-gesture release on the wire: the release endpoint `{x,y}` (world px),
+/// whether it landed on a live snap, and that snap's target id (empty = none).
+#[derive(Deserialize)]
+struct CreateReleaseWire {
+    x: f64,
+    y: f64,
+    snapped: bool,
+    target: String,
+}
+
+/// The resolved create release on the wire: the endpoint the created node lands on
+/// and the anchor target (`null` = author no anchor).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolvedCreateReleaseWire {
+    end: [f64; 2],
+    target: Option<String>,
+}
+
+/// Resolve a shape drag-create RELEASE to its final endpoint + anchor target: honor
+/// the release's own snap, else reuse the gesture's last snap when the release lands
+/// within `tolerance_world` (WORLD units) by squared distance. `last_snap_json` is
+/// `{x,y,target}` | empty (no prior snap). The reuse radius lives in core
+/// (`CREATE_ANCHOR_REUSE_TOLERANCE_PX`); the shell passes it / zoom as
+/// `tolerance_world`.
+#[wasm_bindgen]
+pub fn resolve_create_release(
+    release_json: &str,
+    last_snap_json: &str,
+    tolerance_world: f64,
+) -> String {
+    let release: CreateReleaseWire = match parse("release", release_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let last_snap: Option<CreateSnap> = if last_snap_json.is_empty() {
+        None
+    } else {
+        #[derive(Deserialize)]
+        struct SnapWire {
+            x: f64,
+            y: f64,
+            target: String,
+        }
+        match parse::<SnapWire>("lastSnap", last_snap_json) {
+            Ok(s) => Some(CreateSnap { at: (s.x, s.y), target: s.target }),
+            Err(e) => return e,
+        }
+    };
+    let release = CreateRelease {
+        end: (release.x, release.y),
+        snapped: release.snapped,
+        target: (!release.target.is_empty()).then_some(release.target),
+    };
+    let resolved = resolve_create_release_pure(&release, last_snap.as_ref(), tolerance_world);
+    ok_json(&ResolvedCreateReleaseWire {
+        end: [resolved.end.0, resolved.end.1],
+        target: resolved.target,
+    })
 }
 
 /// True iff `d` parses to exactly one open subpath. The core classifier
@@ -510,6 +756,112 @@ pub fn double_click_action(scene_json: &str, id: &str) -> String {
         Err(e) => return e,
     };
     ok_json(&double_click_action_pure(&scene, id))
+}
+
+/// The ops grouping `ids` under a new frame `frame_id`: an `insert-object` for a
+/// clipped frame sized + placed to the children's union world-AABB, then one
+/// `reparent` per child re-homing it into the frame. `null` when fewer than two
+/// known members resolve or no member yields a derivable region. `ids_json` is a
+/// JSON string array of object ids.
+#[wasm_bindgen]
+pub fn group_ops(scene_json: &str, ids_json: &str, frame_id: &str) -> String {
+    let mut scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = scene.ensure_parsed() {
+        return error_json(&format!("scene geometry parse failed: {e}"));
+    }
+    let ids: Vec<String> = match parse("ids", ids_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&group_ops_pure(&scene, &ids, frame_id))
+}
+
+/// The ops dissolving the container `frame_id`: one `reparent` per child re-homing
+/// it to the frame's parent (grandparent or canvas root), then a `delete` of the
+/// empty frame. `null` when `frame_id` is unknown.
+#[wasm_bindgen]
+pub fn ungroup_ops(scene_json: &str, frame_id: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&ungroup_ops_pure(&scene, frame_id))
+}
+
+/// The order key for a NEW object landing on top (strictly above the scene's max
+/// order, the canonical first key on an empty scene), minted through fractional
+/// indexing so the shell never invents an `order~` key.
+#[wasm_bindgen]
+pub fn next_order_key(scene_json: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&next_order_key_pure(&scene))
+}
+
+/// The order key for a NEW object landing at the back (strictly below the
+/// scene's min order). Replaces the shell's `0`-prefixed key invention.
+#[wasm_bindgen]
+pub fn back_order_key(scene_json: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&back_order_key_pure(&scene))
+}
+
+/// A key strictly between `a` and `b` (empty = open end). `{error}` when a bound
+/// is malformed or `a >= b`.
+#[wasm_bindgen]
+pub fn key_between(a: &str, b: &str) -> String {
+    let lo = (!a.is_empty()).then_some(a);
+    let hi = (!b.is_empty()).then_some(b);
+    match key_between_pure(lo, hi) {
+        Ok(key) => ok_json(&key),
+        Err(e) => error_json(&e),
+    }
+}
+
+/// The 2-op `reorder` swap stepping `id` one place toward the front
+/// (`"forward"`) or back (`"backward"`) over the flat scene order. `null` when
+/// `id` is unknown or has no neighbor in that direction. `{error}` for an
+/// unknown direction.
+#[wasm_bindgen]
+pub fn reorder_step_ops(scene_json: &str, id: &str, direction: &str) -> String {
+    let direction = match direction {
+        "forward" => ReorderDirection::Forward,
+        "backward" => ReorderDirection::Backward,
+        _ => return error_json("direction must be \"forward\" or \"backward\""),
+    };
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&reorder_step_ops_pure(&scene, id, direction))
+}
+
+/// The create-gesture screen-px thresholds the shell owns no copy of: the
+/// click-vs-drag extent, the release anchor-reuse radius, and the stroke
+/// merge-endpoint radius. The shell reads them here and divides by zoom — the
+/// values live ONLY in `recognize`.
+#[wasm_bindgen]
+pub fn create_thresholds() -> String {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Thresholds {
+        min_drag_extent_px: f64,
+        create_anchor_reuse_tolerance_px: f64,
+        merge_endpoint_tolerance_px: f64,
+    }
+    ok_json(&Thresholds {
+        min_drag_extent_px: MIN_DRAG_EXTENT_PX,
+        create_anchor_reuse_tolerance_px: CREATE_ANCHOR_REUSE_TOLERANCE_PX,
+        merge_endpoint_tolerance_px: MERGE_ENDPOINT_TOLERANCE_PX,
+    })
 }
 
 // Stateful wrapper over the core `UndoStack`: undo/redo hand out an op JSON for
@@ -702,6 +1054,81 @@ mod tests {
     }
 
     #[test]
+    fn synthesize_create_anchors_both_bridge_binds_dedupes_and_skips() {
+        // rect-a spans x in [200,300] via a drag-built rect; an open line whose node
+        // 0 sits at world (200,30) and node 1 at (500,30).
+        let scene = r#"{"sceneVersion":1,"objects":[
+            {"id":"rect-a","order":"a0","transform":[[1,0,200],[0,1,0],[0,0,1]],"geometry":{"d":"M 0 0 L 800 0 L 800 480 L 0 480 Z"}},
+            {"id":"rect-b","order":"a0","transform":[[1,0,500],[0,1,0],[0,0,1]],"geometry":{"d":"M 0 0 L 800 0 L 800 480 L 0 480 Z"}}
+        ],"tags":[],"selection":{"kind":"canvas"},"updatedAt":""}"#;
+        let created = r#"{"id":"edge","order":"a1","transform":[[1,0,0],[0,1,0],[0,0,1]],"geometry":{"d":"M 1600 240 L 4000 240"}}"#;
+        let out = synthesize_create_anchors_both(
+            scene,
+            created,
+            r#"[{"target":"rect-a","x":200,"y":30},{"target":"rect-b","x":500,"y":30}]"#,
+        );
+        let anchors: Vec<crate::object::model::Anchor> =
+            serde_json::from_str(&out).expect("both returns anchors");
+        assert_eq!(anchors.len(), 2, "one anchor per corner: {out}");
+        assert_eq!(anchors[0].node_index, 0);
+        assert_eq!(anchors[0].target, "rect-a");
+        assert_eq!(anchors[1].node_index, 1);
+        assert_eq!(anchors[1].target, "rect-b");
+
+        // A null corner + a stale-target corner author nothing.
+        let none = synthesize_create_anchors_both(
+            scene,
+            created,
+            r#"[null,{"target":"rect-gone","x":500,"y":30}]"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<crate::object::model::Anchor>>(&none).unwrap().len(),
+            0,
+            "null + stale corners bind nothing: {none}"
+        );
+    }
+
+    #[test]
+    fn resolve_create_release_bridge_reuses_within_radius_and_drops_outside() {
+        // A live snap on the release wins outright.
+        let live = resolve_create_release(
+            r#"{"x":200,"y":30,"snapped":true,"target":"rect-b"}"#,
+            r#"{"x":10,"y":10,"target":"old"}"#,
+            24.0,
+        );
+        let v: serde_json::Value = serde_json::from_str(&live).unwrap();
+        assert_eq!(v["target"], "rect-b");
+        assert_eq!(v["end"][0].as_f64().unwrap(), 200.0);
+
+        // A miss INSIDE the reuse radius reuses the snap point + target.
+        let reuse = resolve_create_release(
+            r#"{"x":318,"y":0,"snapped":false,"target":""}"#,
+            r#"{"x":300,"y":0,"target":"rect-a"}"#,
+            24.0,
+        );
+        let v: serde_json::Value = serde_json::from_str(&reuse).unwrap();
+        assert_eq!(v["target"], "rect-a", "within radius reuses: {reuse}");
+        assert_eq!(v["end"][0].as_f64().unwrap(), 300.0, "snap point, not the release end");
+
+        // A miss OUTSIDE the radius authors no anchor and keeps the release endpoint.
+        let drop = resolve_create_release(
+            r#"{"x":400,"y":0,"snapped":false,"target":""}"#,
+            r#"{"x":300,"y":0,"target":"rect-a"}"#,
+            24.0,
+        );
+        let v: serde_json::Value = serde_json::from_str(&drop).unwrap();
+        assert!(v["target"].is_null(), "outside the radius authors no anchor: {drop}");
+        assert_eq!(v["end"][0].as_f64().unwrap(), 400.0);
+
+        // No prior snap at all: the release passes through unbound.
+        let unbound =
+            resolve_create_release(r#"{"x":50,"y":60,"snapped":false,"target":""}"#, "", 24.0);
+        let v: serde_json::Value = serde_json::from_str(&unbound).unwrap();
+        assert!(v["target"].is_null());
+        assert_eq!(v["end"][1].as_f64().unwrap(), 60.0);
+    }
+
+    #[test]
     fn partial_erase_ops_returns_the_whole_op_batch() {
         // A touch near the middle node cuts the stroke; a far touch misses; an
         // unknown id is a no-op.
@@ -799,6 +1226,69 @@ mod tests {
         assert!(out.contains("\"error\""), "malformed roots is a bridge error");
     }
 
+    // --- move_ops_for_pick / duplicate_ops / detach_move_ops bridges ---
+
+    #[test]
+    fn move_ops_for_pick_bridge_multi_member_moves_the_set() {
+        // [a,b] multi, picking `a`: both members move (vs single `a` only).
+        let scene = scene_json(&[
+            line_object_json("a", None, 0.0, 0.0),
+            line_object_json("b", None, 50.0, 0.0),
+        ]);
+        let selection = r#"{"kind":"multi","ids":["a","b"]}"#;
+        let out = move_ops_for_pick(&scene, selection, "a", "[[1,0,10],[0,1,0],[0,0,1]]");
+        assert_eq!(move_ops_ids(&out), vec!["a", "b"]);
+        // Picking a non-member cascades only that single root.
+        let single = move_ops_for_pick(&scene, selection, "b", "[[1,0,10],[0,1,0],[0,0,1]]");
+        assert_eq!(move_ops_ids(&single), vec!["a", "b"], "b is a member, still moves the set");
+        let outside = move_ops_for_pick(
+            &scene_json(&[line_object_json("c", None, 0.0, 0.0)]),
+            r#"{"kind":"object","id":"c"}"#,
+            "c",
+            "[[1,0,10],[0,1,0],[0,0,1]]",
+        );
+        assert_eq!(move_ops_ids(&outside), vec!["c"], "single selection = single root");
+    }
+
+    #[test]
+    fn duplicate_ops_bridge_authors_inserts_with_fresh_ids_order_and_offset() {
+        let scene = scene_json(&[line_object_json("a", None, 100.0, 50.0)]);
+        let out = duplicate_ops(&scene, r#"["a"]"#, "dup", 0);
+        let ops: serde_json::Value = serde_json::from_str(&out).expect("dup returns ops");
+        let arr = ops.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["kind"], "insert-object");
+        assert_eq!(arr[0]["object"]["id"], "dup-0", "fresh id");
+        // +40/+40 from the source's (100,50).
+        let t = &arr[0]["object"]["transform"];
+        assert_eq!(t[0][2].as_f64().unwrap(), 140.0);
+        assert_eq!(t[1][2].as_f64().unwrap(), 90.0);
+        // Fresh order sorts strictly above the scene top ("a0").
+        assert!(arr[0]["object"]["order"].as_str().unwrap() > "a0");
+    }
+
+    #[test]
+    fn detach_move_ops_bridge_clears_anchor_then_translates_whole() {
+        // An open line anchored to a rect: detach clears the anchor and keeps a
+        // whole-object set-transform (no anchor-follow edit-geometry).
+        let edge = r#"{"id":"edge","order":"a1","transform":[[1,0,0],[0,1,0],[0,0,1]],"geometry":{"d":"M 0 0 L 800 0"},"anchors":[{"nodeIndex":0,"target":"rect","at":{"x":0,"y":0}}]}"#.to_string();
+        let scene = scene_json(&[line_object_json("rect", None, 0.0, 0.0), edge]);
+        let out = detach_move_ops(&scene, "edge", "[[1,0,40],[0,1,30],[0,0,1]]");
+        let ops: serde_json::Value = serde_json::from_str(&out).expect("detach returns ops");
+        let arr = ops.as_array().expect("array");
+        assert_eq!(arr[0]["kind"], "set-anchor");
+        assert_eq!(arr[0]["id"], "edge");
+        assert!(arr[0]["anchors"].as_array().unwrap().is_empty(), "anchors cleared first");
+        assert!(
+            arr.iter().any(|op| op["kind"] == "set-transform" && op["id"] == "edge"),
+            "whole-object translate: {out}"
+        );
+        assert!(
+            !arr.iter().any(|op| op["kind"] == "edit-geometry" && op["id"] == "edge"),
+            "no anchor-follow reprojection of the detached edge: {out}"
+        );
+    }
+
     // --- grouping bridges ---
 
     /// A scene with `root -> mid -> deep` plus a root-level `leaf`.
@@ -849,6 +1339,49 @@ mod tests {
         let edit: serde_json::Value =
             serde_json::from_str(&double_click_action(&grouping_scene_json(), "leaf")).unwrap();
         assert_eq!(edit["kind"], "edit-leaf");
+    }
+
+    #[test]
+    fn group_ops_bridge_authors_insert_frame_plus_reparents() {
+        // Two root-level members with distinct orders.
+        let a = r#"{"id":"a","order":"a0","transform":[[1,0,0],[0,1,0],[0,0,1]],"geometry":{"d":"M 0 0 L 8 0"}}"#.to_string();
+        let b = r#"{"id":"b","order":"a1","transform":[[1,0,5],[0,1,0],[0,0,1]],"geometry":{"d":"M 0 0 L 8 0"}}"#.to_string();
+        let scene = scene_json(&[a, b]);
+        let out = group_ops(&scene, r#"["a","b"]"#, "frame");
+        let ops: serde_json::Value = serde_json::from_str(&out).expect("ops json");
+        let arr = ops.as_array().expect("array");
+        assert_eq!(arr.len(), 3, "insert frame + 2 reparents");
+        assert_eq!(arr[0]["kind"], "insert-object");
+        assert_eq!(arr[0]["object"]["id"], "frame");
+        assert_eq!(arr[1]["kind"], "reparent");
+        assert_eq!(arr[1]["parent"], "frame");
+        assert_eq!(arr[2]["kind"], "reparent");
+        assert_eq!(arr[2]["parent"], "frame");
+    }
+
+    #[test]
+    fn group_ops_bridge_is_null_below_two_members() {
+        let scene = scene_json(&[line_object_json("a", None, 0.0, 0.0)]);
+        assert_eq!(group_ops(&scene, r#"["a"]"#, "frame"), "null");
+    }
+
+    #[test]
+    fn ungroup_ops_bridge_authors_reparents_then_delete() {
+        let out = ungroup_ops(&grouping_scene_json(), "mid");
+        let ops: serde_json::Value = serde_json::from_str(&out).expect("ops json");
+        let arr = ops.as_array().expect("array");
+        // `mid` has one child (`deep`) -> one reparent to grandparent (`root`) + delete.
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["kind"], "reparent");
+        assert_eq!(arr[0]["id"], "deep");
+        assert_eq!(arr[0]["parent"], "root");
+        assert_eq!(arr[1]["kind"], "delete");
+        assert_eq!(arr[1]["id"], "mid");
+    }
+
+    #[test]
+    fn ungroup_ops_bridge_is_null_for_unknown_frame() {
+        assert_eq!(ungroup_ops(&grouping_scene_json(), "ghost"), "null");
     }
 
     // --- WasmUndoStack bridge ---

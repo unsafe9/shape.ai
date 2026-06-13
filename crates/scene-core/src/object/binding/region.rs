@@ -4,7 +4,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::object::model::{Geometry, LocalPoint};
+use crate::object::anchor_follow::{affine_of, apply_affine, invert_affine, local_nodes};
+use crate::object::model::{Geometry, LocalPoint, Object, GEOMETRY_QUANTUM_PER_PX};
+
+/// Quantized units per logical pixel (Q=8); the world<->local map quantizes with
+/// the SAME factor as the renderer / anchor reproject.
+const UNITS_PER_PX: f64 = GEOMETRY_QUANTUM_PER_PX as f64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,4 +123,148 @@ fn nearest_on_outline(poly: &[LocalPoint], at: LocalPoint) -> Option<LocalPoint>
         let dy = i64::from(q.y - at.y);
         dx * dx + dy * dy
     })
+}
+
+/// A world-aligned bounding box in logical px (the AABB of the transformed
+/// geometry corners).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldAabb {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+}
+
+/// Map a WORLD point (logical px) into `object`'s local quantized geometry space:
+/// inverse-affine into object-local logical px, then quantize by [`UNITS_PER_PX`]
+/// with `round()` — byte-equivalent to the shell's old `worldToObjectLocalQuantized`
+/// and to `node_index_nearest_world`'s mapping. `None` when the object's transform
+/// is singular (degenerate scale), so no inverse-affine math lives in the shell.
+pub fn world_to_local_quantized(object: &Object, wx: f64, wy: f64) -> Option<(i32, i32)> {
+    let a = affine_of(&object.transform);
+    let det = a[0][0] * a[1][1] - a[0][1] * a[1][0];
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let inv = invert_affine(&a);
+    let (lx, ly) = apply_affine(&inv, wx, wy);
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "quantize to integer object-local units: .round() then narrow, the canonical de/quantize semantic"
+    )]
+    let qx = (lx * UNITS_PER_PX).round() as i32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "quantize to integer object-local units: .round() then narrow, the canonical de/quantize semantic"
+    )]
+    let qy = (ly * UNITS_PER_PX).round() as i32;
+    Some((qx, qy))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{object_world_aabb, world_to_local_quantized};
+    use crate::object::model::{
+        FillRule, Geometry, Object, PathNode, SubPath, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
+    };
+
+    fn rect_object(transform: Transform3x3) -> Object {
+        // A 10x6 logical-px rect, local-quantized.
+        let q = GEOMETRY_QUANTUM_PER_PX;
+        let geometry = Geometry::from_subpaths(
+            vec![SubPath {
+                closed: true,
+                nodes: vec![
+                    PathNode::corner(0, 0),
+                    PathNode::corner(10 * q, 0),
+                    PathNode::corner(10 * q, 6 * q),
+                    PathNode::corner(0, 6 * q),
+                ],
+            }],
+            FillRule::EvenOdd,
+        );
+        let mut obj = Object::new("r", "a0", geometry);
+        obj.transform = transform;
+        obj
+    }
+
+    // A rotate(90°) + scale(2) transform; det != 0 so it inverts cleanly.
+    fn rot90_scale2() -> Transform3x3 {
+        // local (x, y) -> world (-2y + 100, 2x + 50): 90° CCW, scale 2, offset.
+        Transform3x3 {
+            m: [[0.0, -2.0, 100.0], [2.0, 0.0, 50.0], [0.0, 0.0, 1.0]],
+        }
+    }
+
+    #[test]
+    fn world_point_inside_rotated_scaled_object_maps_to_right_local_node() {
+        let obj = rect_object(rot90_scale2());
+        // Target the node at local px (10, 6) — quantized (80, 48). Its world point is
+        // (-2*6 + 100, 2*10 + 50) = (88, 70). A world touch ON it must recover (80, 48),
+        // NOT the origin node (0,0) or any other corner.
+        let (lx, ly) = world_to_local_quantized(&obj, 88.0, 70.0).expect("invertible");
+        assert_eq!((lx, ly), (10 * 8, 6 * 8));
+        // The origin corner's world point (100, 50) must map back to (0, 0), proving the
+        // inverse is faithful (a wrong inverse would land elsewhere).
+        assert_eq!(world_to_local_quantized(&obj, 100.0, 50.0).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn world_to_local_quantized_none_on_singular_transform() {
+        // Collapse the x-axis: det = 0, not invertible.
+        let singular = Transform3x3 {
+            m: [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        let obj = rect_object(singular);
+        assert_eq!(world_to_local_quantized(&obj, 5.0, 5.0), None);
+    }
+
+    #[test]
+    fn world_aabb_matches_union_of_transformed_corners() {
+        let t = rot90_scale2();
+        let obj = rect_object(t);
+        let aabb = object_world_aabb(&obj).expect("has nodes");
+        // Local-px corners (0,0),(10,0),(10,6),(0,6) through world(x,y)=(-2y+100, 2x+50):
+        //   (100,50), (100,70), (88,70), (88,50)  => x in [88,100], y in [50,70].
+        assert_eq!(aabb.min_x, 88.0);
+        assert_eq!(aabb.max_x, 100.0);
+        assert_eq!(aabb.min_y, 50.0);
+        assert_eq!(aabb.max_y, 70.0);
+    }
+
+    #[test]
+    fn world_aabb_none_on_empty_geometry() {
+        let obj = Object::new("e", "a0", Geometry::default());
+        assert_eq!(object_world_aabb(&obj), None);
+    }
+}
+
+/// The world-space AABB (logical px) of `object`: each geometry node de-quantized
+/// to object-local px, carried through the transform's affine, then min/max'd. This
+/// is the union of the transformed corners for an axis-aligned object, and the true
+/// transformed-node AABB for a rotated/scaled one. `None` when the geometry has no
+/// nodes.
+pub fn object_world_aabb(object: &Object) -> Option<WorldAabb> {
+    let nodes = local_nodes(&object.geometry.path_string);
+    if nodes.is_empty() {
+        return None;
+    }
+    let a = affine_of(&object.transform);
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for (nx, ny) in nodes {
+        let (wx, wy) = apply_affine(&a, nx / UNITS_PER_PX, ny / UNITS_PER_PX);
+        min_x = min_x.min(wx);
+        min_y = min_y.min(wy);
+        max_x = max_x.max(wx);
+        max_y = max_y.max(wy);
+    }
+    if min_x.is_finite() {
+        Some(WorldAabb { min_x, min_y, max_x, max_y })
+    } else {
+        None
+    }
 }

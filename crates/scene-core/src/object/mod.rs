@@ -7,9 +7,9 @@ pub mod binding;
 pub mod catalog;
 pub mod kernel;
 
-pub use kernel::{apply, model, op, undo, validate};
+pub use kernel::{apply, model, op, selection, undo, validate};
 
-pub use authoring::{deform, drawing, merge, primitives, recognize, templates};
+pub use authoring::{deform, drawing, edit, merge, primitives, recognize, templates};
 
 pub use binding::{
     anchor_follow, anchors, cascade, grouping, layout_solve, move_together, region,
@@ -19,7 +19,8 @@ pub use catalog::{commands, gestures, theme};
 
 pub use anchor_follow::{
     anchor_follow_ops, geometry_follow_ops, local_nodes, reproject_geometry_node,
-    synthesize_create_anchors,
+    resolve_create_release, synthesize_create_anchors, synthesize_create_anchors_both,
+    CreateRelease, CreateSnap, ResolvedCreateRelease,
 };
 pub use move_together::{BindingGraph, BindingNode, PropEdge, PropKind};
 pub use anchors::{connection_graph, neighbors, reproject_object_anchors, resolve_endpoint};
@@ -33,14 +34,21 @@ pub use deform::{
     open_endpoint_pins, route_open_endpoints, EndpointRoute,
 };
 pub use drawing::{fit_beziers, pressure_to_width, rdp_simplify, Brush};
+pub use edit::{
+    detach_move_ops, duplicate_ops, move_ops_for_pick, move_roots_for, DUPLICATE_OFFSET_PX,
+};
 pub use merge::merge_open_stroke_ops;
-pub use recognize::{recognize_stroke, recognize_stroke_object, RecognizeMode, RecognizedStroke};
+pub use recognize::{
+    recognize_stroke, recognize_stroke_object, RecognizeMode, RecognizedStroke,
+    CREATE_ANCHOR_REUSE_TOLERANCE_PX, MERGE_ENDPOINT_TOLERANCE_PX, MIN_DRAG_EXTENT_PX,
+};
 pub use gestures::{
     object_gesture_catalog, object_gesture_catalog_json, HoldInput, HoldTrigger, ObjectGesture,
     ObjectGestureCategory,
 };
 pub use grouping::{
-    double_click_action, has_children, pop_out_op, ungroup_enabled, DoubleClickAction,
+    double_click_action, group_ops, has_children, pop_out_op, ungroup_enabled, ungroup_ops,
+    DoubleClickAction,
 };
 pub use primitives::{
     build_primitive, build_primitive_from_drag, build_set_style_op, paint_for_color, DragSpan,
@@ -49,8 +57,9 @@ pub use primitives::{
 pub use layout_solve::solve_layout;
 pub use templates::{
     build_template, object_template_catalog, semantic_preset_style, semantic_presets,
-    template_to_ops, ObjectTemplate, ObjectTemplateMeta, TemplateCategory,
+    template_anchor, template_to_ops, ObjectTemplate, ObjectTemplateMeta, TemplateCategory,
 };
+pub use selection::{select_all, valid_selection};
 pub use undo::{UndoEntry, UndoStack};
 pub use validate::{
     validate_anchor_targets, validate_geometry, validate_no_parent_cycle, validate_object,
@@ -64,7 +73,10 @@ pub use model::{
 };
 pub use op::{FeatureRequest, FeatureResponse, FieldEdit, ObjectOp};
 pub use theme::{resolve_token, Token, ALL_TOKENS};
-pub use region::{LocalBounds, OutlineDeriver, Region, RegionError, StubOutlineDeriver};
+pub use region::{
+    object_world_aabb, world_to_local_quantized, LocalBounds, OutlineDeriver, Region, RegionError,
+    StubOutlineDeriver, WorldAabb,
+};
 
 #[cfg(test)]
 mod tests {
@@ -202,6 +214,34 @@ mod tests {
         assert_eq!(json, r#"{"kind":"token","name":"selection-ring"}"#);
         let back: Paint = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, paint);
+    }
+
+    #[test]
+    fn identical_set_text_is_a_noop_with_noop_inverse() {
+        use super::model::{Text, TextAlign, TextRun, TextVAlign};
+        let mut scene = ObjectScene::default();
+        apply_object_op(&mut scene, ObjectOp::InsertObject { object: Object::new("r", "a0", rect_geometry()) }).unwrap();
+        let text = Some(Text {
+            runs: vec![TextRun {
+                text: "hi".into(),
+                color: None,
+                size: None,
+                bold: false,
+                italic: false,
+                font: None,
+            }],
+            align: TextAlign::default(),
+            valign: TextVAlign::default(),
+        });
+
+        // First set changes the text and returns a real (set-text) inverse.
+        let inv = apply_object_op(&mut scene, ObjectOp::SetText { id: "r".into(), text: text.clone() }).unwrap();
+        assert!(matches!(inv, ObjectOp::SetText { .. }));
+        assert_eq!(scene.get("r").unwrap().text, text);
+
+        // Re-applying the SAME text is a no-op: empty-Batch inverse, so no bogus undo entry.
+        let inv2 = apply_object_op(&mut scene, ObjectOp::SetText { id: "r".into(), text }).unwrap();
+        assert_eq!(inv2, ObjectOp::Batch { ops: Vec::new() });
     }
 
     #[test]

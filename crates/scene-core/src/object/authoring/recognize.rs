@@ -80,6 +80,19 @@ const MAX_FALLBACK_NODES: usize = 24;
 /// Cubic-arc circle constant (matches the primitive ellipse builders).
 const KAPPA: f64 = 0.5523;
 
+/// Smallest extent (screen px) a drag must reach before a closed primitive counts
+/// as SIZED; below this the create gesture is a click (a default fixed-size shape
+/// at the start). The shell divides by zoom and holds no copy of this threshold.
+pub const MIN_DRAG_EXTENT_PX: f64 = 4.0;
+/// Screen-px radius within which a create RELEASE that missed the outline snap
+/// reuses the gesture's last in-flight snap (wider than the per-move 8px tolerance
+/// so a near-miss release still binds). The shell divides by zoom.
+pub const CREATE_ANCHOR_REUSE_TOLERANCE_PX: f64 = 24.0;
+/// Screen-px radius within which a freehand release END landing on an open-class
+/// object's ENDPOINT merges the stroke into it instead of inserting. The shell
+/// divides by zoom; the merge judgment itself lives in [`super::merge`].
+pub const MERGE_ENDPOINT_TOLERANCE_PX: f64 = 12.0;
+
 /// `Free` is the full pipeline; `Basic` (the toolbar default) force-snaps every
 /// stroke to a basic primitive (open -> 2-node line, closed -> best of ellipse /
 /// rect / triangle, threshold-free).

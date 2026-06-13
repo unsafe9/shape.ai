@@ -56,7 +56,7 @@ pub fn paint_for_color(color: &str) -> Paint {
 
 /// Quantize logical px to object-local integer units with JS `Math.round`
 /// semantics (`floor(x + 0.5)`, round half toward +∞) to match the TS exactly.
-fn q(px: f64) -> i32 {
+pub(crate) fn q(px: f64) -> i32 {
     if px.is_nan() {
         return 0;
     }
@@ -71,7 +71,7 @@ fn q(px: f64) -> i32 {
 }
 
 /// A closed rectangle path-string of `w`×`h` logical px (object-local).
-fn rect_path(w: f64, h: f64) -> String {
+pub(crate) fn rect_path(w: f64, h: f64) -> String {
     format!("M 0 0 L {} 0 L {} {} L 0 {} Z", q(w), q(w), q(h), q(h))
 }
 

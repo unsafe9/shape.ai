@@ -2,8 +2,13 @@
 //! pointer-width-agnostic; these AUTHOR the op (or report the decision) the
 //! shell then dispatches, never applying it themselves.
 
-use crate::object::model::{ObjectId, ObjectScene};
+use crate::fractional::{generate_n_keys_between, next_order_key};
+use crate::object::model::{
+    FillRule, Geometry, Object, ObjectId, ObjectScene, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
+};
 use crate::object::op::ObjectOp;
+use crate::object::primitives::rect_path;
+use crate::object::region::{OutlineDeriver, StubOutlineDeriver};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -41,6 +46,117 @@ pub fn pop_out_op(scene: &ObjectScene, id: &str) -> Option<ObjectOp> {
         parent: grandparent,
         order: child.order.clone(),
     })
+}
+
+/// The world-space AABB (logical px) of `object`: its local region bounds
+/// (quantized) mapped to px, then each corner pushed through its transform. The
+/// transform may rotate/skew/perspective, so all four corners are projected and
+/// the min/max taken. `None` when no region derives (empty geometry).
+fn world_aabb(object: &Object, deriver: &impl OutlineDeriver) -> Option<(f64, f64, f64, f64)> {
+    let bounds = deriver.derive_region(&object.geometry, 1).ok()?.bounds;
+    let q = f64::from(GEOMETRY_QUANTUM_PER_PX);
+    let (lx0, ly0) = (f64::from(bounds.min_x) / q, f64::from(bounds.min_y) / q);
+    let (lx1, ly1) = (f64::from(bounds.max_x) / q, f64::from(bounds.max_y) / q);
+    let corners = [(lx0, ly0), (lx1, ly0), (lx1, ly1), (lx0, ly1)];
+    let mut it = corners.iter().map(|&(x, y)| object.transform.apply_point(x, y));
+    let (mut min_x, mut min_y) = it.next()?;
+    let (mut max_x, mut max_y) = (min_x, min_y);
+    for (wx, wy) in it {
+        min_x = min_x.min(wx);
+        min_y = min_y.min(wy);
+        max_x = max_x.max(wx);
+        max_y = max_y.max(wy);
+    }
+    Some((min_x, min_y, max_x, max_y))
+}
+
+/// Author the ops grouping `ids` under a freshly minted frame `frame_id`: an
+/// `insert-object` for the frame (a clipped rect sized + placed to the children's
+/// union WORLD-AABB), then one `reparent` per child re-homing it into the frame.
+///
+/// The frame's geometry is a `rect_path` in object-local px; the world placement
+/// rides a pure-translation transform to the AABB min corner, so a later move is
+/// matrix-only. Children get fresh fractional order keys (in their current
+/// relative paint order) so they stack inside the frame as they did outside.
+///
+/// `None` when fewer than two known children resolve, or no member yields a
+/// derivable region (no AABB to frame).
+pub fn group_ops(scene: &ObjectScene, ids: &[ObjectId], frame_id: &str) -> Option<Vec<ObjectOp>> {
+    let deriver = StubOutlineDeriver;
+
+    // Members that exist, in canonical paint order (fractional `order`, ties by
+    // id) so the minted child keys preserve their relative stacking.
+    let mut members: Vec<&Object> =
+        ids.iter().filter_map(|id| scene.get(id)).collect();
+    if members.len() < 2 {
+        return None;
+    }
+    members.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
+
+    // Union world-AABB over every member with a derivable region.
+    let mut union: Option<(f64, f64, f64, f64)> = None;
+    for m in &members {
+        if let Some((x0, y0, x1, y1)) = world_aabb(m, &deriver) {
+            union = Some(match union {
+                None => (x0, y0, x1, y1),
+                Some((ux0, uy0, ux1, uy1)) => {
+                    (ux0.min(x0), uy0.min(y0), ux1.max(x1), uy1.max(y1))
+                }
+            });
+        }
+    }
+    let (min_x, min_y, max_x, max_y) = union?;
+
+    // The frame: a clipped rect of the union span, translated to its min corner.
+    let mut geometry = Geometry {
+        path_string: rect_path(max_x - min_x, max_y - min_y),
+        fill_rule: FillRule::NonZero,
+        subpaths: Vec::new(),
+    };
+    let _ = geometry.parse();
+    let mut frame = Object::new(frame_id.to_string(), next_order_key(scene), geometry);
+    frame.transform = Transform3x3::translate(min_x, min_y);
+    frame.clip = Some(true);
+
+    let mut ops = vec![ObjectOp::InsertObject { object: frame }];
+
+    // Fresh order keys under the new parent, one per member in paint order.
+    let child_keys = generate_n_keys_between(None, None, members.len()).ok()?;
+    for (m, order) in members.iter().zip(child_keys) {
+        ops.push(ObjectOp::Reparent {
+            id: m.id.clone(),
+            parent: Some(frame_id.to_string()),
+            order,
+        });
+    }
+    Some(ops)
+}
+
+/// Author the ops dissolving the container `frame_id`: re-home every child to the
+/// frame's parent (its grandparent, or the canvas root), each keeping its own
+/// order key, then `delete` the now-empty frame. The multi-child generalization
+/// of [`pop_out_op`] — children are reparented up one level, frame removed,
+/// leaving the forest orphan-free.
+///
+/// `None` when `frame_id` is unknown.
+pub fn ungroup_ops(scene: &ObjectScene, frame_id: &str) -> Option<Vec<ObjectOp>> {
+    let frame = scene.get(frame_id)?;
+    let grandparent = frame.parent.clone();
+
+    let mut children: Vec<&Object> =
+        scene.objects.iter().filter(|o| o.parent.as_deref() == Some(frame_id)).collect();
+    children.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
+
+    let mut ops: Vec<ObjectOp> = children
+        .iter()
+        .map(|c| ObjectOp::Reparent {
+            id: c.id.clone(),
+            parent: grandparent.clone(),
+            order: c.order.clone(),
+        })
+        .collect();
+    ops.push(ObjectOp::Delete { id: frame_id.to_string() });
+    Some(ops)
 }
 
 #[cfg(test)]
@@ -148,5 +264,154 @@ mod tests {
         assert_eq!(double_click_action(&scene, "frame"), DoubleClickAction::DrillInContainer);
         assert_eq!(double_click_action(&scene, "leaf"), DoubleClickAction::EditLeaf);
         assert_eq!(double_click_action(&scene, "ghost"), DoubleClickAction::EditLeaf);
+    }
+
+    // --- S2 group_ops / S3 ungroup_ops ---
+
+    use crate::fractional::cmp_keys;
+    use crate::object::apply::apply_object_op;
+
+    /// A closed `w`×`h` (px) rect at world `(tx, ty)` via a pure-translation
+    /// transform — geometry authored from local (0,0), so the world AABB is the
+    /// translate plus the local span.
+    fn rect(id: &str, order: &str, tx: f64, ty: f64, w: i32, h: i32) -> Object {
+        let q = GEOMETRY_QUANTUM_PER_PX;
+        let geometry = Geometry::from_subpaths(
+            vec![SubPath {
+                closed: true,
+                nodes: vec![
+                    PathNode::corner(0, 0),
+                    PathNode::corner(w * q, 0),
+                    PathNode::corner(w * q, h * q),
+                    PathNode::corner(0, h * q),
+                ],
+            }],
+            FillRule::NonZero,
+        );
+        let mut o = Object::new(id, order, geometry);
+        o.transform = Transform3x3::translate(tx, ty);
+        o
+    }
+
+    fn frame_op(ops: &[ObjectOp]) -> &Object {
+        match &ops[0] {
+            ObjectOp::InsertObject { object } => object,
+            other => panic!("expected insert-object first, got {}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn group_ops_frame_is_sized_and_placed_to_the_union_world_aabb() {
+        // a: 40x20 at (10,10) -> world [10,10]..[50,30]
+        // b: 30x30 at (60,50) -> world [60,50]..[90,80]
+        // union -> min (10,10), max (90,80): 80 wide, 70 tall.
+        let scene = scene_of(vec![rect("a", "a0", 10.0, 10.0, 40, 20), rect("b", "a1", 60.0, 50.0, 30, 30)]);
+        let ops = group_ops(&scene, &["a".into(), "b".into()], "frame").expect("group authors ops");
+        let frame = frame_op(&ops);
+        // Golden d: rect_path(80, 70) -> q(80)=640, q(70)=560.
+        assert_eq!(frame.geometry.path_string, "M 0 0 L 640 0 L 640 560 L 0 560 Z");
+        // Placed at the union min corner via a pure-translation transform.
+        assert_eq!(frame.transform.m[0][2], 10.0);
+        assert_eq!(frame.transform.m[1][2], 10.0);
+        assert_eq!(frame.clip, Some(true));
+        // A wrong AABB would shift the corner or resize the rect; pin both.
+    }
+
+    #[test]
+    fn group_ops_reparents_every_child_into_the_frame_with_validating_ascending_keys() {
+        let scene = scene_of(vec![rect("a", "a0", 0.0, 0.0, 10, 10), rect("b", "a1", 20.0, 0.0, 10, 10)]);
+        let ops = group_ops(&scene, &["a".into(), "b".into()], "frame").expect("ops");
+        // One insert (frame) + one reparent per child.
+        assert_eq!(ops.len(), 3);
+        let mut keys: Vec<String> = Vec::new();
+        for op in &ops[1..] {
+            match op {
+                ObjectOp::Reparent { id, parent, order } => {
+                    assert_eq!(parent.as_deref(), Some("frame"), "child {id} re-homed into frame");
+                    keys.push(order.clone());
+                }
+                other => panic!("expected reparent, got {}", other.kind()),
+            }
+        }
+        // Keys in member paint order (a before b) must strictly ascend, and they
+        // must apply cleanly through the real core (validation lives in apply).
+        assert_eq!(cmp_keys(&keys[0], &keys[1]), core::cmp::Ordering::Less, "{keys:?} not ascending");
+        let mut applied = scene.clone();
+        applied.ensure_parsed().unwrap();
+        for op in ops {
+            apply_object_op(&mut applied, op).expect("group op applies");
+        }
+        // After apply: both children parented to the frame, frame present, no orphans.
+        assert!(applied.get("frame").is_some());
+        assert_eq!(applied.get("a").unwrap().parent.as_deref(), Some("frame"));
+        assert_eq!(applied.get("b").unwrap().parent.as_deref(), Some("frame"));
+    }
+
+    #[test]
+    fn group_ops_is_none_below_two_members() {
+        let scene = scene_of(vec![rect("a", "a0", 0.0, 0.0, 10, 10)]);
+        assert!(group_ops(&scene, &["a".into()], "frame").is_none(), "single member: nothing to group");
+        assert!(group_ops(&scene, &["ghost".into(), "phantom".into()], "frame").is_none(), "unknown members");
+    }
+
+    #[test]
+    fn ungroup_ops_reparents_all_children_to_grandparent_and_deletes_the_frame() {
+        // root > frame > {a, b}; ungrouping frame re-homes a,b to root and deletes frame.
+        let mut a = rect("a", "a0", 0.0, 0.0, 10, 10);
+        a.parent = Some("frame".into());
+        let mut b = rect("b", "a1", 20.0, 0.0, 10, 10);
+        b.parent = Some("frame".into());
+        let mut frame = rect("frame", "a0", 0.0, 0.0, 40, 10);
+        frame.parent = Some("root".into());
+        let scene = scene_of(vec![rect("root", "a0", 0.0, 0.0, 80, 80), frame, a, b]);
+
+        let ops = ungroup_ops(&scene, "frame").expect("ungroup authors ops");
+        // Two reparents (children, in paint order) then the frame delete.
+        assert_eq!(ops.len(), 3);
+        assert_eq!(
+            ops[0],
+            ObjectOp::Reparent { id: "a".into(), parent: Some("root".into()), order: "a0".into() }
+        );
+        assert_eq!(
+            ops[1],
+            ObjectOp::Reparent { id: "b".into(), parent: Some("root".into()), order: "a1".into() }
+        );
+        assert_eq!(ops[2], ObjectOp::Delete { id: "frame".into() });
+
+        // Drive the real core: after apply the forest is orphan-free.
+        let mut applied = scene.clone();
+        applied.ensure_parsed().unwrap();
+        for op in ops {
+            apply_object_op(&mut applied, op).expect("ungroup op applies");
+        }
+        assert!(applied.get("frame").is_none(), "empty frame deleted");
+        assert_eq!(applied.get("a").unwrap().parent.as_deref(), Some("root"));
+        assert_eq!(applied.get("b").unwrap().parent.as_deref(), Some("root"));
+        // No object references the dissolved frame as a parent.
+        assert!(
+            applied.objects.iter().all(|o| o.parent.as_deref() != Some("frame")),
+            "no orphan still points at the frame"
+        );
+    }
+
+    #[test]
+    fn ungroup_ops_reparents_root_frame_children_to_the_canvas_root() {
+        // frame at the canvas root: its children pop out to None (the root).
+        let mut a = rect("a", "a0", 0.0, 0.0, 10, 10);
+        a.parent = Some("frame".into());
+        let mut frame = rect("frame", "a0", 0.0, 0.0, 20, 10);
+        frame.parent = None;
+        let scene = scene_of(vec![frame, a]);
+        let ops = ungroup_ops(&scene, "frame").expect("ops");
+        assert_eq!(
+            ops[0],
+            ObjectOp::Reparent { id: "a".into(), parent: None, order: "a0".into() }
+        );
+    }
+
+    #[test]
+    fn ungroup_ops_is_none_for_unknown_frame() {
+        let scene = scene_of(vec![rect("a", "a0", 0.0, 0.0, 10, 10)]);
+        assert!(ungroup_ops(&scene, "ghost").is_none());
     }
 }

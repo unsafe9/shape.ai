@@ -14,11 +14,16 @@
 //! happens (the only `f64` values live in `Transform3x3`).
 
 use crate::object::model::{
-    Anchor, Fill, FillRule, Geometry, LineCap, LineJoin, LocalPoint, Object, Paint, PathNode,
-    Stroke, SubPath, Text, TextAlign, TextRun, TextVAlign, Transform3x3, GEOMETRY_QUANTUM_PER_PX,
+    Anchor, Fill, FillRule, Geometry, LineCap, LineJoin, LocalPoint, Object, ObjectScene, Paint,
+    PathNode, Stroke, SubPath, Text, TextAlign, TextRun, TextVAlign, Transform3x3,
+    GEOMETRY_QUANTUM_PER_PX,
 };
 use crate::object::op::ObjectOp;
 use serde::{Deserialize, Serialize};
+
+/// Gap (logical px) placed to the right of the right-most object's transform
+/// origin, so a freshly-applied template never lands on top of existing content.
+const TEMPLATE_ANCHOR_GAP_PX: f64 = 240.0;
 
 /// Coarse grouping for the template picker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +168,28 @@ pub fn build_template(
     match registry().into_iter().find(|t| t.id == template_id) {
         Some(t) => (t.build)(anchor_x, anchor_y, id_alloc, order_alloc),
         None => Vec::new(),
+    }
+}
+
+/// Where a new template should land in world space. Content-extent + spacing: the
+/// anchor sits [`TEMPLATE_ANCHOR_GAP_PX`] to the right of the right-most object's
+/// transform origin, top-aligned to the highest origin. An empty scene has no
+/// content to clear, so it falls back to `(fallback_x, fallback_y)` (the shell's
+/// viewport center). Reads only the transform origin (the translation column), not
+/// the geometry AABB, matching the placement of a template's own recipe origin.
+pub fn template_anchor(scene: &ObjectScene, fallback_x: f64, fallback_y: f64) -> (f64, f64) {
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    for object in &scene.objects {
+        // The transform origin is the translation column of the affine matrix.
+        let (ox, oy) = (object.transform.m[0][2], object.transform.m[1][2]);
+        max_x = max_x.max(ox);
+        min_y = min_y.min(oy);
+    }
+    if max_x.is_finite() && min_y.is_finite() {
+        (max_x + TEMPLATE_ANCHOR_GAP_PX, min_y)
+    } else {
+        (fallback_x, fallback_y)
     }
 }
 
@@ -906,6 +933,38 @@ mod tests {
             assert_eq!(o.id, format!("id-{}", i + 1));
             assert_eq!(o.order, format!("o{}", i + 1));
         }
+    }
+
+    /// A scene of one rect placed at the given world origin (the only field
+    /// `template_anchor` reads is the transform's translation column).
+    fn scene_with_origins(origins: &[(f64, f64)]) -> ObjectScene {
+        let mut scene = ObjectScene::default();
+        for (i, &(x, y)) in origins.iter().enumerate() {
+            let mut obj = Object::new(format!("o{i}"), format!("a{i}"), rect_geometry(40, 30));
+            obj.transform = Transform3x3::translate(x, y);
+            scene.objects.push(obj);
+        }
+        scene
+    }
+
+    #[test]
+    fn template_anchor_lands_right_and_top_aligned() {
+        // Three objects; right-most origin x = 500, highest origin y = 10.
+        let scene = scene_with_origins(&[(100.0, 200.0), (500.0, 80.0), (300.0, 10.0)]);
+        let (ax, ay) = template_anchor(&scene, -1.0, -1.0);
+        // +240 right of the right-most origin, top-aligned to the highest origin.
+        assert_eq!(ax, 500.0 + 240.0);
+        assert_eq!(ay, 10.0);
+        // The fallback is ignored when the scene has content.
+        assert_ne!((ax, ay), (-1.0, -1.0));
+    }
+
+    #[test]
+    fn template_anchor_empty_scene_uses_fallback() {
+        let scene = ObjectScene::default();
+        assert!(scene.objects.is_empty());
+        let (ax, ay) = template_anchor(&scene, 17.0, 23.0);
+        assert_eq!((ax, ay), (17.0, 23.0));
     }
 
     #[test]

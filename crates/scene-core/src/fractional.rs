@@ -17,6 +17,9 @@
 
 use std::cmp::Ordering;
 
+use crate::object::model::ObjectScene;
+use crate::object::op::ObjectOp;
+
 const BASE_62_DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 const ZERO: u8 = b'0';
@@ -351,6 +354,73 @@ pub fn generate_n_keys_between(
     Ok(left)
 }
 
+// Scene-aware order-key surfaces. The shell never invents `order~`/`0`-prefixed
+// keys: it mints every z-order key through these, so each minted key passes
+// `validate_order_key` and sorts under the same plain `str` Ord the scene uses.
+// Order is the FLAT scene-wide z-order — the canonical paint order over all
+// `scene.objects`, matching how the model sorts.
+
+/// The order key for a NEW object landing on top: strictly above the scene's
+/// current max order. An empty scene yields the canonical first key `"a0"`.
+pub fn next_order_key(scene: &ObjectScene) -> String {
+    match scene.objects.iter().map(|o| o.order.as_str()).max_by(|a, b| cmp_keys(a, b)) {
+        Some(max) => generate_key_between(Some(max), None)
+            .unwrap_or_else(|_| generate_key_between(None, None).unwrap()),
+        None => generate_key_between(None, None).unwrap(),
+    }
+}
+
+/// The order key for a NEW object landing at the back: strictly below the
+/// scene's current min order. An empty scene yields the canonical first key.
+pub fn back_order_key(scene: &ObjectScene) -> String {
+    match scene.objects.iter().map(|o| o.order.as_str()).min_by(|a, b| cmp_keys(a, b)) {
+        Some(min) => generate_key_between(None, Some(min))
+            .unwrap_or_else(|_| generate_key_between(None, None).unwrap()),
+        None => generate_key_between(None, None).unwrap(),
+    }
+}
+
+/// A key strictly between `a` and `b`, the bare [`generate_key_between`] the
+/// shell calls so it never re-derives midpoints itself. `Err` if a bound is
+/// malformed or `a >= b`.
+pub fn key_between(a: Option<&str>, b: Option<&str>) -> Result<String, String> {
+    generate_key_between(a, b)
+}
+
+/// Direction of a single-step z-order move over the flat scene order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReorderDirection {
+    /// One step toward the front (the next-higher order neighbor).
+    Forward,
+    /// One step toward the back (the next-lower order neighbor).
+    Backward,
+}
+
+/// A single-step reorder: swap `id`'s order key with its forward/back neighbor
+/// over the flat scene order. Returns the two `Reorder` ops authoring the swap,
+/// or `None` when `id` is unknown or there is no neighbor in that direction
+/// (already at the relevant extent).
+pub fn reorder_step_ops(
+    scene: &ObjectScene,
+    id: &str,
+    direction: ReorderDirection,
+) -> Option<Vec<ObjectOp>> {
+    let mut sorted: Vec<&_> = scene.objects.iter().collect();
+    sorted.sort_by(|a, b| cmp_keys(&a.order, &b.order));
+    let index = sorted.iter().position(|o| o.id == id)?;
+    let neighbor_index = match direction {
+        ReorderDirection::Forward => index.checked_add(1)?,
+        ReorderDirection::Backward => index.checked_sub(1)?,
+    };
+    let neighbor = sorted.get(neighbor_index)?;
+    let self_obj = sorted[index];
+    Some(vec![
+        ObjectOp::Reorder { id: self_obj.id.clone(), order: neighbor.order.clone() },
+        ObjectOp::Reorder { id: neighbor.id.clone(), order: self_obj.order.clone() },
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +665,143 @@ mod tests {
         }
         assert_sorted_unique(&keys);
         assert!(keys[0].as_bytes()[0] < b'a', "expected negative head, got {:?}", keys[0]);
+    }
+
+    // --- scene-aware order-key surfaces (S1 + S6) ---
+
+    use crate::object::model::{FillRule, Geometry, Object, ObjectScene, PathNode, SubPath};
+    use crate::object::op::ObjectOp;
+
+    fn obj(id: &str, order: &str) -> Object {
+        let geometry = Geometry::from_subpaths(
+            vec![SubPath {
+                closed: false,
+                nodes: vec![PathNode::corner(0, 0), PathNode::corner(8, 0)],
+            }],
+            FillRule::EvenOdd,
+        );
+        Object::new(id, order, geometry)
+    }
+
+    fn scene_of(objects: Vec<Object>) -> ObjectScene {
+        ObjectScene { objects, ..Default::default() }
+    }
+
+    #[test]
+    fn next_order_key_lands_strictly_above_max_and_is_valid() {
+        let scene = scene_of(vec![obj("a", "a0"), obj("b", "a1"), obj("c", "a2")]);
+        let key = next_order_key(&scene);
+        validate_order_key(&key).expect("minted key validates");
+        // Strictly above the current max ("a2"), and above all existing.
+        for o in &scene.objects {
+            assert_eq!(cmp_keys(&o.order, &key), Ordering::Less, "{:?} !< {key:?}", o.order);
+        }
+    }
+
+    #[test]
+    fn back_order_key_lands_strictly_below_min_and_is_valid() {
+        let scene = scene_of(vec![obj("a", "a0"), obj("b", "a1"), obj("c", "a2")]);
+        let key = back_order_key(&scene);
+        validate_order_key(&key).expect("minted key validates");
+        // Strictly below the current min ("a0"), and below all existing.
+        for o in &scene.objects {
+            assert_eq!(cmp_keys(&key, &o.order), Ordering::Less, "{key:?} !< {:?}", o.order);
+        }
+    }
+
+    #[test]
+    fn empty_scene_order_keys_are_the_canonical_first_key() {
+        let scene = scene_of(vec![]);
+        assert_eq!(next_order_key(&scene), "a0");
+        assert_eq!(back_order_key(&scene), "a0");
+    }
+
+    #[test]
+    fn repeated_next_keys_keep_growing_without_drift() {
+        // Minting `next` repeatedly (feeding each new key back into the scene)
+        // stays strictly ascending — no repeat collides with the prior extent.
+        let mut scene = scene_of(vec![obj("a", "a0")]);
+        let mut prev = "a0".to_string();
+        for i in 0..50 {
+            let key = next_order_key(&scene);
+            assert_eq!(cmp_keys(&prev, &key), Ordering::Less, "step {i}: {prev:?} !< {key:?}");
+            validate_order_key(&key).expect("validates");
+            scene.objects.push(obj(&format!("n{i}"), &key));
+            prev = key;
+        }
+    }
+
+    #[test]
+    fn repeated_back_keys_keep_shrinking_without_drift() {
+        let mut scene = scene_of(vec![obj("a", "a0")]);
+        let mut prev = "a0".to_string();
+        for i in 0..50 {
+            let key = back_order_key(&scene);
+            assert_eq!(cmp_keys(&key, &prev), Ordering::Less, "step {i}: {key:?} !< {prev:?}");
+            validate_order_key(&key).expect("validates");
+            scene.objects.push(obj(&format!("b{i}"), &key));
+            prev = key;
+        }
+    }
+
+    #[test]
+    fn key_between_passes_through_generate_key_between() {
+        let k = key_between(Some("a0"), Some("a1")).unwrap();
+        assert_strictly_between("a0", &k, "a1");
+        assert!(key_between(Some("a1"), Some("a1")).is_err(), "a >= b is an error");
+    }
+
+    #[test]
+    fn reorder_step_forward_swaps_the_next_higher_neighbor() {
+        // Flat z-order a0 < a1 < a2; stepping "b" (a1) forward swaps it with "c" (a2).
+        let scene = scene_of(vec![obj("a", "a0"), obj("b", "a1"), obj("c", "a2")]);
+        let ops = reorder_step_ops(&scene, "b", ReorderDirection::Forward).expect("has a neighbor");
+        assert_eq!(
+            ops,
+            vec![
+                ObjectOp::Reorder { id: "b".into(), order: "a2".into() },
+                ObjectOp::Reorder { id: "c".into(), order: "a1".into() },
+            ],
+            "forward step swaps b<->c"
+        );
+    }
+
+    #[test]
+    fn reorder_step_backward_swaps_the_next_lower_neighbor() {
+        let scene = scene_of(vec![obj("a", "a0"), obj("b", "a1"), obj("c", "a2")]);
+        let ops = reorder_step_ops(&scene, "b", ReorderDirection::Backward).expect("has a neighbor");
+        assert_eq!(
+            ops,
+            vec![
+                ObjectOp::Reorder { id: "b".into(), order: "a0".into() },
+                ObjectOp::Reorder { id: "a".into(), order: "a1".into() },
+            ],
+            "backward step swaps b<->a"
+        );
+    }
+
+    #[test]
+    fn reorder_step_resolves_neighbor_over_sort_not_insertion_order() {
+        // Insertion order differs from sort order: c(a2), a(a0), b(a1). Stepping
+        // "a" forward must swap with "b" (next-higher by order), not by position.
+        let scene = scene_of(vec![obj("c", "a2"), obj("a", "a0"), obj("b", "a1")]);
+        let ops = reorder_step_ops(&scene, "a", ReorderDirection::Forward).expect("neighbor");
+        assert_eq!(
+            ops,
+            vec![
+                ObjectOp::Reorder { id: "a".into(), order: "a1".into() },
+                ObjectOp::Reorder { id: "b".into(), order: "a0".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_step_none_at_extent_or_unknown() {
+        let scene = scene_of(vec![obj("a", "a0"), obj("b", "a1")]);
+        // Top object has no forward neighbor; bottom has no backward neighbor.
+        assert!(reorder_step_ops(&scene, "b", ReorderDirection::Forward).is_none());
+        assert!(reorder_step_ops(&scene, "a", ReorderDirection::Backward).is_none());
+        // Unknown id resolves to no neighbor.
+        assert!(reorder_step_ops(&scene, "ghost", ReorderDirection::Forward).is_none());
     }
 }

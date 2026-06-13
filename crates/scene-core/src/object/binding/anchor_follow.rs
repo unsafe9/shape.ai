@@ -520,6 +520,92 @@ pub fn synthesize_create_anchors(
     }])
 }
 
+/// A create gesture's most recent successful outline snap: the snapped world point
+/// plus the object it bound to. Tracked sticky across the drag so a release that
+/// missed the live snap can still reuse it.
+pub struct CreateSnap {
+    pub at: (f64, f64),
+    pub target: String,
+}
+
+/// A create-gesture RELEASE: where the pointer let go (`end`, world px) and whether
+/// that release itself landed on a live outline snap (`target` set iff `snapped`).
+pub struct CreateRelease {
+    pub end: (f64, f64),
+    pub snapped: bool,
+    pub target: Option<String>,
+}
+
+/// The resolved create endpoint + anchor target: the world point the created node
+/// lands on and the object it binds to (`None` = author no anchor).
+pub struct ResolvedCreateRelease {
+    pub end: (f64, f64),
+    pub target: Option<String>,
+}
+
+/// Resolve a shape drag-create RELEASE to its final endpoint + anchor target: honor
+/// the release's own snap; else reuse the gesture's last snap when the release
+/// landed within `tolerance_world` (WORLD units) of it, decided by SQUARED
+/// world-distance so a near-miss release still authors the anchor instead of
+/// dropping it. The shell holds no copy of the reuse radius — it passes
+/// [`CREATE_ANCHOR_REUSE_TOLERANCE_PX`] / zoom.
+///
+/// [`CREATE_ANCHOR_REUSE_TOLERANCE_PX`]: crate::object::recognize::CREATE_ANCHOR_REUSE_TOLERANCE_PX
+pub fn resolve_create_release(
+    release: &CreateRelease,
+    last_snap: Option<&CreateSnap>,
+    tolerance_world: f64,
+) -> ResolvedCreateRelease {
+    if release.snapped {
+        if let Some(target) = &release.target {
+            return ResolvedCreateRelease { end: release.end, target: Some(target.clone()) };
+        }
+    }
+    if let Some(snap) = last_snap {
+        let dx = release.end.0 - snap.at.0;
+        let dy = release.end.1 - snap.at.1;
+        if dx * dx + dy * dy <= tolerance_world * tolerance_world {
+            return ResolvedCreateRelease { end: snap.at, target: Some(snap.target.clone()) };
+        }
+    }
+    ResolvedCreateRelease { end: release.end, target: None }
+}
+
+/// Release-time anchor authoring for BOTH gesture corners at once (shape
+/// drag-create AND the freehand pen): each corner binds `created`'s nearest node
+/// to its snapped target's outline via [`synthesize_create_anchors`]. A `None`
+/// corner, or one whose target is absent from `scene`, authors nothing. The result
+/// is deduped to ONE anchor per `node_index` — corners resolving to the SAME
+/// nearest node keep only the FIRST binding (so a degenerate tap, whose two corners
+/// collapse onto one node, binds at most one anchor). Returns the (possibly empty)
+/// anchor vector the caller stamps onto the created object.
+pub fn synthesize_create_anchors_both(
+    scene: &ObjectScene,
+    created: &Object,
+    corners: &[Option<(String, f64, f64)>],
+) -> Vec<Anchor> {
+    let mut anchors: Vec<Anchor> = Vec::new();
+    for corner in corners {
+        let Some((target_id, ex, ey)) = corner else {
+            continue;
+        };
+        let Some(target) = scene.get(target_id) else {
+            continue;
+        };
+        let Some(synthesized) = synthesize_create_anchors(created, target, *ex, *ey) else {
+            continue;
+        };
+        for anchor in synthesized {
+            // One anchor per node: a corner resolving to an already-bound node is dropped.
+            if anchors.iter().any(|prior| prior.node_index == anchor.node_index) {
+                continue;
+            }
+            anchors.push(anchor);
+        }
+    }
+    anchors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,6 +917,123 @@ mod tests {
     fn synthesize_returns_none_for_self_target() {
         let line = line("edge-1", 100 * Q, 0, 0.0, 0.0);
         assert!(synthesize_create_anchors(&line, &line, 100.0, 0.0).is_none());
+    }
+
+    // --- S11: resolve_create_release -------------------------------------
+
+    fn release(end: (f64, f64), snapped: bool, target: Option<&str>) -> CreateRelease {
+        CreateRelease { end, snapped, target: target.map(str::to_string) }
+    }
+
+    // A release that itself snapped binds to ITS OWN target at ITS OWN endpoint,
+    // ignoring the (stale) last snap.
+    #[test]
+    fn resolve_release_honors_its_own_live_snap() {
+        let last = CreateSnap { at: (10.0, 10.0), target: "old".into() };
+        let r = resolve_create_release(
+            &release((200.0, 30.0), true, Some("rect-b")),
+            Some(&last),
+            24.0,
+        );
+        assert_eq!(r.end, (200.0, 30.0));
+        assert_eq!(r.target.as_deref(), Some("rect-b"));
+    }
+
+    // A release that MISSED but landed INSIDE the reuse radius of the last snap
+    // reuses that snap's point and target. The boundary is INCLUSIVE: a release
+    // exactly `tolerance` away (squared distance == tolerance²) still reuses.
+    #[test]
+    fn resolve_release_reuses_last_snap_within_radius_inclusive() {
+        let last = CreateSnap { at: (300.0, 0.0), target: "rect-a".into() };
+        // Exactly 24 world units away on x: squared dist (576) == tolerance² (576).
+        let on_boundary =
+            resolve_create_release(&release((324.0, 0.0), false, None), Some(&last), 24.0);
+        assert_eq!(on_boundary.end, (300.0, 0.0), "reused snap point, not the release end");
+        assert_eq!(on_boundary.target.as_deref(), Some("rect-a"));
+    }
+
+    // Just OUTSIDE the reuse radius authors no anchor — the release endpoint stays,
+    // target is None. Pins the classifier boundary from the other side.
+    #[test]
+    fn resolve_release_drops_snap_just_outside_radius() {
+        let last = CreateSnap { at: (300.0, 0.0), target: "rect-a".into() };
+        // 24.001 away: squared dist > tolerance².
+        let out =
+            resolve_create_release(&release((324.001, 0.0), false, None), Some(&last), 24.0);
+        assert_eq!(out.end, (324.001, 0.0), "kept the release endpoint");
+        assert!(out.target.is_none(), "outside the reuse radius authors no anchor");
+    }
+
+    // No prior snap and no live snap: the release endpoint passes through unbound.
+    #[test]
+    fn resolve_release_without_any_snap_is_unbound() {
+        let r = resolve_create_release(&release((50.0, 60.0), false, None), None, 24.0);
+        assert_eq!(r.end, (50.0, 60.0));
+        assert!(r.target.is_none());
+    }
+
+    // --- S12: synthesize_create_anchors_both -----------------------------
+
+    // Both corners snap to DISTINCT targets and bind DISTINCT nodes (0 and last):
+    // two anchors come back, one per node.
+    #[test]
+    fn synthesize_both_binds_each_corner_to_its_target() {
+        let rect_a = line("rect-a", 0, 0, 200.0, 0.0);
+        let rect_b = line("rect-b", 0, 0, 500.0, 0.0);
+        // An open line whose node 0 sits at world (200,0) and node 1 at (500,0).
+        let mut created = Object::new("edge", "a1", polyline("M 1600 0 L 4000 0"));
+        created.transform = Transform3x3::IDENTITY;
+        let scene = scene_of(vec![rect_a, rect_b, created.clone()]);
+        let anchors = synthesize_create_anchors_both(
+            &scene,
+            &created,
+            &[
+                Some(("rect-a".into(), 200.0, 0.0)),
+                Some(("rect-b".into(), 500.0, 0.0)),
+            ],
+        );
+        assert_eq!(anchors.len(), 2, "one anchor per corner");
+        assert_eq!(anchors[0].node_index, 0);
+        assert_eq!(anchors[0].target, "rect-a");
+        assert_eq!(anchors[1].node_index, 1);
+        assert_eq!(anchors[1].target, "rect-b");
+    }
+
+    // A None corner and a corner whose target left the scene both author nothing.
+    #[test]
+    fn synthesize_both_skips_null_and_stale_corners() {
+        let rect_a = line("rect-a", 0, 0, 200.0, 0.0);
+        let mut created = Object::new("edge", "a1", polyline("M 1600 0 L 4000 0"));
+        created.transform = Transform3x3::IDENTITY;
+        let scene = scene_of(vec![rect_a, created.clone()]);
+        let anchors = synthesize_create_anchors_both(
+            &scene,
+            &created,
+            &[None, Some(("rect-gone".into(), 500.0, 0.0))],
+        );
+        assert!(anchors.is_empty(), "null + stale-target corners bind nothing");
+    }
+
+    // A degenerate tap: both corners collapse onto the SAME nearest node, so only
+    // the FIRST binding survives — at most one anchor per node.
+    #[test]
+    fn synthesize_both_degenerate_tap_binds_at_most_one_anchor_per_node() {
+        let rect_a = line("rect-a", 0, 0, 200.0, 0.0);
+        // A zero-length 2-node line: both nodes coincide at world (200,0), so BOTH
+        // corners resolve to the SAME nearest node.
+        let mut tap = Object::new("tap", "a1", polyline("M 1600 0 L 1600 0"));
+        tap.transform = Transform3x3::IDENTITY;
+        let scene = scene_of(vec![rect_a, tap.clone()]);
+        let anchors = synthesize_create_anchors_both(
+            &scene,
+            &tap,
+            &[
+                Some(("rect-a".into(), 200.0, 0.0)),
+                Some(("rect-a".into(), 200.0, 0.0)),
+            ],
+        );
+        assert_eq!(anchors.len(), 1, "a tap binds at most one anchor per node");
+        assert_eq!(anchors[0].target, "rect-a");
     }
 
     // Cross-core equivalence guard (the drift killer): one hand-computed vector,

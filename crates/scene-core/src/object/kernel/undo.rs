@@ -64,6 +64,13 @@ impl UndoStack {
     /// Clears the redo stack (a new edit forks history). During a coalescing
     /// window this folds into the single live entry.
     pub fn record(&mut self, forward: ObjectOp, inverse: ObjectOp) {
+        // An empty-Batch inverse means the op was a no-op (apply applied nothing
+        // and returned `Batch{ops:[]}`), so there is nothing to undo: skip it
+        // entirely. Recording it would leave a bogus undo entry that consumes a
+        // slot and does nothing, and would wrongly fork history (clear redo).
+        if matches!(&inverse, ObjectOp::Batch { ops } if ops.is_empty()) {
+            return;
+        }
         self.redo.clear();
         if self.coalescing_open {
             match &mut self.coalescing {
@@ -187,7 +194,8 @@ mod tests {
     use super::*;
     use crate::object::apply::apply_object_op;
     use crate::object::model::{
-        FillRule, Geometry, Object, ObjectScene, PathNode, SubPath, Transform3x3,
+        FillRule, Geometry, Object, ObjectScene, PathNode, SubPath, Text, TextAlign, TextRun,
+        TextVAlign, Transform3x3,
     };
     use crate::object::op::ObjectOp;
 
@@ -307,6 +315,75 @@ mod tests {
         stack.record(f2, i2);
         assert!(!stack.can_redo());
         assert_eq!(stack.redo_depth(), 0);
+    }
+
+    fn set_text(id: &str, body: &str) -> ObjectOp {
+        ObjectOp::SetText {
+            id: id.into(),
+            text: Some(Text {
+                runs: vec![TextRun {
+                    text: body.into(),
+                    color: None,
+                    size: None,
+                    bold: false,
+                    italic: false,
+                    font: None,
+                }],
+                align: TextAlign::default(),
+                valign: TextVAlign::default(),
+            }),
+        }
+    }
+
+    // A no-op op (identical SetText) returns an empty-Batch inverse from the real
+    // core; `record` must skip it so it leaves no bogus undo entry and does not
+    // fork history. Falsify by removing the skip in `record`: this fails because
+    // the no-op then pushes an entry that undoes nothing and clears redo.
+    #[test]
+    fn noop_inverse_is_not_recorded() {
+        let mut scene = scene_with_rect();
+
+        // A real edit followed by an undo so a redo entry exists; the no-op must
+        // not disturb it (branch-truncation only on a genuine fork).
+        let forward = set_text("r", "hello");
+        let inverse = apply_object_op(&mut scene, forward.clone()).expect("apply real set-text");
+        assert_eq!(inverse, ObjectOp::SetText { id: "r".into(), text: None });
+
+        let mut stack = UndoStack::new("a".into());
+        stack.record(forward, inverse.clone());
+        assert_eq!(stack.undo_depth(), 1);
+
+        let undo_op = stack.undo().expect("undo the real edit");
+        let ri = apply_object_op(&mut scene, undo_op).expect("apply undo");
+        stack.note_undo_applied(ri);
+        assert!(stack.can_redo());
+        assert_eq!(stack.redo_depth(), 1);
+        assert_eq!(stack.undo_depth(), 0);
+
+        // Author an identical no-op through the real core: text is already None
+        // after the undo, so setting None again yields an empty-Batch inverse.
+        let noop_forward = ObjectOp::SetText { id: "r".into(), text: None };
+        let noop_inverse =
+            apply_object_op(&mut scene, noop_forward.clone()).expect("apply no-op set-text");
+        assert_eq!(noop_inverse, ObjectOp::Batch { ops: Vec::new() });
+        stack.record(noop_forward, noop_inverse);
+
+        // The no-op changed nothing: depth unchanged, redo branch intact.
+        assert_eq!(stack.undo_depth(), 0);
+        assert!(!stack.can_undo());
+        assert!(stack.can_redo());
+        assert_eq!(stack.redo_depth(), 1);
+
+        // Redo still replays the real edit (the no-op did not truncate history),
+        // and undoing it returns the real op's inverse — not an empty no-op.
+        let redo_op = stack.redo().expect("redo survives the no-op");
+        let inv = apply_object_op(&mut scene, redo_op).expect("apply redo");
+        stack.note_redo_applied(inv);
+        assert_eq!(stack.undo_depth(), 1);
+
+        let undo_again = stack.undo().expect("undo the redone edit");
+        assert_eq!(undo_again, inverse);
+        assert_ne!(undo_again, ObjectOp::Batch { ops: Vec::new() });
     }
 
     #[test]

@@ -4,5 +4,6 @@
 pub mod apply;
 pub mod model;
 pub mod op;
+pub mod selection;
 pub mod undo;
 pub mod validate;

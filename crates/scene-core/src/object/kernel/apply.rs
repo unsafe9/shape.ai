@@ -138,6 +138,12 @@ fn apply_inner(scene: &mut ObjectScene, op: ObjectOp) -> Result<ObjectOp, ApplyE
 
         ObjectOp::SetText { id, text } => {
             let idx = index_of(scene, &id)?;
+            // An identical set is an empty-Batch no-op with a no-op inverse, so a
+            // commit/blur that did not change the text never pushes a bogus undo
+            // step (mirrors the SetAnchor degrade-to-no-op above).
+            if scene.objects[idx].text == text {
+                return Ok(ObjectOp::Batch { ops: Vec::new() });
+            }
             let old = scene.objects[idx].text.clone();
             scene.objects[idx].text = text;
             Ok(ObjectOp::SetText { id, text: old })
