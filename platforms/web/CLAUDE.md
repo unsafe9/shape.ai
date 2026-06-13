@@ -13,8 +13,14 @@ and id/seq generators handed in at construction. Everything else routes into the
 wasm core.
 
 Forbidden: any canvas decision in TS — coordinate math, op construction,
-hit-test, layout, undo, or collaboration policy. If you reach for one, stop; it
-belongs in a core crate, exposed over `wasm_api` and called from here.
+hit-test, layout, undo, or collaboration policy — and owning canonical state. The
+shell never holds the authoritative scene, commits to it, or authors the next op
+from a shell-side copy; it keeps at most a render-only projection the core hands it
+(the `onScene` payload), never mutated and never a decision basis. The single
+source of truth is the `client-runtime` session. If you reach for one of these,
+stop; it belongs in a core crate, exposed over `wasm_api` and called from here.
+`tests/thin-shell-endstate.test.ts` pins this boundary as source-level assertions —
+a leak there fails the build.
 
 `controller/gestureBindings.ts` is the ONLY sanctioned frozen mirror of core
 state: the hot pointer path can't await a wasm round-trip per event, so the

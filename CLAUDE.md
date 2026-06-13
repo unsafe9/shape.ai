@@ -17,7 +17,9 @@ The one rule: **keep canvas logic in the Rust cores, keep every shell thin.**
 `server`, and `platform-contract` — what a shell may see, so a new shell needs
 no core change. `platforms/` holds one shell per OS: `web/`
 is live, `macos/`/`ios/`/`android/` reserved empty dirs. A shell only forwards OS
-input, gives a surface, implements host ports, draws product UI. Directory-scoped
+input, gives a surface, implements host ports, draws product UI; it owns no
+canonical state, holding at most a render-only projection the core hands it —
+never authoring a decision or the next op from a shell-side copy. Directory-scoped
 rules live in each dir's `CLAUDE.md`.
 
 The cores stay portable because native targets (macOS Metal, iOS) are intended —
@@ -30,6 +32,15 @@ Performance is the top-priority target in every change: never ship a known-slow
 "just make it work first" implementation — redesign until it can hit the bar
 (transform-only updates, zero per-frame re-tessellation, no avoidable allocations
 on the hot path).
+
+Comments carry only what the code can't say — a non-obvious constraint, a why, a
+hazard. Cut narration that restates the next line, task/changelog markers, and edit
+history (that lives in the commit); a comment that only repeats the code is deleted.
+
+Build no abstraction past what a present caller needs — no indirection, option, or
+generality for one use site or a hypothetical future. The simplest code that clears
+the performance bar beats a flexible one that doesn't; collapse a layer the moment
+it has a single caller.
 
 The pure cores stay pointer-width-agnostic: no 32-bit address assumptions, so a
 future 64-bit wasm (Memory64) port is a target-triple flip, not a rewrite —
