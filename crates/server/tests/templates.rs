@@ -56,3 +56,34 @@ async fn list_returns_the_builtin_object_template_catalog() {
         assert!(ids.contains(&want), "missing {want}");
     }
 }
+
+/// `GET /api/extensions` serves the data-rep extension tool catalog, namespaced
+/// `ext_<name>_<tool>` — the same self-describing set `/mcp` advertises. Falsifiable
+/// against a dropped extension registration (the catalog would lose the group).
+#[tokio::test]
+async fn list_returns_the_namespaced_extension_tool_catalog() {
+    let canvases = CanvasRegistry::open_in_memory().unwrap();
+    let app = build_router_with_mcp(&test_config(), canvases);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/extensions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body_json(response).await;
+    let tools = body["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for want in ["ext_kanban_add_card", "ext_diagram_connect"] {
+        assert!(names.contains(&want), "missing extension tool {want} in {names:?}");
+    }
+    for tool in tools {
+        assert!(tool["description"].is_string());
+        assert_eq!(tool["schema"]["type"], "object");
+    }
+}

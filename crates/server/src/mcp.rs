@@ -11,21 +11,26 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::sync::Arc;
+
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, InitializeRequestParams, InitializeResult,
-    ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResult, Content, Implementation, InitializeRequestParams,
+    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
+    ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
+use rmcp::{tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 
 use shape_scene_core::object::{ObjectOp, ObjectScene, ObjectSelection};
 use shape_scene_core::CanvasId;
 
 use crate::canvas_actor::{ActorHandle, ApplyResult};
+use crate::extension_registry::ExtensionRegistry;
 use crate::object_mcp::{
     self, Bounds, CreateObjectSpec, PatchObjectSpec, QueryFilter,
 };
@@ -168,27 +173,61 @@ pub struct ExportArgs {
     pub canvas_id: Option<String>,
 }
 
-/// A handle to the shared canvas registry, cloned per streamable-HTTP session.
+/// A handle to the shared canvas registry + the data-rep extension registry,
+/// cloned per streamable-HTTP session.
+///
+/// The MCP surface is the SINGLE facade for both the core object tools and every
+/// extension's namespaced `ext_<name>_<tool>` group: `list_tools` advertises the
+/// core router's tools ++ each extension's tools; `call_tool` routes an
+/// `ext_*`-prefixed call to the extension registry (its author path funnels through
+/// the SAME `ActorHandle::apply_op`), and everything else to the core router. No
+/// second transport, no second op-apply.
 #[derive(Clone)]
 pub struct SceneMcp {
     canvases: CanvasRegistry,
-    // Read by `#[tool_handler]`-generated dispatch; the macro hides it from
-    // dead-code analysis.
-    #[allow(dead_code)]
+    extensions: ExtensionRegistry,
+    // The core object tool router. We DON'T use `#[tool_handler]` (which would
+    // generate `list_tools`/`call_tool`/`get_tool` from this router alone); instead
+    // the hand-written `ServerHandler` below overlays the extension tools on top.
     tool_router: ToolRouter<SceneMcp>,
 }
 
 impl SceneMcp {
     pub fn new(canvases: CanvasRegistry) -> Self {
+        Self::with_extensions(canvases, ExtensionRegistry::with_builtins())
+    }
+
+    pub fn with_extensions(canvases: CanvasRegistry, extensions: ExtensionRegistry) -> Self {
         Self {
             canvases,
+            extensions,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Tool definitions as `tools/list` returns them.
-    pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
-        Self::tool_router().list_all()
+    /// Tool definitions as `tools/list` returns them: the core object tools plus
+    /// every extension's namespaced tool group.
+    pub fn tool_definitions(&self) -> Vec<Tool> {
+        let mut tools = self.tool_router.list_all();
+        tools.extend(self.extension_tools());
+        tools
+    }
+
+    /// The extension tools as rmcp `Tool`s (namespaced `ext_<name>_<tool>`), built
+    /// from each extension's self-describing `mcp_tools()`.
+    fn extension_tools(&self) -> Vec<Tool> {
+        self.extensions
+            .tool_defs()
+            .into_iter()
+            .map(|def| {
+                let schema = match def.schema {
+                    Value::Object(map) => map,
+                    // A non-object schema degrades to an empty object schema.
+                    _ => Map::new(),
+                };
+                Tool::new(def.name, def.description.to_string(), Arc::new(schema))
+            })
+            .collect()
     }
 
     fn canvas(&self, canvas_id: &Option<String>) -> CanvasId {
@@ -406,7 +445,11 @@ pub struct SetSelectionArgs {
     pub canvas_id: Option<String>,
 }
 
-#[tool_handler]
+// Hand-written (NOT `#[tool_handler]`, whose generated `list_tools`/`call_tool`/
+// `get_tool` see ONLY the core router): `list_tools`/`get_tool` overlay the
+// extension tools, and `call_tool` routes an `ext_*` call to the extension
+// registry (else to the core router) — so the one `/mcp` facade advertises and
+// dispatches both. No second transport.
 impl ServerHandler for SceneMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
@@ -417,7 +460,7 @@ impl ServerHandler for SceneMcp {
         info.instructions = Some(
             "shape.ai object canvas MCP. Read tools: list_objects, get_object, query, \
              export. Write tools: create_object, patch_object, tag_object, add_comment, \
-             set_selection."
+             set_selection. Data-rep extension tools are namespaced ext_<name>_<tool>."
                 .to_string(),
         );
         info
@@ -429,5 +472,51 @@ impl ServerHandler for SceneMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         Ok(self.get_info())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.tool_definitions(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        if let Some(tool) = self.tool_router.get(name) {
+            return Some(tool.clone());
+        }
+        self.extension_tools().into_iter().find(|t| t.name == name)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // An `ext_*`-namespaced call dispatches to the extension registry, whose
+        // author path funnels through the SAME `ActorHandle::apply_op` as the core
+        // write tools. TODO(auth): real authn/authz attaches at this boundary.
+        if self.extensions.handles(&request.name) {
+            let args = request
+                .arguments
+                .clone()
+                .map(Value::Object)
+                .unwrap_or(Value::Null);
+            let canvas_id = args.get("canvasId").and_then(Value::as_str).map(str::to_string);
+            let handle = self.open_canvas(&canvas_id).await?;
+            let result = self
+                .extensions
+                .dispatch(&handle, &request.name, &args)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(json_response(result));
+        }
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 }

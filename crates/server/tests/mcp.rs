@@ -7,7 +7,7 @@ use shape_server::mcp::{
     AddCommentArgs, CanvasOnlyArgs, CreateObjectArgs, GetObjectArgs, PatchObjectArgs, QueryArgs,
     TagObjectArgs,
 };
-use shape_server::{CanvasRegistry, SceneMcp};
+use shape_server::{CanvasRegistry, ExtensionRegistry, SceneMcp};
 
 fn mcp_instance() -> SceneMcp {
     let canvases = CanvasRegistry::open_in_memory().unwrap();
@@ -26,7 +26,7 @@ fn result_json(result: &rmcp::model::CallToolResult) -> Value {
 
 #[test]
 fn tool_router_lists_object_tools() {
-    let tools = SceneMcp::tool_definitions();
+    let tools = mcp_instance().tool_definitions();
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     for expected in [
         "list_objects",
@@ -48,6 +48,140 @@ fn tool_router_lists_object_tools() {
             tool.name
         );
     }
+}
+
+/// The MCP-register seam: `tool_definitions` (what `list_tools` returns) overlays
+/// EVERY extension's namespaced tools on top of the core object tools. This is the
+/// falsifiable guard for the per-extension registration path — it FAILS if the
+/// facade ever drops the extension tool group (e.g. reverting to the macro-
+/// generated `#[tool_handler]` that sees only the core router).
+#[test]
+fn tool_definitions_advertise_namespaced_extension_tools() {
+    let names: Vec<String> = mcp_instance()
+        .tool_definitions()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    // The two reference extensions, namespaced `ext_<name>_<tool>`.
+    for expected in [
+        "ext_kanban_list_board",
+        "ext_kanban_add_column",
+        "ext_kanban_add_card",
+        "ext_diagram_list",
+        "ext_diagram_add_node",
+        "ext_diagram_connect",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "missing extension tool {expected} in {names:?}"
+        );
+    }
+    // The core tools are still there alongside them (one facade, both groups).
+    assert!(names.iter().any(|n| n == "create_object"));
+}
+
+/// The MCP-register seam end to end: a namespaced `ext_*` author call dispatches
+/// through the registry, whose author path funnels through the SAME `ActorHandle::
+/// apply_op` (so the board's objects land on the canvas the core tools also see),
+/// and a subsequent read reflects the authored model. Driving the real registry +
+/// a real actor handle is what makes this falsifiable against a broken path.
+#[tokio::test]
+async fn extension_author_and_read_funnel_through_the_one_apply_op() {
+    use shape_scene_core::CanvasId;
+    let canvases = CanvasRegistry::open_in_memory().unwrap();
+    let handle = canvases.get_or_spawn(&CanvasId::from("default")).await.unwrap();
+    let registry = ExtensionRegistry::with_builtins();
+
+    // Author a kanban column + card via the namespaced extension tools.
+    registry
+        .dispatch(&handle, "ext_kanban_add_column", &serde_json::json!({ "id": "todo", "title": "To do" }))
+        .await
+        .expect("add_column dispatches");
+    registry
+        .dispatch(&handle, "ext_kanban_add_card", &serde_json::json!({ "id": "k1", "column": "todo", "title": "First" }))
+        .await
+        .expect("add_card dispatches");
+
+    // The domain read reflects the authored model (one column, one card).
+    let listed = registry
+        .dispatch(&handle, "ext_kanban_list_board", &serde_json::json!({}))
+        .await
+        .expect("list_board dispatches");
+    assert_eq!(listed["columns"][0]["id"], "todo");
+    assert_eq!(listed["columns"][0]["cards"].as_array().unwrap().len(), 1);
+
+    // The export landed real objects on the SAME canvas the core tools see: the
+    // card rect is a normal scene object the extension tagged + keyed by domain key.
+    let scene = handle.get_scene().await;
+    assert!(
+        scene.get("ext-kanban-card:k1").is_some(),
+        "the authored card object rode the one op-apply onto the canvas"
+    );
+}
+
+/// The graph-shaped reference's MCP round-trip through the server boundary: author
+/// nodes + edges via the namespaced `ext_diagram_*` tools (the same registry +
+/// real actor a live `/mcp` call uses), then assert the core `connection_graph`
+/// over the resulting scene EQUALS the authored edge set. This proves a relational
+/// domain rides anchors all the way through the one op-apply — and is falsifiable
+/// against a broken export/dispatch/reconcile (it fails if the edges don't land as
+/// real connector objects the core graph can see).
+#[tokio::test]
+async fn diagram_author_lands_edges_the_core_connection_graph_sees() {
+    use shape_scene_core::object::connection_graph;
+    use shape_scene_core::CanvasId;
+    let canvases = CanvasRegistry::open_in_memory().unwrap();
+    let handle = canvases.get_or_spawn(&CanvasId::from("default")).await.unwrap();
+    let registry = ExtensionRegistry::with_builtins();
+
+    for (id, x) in [("a", 0.0), ("b", 300.0), ("c", 600.0)] {
+        registry
+            .dispatch(&handle, "ext_diagram_add_node", &serde_json::json!({ "id": id, "x": x, "y": 0.0 }))
+            .await
+            .expect("add_node dispatches");
+    }
+    registry
+        .dispatch(&handle, "ext_diagram_connect", &serde_json::json!({ "id": "e1", "from": "a", "to": "b" }))
+        .await
+        .expect("connect a->b dispatches");
+    registry
+        .dispatch(&handle, "ext_diagram_connect", &serde_json::json!({ "id": "e2", "from": "b", "to": "c" }))
+        .await
+        .expect("connect b->c dispatches");
+
+    // The exported scene's connection graph (derived by the core over real anchor
+    // objects) equals the authored edges — the relational invariant, server-side.
+    let scene = handle.get_scene().await;
+    let mut graph = connection_graph(&scene);
+    graph.sort();
+    let mut want = vec![
+        ("ext-diagram-node:a".to_string(), "ext-diagram-node:b".to_string()),
+        ("ext-diagram-node:b".to_string(), "ext-diagram-node:c".to_string()),
+    ];
+    want.sort();
+    assert_eq!(graph, want, "core connection graph == authored edges (a-b, b-c)");
+
+    // The domain read reflects the authored model over the SAME canvas.
+    let listed = registry
+        .dispatch(&handle, "ext_diagram_list", &serde_json::json!({}))
+        .await
+        .expect("diagram list dispatches");
+    assert_eq!(listed["nodes"].as_array().unwrap().len(), 3);
+    assert_eq!(listed["edges"].as_array().unwrap().len(), 2);
+}
+
+/// An unknown extension tool name is a dispatch error, not a panic or silent success.
+#[tokio::test]
+async fn dispatch_rejects_an_unknown_extension_tool() {
+    use shape_scene_core::CanvasId;
+    let canvases = CanvasRegistry::open_in_memory().unwrap();
+    let handle = canvases.get_or_spawn(&CanvasId::from("default")).await.unwrap();
+    let registry = ExtensionRegistry::with_builtins();
+    let err = registry
+        .dispatch(&handle, "ext_kanban_does_not_exist", &serde_json::json!({}))
+        .await
+        .expect_err("unknown extension tool errors");
+    assert!(!err.is_empty());
 }
 
 #[tokio::test]

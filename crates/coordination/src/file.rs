@@ -200,7 +200,7 @@ fn append_frame(log_path: &Path, msg: &[u8]) -> Result<()> {
         .create(true)
         .append(true)
         .open(log_path)?;
-    let len = msg.len() as u32;
+    let len = u32::try_from(msg.len())?;
     f.write_all(&len.to_le_bytes())?;
     f.write_all(msg)?;
     f.flush()?;
@@ -228,7 +228,7 @@ impl Coordinator for FileCoordinator {
     async fn acquire_lease(&self, canvas_id: &str, owner: &str, ttl: Duration) -> Result<Lease> {
         let now = self.clock.now_ms();
         let token = self.next_token(owner);
-        let expires_at = now + ttl.as_millis() as u64;
+        let expires_at = now + crate::millis_u64(ttl);
         self.with_lock(canvas_id, || {
             if let Some(existing) = self.read_lease(canvas_id)? {
                 if existing.expires_at > now && existing.owner != owner {
@@ -259,7 +259,7 @@ impl Coordinator for FileCoordinator {
 
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<()> {
         let now = self.clock.now_ms();
-        let new_expiry = now + ttl.as_millis() as u64;
+        let new_expiry = now + crate::millis_u64(ttl);
         self.with_lock(&lease.canvas_id, || {
             match self.read_lease(&lease.canvas_id)? {
                 Some(existing)
@@ -324,7 +324,7 @@ impl Coordinator for FileCoordinator {
         ttl: Duration,
     ) -> Result<()> {
         let now = self.clock.now_ms();
-        let expires_at = now + ttl.as_millis() as u64;
+        let expires_at = now + crate::millis_u64(ttl);
         self.with_lock(canvas_id, || {
             let mut presence = self.read_presence(canvas_id)?;
             presence

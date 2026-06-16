@@ -8,6 +8,9 @@ description = "Coordination seam for shape.ai scale-out (MG8): single-writer can
 name = "shape_coordination"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { version = "1", features = ["sync", "time", "fs", "rt", "macros"] }
 async-trait = "0.1"

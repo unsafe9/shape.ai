@@ -269,7 +269,7 @@ async fn many_ops_then_crash_recovers_all_objects() {
     let reborn = CanvasActor::spawn(canvas.clone(), std::sync::Arc::clone(&store));
     let scene = reborn.get_scene().await;
     assert_eq!(
-        scene.objects.len() as i64,
+        i64::try_from(scene.objects.len()).unwrap(),
         total,
         "all {total} objects recovered from per-object Records"
     );

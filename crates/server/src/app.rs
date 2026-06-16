@@ -57,13 +57,16 @@ pub fn build_router_with_mcp(config: &Config, canvases: CanvasRegistry) -> Route
         .with_state(canvases);
 
     // Object templates are code-defined builtin recipes, not stored documents,
-    // so the catalog is read-only and needs no shared state.
-    let template_api = Router::new().route("/api/templates", get(list_templates));
+    // so the catalog is read-only and needs no shared state. The data-rep extension
+    // tool catalog is the same shape: code-defined, read-only.
+    let catalog_api = Router::new()
+        .route("/api/templates", get(list_templates))
+        .route("/api/extensions", get(list_extension_tools));
 
     build_router(config)
         .merge(ws)
         .merge(canvas_api)
-        .merge(template_api)
+        .merge(catalog_api)
         .nest_service("/mcp", mcp_service)
 }
 
@@ -114,6 +117,14 @@ async fn delete_canvas(
 
 async fn list_templates() -> Json<Value> {
     Json(json!({ "templates": shape_scene_core::object::object_template_catalog() }))
+}
+
+/// The data-rep extension tool catalog, namespaced `ext_<name>_<tool>` — the same
+/// self-describing set `/mcp` advertises, exposed for discovery like `/api/templates`.
+async fn list_extension_tools() -> Json<Value> {
+    Json(crate::extension_registry::extension_tools_json(
+        &crate::extension_registry::ExtensionRegistry::with_builtins(),
+    ))
 }
 
 async fn health() -> Json<Value> {

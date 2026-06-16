@@ -344,7 +344,7 @@ async fn region_windowing_filters_welcome_and_fanout() {
         ("oB1", "a2", 100_000.0, 100_000.0),
     ];
     for (i, (id, order, x, y)) in seed_ops.iter().enumerate() {
-        let ls = (i + 1) as i64;
+        let ls = i64::try_from(i + 1).unwrap();
         send_json(
             &mut seed,
             json!({ "type": "ops", "ops": [wire_op("seed", ls, ls - 1, id, "insert-object", insert_delta(id, order, *x, *y))] }),

@@ -24,7 +24,7 @@ impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .map(crate::millis_u64)
             .unwrap_or(0)
     }
 }
@@ -106,7 +106,7 @@ impl Coordinator for InMemoryCoordinator {
             }
         }
         let token = self.next_token(owner);
-        let expires_at = now + ttl.as_millis() as u64;
+        let expires_at = now + crate::millis_u64(ttl);
         state.leases.insert(
             canvas_id.to_string(),
             LeaseEntry {
@@ -132,7 +132,7 @@ impl Coordinator for InMemoryCoordinator {
                     && entry.owner == lease.owner
                     && entry.expires_at > now =>
             {
-                entry.expires_at = now + ttl.as_millis() as u64;
+                entry.expires_at = now + crate::millis_u64(ttl);
                 Ok(())
             }
             _ => anyhow::bail!(
@@ -187,7 +187,7 @@ impl Coordinator for InMemoryCoordinator {
             key.to_string(),
             PresenceEntry {
                 val,
-                expires_at: now + ttl.as_millis() as u64,
+                expires_at: now + crate::millis_u64(ttl),
             },
         );
         Ok(())

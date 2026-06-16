@@ -13,6 +13,7 @@ pub mod app;
 pub mod canvas_actor;
 pub mod canvas_index;
 pub mod config;
+pub mod extension_registry;
 pub mod mcp;
 pub mod object_feature;
 pub mod object_mcp;
@@ -24,6 +25,7 @@ pub mod ws;
 pub use app::{build_router, build_router_with_mcp};
 pub use canvas_actor::{ActorHandle, ApplyResult, CanvasActor, PatchBroadcast, SharedStore};
 pub use config::Config;
+pub use extension_registry::{extension_tools_json, ExtToolDef, ExtensionRegistry};
 pub use mcp::{SceneMcp, DEFAULT_CANVAS_ID};
 pub use object_feature::{decode_feature, encode_feature_response, handle_feature, FeatureCtx};
 pub use object_mcp::{

@@ -20,6 +20,13 @@ use tokio::sync::broadcast;
 
 pub type Result<T> = anyhow::Result<T>;
 
+/// A TTL in whole milliseconds as the `u64` epoch-ms arithmetic uses. `as_millis`
+/// returns `u128`; a TTL past `u64::MAX` ms (~584M years) is impossible, so the
+/// saturating narrowing is exact in practice.
+pub(crate) fn millis_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// A held single-writer lease on a canvas. `token` disambiguates same-owner
 /// leases across a steal: a stale holder gets a different token, so its
 /// renew/release is rejected. `expires_at` is wall-clock ms since the Unix epoch

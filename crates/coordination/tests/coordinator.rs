@@ -11,7 +11,8 @@ impl FakeClock {
         Arc::new(Self(AtomicU64::new(1_000_000)))
     }
     fn advance(&self, by: Duration) {
-        self.0.fetch_add(by.as_millis() as u64, Ordering::SeqCst);
+        self.0
+            .fetch_add(u64::try_from(by.as_millis()).unwrap(), Ordering::SeqCst);
     }
 }
 

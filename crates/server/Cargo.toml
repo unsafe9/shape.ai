@@ -12,6 +12,9 @@ path = "src/lib.rs"
 name = "shape_server"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 # `ws` feature: the MG-3 WebSocket transport (axum::extract::ws). It pulls in
 # axum's own tokio-tungstenite (0.24); the dev-dep client below pins the same
@@ -43,6 +46,15 @@ shape_scene_core = { path = "../scene-core" }
 shape_storage_core = { path = "../storage-core", features = ["redb"] }
 # MG-8 scale-out: single-writer canvas leases + routing + presence/pubsub seam.
 shape_coordination = { path = "../coordination" }
+
+# P5 data-rep extensions: each is a pure plugin (model + ui-compose + mcp +
+# export→scene). The server CONSUMES them (the pure-crate rule forbids the reverse —
+# a pure crate depending on the server — not the server depending on a pure plugin).
+# In-tree extensions are registered into SceneMcp at build time (rmcp's tool_router
+# is compile-time); a runtime WASM-component plugin system is a later option.
+shape_extension_contract = { path = "../../extensions/extension-contract" }
+shape_ext_todo_kanban = { path = "../../extensions/todo-kanban" }
+shape_ext_structure_diagram = { path = "../../extensions/structure-diagram" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
