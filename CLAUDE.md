@@ -76,3 +76,13 @@ wraps — serve, build, and test through `make` (read it and
 `platforms/web/package.json` for the exact targets), and reach for a raw
 `cargo`/`npm` invocation only for a one-off no target covers, never as a
 shortcut past a target that already exists.
+
+`make lint` is the pointer-width-agnostic clippy gate: it runs clippy with the
+`[workspace.lints]` deny table (width-narrowing casts, `ptr_as_ptr`/`ref_as_ptr`,
+trivial casts) over every workspace member AND the standalone, workspace-excluded
+`renderer-wgpu` (which mirrors the deny table in its own `Cargo.toml`). `make
+test` depends on it, so a width-narrowing `as` that isn't a justified
+`#[allow(clippy::..., reason="...")]` fails the build. A genuinely-intended
+renderer narrowing routes through `renderer-core`'s `cast` helpers
+(`narrow_f32`/`len_u32`/`round_u32`/`round_i32`) — the single audited cast
+boundary the GPU half reuses — never a fresh per-site allow.
