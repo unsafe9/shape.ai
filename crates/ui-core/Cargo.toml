@@ -1,0 +1,14 @@
+[package]
+name = "shape_ui_core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure screen-space UI widget tree → RenderObjectScene producer (renderer-core dep only; no scene-core/op-apply)."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Pure draw-data types only (RenderObjectScene/RenderObject/RFill/RStroke/RText/RPaint/CameraState);
+# default-features off keeps the wgpu-probe gate out — those types are not behind it.
+shape_renderer_core = { path = "../renderer-core", default-features = false }
+serde = { version = "1", features = ["derive"] }

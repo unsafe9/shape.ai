@@ -1,0 +1,24 @@
+[package]
+name = "shape_ui"
+version = "0.1.0"
+edition = "2021"
+description = "The UI extension layer: composes ui-core widgets into the built-in UIs (toolbar, inspector), bound to the scene-core command/inspector catalogs. Pure view-builder — no op-apply, no time/rng/IO."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The widget primitives + render/hit/dispatch seam this layer composes.
+shape_ui_core = { path = "../ui-core" }
+# The catalogs + inspector_view this layer binds the built-in UIs to (the one
+# binding source); default-features off keeps wasm-bindgen/ts-gen out of the
+# pure view builder.
+shape_scene_core = { path = "../scene-core", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Tests assert on the `RenderObject`/`RPaint` types `ui_core::render` returns (the
+# zero-rebake + active-fill pins). Not a production dep — the view builder names no
+# renderer type, only `ui_core::Widget`.
+shape_renderer_core = { path = "../renderer-core", default-features = false }
