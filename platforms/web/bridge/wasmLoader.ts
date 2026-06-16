@@ -13,6 +13,9 @@ export type RustCoreStatus = {
   projectObjectScene:
     | ((sceneJson: string, cameraJson: string, selectionJson: string, sceneId: string) => string)
     | null;
+  // Build the screen-space P1 UI scene JSON (ui-core-authored, identity camera) for the viewport,
+  // fed to the renderer's `loadUiScene`. Null when the wasm build predates the export.
+  buildP1UiScene: ((viewportW: number, viewportH: number) => string) | null;
 };
 
 export type RustWebGpuFrameStats = {
@@ -62,6 +65,8 @@ export type RustWebGpuFrameStats = {
   objectDrawCount?: number | null;
   objectPatchCount?: number | null;
   objectRebuildCount?: number | null;
+  uiPatchCount?: number | null;
+  uiRebuildCount?: number | null;
   backend: string;
 };
 
@@ -78,6 +83,8 @@ export type RustCanvasInputEvent =
   | { kind: "set-tool"; tool: "select" | "hand" }
   // Coarse-rotate modifier (e.g. Shift held); while active a rotate-handle drag snaps its swept delta in-core.
   | { kind: "set-coarse-rotate"; active: boolean }
+  // Active drill-in container scope; the core scopes the next pointer-down pick to its direct children (null clears).
+  | { kind: "set-active-container"; id: string | null }
   // Empty clears the transient multi-select highlight; the persisted single-anchor selection is untouched.
   | { kind: "set-multi-select"; ids: string[] }
   // Right-click pick — populates result.hit without mutating selection.
@@ -115,6 +122,61 @@ export type RustInputBatchResult = {
   // Hover affordance the shell maps to a cursor; defaults to "empty".
   hoverAffordance?: HoverAffordance;
 };
+
+// A ui-core dispatch action, mirroring the Rust `shape_ui_core::Action` (serialized
+// as a `type`-tagged camelCase union). The shell treats these as OPAQUE forward
+// payloads — it emits them as EngineEvents and computes NOTHING from them.
+export type UiAction =
+  | { type: "pressed"; id: string }
+  | { type: "toggleChanged"; id: string; on: boolean }
+  | { type: "sliderChanged"; id: string; value: number }
+  | { type: "segmentChanged"; id: string; index: number }
+  | { type: "textChanged"; id: string; text: string }
+  | { type: "focus"; id: string };
+
+// A ui-core edit request (a focused TextInput's IME mount target, NEXT slice).
+// `rect` is [x, y, w, h] in screen px. Opaque to the shell.
+export type UiEditRequest = {
+  id: string;
+  rect: [number, number, number, number];
+  value: string;
+  sizePx: number;
+};
+
+// The typed request a fired built-in-UI widget resolved to through the set
+// `UiModel` (`shape_ui::resolve`), mirroring the Rust `UiIntentDto` (a `type`-tagged
+// camelCase union). The shell forwards each to its EXISTING op-authoring handler; it
+// invents no op and re-derives no intent from the raw actions.
+export type UiIntent =
+  | { type: "command"; id: string }
+  | { type: "selectColor"; hex: string }
+  | { type: "selectPenWidth"; px: number }
+  | { type: "applyTemplate"; id: string }
+  | { type: "selectCanvas"; id: string }
+  | { type: "newCanvas" }
+  | { type: "deleteCanvas"; id: string }
+  | { type: "inspectorEdit"; controlId: string; opKind: string; field: string | null; unitScale: number; value: unknown }
+  | { type: "inspectorAction"; controlId: string }
+  | { type: "dismiss" };
+
+// The wasm dispatch return. `sceneChanged` is the runtime's dirty bit AFTER the
+// renderer re-fed the UI scene; the shell only knows the RAF must redraw. `intents`
+// are the typed requests the fired actions resolved to through the set model (empty
+// on the demo path / when no action authored); the shell forwards each opaquely.
+// `intents` is optional + feature-detected: a wasm build predating the resolver omits
+// it, and the engine reads `?? []` so an absent list is a clean no-route.
+export type UiDispatchResult = {
+  consumed: boolean;
+  sceneChanged: boolean;
+  actions: UiAction[];
+  edit: UiEditRequest | null;
+  intents?: UiIntent[];
+};
+
+// A neutral key the shell forwards (the core decides; no key-literal BEHAVIOR branch). The raw
+// modifier flags let the core tell a shortcut chord from a bare key, so a focused field does not
+// swallow Cmd+Z/Ctrl+C/etc.
+export type UiKeyInput = { key: string; text: string | null; ctrl: boolean; meta: boolean; alt: boolean };
 
 // Stable hover-affordance wire strings (mirror the Rust enum).
 export type HoverAffordance =
@@ -185,6 +247,12 @@ export type RustWebGpuRenderer = {
   setCoarseRotate?(active: boolean): void;
   // Pure object pick for the right-click context menu — top-most object id under the screen point, no mutation.
   hitTestObject?(screenX: number, screenY: number): string | null;
+  // UI analog of loadObjectScene: feed the screen-space UI scene (ui-core-authored, identity camera) to a
+  // SECOND renderer drawn above the world pass. Returns the built draw counts.
+  loadUiScene?(sceneJson: string): { objects: number; fillIndices: number; strokeVertices: number };
+  // UI analog of hitTestObject: top-most UI widget id under the SCREEN point (identity-camera screen-space),
+  // no mutation. The shell forwards raw canvas-local px and consumes the core-returned id.
+  hitUi?(screenX: number, screenY: number): string | null;
   // Pure swept erase pick — every object crossed between two consecutive SCREEN samples (prev -> curr),
   // top-down, so a fast drag erases the whole swept path; falls back to single-sample `hitTestObject` when absent.
   sweptEraseAt?(prevX: number, prevY: number, currX: number, currY: number): string[];
@@ -208,6 +276,27 @@ export type RustWebGpuRenderer = {
   setMultiSelect?(idsJson: string): void;
   // Theme-bit: flip the renderer dark/light. Re-resolves token-backed instance colors and writes ONLY the color slot (zero rebake).
   setObjectTheme?(dark: boolean): void;
+  // Active drill-in container scope. A forwarded token (like setCoarseRotate): the core scopes the next
+  // pointer-down pick to this container's direct children; `null` clears the scope. The shell decides nothing.
+  setActiveContainer?(id: string | null): void;
+  // Seed the renderer-owned ui-core runtime from the demo widget tree at the viewport + theme, then feed
+  // its first render. After this the runtime OWNS the UI scene (uiPointer/uiKey re-feed it). One-time seed.
+  initUiRuntime?(viewportW: number, viewportH: number, themeDark: boolean): void;
+  // Feed the built-in UI model (toolbar/inspector/settings/context-menu/presence/status) from the shell.
+  // `modelJson` is the UiModelInput shape (camelCase): theme/viewport/tool/selection/inspector view + the
+  // shell-owned UI state. The core composes build_root from it, re-trees the runtime (preserving interaction
+  // caches), and resolves fired actions into typed intents. A model-only change rides the partial-patch path.
+  setUiModel?(modelJson: string): void;
+  // Drive the UI runtime with a pointer phase ("down"|"move"|"up"|"cancel") at SCREEN px. The core decides
+  // everything (hit, slider value, actuation); on sceneChanged the renderer has re-fed the UI scene + regions.
+  uiPointer?(phase: string, screenX: number, screenY: number): UiDispatchResult;
+  // Forward a neutral key (KeyInput JSON) to the focused UI widget; the core decides whether it owns it.
+  uiKey?(keyJson: string): UiDispatchResult;
+  // Commit ONE finished string from the shell's IME surface into the focused UI field (the core blurs it
+  // and emits the final TextChanged). Correct even when CJK composition deleted/replaced in place.
+  uiCommitText?(value: string): UiDispatchResult;
+  // True when a ui-core widget owns text focus (the window arbiter ORs this into its `typing` predicate).
+  uiHasFocus?(): boolean;
 };
 
 type RustWebGpuRendererClass = {
@@ -226,6 +315,8 @@ type RustCoreModule = {
     selectionJson: string,
     sceneId: string
   ) => string;
+  // Build the P1 UI scene JSON (ui-core-authored, screen-space px) for the current viewport, fed to loadUiScene.
+  buildP1UiScene?: (viewportW: number, viewportH: number) => string;
 };
 
 export async function loadRustCore(): Promise<RustCoreStatus> {
@@ -249,7 +340,9 @@ export async function loadRustCore(): Promise<RustCoreStatus> {
       buildObjectSceneGeometry:
         typeof wasmModule.buildObjectSceneGeometry === "function" ? wasmModule.buildObjectSceneGeometry : null,
       projectObjectScene:
-        typeof wasmModule.projectObjectScene === "function" ? wasmModule.projectObjectScene : null
+        typeof wasmModule.projectObjectScene === "function" ? wasmModule.projectObjectScene : null,
+      buildP1UiScene:
+        typeof wasmModule.buildP1UiScene === "function" ? wasmModule.buildP1UiScene : null
     };
   } catch (error) {
     return {
@@ -259,7 +352,8 @@ export async function loadRustCore(): Promise<RustCoreStatus> {
       probeWebGpu: null,
       createWebGpuRenderer: null,
       buildObjectSceneGeometry: null,
-      projectObjectScene: null
+      projectObjectScene: null,
+      buildP1UiScene: null
     };
   }
 }

@@ -9,6 +9,7 @@
 // carry a per-variant `rename_all`) are camelCase.
 
 export type {
+  AffineDecomposition,
   FillRule,
   Geometry,
   HandlePoint,
@@ -27,10 +28,14 @@ export type {
   Stroke,
   LocalPoint,
   Anchor,
-  LayoutDirection,
-  LayoutAlign,
-  LayoutSizing,
+  LayoutAxis,
+  Lanes,
+  MainAlign,
+  CrossAlign,
+  Align,
   Layout,
+  AxisSizing,
+  Sizing,
   CommentAnchor,
   Comment,
   ContentEmbed,

@@ -13,7 +13,7 @@ import {
   type Paint,
   type Transform3x3
 } from "../shared/object";
-import type { ObjectCommand, SceneCore } from "../bridge/sceneCoreWasm";
+import type { InspectorControlValue, ObjectCommand, SceneCore } from "../bridge/sceneCoreWasm";
 import { THEME_DEFAULT_COLOR, type DragSpan } from "./objectPrimitives";
 import type { DragCreateShape, PrimitiveKindId } from "./toolbar";
 
@@ -160,6 +160,113 @@ export function buildColorApplyOp(
   const object = scene.objects.find((o) => o.id === selection.id);
   if (!object) return null;
   return core.buildSetStyleOp(object, color);
+}
+
+// Lower one inspector-panel control edit on `id` to its ObjectOp. The transform/resize fields read the
+// object's current transform/geometry and decompose/recompose/scale in-core (no matrix math here);
+// every other field forwards (control.id, object, raw value, unitScale) to the core's single
+// inspector-edit lowering, which owns the per-field op synthesis, all style/layout/sizing/text defaults,
+// AND the px re-quantization. Null when `id` is gone or the core returns no op (a no-op edit). The shell
+// makes no styling/layout decision.
+export function inspectorEditOp(
+  core: Pick<SceneCore, "objectSetTransformField" | "objectResizeAxis" | "objectInspectorEditOp">,
+  scene: ObjectScene,
+  control: InspectorControlValue,
+  id: string,
+  value: unknown
+): ObjectOp | null {
+  const object = scene.objects.find((o) => o.id === id);
+  if (!object) return null;
+  switch (control.id) {
+    case "width":
+    case "height":
+      // Width/height edit an ABSOLUTE px dimension; the core resolves the matrix from the px target,
+      // the geometry, and the current transform — no scale/geometry math here.
+      return resizeEditOp(core, control.id, id, object, value as number);
+    case "x":
+    case "y":
+    case "rotation":
+    case "rotation-flow":
+      return transformEditOp(core, control.id, id, object, value as number);
+    default:
+      return core.objectInspectorEditOp(object, control.id, value, control.unitScale);
+  }
+}
+
+// Patch one transform field through the core (NO matrix or angle-unit math in the shell): the core
+// decomposes the current transform, sets the named field (x/y in px, rotation/rotation-flow from the
+// display degrees — the deg->rad conversion is the core's), recomposes, and returns the new matrix the
+// shell authors as set-transform. width/height go through resizeEditOp instead.
+function transformEditOp(
+  core: Pick<SceneCore, "objectSetTransformField">,
+  field: string,
+  id: string,
+  object: SceneObject,
+  value: number
+): ObjectOp {
+  const transform = core.objectSetTransformField(JSON.stringify(object.transform), field, value);
+  return { kind: "set-transform", id, transform };
+}
+
+// Resize one axis to an ABSOLUTE px dimension: the core resolves the matrix from the target px, the
+// object's geometry, and its current transform (the scale-vs-AABB math lives there), and the shell
+// authors the returned matrix as set-transform — it does NO geometry math.
+function resizeEditOp(
+  core: Pick<SceneCore, "objectResizeAxis">,
+  field: string,
+  id: string,
+  object: SceneObject,
+  targetPx: number
+): ObjectOp {
+  const transform = core.objectResizeAxis(
+    JSON.stringify(object.transform),
+    JSON.stringify(object.geometry),
+    field === "width" ? "x" : "y",
+    Math.max(0, targetPx)
+  );
+  return { kind: "set-transform", id, transform };
+}
+
+// The canonicalize action op for one selected id (the button control acts per selected object).
+export function inspectorActionOp(control: InspectorControlValue, id: string): ObjectOp | null {
+  return control.opKind === "canonicalize" ? { kind: "canonicalize", id } : null;
+}
+
+// Render-only: whether a segment control's `option` is its currently-selected one (for the active mark).
+// Sizing reads an AxisSizing tag ({kind}); font-weight reads the stored bold boolean (true => "bold");
+// every other segment reads a plain lower-cased token. The panel branches off this — no DOM needed to pin it.
+export function inspectorSegmentSelected(value: unknown, controlId: string, option: string): boolean {
+  const lower = option.toLowerCase();
+  if (controlId === "sizing-w" || controlId === "sizing-h") {
+    return !!value && typeof value === "object" && (value as { kind?: string }).kind === lower;
+  }
+  if (typeof value === "boolean") return value === (lower === "bold");
+  return value === lower;
+}
+
+// Collapse a list of per-id ops into the single ObjectOp the shell authors: drop the nulls (a stale id
+// maps to none), keep one bare, batch many into one undo unit. Null when nothing maps.
+function collapseToOneOp(ops: (ObjectOp | null)[]): ObjectOp | null {
+  const live = ops.filter((op): op is ObjectOp => op !== null);
+  if (live.length === 0) return null;
+  return live.length === 1 ? live[0] : { kind: "batch", ops: live };
+}
+
+// Lower an inspector edit across the whole selection into the ONE ObjectOp the shell authors: one
+// inspectorEditOp per id, nulls dropped, collapsed bare-or-Batch (a multi-select edit is one undo unit).
+export function authorInspectorEdit(
+  core: Pick<SceneCore, "objectSetTransformField" | "objectResizeAxis" | "objectInspectorEditOp">,
+  scene: ObjectScene,
+  control: InspectorControlValue,
+  ids: string[],
+  value: unknown
+): ObjectOp | null {
+  return collapseToOneOp(ids.map((id) => inspectorEditOp(core, scene, control, id, value)));
+}
+
+// Lower an inspector button action across the whole selection into the ONE ObjectOp the shell authors.
+export function authorInspectorAction(control: InspectorControlValue, ids: string[]): ObjectOp | null {
+  return collapseToOneOp(ids.map((id) => inspectorActionOp(control, id)));
 }
 
 // The double-click action — the core's container-vs-leaf decision for the signal's object; null signal is a no-op.

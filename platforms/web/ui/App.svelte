@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { BrainCircuit, Loader2, Copy, Trash2, Group as GroupIcon, Ungroup, MessageSquarePlus, LayoutTemplate, Sun, Moon } from "lucide-svelte";
   import { applyDocumentTheme, readStoredTheme, type Theme } from "../renderer/scene";
   import type { CameraState } from "../shared/geometry";
   import {
@@ -24,7 +23,7 @@
   import type { ConnectionStatus } from "../runtime/wsTransport";
   import type { ActiveTool, TransformKind } from "../renderer/engine";
   import { cursorAffordance as deriveCursorAffordance } from "../controller/cursor";
-  import type { HoverAffordance } from "../bridge/wasmLoader";
+  import type { HoverAffordance, UiEditRequest, UiIntent } from "../bridge/wasmLoader";
   import {
     loadSceneCore,
     ensureSceneCore,
@@ -32,13 +31,17 @@
     type ObjectCommand,
     type ObjectGesture,
     type CreateThresholds,
+    type InspectorView,
+    type InspectorControlValue,
     type SceneCore,
     type UndoStack,
     type WasmSession
   } from "../bridge/sceneCoreWasm";
-  import { createShortcutDispatcher } from "../controller/shortcuts";
+  import { createShortcutDispatcher, detectMac, keyChar } from "../controller/shortcuts";
   import { isFreeRecognizeHold } from "../controller/gestureBindings";
+  import { TextEditHost, type TextEditHandle } from "../ime/textEditHost";
   import { ToastChannel } from "../runtime/statusChannel";
+  import { UiModelFeed } from "../runtime/uiModelFeed";
   import {
     textOverlayScreenRect,
     THEME_DEFAULT_COLOR,
@@ -56,6 +59,8 @@
     canonicalizeHoverSnap,
     buildInsertPrimitive,
     buildColorApplyOp,
+    authorInspectorEdit,
+    authorInspectorAction,
     resolveDoubleClick,
     ungroupPickEnabled as ungroupPickEnabledOf,
     popOutPickEnabled as popOutPickEnabledOf,
@@ -71,12 +76,7 @@
     clientIdentity as clientIdentityOf,
     userIdentity as userIdentityOf
   } from "../controller/session";
-  import Toolbar from "./Toolbar.svelte";
-  import SettingsModal from "./SettingsModal.svelte";
   import CanvasHost from "./ShapeCanvasHost.svelte";
-  import ContextMenu, { type ContextMenuItem } from "./ContextMenu.svelte";
-  import TemplatePopup, { type TemplatePopupItem } from "./TemplatePopup.svelte";
-  import PeerCursors from "./PeerCursors.svelte";
 
   // Render-only mirror of the core's scene. The Rust core (the offline `session` pre-connect, the
   // SceneClient engine once connected) is the single source of truth; this is written ONCE per frame
@@ -125,9 +125,13 @@
   // `feedScene` renders a PERSISTENT anchor ring from it (only while `createDrag` is null). Null off any edge.
   let createHoverSnap = $state<{ at: { x: number; y: number }; target: string | null } | null>(null);
 
-  // Inline text editing: `textEdit` holds the edited object id + in-progress value; a contenteditable
-  // overlay (which handles IME) is positioned over its screen bbox. Blur/Enter commits a set-text op; Esc cancels.
+  // Inline text editing: `textEdit` holds the edited object id + in-progress value (a render-only mirror
+  // of the OS editing surface). The shared `TextEditHost` library mounts the contenteditable + owns the
+  // IME mechanics; this shell only forwards the committed string into a set-text op. Blur/Enter commits; Esc commits too.
   let textEdit = $state<{ id: string; value: string } | null>(null);
+  // A freshly-inserted text object held only until the canonical scene lands. The connected insert is
+  // async, so textEditObject falls back to this so the overlay mounts + focuses this tick; render-only.
+  let pendingTextInsert = $state<SceneObject | null>(null);
 
   let camera = $state<CameraState>({ x: 140, y: 120, zoom: 0.6 });
   let status = $state("Ready");
@@ -178,7 +182,7 @@
   let canvasId = $state("default");
   let sceneClient: SceneClient | null = null;
   let sceneClientReady = false;
-  let sceneCore: SceneCore | null = null;
+  let sceneCore = $state<SceneCore | null>(null);
   let commandCatalog = $state<ObjectCommand[]>([]);
   let gestureCatalog = $state<ObjectGesture[]>([]);
   // The create-gesture screen-px thresholds, read from scene-core at bootstrap so the shell keeps no
@@ -194,12 +198,24 @@
   let host: ShapeCanvasHost | null = null;
   let canvasWrap: HTMLDivElement;
 
+  // The shared OS text-edit / IME host-port library, realizing both the canvas inline edit and the
+  // ui-core TextInput edit through ONE reused contenteditable. Created once the canvas wrapper mounts
+  // (it is the positioning context for the absolute-positioned overlay). Holds no canvas/ui decision.
+  let textEditHost: TextEditHost | null = null;
+  // The open canvas-edit handle, so the reposition effect can track pan/zoom transform-only.
+  let canvasEditHandle: TextEditHandle | null = null;
+
   // The cursor affordance reflected onto the canvas wrapper; the mapping lives in `cursor.ts` (the single source styles.css mirrors).
   const cursorAffordance = $derived(deriveCursorAffordance(spaceHeld, activeTool, affordance));
 
   // The inline text-edit overlay rect, recomputed when the edited object, its transform, or the camera
   // changes (so the overlay tracks the object under pan/zoom). Null when not editing or the path is gone.
-  const textEditObject = $derived(textEdit ? scene.objects.find((o) => o.id === textEdit.id) ?? null : null);
+  const textEditObject = $derived(
+    textEdit
+      ? scene.objects.find((o) => o.id === textEdit.id) ??
+          (pendingTextInsert?.id === textEdit.id ? pendingTextInsert : null)
+      : null
+  );
   const textEditRect = $derived(
     textEditObject && sceneCore
       ? textOverlayScreenRect(sceneCore.objectWorldAabb(textEditObject), (world) => {
@@ -212,7 +228,14 @@
   const readyState = $derived(rendererHealth?.state ?? "wasm-unavailable");
   const rendererDetail = $derived(rendererHealth?.detail ?? "Detecting Rust/WASM package.");
   const hasRenderableScene = $derived(scene.objects.length > 0);
-  const selectedObject = $derived(selection.kind === "object" ? scene.objects.find((o) => o.id === selection.id) ?? null : null);
+
+  // The dynamic inspector view for the current selection, resolved by the core from the render-only
+  // mirror (scene + selection). Null for a canvas selection or before the core loads; the panel renders
+  // nothing then. The core decides the role + which controls apply, so the shell computes no derived state.
+  const inspectorView = $derived.by<InspectorView | null>(() => {
+    if (!sceneCore || selection.kind === "canvas") return null;
+    return sceneCore.objectInspectorView(JSON.stringify(scene), JSON.stringify(selection));
+  });
 
   // The scene fed to the renderer: the canonical scene plus any transient NEW-object preview (a live
   // transform of an EXISTING object no longer rebuilds this — it's pushed straight to the GPU instance
@@ -287,7 +310,9 @@
     onCreate: (phase, world, snapped, targetId) => handleCreate(phase, world, snapped, targetId),
     onCreateHover: (world, snapped, targetId) => handleCreateHover(world, snapped, targetId),
     onErase: (id, world, partial) => handleErase(id, world, partial),
-    onAffordance: (next) => (affordance = next)
+    onAffordance: (next) => (affordance = next),
+    onUiEdit: (edit) => handleUiEdit(edit),
+    onUiIntent: (intent) => handleUiIntent(intent)
   };
 
   // Boot the scene-core wasm (op-apply + catalog) and open the WS session.
@@ -326,6 +351,119 @@
     host?.setTool(tool);
   });
 
+  // The active tool as a TOOLBAR COMMAND id (the toolbar marks its matching button active off this
+  // mirror). The shell's `create` submode owns no toolbar button — its active insert button is marked via
+  // `create_kind` instead, so it maps to no tool command. The core decides nothing here; this only mirrors
+  // the shell tool state into the catalog vocabulary the Rust toolbar reads.
+  const activeToolCommand = $derived(
+    activeTool === "draw" ? "draw" : activeTool === "erase" ? "erase" : activeTool === "create" ? "" : "select-move"
+  );
+  const createKindCommand = $derived(createKind ? `insert-${createKind}` : null);
+  const isMac = detectMac();
+
+  // rAF-coalesced UI-model feed: a presence burst (many cursor frames per animation frame) collapses to
+  // one heavy feed per frame. The real requestAnimationFrame is injected so the coalescer stays testable.
+  const uiModelFeed = new UiModelFeed(
+    { request: (cb) => requestAnimationFrame(cb), cancel: (h) => cancelAnimationFrame(h as number) },
+    (json) => host?.setUiModel(json)
+  );
+
+  // Feed the built-in UI model to the Rust runtime whenever any UI-affecting state changes. Reading each
+  // dependency here makes Svelte re-run the effect (and re-feed) ONLY on a real change — a theme flip /
+  // selection change re-derives the small tree off the model and rides the core's partial-patch path, with
+  // no per-frame re-feed and no geometry rebake. The runtime then owns build_root / hit-test / dispatch;
+  // this shell holds only the render-only mirror it serializes here, authoring no decision. The serialized
+  // model is handed to the rAF-coalesced feed so a presence burst collapses to one feed per frame.
+  $effect(() => {
+    const rect = canvasWrap?.getBoundingClientRect();
+    const model = {
+      themeDark: theme === "dark",
+      viewport: [rect?.width ?? 0, rect?.height ?? 0] as [number, number],
+      activeTool: activeToolCommand,
+      createKind: createKindCommand,
+      selectedColor,
+      penPalette: PEN_PALETTE,
+      penWidth: penWidthPx,
+      penWidths: PEN_WIDTHS,
+      templates: TEMPLATES,
+      templateOpen,
+      canvases: canvases.map((c) => ({ id: c.id, title: c.title })),
+      activeCanvasId: canvasId,
+      connectionOnline: connectionStatus !== "offline",
+      canvasBusy,
+      diagnostics: diagnosticsOpen ? diagnosticsModel() : null,
+      diagnosticsOpen,
+      inspectorView,
+      isMac,
+      settingsOpen,
+      contextMenu: contextMenu
+        ? { x: contextMenu.x, y: contextMenu.y, title: contextMenuTitle(contextMenu.selection), items: contextMenuItems(contextMenu) }
+        : null,
+      peers: projectedPeers(),
+      busy,
+      status: status === "Ready" ? null : status,
+      toast
+    };
+    uiModelFeed.schedule(JSON.stringify(model));
+  });
+
+  // The diagnostics readout rows (pre-formatted display strings; the cores are time-free so the shell
+  // computes the frame timing). Mirrors the old Svelte diagnostics panel content.
+  function diagnosticsModel(): { state: string; detail: string; objects: string; frameMs: string; camera: string } {
+    return {
+      state: readyState,
+      detail: rendererDetail,
+      objects: String(scene.objects.length),
+      frameMs: rendererStats?.frameMs != null ? `${rendererStats.frameMs.toFixed(2)} ms` : "—",
+      camera: `${camera.x.toFixed(0)}, ${camera.y.toFixed(0)} @ ${camera.zoom.toFixed(2)}x`
+    };
+  }
+
+  // Project the live peers' WORLD cursors to SCREEN coords through the live core camera, dropping any the
+  // camera can't project (mirrors the old PeerCursors projection). Projection stays shell-side — the pure
+  // core never sees a camera here; the Rust presence layer renders the already-projected screen points.
+  function projectedPeers(): { userId: string; screen: [number, number]; color: string; label: string }[] {
+    void camera;
+    return peers
+      .filter((peer) => peer.cursor !== null)
+      .map((peer) => ({ peer, screen: host?.projectWorldToScreen(peer.cursor!) ?? null }))
+      .filter((p): p is { peer: PeerPresence; screen: { x: number; y: number } } => p.screen !== null)
+      .map(({ peer, screen }) => ({
+        userId: peer.userId,
+        screen: [screen.x, screen.y] as [number, number],
+        color: peer.color,
+        label: peer.userId.length > 12 ? `${peer.userId.slice(0, 12)}…` : peer.userId
+      }));
+  }
+
+  // Mount / track / tear down the canvas inline-edit surface through the shared IME library. Opening
+  // seeds the value + focus once (when the edit begins and its screen rect is known); subsequent rect
+  // changes only reposition (transform-only, so the caret never resets under pan/zoom). The library owns
+  // the contenteditable + IME mechanics; this effect only forwards the mount target and the callbacks.
+  $effect(() => {
+    const edit = textEdit;
+    const rect = textEditRect;
+    if (!edit || !rect) {
+      canvasEditHandle = null;
+      return;
+    }
+    if (canvasEditHandle) {
+      canvasEditHandle.reposition(rect);
+      return;
+    }
+    const imeHost = ensureTextEditHost();
+    if (!imeHost) return;
+    canvasEditHandle = imeHost.open(
+      { rect, value: edit.value },
+      {
+        onInput: (value) => {
+          if (textEdit) textEdit = { id: textEdit.id, value };
+        },
+        onCommit: (value) => commitTextEdit(value)
+      }
+    );
+  });
+
   // Windowed replica: re-aim the data-layer window at the camera viewport.
   $effect(() => {
     void camera;
@@ -359,7 +497,25 @@
     const dispatch = dispatchShortcut;
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
-      const typing = target ? ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName) || target.isContentEditable : false;
+      // The single focus arbiter: a DOM input OR a focused ui-core TextInput owns typing. The latter
+      // extends the same predicate (no second focus check) so a focused UI field suppresses the catalog.
+      const domTyping = target ? ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName) || target.isContentEditable : false;
+      const typing = domTyping || (host?.uiHasFocus() ?? false);
+      // Forward the key to the UI runtime FIRST (a neutral forward — the core decides whether it owns it);
+      // on consume, swallow it before Escape/Space/catalog. No event.key BEHAVIOR branch here. The raw
+      // modifier flags ride along so the core tells a shortcut chord (Cmd+Z/Ctrl+C) from a bare key — a
+      // focused field must NOT swallow a chord, or undo/copy/paste/select-all would die inside it.
+      // SUPPRESSED while the IME surface is mounted: that OS surface is the sole writer for the focused
+      // ui-core field (it owns composition and hands back one committed string via onCommit->uiCommitText).
+      // Relaying here too would push each composing keydown — incl. the raw mid-composition jamo Safari/
+      // Firefox put in event.key — into the core a SECOND time, doubling/corrupting the field.
+      const uiKey = textEditHost?.isEditing()
+        ? null
+        : host?.uiKey({ key: event.key, text: keyChar(event), ctrl: event.ctrlKey, meta: event.metaKey, alt: event.altKey });
+      if (uiKey?.consumed) {
+        event.preventDefault();
+        return;
+      }
       freeRecognitionHeld = isFreeRecognizeHold(event);
       if (event.key === "Escape") {
         event.preventDefault();
@@ -397,6 +553,8 @@
     sceneClient?.close();
     // Cancel any in-flight toast timer so it can't fire after teardown.
     toastChannel.dismiss();
+    // Drop a queued UI-model feed so it can't fire against a torn-down host.
+    uiModelFeed.dispose();
   });
 
   async function connectSceneClient(): Promise<void> {
@@ -621,6 +779,9 @@
     if (!sceneCore) return;
     const center = anchor ?? viewportCenterWorld();
     const object = buildInsertPrimitive(sceneCore, kind, center, freshId(kind), nextOrderKey(), selectedColor);
+    // Hold the built text object so the overlay can mount this tick on the async connected path, before
+    // the canonical scene reflects the insert.
+    if (kind === "text") pendingTextInsert = object;
     authorOp({ kind: "insert-object", object });
     selection = { kind: "object", id: object.id };
     persistSelection(selection);
@@ -950,17 +1111,29 @@
     persistSelection(selection);
   }
 
-  // Rename / set text on the selected object via a set-text op.
-  function renameSelected(text: string): void {
-    if (selection.kind !== "object") return;
-    authorOp({ kind: "set-text", id: selection.id, text: { runs: [{ text }] } });
-  }
-
   // Adopt the toolbar's color (the default for the next NEW shape), then recolor a single selection via a `set-style` op.
   function applySelectedColor(color: string): void {
     selectedColor = color;
     if (!sceneCore) return;
     const op = buildColorApplyOp(sceneCore, scene, selection, color);
+    if (op) authorOp(op);
+  }
+
+  // ----- inspector property panel ------------------------------------------
+
+  // Author a direct property edit from the panel. The control carries its op kind + field (the core's
+  // catalog metadata); the core helper lowers it to the matching ObjectOp PER selected id, and these
+  // author as one undo unit (a Batch for multi-select). The decompose/recompose for transform edits
+  // happens in-core inside inspectorEditOp — never matrix math here.
+  function onInspectorEdit(control: InspectorControlValue, value: unknown): void {
+    if (!sceneCore) return;
+    const op = authorInspectorEdit(sceneCore, scene, control, currentSelectionIds(), value);
+    if (op) authorOp(op);
+  }
+
+  // A button control (canonicalize) acts on each selected id as one Batch.
+  function onInspectorAction(control: InspectorControlValue): void {
+    const op = authorInspectorAction(control, currentSelectionIds());
     if (op) authorOp(op);
   }
 
@@ -970,12 +1143,97 @@
     if (!signal || !sceneCore) return;
     const action = resolveDoubleClick(sceneCore, scene, signal);
     if (action.kind === "drill-in") {
-      activeContainer = action.id;
+      enterContainerScope(action.id);
       selectObject({ kind: "object", id: action.id });
       showToast("Entered group");
       return;
     }
     if (action.kind === "edit-leaf") enterTextEdit(action.id);
+  }
+
+  // A focused ui-core TextInput asked the shell to mount an editing surface (the core's EditRequest). Open
+  // the SAME shared IME library the canvas inline edit uses, so CJK/IME composition has an OS surface that
+  // owns the live text natively. The OS surface is the SOLE writer while mounted: the window key relay is
+  // suppressed for it (see the keydown arbiter) so a typed/composed char is not also pushed per-key into
+  // the core, and onInput stays a no-op (the core needs no live mirror). On commit the library hands back
+  // ONE finished string, which the core lands wholesale via uiCommitText (blur + final TextChanged) —
+  // correct even when CJK composition deleted/replaced in place. The library never knows which consumer
+  // it serves.
+  function handleUiEdit(edit: UiEditRequest): void {
+    const imeHost = ensureTextEditHost();
+    if (!imeHost) return;
+    const [x, y, w, h] = edit.rect;
+    imeHost.open(
+      { rect: { x, y, width: w, height: h }, value: edit.value },
+      {
+        onInput: () => {},
+        onCommit: (value) => host?.uiCommitText(value)
+      }
+    );
+  }
+
+  // Route a typed intent the Rust built-in UI resolved a widget actuation to (the core's
+  // `shape_ui::resolve`) into the shell's EXISTING op-authoring handler. The shell authors no op here and
+  // re-derives nothing — each arm forwards to a handler it already has. A `Command` fired from an OPEN
+  // context menu routes through contextHandlers (anchored inserts + pop-out on the picked id); otherwise
+  // it runs the plain catalog handler. `Dismiss` closes the matching floating overlay.
+  function handleUiIntent(intent: UiIntent): void {
+    switch (intent.type) {
+      case "command": {
+        const menu = contextMenu;
+        if (menu) {
+          // A context-menu command acts at the right-click anchor / on the picked selection, then the
+          // menu closes (the scrim's own Dismiss also closes it, but a chosen row dismisses immediately).
+          const handler = contextHandlers(menu)[intent.id];
+          contextMenu = null;
+          if (handler) return void handler();
+        }
+        shortcutHandlers()[intent.id as keyof ReturnType<typeof shortcutHandlers>]?.();
+        return;
+      }
+      case "selectColor":
+        return applySelectedColor(intent.hex);
+      case "selectPenWidth":
+        return void (penWidthPx = intent.px);
+      case "applyTemplate":
+        return applyTemplate(intent.id);
+      case "selectCanvas":
+        return void switchToCanvas(intent.id);
+      case "newCanvas":
+        return void createCanvas("New canvas");
+      case "deleteCanvas":
+        return void deleteCanvas(intent.id);
+      case "inspectorEdit":
+        // The intent carries the catalog metadata (opKind/field/unitScale) the core resolved; rebuild the
+        // control value the existing authoring path expects and lower it through onInspectorEdit.
+        return onInspectorEdit(
+          {
+            id: intent.controlId,
+            label: intent.controlId,
+            widget: { kind: "text" },
+            value: null,
+            mixed: false,
+            opKind: intent.opKind,
+            field: intent.field ?? undefined,
+            unitScale: intent.unitScale
+          },
+          intent.value
+        );
+      case "inspectorAction":
+        return onInspectorAction({
+          id: intent.controlId,
+          label: intent.controlId,
+          widget: { kind: "button" },
+          value: null,
+          mixed: false,
+          opKind: "canonicalize",
+          unitScale: 1
+        });
+      case "dismiss":
+        settingsOpen = false;
+        contextMenu = null;
+        return;
+    }
   }
 
   // Enter inline edit: seed the overlay value from the object's first text run (empty when the object
@@ -985,40 +1243,23 @@
     textEdit = { id, value: object?.text?.runs?.[0]?.text ?? "" };
   }
 
-  // Commit the in-progress inline edit as a set-text op, then dismiss the overlay. Called on blur
-  // or Enter. An unchanged commit degrades to a no-op in the core (identical set-text applies nothing
-  // and its empty-Batch inverse is skipped by the undo stack), so no shell-side dedup is needed.
-  function commitTextEdit(): void {
+  // Commit the inline edit's committed string (handed back by the IME library) as a set-text op, then
+  // dismiss the edit state. An unchanged commit degrades to a no-op in the core (identical set-text
+  // applies nothing and its empty-Batch inverse is skipped by the undo stack), so no shell-side dedup.
+  function commitTextEdit(value: string): void {
     const edit = textEdit;
     textEdit = null;
+    pendingTextInsert = null;
     if (!edit) return;
-    authorOp({ kind: "set-text", id: edit.id, text: { runs: [{ text: edit.value }] } });
+    authorOp({ kind: "set-text", id: edit.id, text: { runs: [{ text: value }] } });
   }
 
-  // Discard the in-progress inline edit without committing (Esc).
-  function cancelTextEdit(): void {
-    textEdit = null;
-  }
-
-  // Svelte action — seed the contenteditable with the object's text and focus it (caret at the end) on mount.
-  function mountTextEdit(node: HTMLDivElement, value: string) {
-    node.textContent = value;
-    node.focus();
-    const selection = window.getSelection();
-    if (selection) {
-      const range = document.createRange();
-      range.selectNodeContents(node);
-      range.collapse(false);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    }
-  }
-
-  // The templates the scroll-popup offers; ids map to buildObjectTemplate.
-  const TEMPLATES: TemplatePopupItem[] = [
-    { id: "todo_board", title: "Todo board", desc: "Grouped To do / In progress / Done columns" },
-    { id: "decision_map", title: "Decision map", desc: "Options and outcomes wired with connectors" },
-    { id: "presentation", title: "Presentation", desc: "A deck grouping title and content slides" }
+  // The templates the More→Templates popup offers; ids map to buildObjectTemplate. Fed to the Rust UI
+  // model as TemplateEntry rows ({ id, title, description }).
+  const TEMPLATES: { id: string; title: string; description: string }[] = [
+    { id: "todo_board", title: "Todo board", description: "Grouped To do / In progress / Done columns" },
+    { id: "decision_map", title: "Decision map", description: "Options and outcomes wired with connectors" },
+    { id: "presentation", title: "Presentation", description: "A deck grouping title and content slides" }
   ];
 
   function toggleTemplates(): void {
@@ -1094,7 +1335,26 @@
 
   function selectObject(next: ObjectSelection): void {
     selection = validSelection(scene, next);
+    // Keep the forwarded drill-in scope token in lockstep: the core decides whether the new selection
+    // still sits in the active container's scope; the shell only forwards selection + container and
+    // mirrors the token (retracting it when the verdict says out of scope). Pre-core, do not retract —
+    // matches the validSelection pre-core passthrough.
+    if (activeContainer !== null && sceneCore && !sceneCore.objectSelectionInScope(scene, selection, activeContainer)) {
+      clearContainerScope();
+    }
     persistSelection(selection);
+  }
+
+  // Forwarded drill-in scope token (like setCoarseRotate): the core scopes the next pointer-down pick to
+  // this container's direct children. The shell only mirrors + forwards the id; it never picks off it.
+  function enterContainerScope(id: string): void {
+    activeContainer = id;
+    host?.setActiveContainer(id);
+  }
+
+  function clearContainerScope(): void {
+    activeContainer = null;
+    host?.setActiveContainer(null);
   }
 
   function validSelection(currentScene: ObjectScene, currentSelection: ObjectSelection): ObjectSelection {
@@ -1104,8 +1364,11 @@
   }
 
   function handleEscape(): void {
-    // Escape cancels, in priority order: inline text edit, pen stroke, shape drag-create, then disarms the tool.
-    if (textEdit) return void cancelTextEdit();
+    // Escape, in priority order: commit the inline text edit (keep typed text), cancel pen stroke, cancel
+    // shape drag-create, then disarm the tool. The inline edit's own Escape (mid-edit, contenteditable
+    // focused) is handled + stopPropagation'd by the IME library; this window-level fallback blurs the
+    // active surface so the library commits the live value (never the stale shell mirror).
+    if (textEdit) return void textEditHost?.blurActive();
     if (drawPoints) {
       drawPoints = null;
       drawSnap = null;
@@ -1137,6 +1400,7 @@
     return {
       "select-move": () => setActiveTool("select"),
       draw: () => setActiveTool("draw"),
+      erase: () => setActiveTool("erase"),
       "insert-rectangle": () => insertPrimitive("rectangle"),
       "insert-ellipse": () => insertPrimitive("ellipse"),
       "insert-line": () => insertPrimitive("line"),
@@ -1166,6 +1430,10 @@
       "zoom-in": () => zoomAtCenter(-160),
       "zoom-out": () => zoomAtCenter(160),
       "zoom-fit": () => host?.fitScene(),
+      "toggle-fullscreen": () => void toggleFullscreen(),
+      export: () => exportSelection(),
+      "toggle-diagnostics": () => (diagnosticsOpen = !diagnosticsOpen),
+      "toggle-theme": () => toggleTheme(),
       "open-settings": () => (settingsOpen = !settingsOpen),
       "open-template-library": () => toggleTemplates()
     };
@@ -1201,23 +1469,6 @@
     contextMenu = { selection: picked, x: anchor.clientX, y: anchor.clientY, world };
   }
 
-  $effect(() => {
-    if (!contextMenu) return;
-    const dismiss = () => (contextMenu = null);
-    window.addEventListener("pointerdown", dismiss);
-    return () => window.removeEventListener("pointerdown", dismiss);
-  });
-
-  // The menu layout + resolver live in controller/interactions; here we only decorate the icon tag with the lucide component and gate `enabled` on core queries.
-  const MENU_ICONS: Record<string, typeof Copy> = {
-    copy: Copy,
-    group: GroupIcon,
-    ungroup: Ungroup,
-    comment: MessageSquarePlus,
-    template: LayoutTemplate,
-    trash: Trash2
-  };
-
   // An entry's `enabled` predicate: ungroup needs a container, pop-out needs a parent (both core-only queries, disabled until the core loads); everything else is enabled.
   function contextEntryEnabled(entry: Extract<ContextMenuEntry<string>, { id: string }>, picked: ObjectSelection): boolean {
     if (entry.id === "ungroup") return !!sceneCore && ungroupPickEnabledOf(sceneCore, scene, picked);
@@ -1225,7 +1476,11 @@
     return true;
   }
 
-  function contextMenuItems(menu: ContextMenuState): (ContextMenuItem | null)[] {
+  // The Rust context-menu model rows: each resolved item is a catalog-bound row (`commandId`), a danger
+  // flag, and a disabled flag; a null entry becomes a separator (`commandId: null`). The Rust UI renders
+  // this and a pressed enabled row resolves to a `Command` intent the shell routes through contextHandlers.
+  type ContextItemModel = { commandId: string | null; label: string; danger: boolean; disabled: boolean };
+  function contextMenuItems(menu: ContextMenuState): ContextItemModel[] {
     const handlers = contextHandlers(menu);
     const resolved = resolveContextMenuItems<string>(
       menu.selection,
@@ -1235,14 +1490,8 @@
     );
     return resolved.map((item) =>
       item === null
-        ? null
-        : {
-            label: item.label,
-            icon: item.icon ? MENU_ICONS[item.icon] : undefined,
-            danger: item.danger,
-            disabled: item.disabled,
-            onSelect: () => closeContextThen(handlers[item.id])
-          }
+        ? { commandId: null, label: "", danger: false, disabled: false }
+        : { commandId: item.id, label: item.label, danger: item.danger ?? false, disabled: item.disabled }
     );
   }
 
@@ -1265,10 +1514,6 @@
       "open-template-library": base["open-template-library"],
       "select-all": base["select-all"]
     };
-  }
-  function closeContextThen(action: () => void): void {
-    contextMenu = null;
-    action();
   }
 
   function contextMenuTitle(picked: ObjectSelection): string {
@@ -1295,10 +1540,33 @@
     }
   }
 
+  // Lazily build the shared IME host against the canvas wrapper (the overlay's positioning context).
+  // Returns null until the wrapper is bound. The instance is reused for both the canvas inline edit and
+  // the ui-core TextInput edit so there is ever only ONE editing surface.
+  function ensureTextEditHost(): TextEditHost | null {
+    if (textEditHost) return textEditHost;
+    if (!canvasWrap) return null;
+    textEditHost = new TextEditHost({
+      overlayRoot: canvasWrap,
+      className: "text-edit-overlay",
+      ariaLabel: "Edit text"
+    });
+    return textEditHost;
+  }
+
   function handleHost(next: ShapeCanvasHost): void {
     host = next;
+    // Apply the persisted theme the moment the host is wired. The theme $effect runs at mount when
+    // `host` is still null (a non-reactive `let`, so it never re-runs on assignment), so without this
+    // the renderer would never hear the theme and the canvas + Rust UI would stay on the light default
+    // — dark mode rendered light. Set it before the scene loads so the canvas is born in-theme.
+    host.setObjectTheme(theme === "dark");
     host.loadObjectScene(scene, selection);
     host.setTool(activeTool);
+    // Relocate the blur-before-preventDefault hazard into the shared library: the engine commits an
+    // active edit through this hook before its mousedown preventDefault swallows the blur.
+    const imeHost = ensureTextEditHost();
+    if (imeHost) host.setBlurActiveEditable(() => imeHost.blurActive());
   }
 
   function handlePointerMove(event: PointerEvent): void {
@@ -1329,74 +1597,16 @@
   }
 </script>
 
+<!--
+  The shell renders ONLY the surface + the OS-input-forwarding wrapper now. Every product UI — toolbar,
+  inspector, settings, context menu, templates, presence, status/toast, watermark, theme toggle, canvas
+  switcher, diagnostics — is rendered by the Rust ui extension through the canvas, fed via host.setUiModel
+  and actuated through the resolved-intent path (handleUiIntent). No product UI lives in this shell.
+-->
 <div class="app-shell">
   <main class="studio-stage">
     <section class="canvas-panel">
       <div class="flow-wrap renderer-scene-surface" data-tool={activeTool} data-affordance={cursorAffordance} bind:this={canvasWrap} role="application" aria-label="Canvas" onpointermove={handlePointerMove}>
-        <div class="canvas-watermark" aria-hidden="true">
-          <BrainCircuit size={28} />
-          <span>shape.ai</span>
-        </div>
-        <PeerCursors {peers} projectWorldToScreen={(world) => { void camera; return host?.projectWorldToScreen(world) ?? null; }} />
-
-        <Toolbar
-          {activeTool}
-          {createKind}
-          {penWidthPx}
-          penPalette={PEN_PALETTE}
-          penWidths={PEN_WIDTHS}
-          {selectedColor}
-          dark={theme === "dark"}
-          {busy}
-          {templateOpen}
-          {diagnosticsOpen}
-          {selectedObject}
-          {canvases}
-          activeCanvasId={canvasId}
-          {connectionStatus}
-          {canvasBusy}
-          onSetTool={setActiveTool}
-          onSetPenWidth={(width) => (penWidthPx = width)}
-          onSelectColor={applySelectedColor}
-          onInsertPrimitive={insertPrimitive}
-          onToggleTemplates={toggleTemplates}
-          onZoomIn={() => zoomAtCenter(-160)}
-          onZoomOut={() => zoomAtCenter(160)}
-          onFit={() => host?.fitScene()}
-          onFullscreen={() => void toggleFullscreen()}
-          onToggleDiagnostics={() => (diagnosticsOpen = !diagnosticsOpen)}
-          onExport={exportSelection}
-          onSelectCanvas={(id) => void switchToCanvas(id)}
-          onCreateCanvas={(title) => void createCanvas(title)}
-          onDeleteCanvas={(id) => void deleteCanvas(id)}
-          onRenameSelected={renameSelected}
-          onDeleteSelected={deleteSelection}
-        />
-
-        <button
-          class="icon-button theme-toggle"
-          type="button"
-          aria-label="Toggle dark mode"
-          aria-pressed={theme === "dark"}
-          onclick={toggleTheme}
-        >
-          {#if theme === "dark"}<Sun size={16} />{:else}<Moon size={16} />{/if}
-        </button>
-
-        {#if templateOpen}
-          <TemplatePopup items={TEMPLATES} onSelect={applyTemplate} />
-        {/if}
-
-        {#if diagnosticsOpen}
-          <div class="diagnostics-panel" role="status" aria-label="Renderer diagnostics">
-            <div>state: {readyState}</div>
-            <div>{rendererDetail}</div>
-            <div>objects: {scene.objects.length}</div>
-            <div>frame: {rendererStats?.frameMs?.toFixed?.(2) ?? "—"} ms</div>
-            <div>camera: {camera.x.toFixed(0)}, {camera.y.toFixed(0)} @ {camera.zoom.toFixed(2)}x</div>
-          </div>
-        {/if}
-
         <CanvasHost
           initialCamera={camera}
           callbacks={hostCallbacks}
@@ -1406,60 +1616,7 @@
           onHost={handleHost}
           onContextMenuRequest={handleContextMenuRequest}
         />
-
-        {#if textEdit && textEditRect}
-          <div
-            class="text-edit-overlay"
-            contenteditable="plaintext-only"
-            role="textbox"
-            tabindex="0"
-            aria-label="Edit text"
-            style:left={`${textEditRect.x}px`}
-            style:top={`${textEditRect.y}px`}
-            style:width={`${textEditRect.width}px`}
-            style:height={`${textEditRect.height}px`}
-            use:mountTextEdit={textEdit.value}
-            oninput={(event) => {
-              if (textEdit) textEdit = { id: textEdit.id, value: (event.currentTarget as HTMLDivElement).textContent ?? "" };
-            }}
-            onkeydown={(event) => {
-              if (event.isComposing) return;
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                event.stopPropagation();
-                commitTextEdit();
-              } else if (event.key === "Escape") {
-                event.preventDefault();
-                event.stopPropagation();
-                cancelTextEdit();
-              }
-            }}
-            onblur={() => commitTextEdit()}
-          ></div>
-        {/if}
       </div>
-
-      {#if contextMenu}
-        <ContextMenu x={contextMenu.x} y={contextMenu.y} title={contextMenuTitle(contextMenu.selection)} items={contextMenuItems(contextMenu)} />
-      {/if}
-
-      {#if settingsOpen}
-        <SettingsModal catalog={commandCatalog} gestures={gestureCatalog} onClose={() => (settingsOpen = false)} />
-      {/if}
-
-      {#if busy || status !== "Ready"}
-        <div class="canvas-status" role="status">
-          {#if busy}<Loader2 class="spin" size={15} />{/if}
-          {status}
-        </div>
-      {/if}
-
-      <!-- Keyed by message so each new notice remounts and replays the fade-in/out. -->
-      {#if toast}
-        {#key toast}
-          <div class="canvas-toast" role="status" aria-live="polite">{toast}</div>
-        {/key}
-      {/if}
     </section>
   </main>
 </div>

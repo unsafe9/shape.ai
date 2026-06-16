@@ -102,7 +102,11 @@ describe("every key floating surface consumes the themeable base (so it flips)",
     return m![1].trim();
   }
 
-  for (const selector of [".toolbar-remote", ".toolbar-draw", ".settings-modal", ".node-context-menu", ".template-picker", ".color-popup"]) {
+  // The toolbar / settings / context-menu / color-popup surfaces moved into the Rust ui extension, where
+  // their theme flip rides core theme tokens (pinned by the crates/ui tests), so they no longer carry a
+  // themeable CSS surface here. `.template-picker` is the remaining shell-side floating surface; it must
+  // still consume the themeable base so it flips with the dark block.
+  for (const selector of [".template-picker"]) {
     it(`${selector} resolves to a dark surface in dark mode`, () => {
       const bg = surfaceBackground(selector);
       const resolved = resolve(dark, bg);

@@ -39,6 +39,17 @@ describe("doubleClickAction (drill-in branch) — core query", () => {
   });
 });
 
+describe("objectSelectionInScope (drill-in scope-exit verdict) — core query", () => {
+  const scene = sceneOf([obj("frame", undefined), obj("child", "frame"), obj("leaf", undefined)]);
+
+  it("stays in scope for the container itself or a direct child; exits for canvas or an outside object", () => {
+    expect(core.objectSelectionInScope(scene, { kind: "object", id: "child" }, "frame")).toBe(true);
+    expect(core.objectSelectionInScope(scene, { kind: "object", id: "frame" }, "frame")).toBe(true);
+    expect(core.objectSelectionInScope(scene, { kind: "canvas" }, "frame")).toBe(false);
+    expect(core.objectSelectionInScope(scene, { kind: "object", id: "leaf" }, "frame")).toBe(false);
+  });
+});
+
 describe("ungroupEnabled — core query", () => {
   const scene = sceneOf([obj("frame", undefined), obj("child", "frame"), obj("leaf", undefined)]);
 

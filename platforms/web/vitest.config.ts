@@ -5,6 +5,6 @@ export default defineConfig({
   plugins: [svelte({ hot: false })],
   test: {
     environment: "node",
-    include: ["tests/**/*.test.ts"]
+    include: ["tests/**/*.test.ts", "ime/**/*.test.ts"]
   }
 });

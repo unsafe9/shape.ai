@@ -55,6 +55,91 @@ export type ObjectGesture = {
   description: string;
 };
 
+// The inspector catalog/view types mirror `crates/scene-core/src/object/catalog/inspector.rs`.
+// Like ObjectCommand/ObjectGesture they are Serialize-only on the Rust side, so they are
+// hand-declared here (NOT ts-rs). Enum strings are kebab-case (section / appliesTo); the
+// widget union is tagged on `kind`, camelCase.
+
+// Which roles a control is offered for; the dynamic view intersects this across the selection.
+export type AppliesTo =
+  | "always"
+  | "free-placed"
+  | "flow-child"
+  | "container"
+  | "flow-container"
+  | "has-text";
+
+export type InspectorSection =
+  | "header"
+  | "placement"
+  | "layout"
+  | "appearance"
+  | "text"
+  | "action";
+
+// The widget a control renders as. `number`'s bounds/step are advisory hints (null = unbounded).
+export type InspectorWidget =
+  | { kind: "text" }
+  | { kind: "toggle" }
+  | { kind: "badge" }
+  | { kind: "button" }
+  | { kind: "paint" }
+  | { kind: "number"; unit: string; min: number | null; max: number | null; step: number }
+  | { kind: "segment"; options: string[] }
+  | { kind: "lanes" }
+  | { kind: "align9" };
+
+// A static catalog entry: one inspector control and how it lowers to an op.
+// `opKind`/`field` are omitted (not null) on the wire for a read-only display / a button.
+export type InspectorControl = {
+  id: string;
+  label: string;
+  section: InspectorSection;
+  widget: InspectorWidget;
+  appliesTo: AppliesTo;
+  opKind?: string;
+  field?: string;
+  // Quantized-units-per-px for a px-denominated numeric control (spacing/stroke-width/font-size),
+  // else 1.0. The view value is already divided to px; the shell multiplies a px edit back by it.
+  unitScale: number;
+  description: string;
+};
+
+export type Placement = "free" | "flow-child";
+
+// The resolved role of a single object — the basis for filtering the catalog.
+export type InspectorRole = {
+  placement: Placement;
+  container: boolean;
+  flowContainer: boolean;
+  hasText: boolean;
+};
+
+// A control resolved for the current selection: catalog metadata + its current value
+// (`null` when unset/not-applicable or `mixed`) and the multi-select divergence flag.
+export type InspectorControlValue = {
+  id: string;
+  label: string;
+  widget: InspectorWidget;
+  value: unknown;
+  mixed: boolean;
+  opKind?: string;
+  field?: string;
+  // Carried from the catalog so a px edit re-quantizes (px * unitScale) without the shell owning the Q.
+  unitScale: number;
+};
+
+export type InspectorSectionView = {
+  section: InspectorSection;
+  controls: InspectorControlValue[];
+};
+
+// The full dynamic inspector view for a selection.
+export type InspectorView = {
+  role: InspectorRole;
+  sections: InspectorSectionView[];
+};
+
 export type DerivedRegion = Record<string, unknown>;
 
 // Container-vs-leaf decision for a double-click: a container drills in, a leaf edits its text.
@@ -87,6 +172,22 @@ type SceneCoreModule = {
   derive_region: (geometryJson: string, flatness: number) => string;
   object_command_catalog: () => string;
   object_gesture_catalog: () => string;
+  object_inspector_catalog: () => string;
+  object_inspector_view: (sceneJson: string, selectionJson: string) => string;
+  object_set_transform_field: (matrixJson: string, field: string, value: number) => string;
+  object_quantize_units: (px: number, scale: number) => number;
+  object_resize_axis: (
+    transformJson: string,
+    geometryJson: string,
+    axis: string,
+    targetPx: number
+  ) => string;
+  object_inspector_edit_op: (
+    objectJson: string,
+    controlId: string,
+    valueJson: string,
+    unitScale: number
+  ) => string;
   template_anchor: (
     sceneJson: string,
     fallbackX: number,
@@ -171,6 +272,11 @@ type SceneCoreModule = {
   has_children: (sceneJson: string, id: string) => string;
   ungroup_enabled: (sceneJson: string, selectedId: string) => string;
   double_click_action: (sceneJson: string, id: string) => string;
+  object_selection_in_scope: (
+    sceneJson: string,
+    selectionJson: string,
+    container: string
+  ) => string;
   group_ops: (sceneJson: string, idsJson: string, frameId: string) => string;
   ungroup_ops: (sceneJson: string, frameId: string) => string;
   create_thresholds: () => string;
@@ -269,6 +375,31 @@ export type SceneCore = {
   deriveRegion(geometry: SceneObject["geometry"], flatness: number): DerivedRegion;
   objectCommandCatalog(): ObjectCommand[];
   objectGestureCatalog(): ObjectGesture[];
+  // The static inspector control catalog (every property control + how it lowers to an op),
+  // in panel order. The settings-style read-only mirror; the property panel filters it via the view.
+  objectInspectorCatalog(): InspectorControl[];
+  // The dynamic inspector view for a selection: the applicable controls (intersected across a
+  // multi-select) with their current values + `mixed` divergence flags. Inputs are JSON strings of
+  // the render-only mirror's scene + selection so the panel reads ONE core-resolved snapshot.
+  objectInspectorView(sceneJson: string, selectionJson: string): InspectorView;
+  // Patch ONE transform field (x/y in px, rotation/rotation-flow in DISPLAY degrees) on a bare 3x3 and
+  // return the new 3x3 for a `set-transform` op. The core owns the decompose/recompose seam AND the
+  // deg->rad conversion; the shell does no matrix or angle-unit math.
+  objectSetTransformField(matrixJson: string, field: string, value: number): Transform3x3;
+  // Re-quantize an inspector px edit to its stored i32 via the cores' single `round(px * scale)`
+  // discipline; `scale` is the control's `unitScale`, so the shell owns neither the rounding nor the Q.
+  objectQuantizeUnits(px: number, scale: number): number;
+  // The transform that makes a width (`axis: "x"`) or height (`axis: "y"`) edit read `targetPx` absolute
+  // px in the inspector. The core does the geometry/scale math; the shell authors the result as
+  // `set-transform`. `geometryJson` is the object's `Geometry`, `transformJson` its current 3x3.
+  objectResizeAxis(transformJson: string, geometryJson: string, axis: "x" | "y", targetPx: number): Transform3x3;
+  // Lower ONE inspector property edit (set-style/set-text/set-sizing/set-layout/set-meta/set-clip) to its
+  // ObjectOp, patching the edited field on the object's current value. The core owns the per-field op
+  // synthesis AND every style/layout/sizing/text default a borderless or layout-less object gains, so the
+  // shell makes no styling decision. `null` for a control this surface does not own (the transform/resize
+  // fields x/y/rotation/width/height route through objectSetTransformField/objectResizeAxis) or an edit
+  // that cannot apply (a layout field on a layout-less object). `unitScale` re-quantizes a px edit in-core.
+  objectInspectorEditOp(object: SceneObject, controlId: string, value: unknown, unitScale: number): ObjectOp | null;
   // Where a new template should land: `gap` right of the right-most object's transform origin and
   // top-aligned, or `fallback` (the shell's viewport center) when the scene is empty.
   templateAnchor(
@@ -410,6 +541,10 @@ export type SceneCore = {
   // True only when a non-null `selectedId` is a container (has children).
   ungroupEnabled(scene: ObjectScene, selectedId: string | null): boolean;
   doubleClickAction(scene: ObjectScene, id: string): DoubleClickAction;
+  // The core verdict the shell mirrors for active-container token lockstep: true when `selection` is
+  // the drill-in `container` itself or a direct child (stays in scope), false otherwise (the shell
+  // retracts the token). The scope-exit decision lives in the core, never recomputed in the shell.
+  objectSelectionInScope(scene: ObjectScene, selection: ObjectSelection, container: string): boolean;
   // The ops grouping `ids` under a new frame `frameId`: an insert-object for a clipped frame sized +
   // placed to the children's union world-AABB, then one reparent per child re-homing it into the frame.
   // Null when fewer than two known members resolve or no member yields a derivable region.
@@ -511,6 +646,44 @@ export async function loadSceneCore(): Promise<SceneCore> {
       return parseBridge<ObjectGesture[]>(
         "object_gesture_catalog",
         mod.object_gesture_catalog()
+      );
+    },
+    objectInspectorCatalog() {
+      return parseBridge<InspectorControl[]>(
+        "object_inspector_catalog",
+        mod.object_inspector_catalog()
+      );
+    },
+    objectInspectorView(sceneJson, selectionJson) {
+      return parseBridge<InspectorView>(
+        "object_inspector_view",
+        mod.object_inspector_view(sceneJson, selectionJson)
+      );
+    },
+    objectSetTransformField(matrixJson, field, value) {
+      return parseBridge<Transform3x3>(
+        "object_set_transform_field",
+        mod.object_set_transform_field(matrixJson, field, value)
+      );
+    },
+    objectQuantizeUnits(px, scale) {
+      return mod.object_quantize_units(px, scale);
+    },
+    objectResizeAxis(transformJson, geometryJson, axis, targetPx) {
+      return parseBridge<Transform3x3>(
+        "object_resize_axis",
+        mod.object_resize_axis(transformJson, geometryJson, axis, targetPx)
+      );
+    },
+    objectInspectorEditOp(object, controlId, value, unitScale) {
+      return parseBridge<ObjectOp | null>(
+        "object_inspector_edit_op",
+        mod.object_inspector_edit_op(
+          JSON.stringify(object),
+          controlId,
+          JSON.stringify(value ?? null),
+          unitScale
+        )
       );
     },
     templateAnchor(scene, fallback) {
@@ -713,6 +886,12 @@ export async function loadSceneCore(): Promise<SceneCore> {
       return parseBridge<DoubleClickAction>(
         "double_click_action",
         mod.double_click_action(JSON.stringify(scene), id)
+      );
+    },
+    objectSelectionInScope(scene, selection, container) {
+      return parseBridge<boolean>(
+        "object_selection_in_scope",
+        mod.object_selection_in_scope(JSON.stringify(scene), JSON.stringify(selection), container)
       );
     },
     groupOps(scene, ids, frameId) {

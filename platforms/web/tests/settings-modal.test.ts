@@ -1,9 +1,10 @@
 // The Gestures section is fed by the wasm core's object_gesture_catalog() (single
-// source, no TS mirror). No DOM in node, so assert the .svelte source renders the
-// section against the catalog and formatGestureTrigger produces a readable trigger.
+// source, no TS mirror). The settings modal is now rendered by the Rust `shape_ui`
+// extension (crates/ui/src/settings.rs), so the section-rendering wiring is pinned by
+// the crates/ui Rust tests, not a .svelte source here. What stays shell-side and is
+// verified below: the catalog itself (from the real core) and formatGestureTrigger,
+// the shell helper the modal's trigger formatting and the settings catalog both read.
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   ensureSceneCore,
@@ -19,11 +20,6 @@ beforeAll(async () => {
   const core = await loadSceneCore();
   gestures = core.objectGestureCatalog();
 });
-
-const source = readFileSync(
-  fileURLToPath(new URL("../ui/SettingsModal.svelte", import.meta.url)),
-  "utf8"
-);
 
 describe("object gesture catalog (from the wasm core)", () => {
   it("is non-empty with id/label/trigger/description rows", () => {
@@ -55,23 +51,6 @@ describe("formatGestureTrigger", () => {
     expect(
       formatGestureTrigger({ input: "modifier", modifier: "Shift", degrees: 15 }, false)
     ).toBe("Hold Shift · 15°");
-  });
-});
-
-describe("SettingsModal Gestures section (against the .svelte source)", () => {
-  it("declares the gestures prop and a dedicated Gestures section", () => {
-    expect(source).toMatch(/gestures:\s*ObjectGesture\[\]/);
-    expect(source).toMatch(/<h3>Gestures<\/h3>/);
-  });
-
-  it("renders each gesture's label, formatted trigger, and description", () => {
-    expect(source).toMatch(/\{gesture\.label\}/);
-    expect(source).toMatch(/formatGestureTrigger\(gesture\.trigger,\s*isMac\)/);
-    expect(source).toMatch(/\{gesture\.description\}/);
-  });
-
-  it("iterates the gesture catalog (keyed by id)", () => {
-    expect(source).toMatch(/#each gestures as gesture \(gesture\.id\)/);
   });
 
   it("produces a non-empty label and trigger for every catalog gesture", () => {

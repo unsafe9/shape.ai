@@ -10,7 +10,11 @@ import type {
   RustCanvasInputEvent,
   RustInputBatchResult,
   RustWebGpuFrameStats,
-  RustWebGpuRenderer
+  RustWebGpuRenderer,
+  UiAction,
+  UiEditRequest,
+  UiIntent,
+  UiKeyInput
 } from "../bridge/wasmLoader";
 import {
   isAdditiveSelect,
@@ -85,6 +89,16 @@ export type EngineEvent =
   | { type: "erase"; id: string; world: WorldPoint; partial: boolean }
   // The hover affordance under the cursor (from result.hoverAffordance on a no-drag move); the shell maps it to a cursor.
   | { type: "affordance"; affordance: HoverAffordance }
+  // A ui-core dispatch action, forwarded OPAQUELY for the app to consume (it computes nothing from it).
+  // The decision is the core's; this is a pure relay (the thin-shell rule).
+  | { type: "ui-action"; action: UiAction }
+  // A typed intent a fired built-in-UI widget resolved to through the set UiModel (the core's
+  // `shape_ui::resolve`). Forwarded VERBATIM so the shell routes it to its existing op-authoring handler;
+  // the shell re-derives no intent and authors no op of its own here — a pure relay (the thin-shell rule).
+  | { type: "ui-intent"; intent: UiIntent }
+  // A focused ui-core TextInput's IME mount request (the core decided "edit here, this value/rect"). The
+  // shell opens the SAME shared IME library the canvas inline edit uses. A pure relay — no decision here.
+  | { type: "ui-edit"; edit: UiEditRequest }
   | { type: "status"; message: string };
 
 export type ShapeCanvasEngineOptions = {
@@ -93,6 +107,10 @@ export type ShapeCanvasEngineOptions = {
   backend: string;
   webGpuRenderer?: RustWebGpuRenderer | null;
   onEvent: (event: EngineEvent) => void;
+  // Commit any active text-edit surface BEFORE the canvas mousedown's preventDefault swallows its blur.
+  // Injected by the shell so the blur-before-preventDefault hazard lives in ONE place (the shared IME
+  // library's `blurActive`), shared by the canvas inline edit and the ui-core TextInput edit.
+  blurActiveEditable?: () => void;
 };
 
 export type FocusBoundsOptions = {
@@ -117,6 +135,9 @@ export class ShapeCanvasEngine {
   private canvas: HTMLCanvasElement;
   private overlayRoot: HTMLElement;
   private onEvent: (event: EngineEvent) => void;
+  // Injected commit-before-preventDefault hook (see ShapeCanvasEngineOptions). Set late: the shell's
+  // IME library is created after the engine, so it is wired via `setBlurActiveEditable`.
+  private blurActiveEditable: (() => void) | null = null;
   private camera: CameraState = { x: 0, y: 0, zoom: 1 };
   private dpr = 1;
   private width = 1;
@@ -131,6 +152,10 @@ export class ShapeCanvasEngine {
   private webGpuRenderer: RustWebGpuRenderer | null;
   private webGpuUnavailableNotified = false;
   private mouseDragActive = false;
+  // True between a UI-consumed pointer-DOWN and its up/cancel: a forwarding flag (like mouseDragActive),
+  // not a canvas decision. While set, every move/up/cancel routes to the UI runtime (a captured slider
+  // drag), so the canvas pointer hot path never sees them and adds no per-move wasm await of its own.
+  private uiPointerActive = false;
   private mouseFallbackTarget: EventTarget | null = null;
   // Shift/meta held at the most recent down; consumed by object-select to build a transient multi-select set.
   private lastPointerAdditive = false;
@@ -172,6 +197,7 @@ export class ShapeCanvasEngine {
     this.onEvent = options.onEvent;
     this.backend = options.backend;
     this.webGpuRenderer = options.webGpuRenderer ?? null;
+    this.blurActiveEditable = options.blurActiveEditable ?? null;
     if (!this.webGpuRenderer) {
       this.onEvent({ type: "status", message: "WebGPU renderer unavailable: build WASM and use a WebGPU-capable browser." });
       this.webGpuUnavailableNotified = true;
@@ -234,6 +260,11 @@ export class ShapeCanvasEngine {
   // The shell mirrors the Space key down/up here; a pointer-down while Space is held becomes a pan gesture.
   setSpaceHeld(held: boolean) {
     this.spaceHeld = held;
+  }
+
+  // Wire the commit-before-preventDefault hook late (the shell's IME library is built after the engine).
+  setBlurActiveEditable(blur: () => void) {
+    this.blurActiveEditable = blur;
   }
 
   // Arm the core's hand-pan path for one pan gesture; the core owns the pan state machine, the engine
@@ -449,6 +480,9 @@ export class ShapeCanvasEngine {
 
   private onPointerDown = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    // Two-tier dispatch: the UI runtime sees the pointer-down FIRST. On consume the canvas never
+    // sees it (zero inputBatch); a captured widget (e.g. a slider) then owns move/up via uiPointerActive.
+    if (this.routeUiPointerDown(event)) return;
     this.shiftHeld = event.shiftKey;
     this.altHeld = event.altKey;
     this.syncCoarseRotate();
@@ -482,6 +516,12 @@ export class ShapeCanvasEngine {
 
   private onPointerMove = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    // A captured UI widget (slider drag) owns the whole move stream — the canvas hot path is never
+    // entered, so no inputBatch / sendInputBatch await is added to it. Returns before the canvas path.
+    if (this.uiPointerActive) {
+      this.uiPointer("move", this.eventPoint(event));
+      return;
+    }
     this.shiftHeld = event.shiftKey;
     this.altHeld = event.altKey;
     this.syncCoarseRotate();
@@ -513,6 +553,16 @@ export class ShapeCanvasEngine {
 
   private onPointerUp = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    if (this.uiPointerActive) {
+      this.uiPointer("up", this.eventPoint(event));
+      this.uiPointerActive = false;
+      try {
+        this.canvas.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released.
+      }
+      return;
+    }
     if (this.activeTool === "draw" && !this.panGestureActive) {
       this.drawDragActive = false;
       this.emitDraw("end", event);
@@ -563,6 +613,16 @@ export class ShapeCanvasEngine {
 
   private onPointerCancel = (event: PointerEvent) => {
     if (isMousePointerEvent(event)) return;
+    if (this.uiPointerActive) {
+      this.uiPointer("cancel", this.eventPoint(event));
+      this.uiPointerActive = false;
+      try {
+        this.canvas.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may already be released.
+      }
+      return;
+    }
     if (this.activeTool === "draw" && !this.panGestureActive) {
       this.drawDragActive = false;
       this.emitDraw("cancel", event);
@@ -600,12 +660,21 @@ export class ShapeCanvasEngine {
   };
 
   private onMouseDown = (event: MouseEvent) => {
-    this.shiftHeld = event.shiftKey;
-    this.altHeld = event.altKey;
-    this.syncCoarseRotate();
     // Left (0) drives select/draw; middle (1) is a pan gesture; right (2) is the context menu (shell-handled) — ignore here.
     const pan = isPanIntent({ spaceHeld: this.spaceHeld, button: event.button });
     if (event.button !== 0 && !pan) return;
+    // Two-tier dispatch (mirror of onPointerDown): the UI runtime sees the mouse-down FIRST, before any
+    // modifier sync / inputBatch / blur / preventDefault, so a consumed click forwards nothing to the core.
+    if (this.routeUiPointerDown(event)) return;
+    this.shiftHeld = event.shiftKey;
+    this.altHeld = event.altKey;
+    this.syncCoarseRotate();
+    // Commit any active inline edit before preventDefault swallows the native blur: preventDefault on a
+    // mousedown cancels the browser's focus shift (so the editing surface's blur->commit never fires),
+    // but it does NOT cancel an explicit .blur(). The blur logic lives in ONE place — the shared IME
+    // library's `blurActive`, injected here — so the canvas inline edit and the ui-core TextInput edit
+    // share the same hazard handling. Blur first, then suppress native selection drag.
+    this.blurActiveEditable?.();
     event.preventDefault();
     if (this.activeTool === "draw" && !pan) {
       this.mouseDragActive = true;
@@ -637,6 +706,13 @@ export class ShapeCanvasEngine {
   };
 
   private onMouseMove = (event: MouseEvent) => {
+    // A captured UI widget (slider drag) owns the move stream on the mouse path too — checked before the
+    // mouseDragActive gate (a UI-consumed mousedown sets uiPointerActive, not mouseDragActive).
+    if (this.uiPointerActive) {
+      event.preventDefault();
+      this.uiPointer("move", this.eventPoint(event));
+      return;
+    }
     if (!this.mouseDragActive) return;
     event.preventDefault();
     this.shiftHeld = event.shiftKey;
@@ -658,6 +734,13 @@ export class ShapeCanvasEngine {
   };
 
   private onMouseUp = (event: MouseEvent) => {
+    if (this.uiPointerActive) {
+      event.preventDefault();
+      this.uiPointer("up", this.eventPoint(event));
+      this.uiPointerActive = false;
+      this.unbindMouseFallbackMove();
+      return;
+    }
     if (!this.mouseDragActive) return;
     event.preventDefault();
     this.mouseDragActive = false;
@@ -990,6 +1073,158 @@ export class ShapeCanvasEngine {
     }
   }
 
+  // Pure screen-space UI pick for the pointer pre-pass — the core returns the top-most UI widget id
+  // under the SCREEN point (identity-camera). `screen` is raw canvas-local px (NOT world): the UI
+  // scene is screen-space, so it must NOT be projected through the world camera. Cheap synchronous
+  // wasm call, pointer-DOWN only (never per-move). The widget-id decision stays in the core.
+  hitUi(screen: WorldPoint): string | null {
+    if (!this.webGpuRenderer || typeof this.webGpuRenderer.hitUi !== "function") return null;
+    try {
+      const id = this.webGpuRenderer.hitUi(screen.x, screen.y);
+      this.rustBoundaryCalls += 1;
+      return id ?? null;
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust hitUi failed: ${error.message}` : "Rust hitUi failed"
+      });
+      return null;
+    }
+  }
+
+  // Drive the ui-core runtime with a pointer phase at SCREEN px. The core decides everything (hit,
+  // slider value, actuation); this only forwards, relays the actions as EngineEvents, and reports
+  // back `consumed`/`sceneChanged`. On sceneChanged the renderer already re-fed the UI scene, so the
+  // RAF loop redraws it next tick (no extra call here). Feature-detected like hitUi. `screen` is raw
+  // canvas-local px (the UI is identity-camera, never world-projected). Returns null when unavailable.
+  private uiPointer(
+    phase: "down" | "move" | "up" | "cancel",
+    screen: WorldPoint
+  ): { consumed: boolean; sceneChanged: boolean } | null {
+    if (!this.webGpuRenderer || typeof this.webGpuRenderer.uiPointer !== "function") return null;
+    try {
+      const result = this.webGpuRenderer.uiPointer(phase, screen.x, screen.y);
+      this.rustBoundaryCalls += 1;
+      this.relayUiDispatch(result);
+      // A focused TextInput's EditRequest: relay it so the shell mounts the shared IME surface. Previously
+      // dropped on the floor, which is why a ui-core field could focus but never mount an editing surface.
+      if (result.edit) this.onEvent({ type: "ui-edit", edit: result.edit });
+      return { consumed: result.consumed, sceneChanged: result.sceneChanged };
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust uiPointer failed: ${error.message}` : "Rust uiPointer failed"
+      });
+      return null;
+    }
+  }
+
+  // Forward a neutral key to the focused UI widget. The core decides whether it owns the key (only a
+  // focused TextInput consumes); this is a pure forward — no key-literal BEHAVIOR branch in TS. Relays
+  // actions as EngineEvents; returns `consumed`/`sceneChanged` (null when unavailable).
+  uiKey(key: UiKeyInput): { consumed: boolean; sceneChanged: boolean } | null {
+    if (!this.webGpuRenderer || typeof this.webGpuRenderer.uiKey !== "function") return null;
+    try {
+      const result = this.webGpuRenderer.uiKey(JSON.stringify(key));
+      this.rustBoundaryCalls += 1;
+      this.relayUiDispatch(result);
+      return { consumed: result.consumed, sceneChanged: result.sceneChanged };
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust uiKey failed: ${error.message}` : "Rust uiKey failed"
+      });
+      return null;
+    }
+  }
+
+  // Commit the IME surface's single finished string into the focused UI field. The OS surface owned the
+  // composition; this lands its one committed value (no per-key relay, so CJK composition can't double).
+  // Relays the resulting TextChanged as a ui-action EngineEvent; returns consumed/sceneChanged (null when
+  // unavailable). Used by the ui-core IME consumer's onCommit.
+  uiCommitText(value: string): { consumed: boolean; sceneChanged: boolean } | null {
+    if (!this.webGpuRenderer || typeof this.webGpuRenderer.uiCommitText !== "function") return null;
+    try {
+      const result = this.webGpuRenderer.uiCommitText(value);
+      this.rustBoundaryCalls += 1;
+      this.relayUiDispatch(result);
+      return { consumed: result.consumed, sceneChanged: result.sceneChanged };
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust uiCommitText failed: ${error.message}` : "Rust uiCommitText failed"
+      });
+      return null;
+    }
+  }
+
+  // Relay a UI dispatch's actions + resolved intents up VERBATIM (a pure forward, no computation): each
+  // raw action stays for the shell's focus/IME bookkeeping, and each typed intent the action resolved to
+  // through the set model routes to the shell's existing op-authoring handler. The shell decides nothing here.
+  private relayUiDispatch(result: { actions: UiAction[]; intents?: UiIntent[] }): void {
+    for (const action of result.actions) this.onEvent({ type: "ui-action", action });
+    for (const intent of result.intents ?? []) this.onEvent({ type: "ui-intent", intent });
+  }
+
+  // Two-tier pointer-down entry: forward the DOWN to the UI runtime; on consume, arm uiPointerActive
+  // (so move/up/cancel route to the UI), capture the pointer, and report consumed=true so the canvas
+  // handler returns without forwarding. When the renderer predates uiPointer, fall back to the bare
+  // hitUi pre-pass (back-compat) so a UI hit still consumes the click. The widget/value decision is
+  // entirely the core's; this only forwards + flags capture. `true` => the canvas must not see the event.
+  private routeUiPointerDown(event: PointerEvent | MouseEvent): boolean {
+    const screen = this.eventPoint(event);
+    const result = this.uiPointer("down", screen);
+    if (result === null) {
+      // Renderer lacks the runtime dispatch: keep the P1 hit-only pre-pass (consume on a hit id).
+      const uiHit = this.hitUi(screen);
+      if (!uiHit) return false;
+      this.onEvent({ type: "status", message: `ui-hit ${uiHit}` });
+      return true;
+    }
+    if (!result.consumed) return false;
+    this.uiPointerActive = true;
+    if (isPointerLikeEvent(event)) {
+      this.canvas.setPointerCapture(event.pointerId);
+    } else {
+      // The mouse path has no pointer capture; bind the window fallback move/up so a drag off the
+      // canvas still streams to the UI runtime (mirrors the canvas mouse-drag fallback).
+      this.bindMouseFallbackMove();
+    }
+    return true;
+  }
+
+  // Feed the built-in UI model JSON to the core, which composes `build_root` and re-trees the runtime
+  // (preserving interaction caches). A pure forward of the shell's render-only mirror — the shell authors
+  // no widget here. Returns true when the model was fed (the runtime now owns the real UI, so the demo
+  // seed must stop), false when the renderer predates the export. Feature-detected like the other UI calls.
+  setUiModel(modelJson: string): boolean {
+    if (!this.webGpuRenderer || typeof this.webGpuRenderer.setUiModel !== "function") return false;
+    try {
+      this.webGpuRenderer.setUiModel(modelJson);
+      this.rustBoundaryCalls += 1;
+      return true;
+    } catch (error) {
+      this.onEvent({
+        type: "status",
+        message: error instanceof Error ? `Rust setUiModel failed: ${error.message}` : "Rust setUiModel failed"
+      });
+      return false;
+    }
+  }
+
+  // True when a ui-core widget owns text focus — the window arbiter ORs this into its `typing`
+  // predicate so a focused UI TextInput suppresses the catalog dispatcher. Feature-detected.
+  uiHasFocus(): boolean {
+    if (!this.webGpuRenderer || typeof this.webGpuRenderer.uiHasFocus !== "function") return false;
+    try {
+      const focused = this.webGpuRenderer.uiHasFocus();
+      this.rustBoundaryCalls += 1;
+      return focused;
+    } catch {
+      return false;
+    }
+  }
+
   // Project a WORLD point to SCREEN space through the LIVE core camera so the shell never recomputes
   // the transform from a mirrored CameraState (the shell holds no TS affine). Feature-detected: a wasm
   // build predating `worldToScreen` returns null and the caller skips the projection.
@@ -1052,4 +1287,10 @@ function mouseFallbackTarget(canvas: HTMLCanvasElement): EventTarget {
 
 function isMousePointerEvent(event: PointerEvent): boolean {
   return event.pointerType === "mouse";
+}
+
+// A PointerEvent (carries `pointerId` + pointer capture) vs a plain MouseEvent. The UI-capture path
+// uses pointer capture on the former and the window mouse fallback on the latter.
+function isPointerLikeEvent(event: PointerEvent | MouseEvent): event is PointerEvent {
+  return "pointerId" in event;
 }

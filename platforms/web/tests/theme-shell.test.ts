@@ -64,6 +64,34 @@ describe("applyDocumentTheme (toggle)", () => {
     expect(() => applyDocumentTheme("dark", { root, storage })).not.toThrow();
     expect(root.get(THEME_ROOT_ATTRIBUTE)).toBe("dark");
   });
+
+  it("a toggle click flips the theme state AND drives setObjectTheme with the new dark bit", () => {
+    // The live handler: `toggleTheme()` flips the reactive theme, then the $effect runs
+    // `applyDocumentTheme`, which calls `host.setObjectTheme(dark)`. This reproduces that
+    // exact flip+apply round-trip (the model the Rust-side dead-click defect blocked) and
+    // asserts each click both flips the persisted theme and drives the renderer setter.
+    // FAILS if a click does not flip the theme or does not push the new dark bit.
+    const root = fakeRoot();
+    const storage = fakeStorage();
+    const driven: boolean[] = [];
+    // The reactive theme state + the App's toggleTheme/$effect, isolated from Svelte.
+    let theme: Theme = readStoredTheme(storage); // "light" by default
+    const toggleTheme = () => {
+      theme = theme === "dark" ? "light" : "dark";
+      applyDocumentTheme(theme, { root, storage, setRendererTheme: (dark) => driven.push(dark) });
+    };
+
+    toggleTheme();
+    expect(theme).toBe("dark");
+    expect(storage.getItem(THEME_STORAGE_KEY)).toBe("dark");
+    expect(root.get(THEME_ROOT_ATTRIBUTE)).toBe("dark");
+    expect(driven).toEqual([true]);
+
+    toggleTheme();
+    expect(theme).toBe("light");
+    expect(storage.getItem(THEME_STORAGE_KEY)).toBe("light");
+    expect(driven).toEqual([true, false]);
+  });
 });
 
 describe("readStoredTheme / isTheme", () => {
@@ -119,5 +147,17 @@ describe("App.svelte + styles.css wiring", () => {
   it("ships dark-mode CSS keyed on the root data-theme attribute", () => {
     expect(cssSource).toContain('[data-theme="dark"]');
     expect(cssSource).toContain("color-scheme: dark");
+  });
+
+  it("applies the persisted theme to the renderer the moment the host is wired", () => {
+    // REGRESSION GUARD: the theme $effect runs at mount when `host` is still null (a
+    // non-reactive `let`, so it never re-runs on assignment). Without applying the theme
+    // in the host-wiring path too, the renderer never hears it and dark mode renders light
+    // (light UI fills under a dark canvas, near-white labels on white buttons). `handleHost`
+    // MUST drive setObjectTheme with the current theme. Fails if that call is removed.
+    const start = appSource.indexOf("function handleHost");
+    expect(start).toBeGreaterThan(-1);
+    const handleHostBody = appSource.slice(start, start + 900);
+    expect(handleHostBody).toContain('host.setObjectTheme(theme === "dark")');
   });
 });

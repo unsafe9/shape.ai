@@ -9,7 +9,7 @@ import type { CameraState } from "../shared/geometry";
 import type { ObjectScene, ObjectSelection } from "../shared/object";
 import { ShapeCanvasEngine, type ActiveTool, type EngineEvent, type FocusBoundsOptions, type TransformKind } from "../renderer/engine";
 import type { FrameStats, RenderTransform3x3, WorldRect } from "../renderer/scene";
-import { loadRustCore, type HoverAffordance, type RustCoreStatus, type RustWebGpuRenderer } from "../bridge/wasmLoader";
+import { loadRustCore, type HoverAffordance, type RustCoreStatus, type RustWebGpuRenderer, type UiEditRequest, type UiIntent, type UiKeyInput } from "../bridge/wasmLoader";
 
 export type RendererStats = FrameStats;
 
@@ -75,6 +75,12 @@ export type ShapeCanvasHostCallbacks = {
   onErase: (id: string, world: { x: number; y: number }, partial: boolean) => void;
   // Hover affordance under the cursor (empty/body/resize-*/rotate); the shell maps it to a CSS cursor.
   onAffordance: (affordance: HoverAffordance) => void;
+  // A focused ui-core TextInput's IME mount request (the core decided "edit here"); the shell opens the
+  // shared IME library. Opaque relay — the shell decides nothing from it.
+  onUiEdit?: (edit: UiEditRequest) => void;
+  // A typed intent a built-in-UI widget resolved to through the set model (the core's `shape_ui::resolve`).
+  // The shell routes it to its existing op-authoring handler; this host only relays it (no decision here).
+  onUiIntent?: (intent: UiIntent) => void;
 };
 
 const initialRustStatus: RustCoreStatus = {
@@ -84,7 +90,8 @@ const initialRustStatus: RustCoreStatus = {
   probeWebGpu: null,
   createWebGpuRenderer: null,
   buildObjectSceneGeometry: null,
-  projectObjectScene: null
+  projectObjectScene: null,
+  buildP1UiScene: null
 };
 
 // The Svelte shell provides the three DOM nodes through mount(), reads camera/stats/health through
@@ -99,6 +106,13 @@ export class ShapeCanvasHost {
   private camera: CameraState = { x: 0, y: 0, zoom: 1 };
   private rustStatus: RustCoreStatus = initialRustStatus;
   private webGpuRenderer: RustWebGpuRenderer | null = null;
+  // True once the ui-core runtime is seeded (initUiRuntime). The runtime then owns the UI scene, so
+  // loadUiScene becomes a no-op (re-seeding would drop a dragged slider value / focused field).
+  private uiRuntimeSeeded = false;
+  // True once the shell has fed the real built-in-UI model via setUiModel. The runtime then owns the
+  // REAL UI (toolbar/inspector/…), so loadUiScene must stop seeding the viewport-fixed demo panel —
+  // a demo seed would replace the live tree and drop the model's interaction state.
+  private uiModelFed = false;
   private engineWebGpuAvailable: boolean | null = null;
   private engineWebGpuDetail: string | null = null;
   private webGpuDetail = "Visible Rust/wgpu renderer has not been created.";
@@ -131,6 +145,7 @@ export class ShapeCanvasHost {
     this.createEngine();
     this.emitHealth();
     if (this.lastObjectScene) this.loadObjectScene(this.lastObjectScene, this.lastSelection);
+    this.loadUiScene();
   }
 
   private async createWebGpuRenderer(): Promise<void> {
@@ -144,6 +159,8 @@ export class ShapeCanvasHost {
       return;
     }
     this.webGpuRenderer = null;
+    this.uiRuntimeSeeded = false;
+    this.uiModelFed = false;
     this.engineWebGpuAvailable = null;
     this.engineWebGpuDetail = null;
     this.webGpuDetail = "Creating visible Rust/wgpu renderer.";
@@ -186,6 +203,9 @@ export class ShapeCanvasHost {
     const resize = () => {
       const rect = canvas.getBoundingClientRect();
       engine.resize(rect.width, rect.height, window.devicePixelRatio || 1);
+      // The screen-space UI scene is viewport-sized, so re-feed it on every resize. P1
+      // rebuilds the static widget tree; a viewport-only PlanPatch update is a P2 follow-up.
+      this.loadUiScene();
     };
     this.observer = new ResizeObserver(resize);
     this.observer.observe(canvas);
@@ -263,6 +283,50 @@ export class ShapeCanvasHost {
     }
   }
 
+  // Seed / re-feed the screen-space UI scene for the current viewport. When the renderer exposes the
+  // ui-core RUNTIME (`initUiRuntime`), seed it ONCE — the runtime then OWNS the scene and re-feeds itself
+  // on dispatch, so subsequent calls (e.g. resize) do nothing here (the demo panel is viewport-fixed; the
+  // app's theme effect drives the runtime's theme via setObjectTheme). When the runtime is unavailable,
+  // fall back to the static P1 build + upload. Feature-detected end to end: a silent no-op on an old wasm.
+  loadUiScene(): void {
+    // Once the shell has fed the real built-in-UI model, the runtime owns the live UI — re-seeding the
+    // demo panel here would replace it and drop the model's interaction state, so stop seeding.
+    if (this.uiModelFed) return;
+    const sizeSource = this.inputCanvas;
+    if (!sizeSource) return;
+    const rect = sizeSource.getBoundingClientRect();
+    const w = rect.width || 1;
+    const h = rect.height || 1;
+    const renderer = this.webGpuRenderer;
+    if (renderer && typeof renderer.initUiRuntime === "function") {
+      // The runtime owns its scene once seeded; re-seeding would drop interaction state, so seed once.
+      if (this.uiRuntimeSeeded) return;
+      // Seed in light; the app applies the real theme via setObjectTheme once the host is wired
+      // (handleHost), which re-resolves the runtime's text + re-feeds — so the initial theme lands
+      // regardless of effect ordering. The core seeds the runtime from its persisted theme bit, so a
+      // setObjectTheme that ran BEFORE this seed is adopted, not clobbered.
+      renderer.initUiRuntime(w, h, false);
+      this.uiRuntimeSeeded = true;
+      return;
+    }
+    const build = this.rustStatus.buildP1UiScene;
+    if (!build) return;
+    const json = build(w, h);
+    this.uploadUiSceneToRenderer(json);
+  }
+
+  // Upload the UI scene to the live renderer's second (identity-camera) renderer. Like the object
+  // upload, the RAF `renderFrame` loop draws the UI pass — no `drawObjects`-style call here.
+  private uploadUiSceneToRenderer(sceneJson: string): void {
+    const renderer = this.webGpuRenderer;
+    if (!renderer || typeof renderer.loadUiScene !== "function") return;
+    try {
+      renderer.loadUiScene(sceneJson);
+    } catch (error) {
+      this.callbacks.onStatus(errorMessage(error, "UI scene upload failed."));
+    }
+  }
+
   setCamera(camera: CameraState): void {
     if (cameraAlmostEqual(this.camera, camera)) return;
     this.camera = camera;
@@ -291,9 +355,47 @@ export class ShapeCanvasHost {
     this.engine?.setSpaceHeld(held);
   }
 
+  // Wire the shell's IME-library blur hook so the engine commits an active text-edit before its
+  // mousedown preventDefault swallows the blur. Pure passthrough to the engine; no logic here.
+  setBlurActiveEditable(blur: () => void): void {
+    this.engine?.setBlurActiveEditable(blur);
+  }
+
   // Drive the renderer theme-bit (dark/light). No-op without a live renderer.
   setObjectTheme(dark: boolean): void {
     this.webGpuRenderer?.setObjectTheme?.(dark);
+  }
+
+  // Forward the active drill-in container scope token to the core (which scopes the next pointer-down
+  // pick); `null` clears it. Pure passthrough — no selection logic here. No-op without a live renderer.
+  setActiveContainer(id: string | null): void {
+    this.webGpuRenderer?.setActiveContainer?.(id);
+  }
+
+  // Forward a neutral key to the focused UI widget (the core decides whether it owns it). Pure
+  // passthrough to the engine wrapper — no key-literal branch here. Returns the dispatch verdict.
+  uiKey(key: UiKeyInput): { consumed: boolean; sceneChanged: boolean } | null {
+    return this.engine?.uiKey(key) ?? null;
+  }
+
+  // Commit the IME surface's single finished string into the focused UI field. Pure passthrough — the
+  // core blurs the field and emits the final TextChanged; the shell authors nothing.
+  uiCommitText(value: string): { consumed: boolean; sceneChanged: boolean } | null {
+    return this.engine?.uiCommitText(value) ?? null;
+  }
+
+  // Feed the built-in UI model JSON to the core (composes build_root + re-trees the runtime, preserving
+  // interaction caches). Returns true when fed, so the shell knows the runtime now owns the real UI and
+  // the demo seed must stop. Pure passthrough — the shell authors no widget. No-op on an old renderer.
+  setUiModel(modelJson: string): boolean {
+    const fed = this.engine?.setUiModel(modelJson) ?? false;
+    if (fed) this.uiModelFed = true;
+    return fed;
+  }
+
+  // True when a ui-core widget owns text focus — the window arbiter ORs this into its `typing` predicate.
+  uiHasFocus(): boolean {
+    return this.engine?.uiHasFocus() ?? false;
   }
 
   getCamera(): CameraState {
@@ -369,6 +471,23 @@ export class ShapeCanvasHost {
     }
     if (event.type === "affordance") {
       this.callbacks.onAffordance(event.affordance);
+      return;
+    }
+    if (event.type === "ui-action") {
+      // The shell consumes NOTHING from a raw UI action — the typed `ui-intent` below carries the
+      // core-resolved request the shell authors. The raw action is otherwise opaque bookkeeping the
+      // engine already used for focus/IME, so it stops here (no status string, no decision).
+      return;
+    }
+    if (event.type === "ui-intent") {
+      // Pure relay of the core-resolved intent to the shell's existing op-authoring handler. The host
+      // decides nothing; the App routes each intent kind to the handler it already has.
+      this.callbacks.onUiIntent?.(event.intent);
+      return;
+    }
+    if (event.type === "ui-edit") {
+      // Pure relay of the core's "mount an edit here" request to the shell's shared IME library.
+      this.callbacks.onUiEdit?.(event.edit);
     }
   }
 

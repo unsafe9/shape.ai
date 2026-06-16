@@ -89,9 +89,13 @@ export type WebAdapterInputContract = {
   fitScene(): void;
 };
 
-// Surface 4 — DOM text overlay (IME-capable). The adapter mounts/positions/styles a `<textarea>` from
-// a `DomOverlayRequest`, guards IME composition (Enter/Escape only outside a composition sequence), and
-// commits/cancels by emitting an op. Never mounted when the renderer is null.
+// Surface 4 — DOM text overlay (IME-capable). The shell-facing seam: from a core "edit here" request it
+// mounts/positions/styles a plaintext-only editing surface, guards IME composition (Enter/Escape only
+// outside a composition sequence), handles the blur-before-preventDefault hazard, and hands back ONE
+// committed string the shell authors into an op. The REALIZATION is the shared `ime/textEditHost.ts`
+// (`TextEditHost`): both the canvas inline edit and the ui-core TextInput edit (the `EditRequest` /
+// `CoreOverlayRequest` seam) route through that one library, so this contract owns no DOM itself.
+// Never mounted when the renderer is null.
 export type WebAdapterOverlayContract = {
   // Returns the initial `DomOverlayRequest`, or null if the hit is not a text field / renderer unavailable.
   beginTextEdit(hit: HitResult): DomOverlayRequest | null;
@@ -134,6 +138,16 @@ export type WebAdapterShellContract = {
   // (ObjectOp + errors, persisted by the shell), "overlay" (DomOverlayRequest|null), "gesture" (active
   // bool, suppresses re-sync), "status" (message string).
   readonly onEvent: (event: EngineEvent) => void;
+};
+
+// Surface 8 — Built-in UI bridge. The shell feeds the render-only UI model (`setUiModel`) and forwards
+// neutral pointer/key input (`uiPointer`/`uiKey`/`uiCommitText`); the core composes/hit-tests/dispatches
+// the Rust-rendered built-in UIs and resolves a fired widget into a typed intent the shell routes to its
+// existing op-authoring handler. The shell builds no widget and authors no op from a raw action — it
+// forwards the model in and routes the resolved intent out, exactly like the canvas op path.
+export type WebAdapterUiContract = {
+  setUiModel(modelJson: string): boolean;
+  uiHasFocus(): boolean;
 };
 
 // The complete adapter↔core call boundary, the only surface the shell never touches (typed as

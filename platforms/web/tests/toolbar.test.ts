@@ -206,58 +206,19 @@ describe("toggleStrokePopup (Stroke toggle button)", () => {
   });
 });
 
-describe("toolbar Stroke popup UI", () => {
-  // No DOM in node: assert the wiring against the .svelte source.
-  const source = readFileSync(
-    fileURLToPath(new URL("../ui/Toolbar.svelte", import.meta.url)),
-    "utf8"
-  );
-
-  it("drops the auto draw sub-toolbar (no activeTool === draw|erase gate)", () => {
-    expect(source).not.toMatch(/activeTool === "draw" \|\| activeTool === "erase"/);
-    expect(source).not.toMatch(/class="toolbar-draw"/);
-  });
-
-  it("renders a Stroke button that toggles its popup", () => {
-    expect(source).toMatch(/aria-label="Stroke"/);
-    expect(source).toMatch(/onclick=\{toggleStrokePopupOpen\}/);
-    expect(source).toMatch(/aria-expanded=\{strokePopupOpen\}/);
-    expect(source).toMatch(/\{#if strokePopupOpen\}/);
-  });
-
-  it("the Stroke popup holds only the brush size buttons (color lives in the separate Color popup)", () => {
-    const strokeStart = source.indexOf('aria-label="Stroke settings"');
-    const colorStart = source.indexOf('class="icon-button color-trigger', strokeStart);
-    const popup = source.slice(strokeStart, colorStart);
-    expect(popup).toMatch(/\{#each penWidths as width/);
-    expect(popup).toMatch(/onclick=\{\(\)\s*=>\s*onSetPenWidth\(width\)\}/);
-    // Brush color swatches removed; color is set via the Color popup only.
-    expect(popup).not.toMatch(/color-popup-swatches/);
-    expect(source).not.toMatch(/onSetPenColor/);
-  });
-
-  it("closes on outside-click and Escape while open (its own effect)", () => {
-    expect(source).toMatch(/strokePopupOpen\s*=\s*false/);
-    expect(source).toMatch(/strokeControl && !strokeControl\.contains/);
-  });
-});
+// The toolbar (incl. its Stroke/Color inline rows) is now rendered by the Rust `shape_ui` extension
+// (crates/ui/src/toolbar.rs), so the popup/swatch/picker rendering is pinned by the crates/ui Rust tests,
+// not against a .svelte source here. The thin-shell endstate guard asserts Toolbar.svelte no longer
+// exists. What stays shell-side is the catalog->primitive mapping + the popup-toggle helpers (verified
+// above) and the App-side Shift-driven recognition mode (below, read only from App.svelte).
 
 describe("pen recognition mode (Basic default, Shift-hold Free)", () => {
-  // No DOM in node: assert the wiring against the .svelte sources.
-  const toolbar = readFileSync(
-    fileURLToPath(new URL("../ui/Toolbar.svelte", import.meta.url)),
-    "utf8"
-  );
+  // No DOM in node: assert the wiring against the App source (the toolbar's Free-form toggle is gone —
+  // the toolbar is Rust now — so only the App-side Shift-driven recognition mode is asserted here).
   const app = readFileSync(
     fileURLToPath(new URL("../ui/App.svelte", import.meta.url)),
     "utf8"
   );
-
-  it("the toolbar carries no Free-form toggle button or prop", () => {
-    expect(toolbar).not.toContain('aria-label="Free-form recognition"');
-    expect(toolbar).not.toContain("freeRecognition");
-    expect(toolbar).not.toContain("onToggleFreeRecognition");
-  });
 
   it("App drives Free recognition from a held Shift, defaulting to Basic", () => {
     expect(app).not.toMatch(/let freeRecognition\b/);
@@ -270,39 +231,12 @@ describe("pen recognition mode (Basic default, Shift-hold Free)", () => {
   });
 });
 
-describe("toolbar color-popup UI", () => {
-  // No DOM in node: assert the prop/callback contract against the .svelte source.
-  const source = readFileSync(
-    fileURLToPath(new URL("../ui/Toolbar.svelte", import.meta.url)),
-    "utf8"
-  );
-
-  it("declares the selectedColor prop and onSelectColor callback (preserved contract)", () => {
-    expect(source).toMatch(/selectedColor:\s*string;/);
-    expect(source).toMatch(/onSelectColor:\s*\(color:\s*string\)\s*=>\s*void;/);
-  });
-
-  it("renders a single color-trigger button (rainbow swatch) that toggles the popup", () => {
-    expect(source).toMatch(/class="icon-button color-trigger/);
-    expect(source).toMatch(/onclick=\{toggleColorPopupOpen\}/);
-    expect(source).toMatch(/aria-expanded=\{colorPopupOpen\}/);
-    // The popup is gated behind the open state, not an always-visible row.
-    expect(source).toMatch(/\{#if colorPopupOpen\}/);
-  });
-
-  it("the popup exposes BOTH the fixed PEN_PALETTE swatches AND the native picker", () => {
-    expect(source).toMatch(/class="color-popup"/);
-    expect(source).toMatch(/\{#each penPalette as color/);
-    expect(source).toMatch(/type="color"/);
-  });
-
-  it("selecting either a swatch or the picker updates selectedColor via onSelectColor", () => {
-    expect(source).toMatch(/onclick=\{\(\)\s*=>\s*onSelectColor\(color\)\}/);
-    expect(source).toMatch(/oninput=\{\(event\)\s*=>\s*onSelectColor\(/);
-  });
-
-  it("closes on outside-click and Escape while open", () => {
-    expect(source).toMatch(/colorPopupOpen\s*=\s*false/);
-    expect(source).toMatch(/event\.key\s*===\s*"Escape"/);
+describe("toolbar color contract (shell-side)", () => {
+  it("App applies a picked color through applySelectedColor (the SelectColor intent target)", () => {
+    // The Rust toolbar's Color swatch resolves to a SelectColor intent; the shell adopts it as the
+    // next-shape default + recolors the selection through applySelectedColor (the preserved contract).
+    const app = readFileSync(fileURLToPath(new URL("../ui/App.svelte", import.meta.url)), "utf8");
+    expect(app).toContain('case "selectColor":');
+    expect(app).toMatch(/applySelectedColor\(intent\.hex\)/);
   });
 });

@@ -77,6 +77,16 @@ export function isTypingTarget(target: EventTarget | null): boolean {
   return element.isContentEditable === true;
 }
 
+// The printable char(s) a keydown would INSERT (a single visible char with no Ctrl/Meta modifier), else
+// null for a control/navigation key. A neutral OS-event classifier the shell forwards to the UI runtime
+// as `KeyInput.text` — the core decides what to do with it; this never branches behavior on the key.
+export function keyChar(event: { key: string; ctrlKey: boolean; metaKey: boolean }): string | null {
+  if (event.ctrlKey || event.metaKey) return null;
+  // A single-code-point printable key (`event.key` is the char itself for printables; control keys are
+  // multi-char names like "Backspace"/"Enter"/"ArrowLeft"). Array spread counts code points, not units.
+  return [...event.key].length === 1 ? event.key : null;
+}
+
 // Render a default shortcut for display, resolving the `Mod` token to the host's primary modifier symbol.
 export function formatShortcut(shortcut: string, isMac = detectMac()): string {
   return shortcut

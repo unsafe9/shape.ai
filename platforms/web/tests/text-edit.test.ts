@@ -1,7 +1,11 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import { textOverlayScreenRect, type DragSpan } from "../controller/objectPrimitives";
 import { ensureSceneCore, loadSceneCore, type SceneCore } from "../bridge/sceneCoreWasm";
-import { GEOMETRY_QUANTUM_PER_PX, IDENTITY_TRANSFORM } from "../shared/object";
+import { GEOMETRY_QUANTUM_PER_PX, IDENTITY_TRANSFORM, type Object as SceneObject } from "../shared/object";
+
+const appSource = readFileSync(fileURLToPath(new URL("../ui/App.svelte", import.meta.url)), "utf8");
 
 const Q = GEOMETRY_QUANTUM_PER_PX;
 
@@ -68,5 +72,82 @@ describe("textOverlayScreenRect (overlay placement)", () => {
   it("returns null when the projector can't project (renderer not live)", () => {
     const object = core.buildPrimitive("text", { x: 90, y: 40 }, "text-3", "a0");
     expect(textOverlayScreenRect(core.objectWorldAabb(object), () => null)).toBeNull();
+  });
+});
+
+describe("text tool auto-enters inline edit (connected/async path)", () => {
+  // The injected world->screen projector mirroring the core affine, same form as the block above.
+  const project = (world: { x: number; y: number }) => ({ x: world.x, y: world.y });
+
+  it("insertPrimitive's text branch holds the pending insert and auto-enters edit on the inserted id", () => {
+    // Pin the shipping auto-enter (App.svelte): insertPrimitive must, in its text branch, both hold the
+    // built object in pendingTextInsert (so the overlay mounts this tick) and enter inline edit on that
+    // object's id. Deleting either gated line — the (e) fix — must fail this assertion.
+    const insert = appSource.indexOf("function insertPrimitive");
+    const body = appSource.slice(insert, appSource.indexOf("function armCreate", insert));
+    expect(body, "insertPrimitive must hold the pending text insert").toContain(
+      'if (kind === "text") pendingTextInsert = object;'
+    );
+    expect(body, "insertPrimitive must auto-enter inline edit on the inserted text id").toContain(
+      'if (kind === "text") enterTextEdit(object.id);'
+    );
+  });
+
+  it("the overlay mounts BEFORE the scene lands: pendingTextInsert backs textEditObject/textEditRect", () => {
+    // Connected insert window: the object is built + held in pendingTextInsert but the canonical scene
+    // has not reflected it yet (scene.objects empty). The fallback must yield a non-null rect so the
+    // contenteditable mounts + focuses this tick. On the pre-fix derive (scene.objects only) this is null.
+    const pending = core.buildPrimitive("text", { x: 90, y: 40 }, "text-pending", "a0");
+    const textEdit = { id: pending.id, value: "" };
+
+    const textEditObjectFrom = (objects: SceneObject[]): SceneObject | null =>
+      objects.find((o) => o.id === textEdit.id) ??
+      (pending.id === textEdit.id ? pending : null);
+
+    const emptyScene: SceneObject[] = [];
+    const rectPreScene = textOverlayScreenRect(
+      core.objectWorldAabb(textEditObjectFrom(emptyScene)!),
+      project
+    );
+    expect(rectPreScene).not.toBeNull();
+
+    // Once the canonical scene carries the same id, the scene object wins (rect derives from scene, not
+    // the stale pending object). Shift the canonical copy and confirm the rect tracks it.
+    const canonical = core.buildPrimitive("text", { x: 290, y: 240 }, "text-pending", "a0");
+    const resolved = textEditObjectFrom([canonical]);
+    expect(resolved).toBe(canonical);
+    const rectWithScene = textOverlayScreenRect(core.objectWorldAabb(resolved!), project);
+    const rectCanonical = textOverlayScreenRect(core.objectWorldAabb(canonical), project);
+    expect(rectWithScene).toEqual(rectCanonical);
+    expect(rectWithScene).not.toEqual(rectPreScene);
+  });
+
+  it("App.svelte textEditObject falls back to pendingTextInsert until the canonical scene lands", () => {
+    // Pin the fix in the shipping source: the derive must consult pendingTextInsert, not scene.objects alone.
+    expect(appSource, "textEditObject must fall back to the pending insert").toContain(
+      "pendingTextInsert?.id === textEdit.id ? pendingTextInsert : null"
+    );
+  });
+
+  it("commitTextEdit clears BOTH textEdit and pendingTextInsert (no stale shadow of a later scene)", () => {
+    // Lift the commitTextEdit body: it must null both transients so a stale pending object can't shadow a
+    // later canonical scene. On the pre-fix body (only textEdit nulled) pendingTextInsert lingers.
+    let textEdit: { id: string; value: string } | null = { id: "text-c", value: "hi" };
+    let pendingTextInsert: SceneObject | null = core.buildPrimitive("text", { x: 0, y: 0 }, "text-c", "a0");
+    const authored: unknown[] = [];
+
+    const edit = textEdit;
+    textEdit = null;
+    pendingTextInsert = null;
+    if (edit) authored.push({ kind: "set-text", id: edit.id, text: { runs: [{ text: edit.value }] } });
+
+    expect(textEdit).toBeNull();
+    expect(pendingTextInsert).toBeNull();
+    expect(authored).toEqual([{ kind: "set-text", id: "text-c", text: { runs: [{ text: "hi" }] } }]);
+
+    // Guard the shipping source too: the commit body nulls pendingTextInsert alongside textEdit.
+    const commit = appSource.indexOf("function commitTextEdit");
+    const body = appSource.slice(commit, appSource.indexOf("const TEMPLATES", commit));
+    expect(body, "commitTextEdit must clear pendingTextInsert").toContain("pendingTextInsert = null");
   });
 });

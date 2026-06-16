@@ -58,6 +58,10 @@ export type RenderObject = {
   stroke: RenderStroke | null;
   text: RenderText | null;
   clip: boolean;
+  // Render-only mirror of the core's meta flags (serde default false on the wire). The shell never reads
+  // them for a canvas decision — the core gates hidden render + hidden/locked hit-test internally.
+  hidden?: boolean;
+  locked?: boolean;
 };
 
 export type RenderObjectScene = {
