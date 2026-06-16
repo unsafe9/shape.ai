@@ -72,6 +72,15 @@ impl ShapeWebGpuRenderer {
                 self.config.format,
             ));
         }
+        if self.object_text.is_none() {
+            self.object_text = Some(
+                SharedObjectText::new(
+                    &self.device,
+                    shape_renderer_core::cast::narrow_f32(self.device_pixel_ratio),
+                )
+                .expect("bundled fonts load"),
+            );
+        }
         // When a compatible renderer exists, DIFF the freshly-built plan and apply
         // targeted patches instead of reconstructing — O(changed objects), not
         // O(scene). A structural / unfittable / theme-divergent diff falls back to a
@@ -82,10 +91,15 @@ impl ShapeWebGpuRenderer {
             .as_ref()
             .map(|r| r.theme().dark == self.object_theme.dark)
             .unwrap_or(false);
+        // Capture the surface size before the `&mut self` atlas borrow below.
+        let (surface_w, surface_h) = self.surface_px_f32();
+        // Borrow the shared atlas + renderer as DISJOINT fields so the re-feed packs
+        // glyphs into the one shared atlas.
+        let text = self.object_text.as_mut().unwrap();
         let patched = if theme_matches {
             self.object_renderer
                 .as_mut()
-                .map(|renderer| renderer.apply_plan_diff(&self.queue, &scene))
+                .map(|renderer| renderer.apply_plan_diff(&self.queue, text, &scene))
                 .filter(|stats| !stats.needs_rebuild)
         } else {
             None
@@ -101,9 +115,10 @@ impl ShapeWebGpuRenderer {
                 &self.device,
                 &self.queue,
                 pipeline,
+                text,
                 &scene,
-                self.width as f32,
-                self.height as f32,
+                surface_w,
+                surface_h,
                 self.object_theme,
             ));
             self.object_rebuild_count += 1;
@@ -125,7 +140,105 @@ impl ShapeWebGpuRenderer {
         self.preview_deformed.clear();
         self.endpoint_preview = None;
         self.object_scene = Some(scene);
+        // The world content changed, so any panel's frosted backdrop is stale even if
+        // the camera held still — invalidate the backdrop-blur crop.
+        self.backdrop_gate.mark_feed();
         serde_wasm(counts)
+    }
+
+    /// Parse the screen-space UI [`RenderObjectScene`] (`ui-core`-authored, identity
+    /// camera) and build + upload it through a SECOND [`ObjectRenderer`], drawn ABOVE
+    /// the world pass in [`Self::render_frame`]. Built in the persisted `object_theme`
+    /// so a re-feed lands in the live dark/light bit (Token paints recolor downstream).
+    /// The P1 widget tree is static and tiny, so each feed rebuilds (no plan diff); a
+    /// rebuild only happens on a viewport change. Does NOT touch the world scene's
+    /// hit-test state (`object_scene`/`object_regions`/`multi_select`/bindings).
+    #[wasm_bindgen(js_name = loadUiScene)]
+    pub fn load_ui_scene(&mut self, scene_json: &str) -> Result<JsValue, JsValue> {
+        let scene: RenderObjectScene = serde_json::from_str(scene_json)
+            .map_err(|error| JsValue::from_str(&format!("Invalid UI scene: {error}")))?;
+        self.feed_ui_scene(&scene);
+        let renderer = self.ui_renderer.as_ref().unwrap();
+        serde_wasm(ObjectSceneLoadResult {
+            objects: scene.objects.len(),
+            fill_indices: renderer.fill_index_count() as usize,
+            stroke_vertices: renderer.stroke_vertex_count() as usize,
+        })
+    }
+
+    /// Build + upload a UI `RenderObjectScene` through the second (identity-camera)
+    /// renderer and re-derive its hit regions. The shared body of `load_ui_scene`
+    /// (the shell's JSON feed) and the runtime re-feed (a state-change re-render), so
+    /// a dispatch that re-renders refreshes `ui_regions` the same way a fresh feed does.
+    ///
+    /// A widget interaction (slider knob/value, toggle/segment actuation) keeps the same
+    /// object SET, so it rides the SAME transform/color/geometry partial-update path the
+    /// world scene uses (`apply_plan_diff` → `PlanPatch`), NOT a full re-tessellation. A
+    /// structural change (object count/order) or a theme divergence falls back to a fresh
+    /// `ObjectRenderer::new`. This holds the P2 perf bar: a slider drag streams patches,
+    /// not per-move rebuilds.
+    pub(crate) fn feed_ui_scene(&mut self, scene: &RenderObjectScene) {
+        if self.object_pipeline.is_none() {
+            self.object_pipeline = Some(ObjectPipeline::new(
+                &self.device,
+                &self.queue,
+                self.config.format,
+            ));
+        }
+        if self.object_text.is_none() {
+            self.object_text = Some(
+                SharedObjectText::new(
+                    &self.device,
+                    shape_renderer_core::cast::narrow_f32(self.device_pixel_ratio),
+                )
+                .expect("bundled fonts load"),
+            );
+        }
+        // Capture the surface size before the `&mut self` atlas borrow below.
+        let (surface_w, surface_h) = self.surface_px_f32();
+        // Pack UI glyphs into the SAME shared atlas the world renderer uses (decision
+        // #1: no duplicate atlas / no second `TextEngine`).
+        let text = self.object_text.as_mut().unwrap();
+        // DIFF against the live UI renderer when it exists and its theme matches, so a
+        // widget state change is a targeted buffer write — O(changed objects). A
+        // structural / theme-divergent diff returns `needs_rebuild`, falling through to
+        // a fresh build (the world `load_object_scene` does the same).
+        let theme_matches = self
+            .ui_renderer
+            .as_ref()
+            .map(|r| r.theme().dark == self.object_theme.dark)
+            .unwrap_or(false);
+        let patched = if theme_matches {
+            self.ui_renderer
+                .as_mut()
+                .map(|renderer| renderer.apply_plan_diff(&self.queue, text, scene))
+                .filter(|stats| !stats.needs_rebuild)
+        } else {
+            None
+        };
+        if let Some(stats) = patched {
+            self.ui_patch_count += stats.patch_count;
+        } else {
+            // First feed / structural / theme-divergent / unfittable update: rebuild in
+            // the persisted theme. CSS-px viewport (NOT config device px) so the UI is
+            // screen-space at 1:1; device px would shrink it by 1/dpr.
+            let pipeline = self.object_pipeline.as_ref().unwrap();
+            self.ui_renderer = Some(ObjectRenderer::new(
+                &self.device,
+                &self.queue,
+                pipeline,
+                text,
+                scene,
+                surface_w,
+                surface_h,
+                self.object_theme,
+            ));
+            self.ui_rebuild_count += 1;
+        }
+        self.ui_regions = derive_object_regions(scene);
+        // A panel re-render changes the screen-fixed chrome layer; invalidate the
+        // backdrop crop so a re-laid-out panel reblurs against the world behind it.
+        self.backdrop_gate.mark_feed();
     }
 
     /// A thin wrapper over [`Self::render_frame`] (the single live frame driver),
@@ -523,8 +636,8 @@ fn reprojected_node_pair(
         &Transform3x3 { m: target.transform },
         &Transform3x3 { m: *delta },
         LocalPoint {
-            x: anchor.at.x.round() as i32,
-            y: anchor.at.y.round() as i32,
+            x: shape_renderer_core::cast::round_i32(anchor.at.x),
+            y: shape_renderer_core::cast::round_i32(anchor.at.y),
         },
         i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
         &follower.geometry_d,
@@ -556,8 +669,8 @@ fn spliced_follower_d(
                 &Transform3x3 { m: target.transform },
                 &Transform3x3 { m: *delta },
                 LocalPoint {
-                    x: anchor.at.x.round() as i32,
-                    y: anchor.at.y.round() as i32,
+                    x: shape_renderer_core::cast::round_i32(anchor.at.x),
+                    y: shape_renderer_core::cast::round_i32(anchor.at.y),
                 },
                 i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
                 &d,
@@ -616,8 +729,8 @@ pub(crate) fn route_preview_member(
             node_index: i32::try_from(a.node_index).unwrap_or(i32::MAX),
             target: a.target.clone(),
             at: LocalPoint {
-                x: a.at.x.round() as i32,
-                y: a.at.y.round() as i32,
+                x: shape_renderer_core::cast::round_i32(a.at.x),
+                y: shape_renderer_core::cast::round_i32(a.at.y),
             },
         })
         .collect();
@@ -1584,6 +1697,10 @@ impl ShapeWebGpuRenderer {
             );
         }
 
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "vertex-slot offsets are bounded by buffer capacity, far below isize::MAX, so the signed delta never wraps"
+        )]
         let suffix_delta = new_suffix_start as isize - old_group_end as isize;
         for slot in self.vertex_ranges.edges.values_mut() {
             slot.offset = slot.offset.saturating_add_signed(suffix_delta);
@@ -1773,6 +1890,10 @@ impl ShapeWebGpuRenderer {
         }
 
         let new_card_start_offset = free_start_offset + target_free_slots * EDGE_VERTEX_SLOT;
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "vertex-slot offsets are bounded by buffer capacity, far below isize::MAX, so the signed delta never wraps"
+        )]
         let card_offset_delta = new_card_start_offset as isize - card_start_offset as isize;
         for slot in self.vertex_ranges.cards.values_mut() {
             slot.offset = slot.offset.saturating_add_signed(card_offset_delta);
@@ -2123,6 +2244,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 
@@ -2205,6 +2328,8 @@ mod tests {
             text: None,
             anchors,
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 
@@ -2282,8 +2407,8 @@ mod tests {
             &Transform3x3 { m: a_base },
             &Transform3x3 { m: delta },
             LocalPoint {
-                x: anchor.at.x.round() as i32,
-                y: anchor.at.y.round() as i32,
+                x: shape_renderer_core::cast::round_i32(anchor.at.x),
+                y: shape_renderer_core::cast::round_i32(anchor.at.y),
             },
             i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
             &b.geometry_d,
@@ -2388,8 +2513,8 @@ mod tests {
                 &Transform3x3 { m: target.transform },
                 &Transform3x3 { m: delta },
                 LocalPoint {
-                    x: anchor.at.x.round() as i32,
-                    y: anchor.at.y.round() as i32,
+                    x: shape_renderer_core::cast::round_i32(anchor.at.x),
+                    y: shape_renderer_core::cast::round_i32(anchor.at.y),
                 },
                 i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
                 &expected,
@@ -2795,5 +2920,46 @@ mod tests {
             ..full.draws[0].stroke_range.end as usize];
         assert!(!full_stroke.is_empty());
         assert_eq!(rebuilt.stroke_vertices, full_stroke, "endpoint patch == full rebake");
+    }
+
+    /// The PERF probe for the UI re-feed: a slider drag's re-render keeps the same
+    /// object SET, so `diff_plans` yields targeted `Patches` (no `Rebuild`). This is
+    /// exactly the branch `feed_ui_scene` now rides — `apply_plan_diff` patches the
+    /// slider's moved knob (transform) + resized fill (geometry) instead of a full
+    /// re-tessellation. Drives the REAL `UiRuntime` (no second impl); a regression that
+    /// reintroduces the per-move rebuild fails here because the diff would have to be a
+    /// `Rebuild` to justify the `ObjectRenderer::new` rebuild path.
+    #[test]
+    fn ui_slider_drag_refeed_is_a_partial_patch_not_a_rebuild() {
+        use shape_renderer_core::object_theme::Theme;
+        use shape_renderer_core::plan::{build_frame_plan, diff_plans, PlanDiff};
+        use shape_ui_core::{PointerPhase, Slider, UiRuntime, Widget};
+
+        let slider = Widget::Slider(Slider {
+            id: "vol".to_string(),
+            x: 24.0,
+            y: 24.0,
+            w: 248.0,
+            h: 24.0,
+            value: 0.2,
+        });
+        let mut rt = UiRuntime::new(slider, (1024.0, 768.0), false);
+
+        // The pre-drag render is what the live `ui_renderer.plan` mirrors; a press
+        // streams a new value, and the post-drag render is the next feed.
+        let before = build_frame_plan(&rt.render(), Theme::light());
+        rt.dispatch_pointer(PointerPhase::Down, (24.0 + 248.0 * 0.4, 24.0 + 12.0));
+        let drag = rt.dispatch_pointer(PointerPhase::Move, (24.0 + 248.0 * 0.8, 24.0 + 12.0));
+        assert!(drag.dirty, "a slider drag is a dirty re-feed");
+        let after = build_frame_plan(&rt.render(), Theme::light());
+
+        // The whole point: the drag keeps the object set, so the diff is partial patches,
+        // never a rebuild. A `Rebuild` here would mean `feed_ui_scene` re-tessellates.
+        match diff_plans(&before, &after) {
+            PlanDiff::Patches(patches) => {
+                assert!(!patches.is_empty(), "the moved knob/resized fill emit patches");
+            }
+            PlanDiff::Rebuild => panic!("a slider drag must ride the partial-update path, not a rebuild"),
+        }
     }
 }

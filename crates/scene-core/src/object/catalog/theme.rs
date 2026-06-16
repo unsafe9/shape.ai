@@ -12,9 +12,14 @@ pub enum Token {
     Text,
     Shadow,
     SelectionRing,
+    Material,
+    Hairline,
+    Hover,
+    AccentSoft,
+    TextSecondary,
 }
 
-pub const ALL_TOKENS: [Token; 8] = [
+pub const ALL_TOKENS: [Token; 13] = [
     Token::CanvasBg,
     Token::Surface,
     Token::SurfaceMuted,
@@ -23,6 +28,11 @@ pub const ALL_TOKENS: [Token; 8] = [
     Token::Text,
     Token::Shadow,
     Token::SelectionRing,
+    Token::Material,
+    Token::Hairline,
+    Token::Hover,
+    Token::AccentSoft,
+    Token::TextSecondary,
 ];
 
 impl Token {
@@ -36,6 +46,11 @@ impl Token {
             Token::Text => "text",
             Token::Shadow => "shadow",
             Token::SelectionRing => "selection-ring",
+            Token::Material => "material",
+            Token::Hairline => "hairline",
+            Token::Hover => "hover",
+            Token::AccentSoft => "accent-soft",
+            Token::TextSecondary => "text-secondary",
         }
     }
 
@@ -64,11 +79,26 @@ impl Token {
             (Token::Text, false) => [0x1d, 0x1d, 0x1f, 0xff],
             (Token::Text, true) => [0xf5, 0xf5, 0xf7, 0xff],
 
-            (Token::Shadow, false) => [0x00, 0x00, 0x00, 0x40],
+            (Token::Shadow, false) => [0x00, 0x00, 0x00, 0x55],
             (Token::Shadow, true) => [0xff, 0xff, 0xff, 0xa8],
 
             (Token::SelectionRing, false) => [0x00, 0x7a, 0xff, 0xff],
             (Token::SelectionRing, true) => [0x0a, 0x84, 0xff, 0xff],
+
+            (Token::Material, false) => [0xf7, 0xf7, 0xf9, 0xe6],
+            (Token::Material, true) => [0x2c, 0x2c, 0x2e, 0xe6],
+
+            (Token::Hairline, false) => [0x00, 0x00, 0x00, 0x1f],
+            (Token::Hairline, true) => [0xff, 0xff, 0xff, 0x26],
+
+            (Token::Hover, false) => [0x00, 0x00, 0x00, 0x14],
+            (Token::Hover, true) => [0xff, 0xff, 0xff, 0x1f],
+
+            (Token::AccentSoft, false) => [0x00, 0x7a, 0xff, 0x26],
+            (Token::AccentSoft, true) => [0x0a, 0x84, 0xff, 0x3d],
+
+            (Token::TextSecondary, false) => [0x8a, 0x8a, 0x8e, 0xff],
+            (Token::TextSecondary, true) => [0x98, 0x98, 0x9d, 0xff],
         }
     }
 }
@@ -127,5 +157,24 @@ mod tests {
         assert_eq!(resolve_token("not-a-token", false), None);
         assert_eq!(resolve_token("not-a-token", true), None);
         assert_eq!(Token::from_name("surface "), None);
+    }
+
+    /// Pin the macOS-material token RGBA so any drift from the renderer-core
+    /// mirror (byte-identical contract) fails here, not silently at draw time.
+    #[test]
+    fn material_language_tokens_have_locked_rgba() {
+        assert_eq!(resolve_token("material", false), Some([0xf7, 0xf7, 0xf9, 0xe6]));
+        assert_eq!(resolve_token("material", true), Some([0x2c, 0x2c, 0x2e, 0xe6]));
+        assert_eq!(resolve_token("hairline", false), Some([0x00, 0x00, 0x00, 0x1f]));
+        assert_eq!(resolve_token("hairline", true), Some([0xff, 0xff, 0xff, 0x26]));
+        assert_eq!(resolve_token("hover", false), Some([0x00, 0x00, 0x00, 0x14]));
+        assert_eq!(resolve_token("hover", true), Some([0xff, 0xff, 0xff, 0x1f]));
+        assert_eq!(resolve_token("accent-soft", false), Some([0x00, 0x7a, 0xff, 0x26]));
+        assert_eq!(resolve_token("accent-soft", true), Some([0x0a, 0x84, 0xff, 0x3d]));
+        assert_eq!(resolve_token("text-secondary", false), Some([0x8a, 0x8a, 0x8e, 0xff]));
+        assert_eq!(resolve_token("text-secondary", true), Some([0x98, 0x98, 0x9d, 0xff]));
+        // The two translucent fills must stay translucent (frosted material reads).
+        assert!(resolve_token("material", false).unwrap()[3] < 0xff);
+        assert!(resolve_token("material", true).unwrap()[3] < 0xff);
     }
 }

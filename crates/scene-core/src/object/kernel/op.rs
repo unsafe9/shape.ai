@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::object::model::{
-    Anchor, Comment, Fill, Geometry, Layout, Object, ObjectId, Stroke, Text, Transform3x3,
+    Anchor, Comment, Fill, Geometry, Layout, Object, ObjectId, Sizing, Stroke, Text, Transform3x3,
 };
 
 /// Three-state edit for an optional field: absent leaves the current value, `Set`
@@ -97,6 +97,34 @@ pub enum ObjectOp {
         clip: Option<bool>,
     },
 
+    /// Per-object sizing (Hug/Fill/Fixed per axis). LWW on the `sizing` property.
+    #[serde(rename_all = "camelCase")]
+    SetSizing {
+        id: ObjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sizing: Option<Sizing>,
+    },
+
+    /// Panel header metadata. Each field is optional — an absent field leaves the
+    /// stored value unchanged. `name` is a `FieldEdit` so it can be cleared; the
+    /// bools are a plain `Option<bool>` (absent = unchanged, present = the value).
+    #[serde(rename_all = "camelCase")]
+    SetMeta {
+        id: ObjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<FieldEdit<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hidden: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locked: Option<bool>,
+    },
+
+    /// Extract a geometry's dominant orientation into `transform` and rewrite the
+    /// geometry axis-aligned. A geometry-rebake op (NOT zero-rebake), driven by an
+    /// explicit user action; its inverse restores the prior geometry + transform.
+    #[serde(rename_all = "camelCase")]
+    Canonicalize { id: ObjectId },
+
     /// Append sugar; inverse is `set-comments` with the prior array.
     #[serde(rename_all = "camelCase")]
     AddComment { id: ObjectId, comment: Comment },
@@ -156,6 +184,9 @@ impl ObjectOp {
             ObjectOp::SetAnchor { .. } => "set-anchor",
             ObjectOp::SetLayout { .. } => "set-layout",
             ObjectOp::SetClip { .. } => "set-clip",
+            ObjectOp::SetSizing { .. } => "set-sizing",
+            ObjectOp::SetMeta { .. } => "set-meta",
+            ObjectOp::Canonicalize { .. } => "canonicalize",
             ObjectOp::AddComment { .. } => "add-comment",
             ObjectOp::SetComments { .. } => "set-comments",
             ObjectOp::SetTags { .. } => "set-tags",
@@ -185,6 +216,9 @@ impl ObjectOp {
             | ObjectOp::SetAnchor { id, .. }
             | ObjectOp::SetLayout { id, .. }
             | ObjectOp::SetClip { id, .. }
+            | ObjectOp::SetSizing { id, .. }
+            | ObjectOp::SetMeta { id, .. }
+            | ObjectOp::Canonicalize { id }
             | ObjectOp::AddComment { id, .. }
             | ObjectOp::SetComments { id, .. }
             | ObjectOp::SetTags { id, .. }

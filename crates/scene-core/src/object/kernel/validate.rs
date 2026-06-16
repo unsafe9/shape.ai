@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::object::model::{CommentAnchor, Geometry, Object, ObjectScene};
+use crate::object::model::{AxisSizing, CommentAnchor, Geometry, Lanes, Layout, Object, ObjectScene, Sizing};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationError {
@@ -24,6 +24,10 @@ pub enum ValidationError {
     MissingAnchorTarget { id: String, target: String },
     AnchorNodeOutOfRange { id: String, node_index: i32, node_count: i32 },
     CommentNodeOutOfRange { id: String, comment_id: String, node_index: i32, node_count: i32 },
+    /// A `Fixed` sizing extent must be a non-negative quantized length.
+    NegativeSizing { value: i32 },
+    /// `Lanes::Count { value }` must be >= 1 (1 = list, N = grid).
+    ZeroLanes,
 }
 
 impl core::fmt::Display for ValidationError {
@@ -52,8 +56,35 @@ impl core::fmt::Display for ValidationError {
                 f,
                 "object {id} comment {comment_id} node_index {node_index} out of range (0..{node_count})"
             ),
+            ValidationError::NegativeSizing { value } => {
+                write!(f, "fixed sizing extent must be non-negative, got {value}")
+            }
+            ValidationError::ZeroLanes => write!(f, "layout lane count must be >= 1"),
         }
     }
+}
+
+/// A `Fixed` sizing extent on either axis must be a non-negative quantized length.
+/// `Hug`/`Fill` carry no value to validate.
+pub fn validate_sizing(sizing: &Sizing) -> Result<(), ValidationError> {
+    for axis in [sizing.w, sizing.h] {
+        if let AxisSizing::Fixed { value } = axis {
+            if value < 0 {
+                return Err(ValidationError::NegativeSizing { value });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `Lanes::Count` must carry at least one track (1 = single list, N = grid).
+pub fn validate_layout(layout: &Layout) -> Result<(), ValidationError> {
+    if let Lanes::Count { value } = layout.lanes {
+        if value < 1 {
+            return Err(ValidationError::ZeroLanes);
+        }
+    }
+    Ok(())
 }
 
 /// Total node count across every subpath. Accumulated in i64 and narrowed once

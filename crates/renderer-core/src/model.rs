@@ -481,6 +481,13 @@ pub enum CanvasInputEvent {
     SetMultiSelect {
         ids: Vec<String>,
     },
+    // Active drill-in container scope (e.g. a double-clicked group), or null to exit.
+    // A forwarded token, not a decision: while set, a pointer-down inside the
+    // container resolves to the DIRECT CHILD under the pointer. A mode bit, not
+    // per-event, so it rides an inputBatch like SetCoarseRotate/SetMultiSelect.
+    SetActiveContainer {
+        id: Option<String>,
+    },
     // Right-click pick: returns the hit for `screen` without mutating selection or
     // starting a drag, so the shell can show a context menu for the picked object.
     ContextPick {

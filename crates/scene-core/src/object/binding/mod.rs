@@ -1,7 +1,9 @@
+pub mod affine;
 pub mod anchor_follow;
 pub mod anchors;
 pub mod cascade;
 pub mod grouping;
+pub mod inspector_edit;
 pub mod layout_solve;
 pub mod move_together;
 pub mod region;

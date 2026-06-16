@@ -52,8 +52,13 @@ use crate::object::edit::{
 };
 use crate::object::model::{ObjectSelection, Transform3x3};
 use crate::object::selection::{select_all as select_all_pure, valid_selection as valid_selection_pure};
+use crate::object::affine::{quantize_units, set_transform_field};
 use crate::object::commands::object_command_catalog_json;
 use crate::object::gestures::object_gesture_catalog_json;
+use crate::object::inspector::{
+    inspector_view, object_inspector_catalog_json, resize_axis as resize_axis_pure, Axis,
+};
+use crate::object::inspector_edit::inspector_edit_op as inspector_edit_op_pure;
 use crate::object::drawing::{split_subpath_at as split_subpath_at_pure, Brush};
 use crate::object::recognize::{
     recognize_stroke_object, RecognizeMode, CREATE_ANCHOR_REUSE_TOLERANCE_PX,
@@ -61,7 +66,8 @@ use crate::object::recognize::{
 };
 use crate::object::grouping::{
     double_click_action as double_click_action_pure, group_ops as group_ops_pure,
-    has_children as has_children_pure, pop_out_op as pop_out_op_pure,
+    has_children as has_children_pure,
+    object_selection_in_scope as object_selection_in_scope_pure, pop_out_op as pop_out_op_pure,
     ungroup_enabled as ungroup_enabled_pure, ungroup_ops as ungroup_ops_pure,
 };
 use crate::object::merge::merge_open_stroke_ops as merge_open_stroke_ops_pure;
@@ -148,6 +154,111 @@ pub fn object_command_catalog() -> String {
 #[wasm_bindgen]
 pub fn object_gesture_catalog() -> String {
     object_gesture_catalog_json()
+}
+
+#[wasm_bindgen]
+pub fn object_inspector_catalog() -> String {
+    object_inspector_catalog_json()
+}
+
+/// `scene_json` is an `ObjectScene`; `selection_json` is an `ObjectSelection`.
+/// Returns the dynamic inspector view (applicable controls + current values).
+#[wasm_bindgen]
+pub fn object_inspector_view(scene_json: &str, selection_json: &str) -> String {
+    let mut scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = scene.ensure_parsed() {
+        return error_json(&format!("scene geometry parse failed: {e}"));
+    }
+    let selection: ObjectSelection = match parse("selection", selection_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&inspector_view(&scene, &selection, &StubOutlineDeriver))
+}
+
+/// `matrix_json` is the bare `[[f64; 3]; 3]`; `field` is the inspector control id
+/// (`x`/`y` set the translate axis in px, `rotation`/`rotation-flow` set the
+/// rotation from the DISPLAY unit — degrees). Returns the patched `Transform3x3`,
+/// so the shell never owns the decompose/recompose seam nor the deg->rad math.
+/// width/height resize through `object_resize_axis` instead.
+#[wasm_bindgen]
+pub fn object_set_transform_field(matrix_json: &str, field: &str, value: f64) -> String {
+    let t: Transform3x3 = match parse("matrix", matrix_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&set_transform_field(&t, field, value))
+}
+
+/// Re-quantize an inspector px edit to the stored i32 via the cores' single
+/// `round(px * scale)` discipline. `scale` is the control's `unit_scale`, so the
+/// shell owns neither the rounding mode nor the geometry quantum.
+#[wasm_bindgen]
+pub fn object_quantize_units(px: f64, scale: f64) -> i32 {
+    quantize_units(px, scale)
+}
+
+/// `transform_json` is a bare `[[f64; 3]; 3]`, `geometry_json` an object `Geometry`,
+/// `axis` is `"x"` (width) or `"y"` (height), `target_px` the desired ABSOLUTE px
+/// size. Returns the bare `Transform3x3` that makes that axis read `target_px` in
+/// the inspector — the geometry/scale math the shell never does. Authored as a
+/// `set-transform` op. A bad `axis` token is an error.
+#[wasm_bindgen]
+pub fn object_resize_axis(
+    transform_json: &str,
+    geometry_json: &str,
+    axis: &str,
+    target_px: f64,
+) -> String {
+    let transform: Transform3x3 = match parse("transform", transform_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut geometry: Geometry = match parse("geometry", geometry_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = geometry.ensure_parsed() {
+        return error_json(&format!("geometry parse failed: {e}"));
+    }
+    let axis = match axis {
+        "x" => Axis::X,
+        "y" => Axis::Y,
+        other => return error_json(&format!("unknown resize axis {other:?}")),
+    };
+    let t = resize_axis_pure(&transform, &geometry, &StubOutlineDeriver, axis, target_px);
+    ok_json(&t)
+}
+
+/// Lower ONE inspector-panel property edit to its `ObjectOp`. `object_json` is the
+/// edited `Object` (read from the render-only mirror), `control_id` the catalog
+/// control id, `value_json` the panel's edit value as the view handed it down, and
+/// `unit_scale` the control's `unit_scale` (so a px edit re-quantizes in-core). The
+/// per-field op synthesis + every style/layout/sizing/text default a borderless or
+/// layout-less object gains live here, not the shell. Returns the op JSON, or `null`
+/// for a control this surface does not own (the transform/resize fields x/y/rotation/
+/// width/height route through `object_set_transform_field` / `object_resize_axis`) or
+/// one whose edit cannot apply (a layout field on a layout-less object). A `null`
+/// `value_json` is treated as JSON null.
+#[wasm_bindgen]
+pub fn object_inspector_edit_op(
+    object_json: &str,
+    control_id: &str,
+    value_json: &str,
+    unit_scale: f64,
+) -> String {
+    let object: Object = match parse("object", object_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let value: serde_json::Value = match parse("value", value_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&inspector_edit_op_pure(&object, control_id, &value, unit_scale))
 }
 
 /// Where a new template should land: `[x, y]` world px, `gap_px` right of the
@@ -761,6 +872,23 @@ pub fn double_click_action(scene_json: &str, id: &str) -> String {
     ok_json(&double_click_action_pure(&scene, id))
 }
 
+/// Whether `selection` still belongs to the active drill-in `container` scope:
+/// `"true"` when it is the container itself or a direct child, else `"false"`. The
+/// shell mirrors this verdict to keep its active-container token in lockstep,
+/// retracting it when this is `"false"`.
+#[wasm_bindgen]
+pub fn object_selection_in_scope(scene_json: &str, selection_json: &str, container: &str) -> String {
+    let scene: ObjectScene = match parse("scene", scene_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let selection: ObjectSelection = match parse("selection", selection_json) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    ok_json(&object_selection_in_scope_pure(&scene, &selection, container))
+}
+
 /// The ops grouping `ids` under a new frame `frame_id`: an `insert-object` for a
 /// clipped frame sized + placed to the children's union world-AABB, then one
 /// `reparent` per child re-homing it into the frame. `null` when fewer than two
@@ -1342,6 +1470,25 @@ mod tests {
         let edit: serde_json::Value =
             serde_json::from_str(&double_click_action(&grouping_scene_json(), "leaf")).unwrap();
         assert_eq!(edit["kind"], "edit-leaf");
+    }
+
+    #[test]
+    fn object_selection_in_scope_bridge_verdict() {
+        // root -> mid -> deep + a root-level leaf. The active scope is "root".
+        let scene = grouping_scene_json();
+        let object = |id: &str| format!(r#"{{"kind":"object","id":"{id}"}}"#);
+        // A direct child of root stays.
+        assert_eq!(object_selection_in_scope(&scene, &object("mid"), "root"), "true");
+        // A grandchild (deep under mid under root) is NOT a direct child -> exits.
+        assert_eq!(object_selection_in_scope(&scene, &object("deep"), "root"), "false");
+        // The container itself stays; an unrelated root-level leaf exits.
+        assert_eq!(object_selection_in_scope(&scene, &object("root"), "root"), "true");
+        assert_eq!(object_selection_in_scope(&scene, &object("leaf"), "root"), "false");
+        // A canvas selection exits.
+        assert_eq!(
+            object_selection_in_scope(&scene, r#"{"kind":"canvas"}"#, "root"),
+            "false"
+        );
     }
 
     #[test]

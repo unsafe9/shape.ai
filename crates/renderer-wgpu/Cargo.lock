@@ -541,6 +541,8 @@ dependencies = [
  "shape_platform_contract",
  "shape_renderer_core",
  "shape_scene_core",
+ "shape_ui",
+ "shape_ui_core",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -574,6 +576,24 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "shape_ui"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shape_scene_core",
+ "shape_ui_core",
+]
+
+[[package]]
+name = "shape_ui_core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "shape_renderer_core",
 ]
 
 [[package]]

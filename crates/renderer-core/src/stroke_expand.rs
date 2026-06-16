@@ -321,8 +321,8 @@ fn add_cap(
                 let t = f64::from(k) / f64::from(n);
                 let ang = start + sweep * t;
                 let p = [
-                    cx + (ang.cos() as f32) * half,
-                    cy + (ang.sin() as f32) * half,
+                    cx + crate::cast::narrow_f32(ang.cos()) * half,
+                    cy + crate::cast::narrow_f32(ang.sin()) * half,
                 ];
                 let cur = mesh.push_vertex(p);
                 mesh.push_tri(c, prev, cur);
@@ -586,8 +586,8 @@ mod tests {
         let cap_verts = 2 + n; // center, start endpoint, then N fan points
         let expected_verts = 4 + 2 * cap_verts;
         let expected_idx = 6 + 2 * (3 * n);
-        assert_eq!(mesh.vertices.len() as u32, expected_verts);
-        assert_eq!(mesh.indices.len() as u32, expected_idx);
+        assert_eq!(crate::cast::len_u32(mesh.vertices.len()), expected_verts);
+        assert_eq!(crate::cast::len_u32(mesh.indices.len()), expected_idx);
         // No fan point exceeds half-width 1 from its cap center.
         let r_max = mesh
             .vertices

@@ -6,6 +6,12 @@
 # the root lock.
 [workspace]
 
+# Standalone workspace root, so the root [profile.dev] does not reach here. Strip
+# debuginfo from stray dev builds (IDE / rust-analyzer); the Makefile builds this
+# crate with --release. See the root Cargo.toml note.
+[profile.dev]
+debug = false
+
 [package]
 name = "shape_canvas_core"
 version = "0.1.0"
@@ -14,6 +20,20 @@ description = "Rust/WASM WebGPU renderer for shape.ai infinite canvas."
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+# This crate is workspace-EXCLUDED (above), so the root [workspace.lints] table
+# does not reach it. Mirror the pointer-width-agnostic denies here by value so the
+# `make lint` gate (and rust-analyzer) holds the GPU half to the same bar; the root
+# Cargo.toml is the source of truth — keep these in sync.
+[lints.rust]
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+
+[lints.clippy]
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+ptr_as_ptr = "deny"
+ref_as_ptr = "deny"
 
 [features]
 default = ["wgpu-probe"]
@@ -32,6 +52,8 @@ serde-wasm-bindgen = "0.6"
 shape_renderer_core = { path = "../renderer-core" }
 shape_platform_contract = { path = "../platform-contract" }
 shape_scene_core = { path = "../scene-core" }
+shape_ui_core = { path = "../ui-core" }
+shape_ui = { path = "../ui" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "console", "HtmlCanvasElement"] }

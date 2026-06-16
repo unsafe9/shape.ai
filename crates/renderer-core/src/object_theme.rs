@@ -15,9 +15,14 @@ pub enum ThemeToken {
     Text,
     Shadow,
     SelectionRing,
+    Material,
+    Hairline,
+    Hover,
+    AccentSoft,
+    TextSecondary,
 }
 
-pub const ALL_TOKENS: [ThemeToken; 8] = [
+pub const ALL_TOKENS: [ThemeToken; 13] = [
     ThemeToken::CanvasBg,
     ThemeToken::Surface,
     ThemeToken::SurfaceMuted,
@@ -26,6 +31,11 @@ pub const ALL_TOKENS: [ThemeToken; 8] = [
     ThemeToken::Text,
     ThemeToken::Shadow,
     ThemeToken::SelectionRing,
+    ThemeToken::Material,
+    ThemeToken::Hairline,
+    ThemeToken::Hover,
+    ThemeToken::AccentSoft,
+    ThemeToken::TextSecondary,
 ];
 
 impl ThemeToken {
@@ -40,6 +50,11 @@ impl ThemeToken {
             ThemeToken::Text => "text",
             ThemeToken::Shadow => "shadow",
             ThemeToken::SelectionRing => "selection-ring",
+            ThemeToken::Material => "material",
+            ThemeToken::Hairline => "hairline",
+            ThemeToken::Hover => "hover",
+            ThemeToken::AccentSoft => "accent-soft",
+            ThemeToken::TextSecondary => "text-secondary",
         }
     }
 
@@ -73,6 +88,21 @@ impl ThemeToken {
 
             (ThemeToken::SelectionRing, false) => [0x00, 0x7a, 0xff, 0xff],
             (ThemeToken::SelectionRing, true) => [0x0a, 0x84, 0xff, 0xff],
+
+            (ThemeToken::Material, false) => [0xf7, 0xf7, 0xf9, 0xe6],
+            (ThemeToken::Material, true) => [0x2c, 0x2c, 0x2e, 0xe6],
+
+            (ThemeToken::Hairline, false) => [0x00, 0x00, 0x00, 0x1f],
+            (ThemeToken::Hairline, true) => [0xff, 0xff, 0xff, 0x26],
+
+            (ThemeToken::Hover, false) => [0x00, 0x00, 0x00, 0x14],
+            (ThemeToken::Hover, true) => [0xff, 0xff, 0xff, 0x1f],
+
+            (ThemeToken::AccentSoft, false) => [0x00, 0x7a, 0xff, 0x26],
+            (ThemeToken::AccentSoft, true) => [0x0a, 0x84, 0xff, 0x3d],
+
+            (ThemeToken::TextSecondary, false) => [0x8a, 0x8a, 0x8e, 0xff],
+            (ThemeToken::TextSecondary, true) => [0x98, 0x98, 0x9d, 0xff],
         }
     }
 
@@ -190,6 +220,25 @@ mod tests {
     fn unknown_token_resolves_to_none() {
         assert_eq!(resolve_token("not-a-token", false), None);
         assert_eq!(resolve_token_f32("not-a-token", true), None);
+    }
+
+    /// Pin the macOS-material token RGBA byte-for-byte against the scene-core
+    /// table contract; any drift between the two mirrors fails here.
+    #[test]
+    fn material_language_tokens_mirror_scene_core() {
+        assert_eq!(resolve_token("material", false), Some([0xf7, 0xf7, 0xf9, 0xe6]));
+        assert_eq!(resolve_token("material", true), Some([0x2c, 0x2c, 0x2e, 0xe6]));
+        assert_eq!(resolve_token("hairline", false), Some([0x00, 0x00, 0x00, 0x1f]));
+        assert_eq!(resolve_token("hairline", true), Some([0xff, 0xff, 0xff, 0x26]));
+        assert_eq!(resolve_token("hover", false), Some([0x00, 0x00, 0x00, 0x14]));
+        assert_eq!(resolve_token("hover", true), Some([0xff, 0xff, 0xff, 0x1f]));
+        assert_eq!(resolve_token("accent-soft", false), Some([0x00, 0x7a, 0xff, 0x26]));
+        assert_eq!(resolve_token("accent-soft", true), Some([0x0a, 0x84, 0xff, 0x3d]));
+        assert_eq!(resolve_token("text-secondary", false), Some([0x8a, 0x8a, 0x8e, 0xff]));
+        assert_eq!(resolve_token("text-secondary", true), Some([0x98, 0x98, 0x9d, 0xff]));
+        // Translucent material fills keep their frosted alpha.
+        assert!(resolve_token("material", false).unwrap()[3] < 0xff);
+        assert!(resolve_token("material", true).unwrap()[3] < 0xff);
     }
 
     #[test]

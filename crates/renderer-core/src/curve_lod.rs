@@ -26,7 +26,12 @@ pub fn zoom_bucket(zoom: f64) -> u8 {
     }
     let tier = zoom.log2().round() + f64::from(BUCKET_ZERO_OFFSET);
     let clamped = tier.clamp(0.0, f64::from(u8::MAX));
-    clamped as u8
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "clamped to [0, u8::MAX] above; the value is an exact integer in range"
+    )]
+    let bucket = clamped as u8;
+    bucket
 }
 
 /// The zoom at the center of `bucket` — its octave anchor `2^(bucket - BUCKET_ZERO_OFFSET)`.
@@ -43,7 +48,7 @@ pub const MIN_FLATNESS_PX: f32 = 0.05;
 pub const MAX_FLATNESS_PX: f32 = 64.0;
 
 pub fn flatness_for_bucket(bucket: u8) -> f32 {
-    let anchor_zoom = bucket_anchor_zoom(bucket) as f32;
+    let anchor_zoom = crate::cast::narrow_f32(bucket_anchor_zoom(bucket));
     let eps = TARGET_SCREEN_ERR_PX / anchor_zoom;
     eps.clamp(MIN_FLATNESS_PX, MAX_FLATNESS_PX)
 }
@@ -195,11 +200,11 @@ mod tests {
 
     #[test]
     fn zoom_bucket_steps_one_per_octave() {
-        assert_eq!(zoom_bucket(1.0), BUCKET_ZERO_OFFSET as u8);
-        assert_eq!(zoom_bucket(2.0), (BUCKET_ZERO_OFFSET + 1) as u8);
-        assert_eq!(zoom_bucket(4.0), (BUCKET_ZERO_OFFSET + 2) as u8);
-        assert_eq!(zoom_bucket(0.5), (BUCKET_ZERO_OFFSET - 1) as u8);
-        assert_eq!(zoom_bucket(0.25), (BUCKET_ZERO_OFFSET - 2) as u8);
+        assert_eq!(zoom_bucket(1.0), u8::try_from(BUCKET_ZERO_OFFSET).unwrap());
+        assert_eq!(zoom_bucket(2.0), u8::try_from(BUCKET_ZERO_OFFSET + 1).unwrap());
+        assert_eq!(zoom_bucket(4.0), u8::try_from(BUCKET_ZERO_OFFSET + 2).unwrap());
+        assert_eq!(zoom_bucket(0.5), u8::try_from(BUCKET_ZERO_OFFSET - 1).unwrap());
+        assert_eq!(zoom_bucket(0.25), u8::try_from(BUCKET_ZERO_OFFSET - 2).unwrap());
     }
 
     #[test]
@@ -434,7 +439,7 @@ mod tests {
         // Several zooms that all land in the same bucket (anchor 1.0, band centered).
         for zoom in [0.9_f64, 1.0, 1.1, 1.25] {
             let bucket = zoom_bucket(zoom);
-            assert_eq!(bucket, BUCKET_ZERO_OFFSET as u8);
+            assert_eq!(bucket, u8::try_from(BUCKET_ZERO_OFFSET).unwrap());
             let eps = flatness_for_bucket(bucket);
             cache.get_or_insert("curve", bucket, || {
                 flatten_calls += 1;

@@ -21,7 +21,7 @@ use shape_renderer_core::model::{
     WorldPoint, WorldRect,
 };
 use shape_renderer_core::hit_test_object::{hit_test_object, HoverAffordance};
-use crate::object_pipeline::{ObjectPipeline, ObjectRenderer};
+use crate::object_pipeline::{ObjectPipeline, ObjectRenderer, SharedObjectText};
 use shape_renderer_core::outline::{derive_region, parse_path_string};
 use shape_renderer_core::render_object::RenderObjectScene;
 use crate::serde_wasm;
@@ -43,8 +43,17 @@ mod frame;
 mod input;
 mod scene_build;
 mod scene_feed;
+mod ui;
 
 pub(crate) use scene_build::*;
+
+/// The screen-space UI scene rides this fixed camera so object-local px map 1:1 to
+/// CSS px (no pan/zoom). The world scene's live camera is never used for UI.
+pub(crate) const UI_IDENTITY_CAMERA: CameraState = CameraState {
+    x: 0.0,
+    y: 0.0,
+    zoom: 1.0,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +81,11 @@ pub(crate) struct ObjectRegion {
     /// selection surface to two endpoint handles (no bbox 8-handle/rotate); `None`
     /// keeps the closed-class surface.
     open_endpoints: Option<OpenEndpoints>,
+    /// Hidden from render + hit-test; locked = non-interactive. A hidden-or-locked
+    /// region is kept (index/lookup invariants) but skipped by every interaction
+    /// consumer (hit/marquee/erase/handles).
+    hidden: bool,
+    locked: bool,
 }
 
 /// An open-class region's endpoints in OBJECT-LOCAL px, plus the END node's
@@ -166,8 +180,8 @@ struct FrameDrawList {
 #[cfg(feature = "wgpu-probe")]
 impl FrameDrawList {
     fn push_slot(&mut self, slot: VertexSlot) {
-        let start = slot.offset as u32;
-        let end = (slot.offset + slot.capacity) as u32;
+        let start = shape_renderer_core::cast::len_u32(slot.offset);
+        let end = shape_renderer_core::cast::len_u32(slot.offset + slot.capacity);
         if let Some(last) = self.ranges.last_mut() {
             if last.end == start {
                 last.end = end;
@@ -303,6 +317,7 @@ struct RendererRollbackState {
     input_drag: Option<InputDragState>,
     active_tool: ActiveTool,
     coarse_rotate: bool,
+    active_container: Option<String>,
     multi_select: Vec<String>,
     last_hit: Option<CoreHitResult>,
     text_layout_cache: TextLayoutCache,
@@ -366,6 +381,10 @@ pub struct ShapeWebGpuRenderer {
     // Coarse-rotate modifier (e.g. Shift held). Renderer-held mode bit; the rotate
     // drag arm reads it live so snapping engages/disengages mid-gesture.
     coarse_rotate: bool,
+    // The active drill-in container scope, a forwarded token (like `coarse_rotate`),
+    // not a decision basis. While set, a pointer-down inside it resolves to the direct
+    // child under the pointer; the core owns the scoped pick.
+    active_container: Option<String>,
     // Transient multi-select highlight set, renderer-held (like `active_tool`) so it
     // survives a `load_scene` rebuild, then mirrored into the scene the draw path
     // reads. Never serialized.
@@ -377,17 +396,45 @@ pub struct ShapeWebGpuRenderer {
     // parallel pass sharing the legacy device/queue/surface/format.
     object_pipeline: Option<ObjectPipeline>,
     object_renderer: Option<ObjectRenderer>,
+    // The ONE object-text MSDF atlas + font shaper (decision #1: no duplicate atlas),
+    // built lazily alongside `object_pipeline` and shared by BOTH the world
+    // `object_renderer` and the screen-space `ui_renderer`. Each renderer borrows it to
+    // populate/upload glyphs; neither owns a second 16 MB atlas or `TextEngine`.
+    object_text: Option<SharedObjectText>,
     // The parsed object scene + per-object regions for draw + hit-test.
     // `object_scene.is_some()` is the live-object branch switch; when None the
     // legacy 2D path stays authoritative.
     object_scene: Option<RenderObjectScene>,
     object_regions: Vec<ObjectRegion>,
+    // The screen-space UI scene's own renderer + hit regions: an identity-camera
+    // `ObjectRenderer` drawn ABOVE the world pass (panels sit above selection chrome),
+    // reusing the scene-independent `object_pipeline`. Authored by `ui-core`, fed via
+    // `load_ui_scene`; never the world scene's hit-test state.
+    ui_renderer: Option<ObjectRenderer>,
+    ui_regions: Vec<ObjectRegion>,
+    // The retained ui-core interaction model. `None` until the shell seeds it via
+    // `init_ui_runtime`; once present it OWNS the UI scene — every pointer/key dispatch
+    // re-renders + re-feeds it (through the same `load_ui_scene` path) when dirty, so
+    // `ui_regions` track the laid-out boxes. The widget tree lives in `ui-core`.
+    ui_runtime: Option<shape_ui_core::UiRuntime>,
+    // The shell-fed UI model state backing the built-in UIs (toolbar/inspector).
+    // `set_ui_model` rebuilds the runtime tree from it via `shape_ui::build_root`
+    // (preserving interaction caches) and a fired action resolves against it into a
+    // typed `Intent` the shell authors. `None` on the demo path (no model set).
+    ui_model: Option<crate::webgpu::ui::UiModelInput>,
     // FramePlan feed accounting: `object_patch_count` accumulates targeted re-feed
     // patches, `object_rebuild_count` counts feeds that fell back to a full
     // `ObjectRenderer::new`. Mirror the legacy `dirty_range_write_count` /
     // `full_buffer_rebuild_count`.
     object_patch_count: usize,
     object_rebuild_count: usize,
+    // UI re-feed accounting, mirroring the world counters: `ui_patch_count` accumulates
+    // targeted partial-update patches (slider/toggle/segment state changes), and
+    // `ui_rebuild_count` counts feeds that fell back to a full `ObjectRenderer::new`
+    // (first feed / structural / theme-divergent). A slider DRAG must bump only the
+    // patch counter — the P2 perf bar (no per-move re-tessellation).
+    ui_patch_count: usize,
+    ui_rebuild_count: usize,
     // Ids whose GPU-baked GEOMETRY deviates from canonical because a live chord
     // deform patched it. GPU-only transient state (like instance-matrix previews);
     // the next preview frame / clear re-expands canonical geometry back in, never
@@ -409,4 +456,8 @@ pub struct ShapeWebGpuRenderer {
     // Surface-sized, recreated in `resize`. Isolated underlay — a fault drops the
     // shadow, never the fill/stroke/text on top.
     shadow_blur: crate::shadow_blur::ShadowBlur,
+    // The backdrop-blur gate: collapses "world behind the screen-fixed panels
+    // changed?" into one host-tested bit so a future panel-frost pass never re-blurs
+    // a static frame. Dormant foundation — fed by `mark_feed`, not yet consumed.
+    backdrop_gate: shape_renderer_core::backdrop_blur::BackdropBlurGate,
 }

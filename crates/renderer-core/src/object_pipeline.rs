@@ -14,7 +14,12 @@ use crate::render_object::{
     resolve_visual, RPaint, RText, RTextAlign, RTextValign, RenderObject, RenderObjectScene,
     VisualState, QUANT_PER_PX,
 };
-use crate::text_layout::{layout_runs, TextAlign, TextRunInput, TextVAlign};
+use crate::text::TextEngine;
+use crate::text_layout::{
+    layout_runs, GlyphCoverage, MsdfAtlasPlan, MsdfGlyphEntry, MsdfGlyphKey, TextAlign,
+    TextRunInput, TextVAlign,
+};
+use std::collections::HashMap;
 use crate::stroke_expand::{dash_segments, expand_stroke, Cap, Join};
 use crate::tessellate::{
     parse_path, quantized_to_px, tessellate_fill, DrawRange, FillRuleKind, MegaBuffer,
@@ -41,9 +46,9 @@ impl ObjectMatrixUniform {
     pub fn from_scene(scene: &RenderObjectScene, pixel_width: f32, pixel_height: f32) -> Self {
         ObjectMatrixUniform {
             camera: [
-                scene.camera.x as f32,
-                scene.camera.y as f32,
-                scene.camera.zoom as f32,
+                crate::cast::narrow_f32(scene.camera.x),
+                crate::cast::narrow_f32(scene.camera.y),
+                crate::cast::narrow_f32(scene.camera.zoom),
                 0.0,
             ],
             viewport: [pixel_width, pixel_height, 0.0, 0.0],
@@ -245,6 +250,77 @@ fn stub_measure(_ch: char, size: f32) -> f32 {
     STUB_ADVANCE_RATIO * size
 }
 
+/// Per-glyph atlas-slot lookup the GPU cutover injects: given a glyph char at a
+/// pixel size, the populated [`MsdfAtlasPlan`] returns its corner UVs + bearing.
+/// `None` (atlas not yet built, glyph unpacked, or blank) => the placeholder
+/// full-atlas cell. The pure core never rasterizes; the host supplies this.
+pub type GlyphUvProvider<'a> = dyn Fn(char, f32) -> Option<MsdfGlyphEntry> + 'a;
+
+/// A provider that maps no glyph (used by the stub/legacy path so quads keep the
+/// placeholder full-atlas `uv 0..1`).
+fn no_glyph_uv(_ch: char, _size: f32) -> Option<MsdfGlyphEntry> {
+    None
+}
+
+/// Pack every glyph of the scene's committed text not yet present in `entries` into
+/// `plan`, keyed by `(char, rounded px)` — the same key the glyph-UV provider
+/// resolves. Returns true if any NEW glyph was packed (the texture needs a
+/// re-upload); idempotent per key, so a pan/zoom re-feed with no new text returns
+/// false (zero-rebake on motion). The host's `ObjectTextAtlas` delegates here so the
+/// populate DECISION (which glyphs, the grew flag, idempotency) lives GPU-free in the
+/// core, with a single glyph-pack implementation shared by the GPU path and tests.
+pub fn populate_atlas_from_scene(
+    plan: &mut MsdfAtlasPlan,
+    entries: &mut HashMap<(u32, u32), MsdfGlyphEntry>,
+    engine: &TextEngine,
+    scene: &RenderObjectScene,
+    oversample: f32,
+) -> bool {
+    let mut grew = false;
+    for obj in &scene.objects {
+        let Some(text) = obj.text.as_ref() else { continue };
+        for run in &text.runs {
+            // Wire size is quantized at QUANT_PER_PX units/px; the layout de-quants,
+            // so the atlas key uses the same rounded px the provider keys on. The key
+            // stays LOGICAL (no `oversample`) so the UV lookup is dpr-independent; the
+            // oversample only raises the SDF source resolution behind that key.
+            let size_px = crate::cast::narrow_f32(run.size / QUANT_PER_PX);
+            let key_px = crate::cast::round_u32(size_px);
+            for ch in run.text.chars() {
+                let map_key = (ch as u32, key_px);
+                if entries.contains_key(&map_key) {
+                    continue;
+                }
+                let Some(cov) = engine.glyph_coverage(ch, size_px, oversample) else {
+                    continue;
+                };
+                let slot = plan.generate_glyph(&GlyphCoverage {
+                    key: MsdfGlyphKey {
+                        font_index: cov.font_index,
+                        glyph_id: cov.glyph_id,
+                        px: cov.px,
+                    },
+                    coverage: &cov.coverage,
+                    width: cov.width,
+                    height: cov.height,
+                    bearing_x: cov.bearing_x,
+                    bearing_y: cov.bearing_y,
+                    // The oversample (dpr) the coverage was rasterized at divides the
+                    // quad back to logical px so layout stays resolution-independent.
+                    oversample: cov.oversample,
+                });
+                // `None` = atlas full; leave the glyph unresolved so the build falls
+                // back to the placeholder cell rather than dropping it silently.
+                if let Some(entry) = slot {
+                    entries.insert(map_key, entry);
+                    grew = true;
+                }
+            }
+        }
+    }
+    grew
+}
+
 /// Build all CPU geometry for `scene` under `theme`: tessellate fill, expand stroke,
 /// resolve instance data, lay out text. The `theme` bit only affects token paint
 /// COLORS (tessellation/ranges are theme-invariant), which makes the toggle a
@@ -255,24 +331,75 @@ pub fn build_scene_geometry_themed(scene: &RenderObjectScene, theme: Theme) -> S
 
 /// As [`build_scene_geometry_themed`], with an injected per-char `measure` closure
 /// (the pure core never calls fontdue itself; the GPU cutover supplies the real one).
+/// Glyph quads keep the placeholder full-atlas UV — use
+/// [`build_scene_geometry_themed_with_text`] for real per-glyph atlas slots.
 pub fn build_scene_geometry_themed_with_measure(
     scene: &RenderObjectScene,
     theme: Theme,
     measure: &dyn Fn(char, f32) -> f32,
 ) -> SceneGeometry {
+    build_scene_geometry_themed_with_text(scene, theme, measure, &no_glyph_uv)
+}
+
+/// As [`build_scene_geometry_themed_with_measure`], with an injected per-glyph
+/// `glyph_uv` provider so each glyph quad carries its REAL atlas-slot UVs + bearing
+/// (the GPU cutover supplies it from a populated [`MsdfAtlasPlan`]). A glyph the
+/// provider does not resolve falls back to the placeholder full-atlas cell.
+pub fn build_scene_geometry_themed_with_text(
+    scene: &RenderObjectScene,
+    theme: Theme,
+    measure: &dyn Fn(char, f32) -> f32,
+    glyph_uv: &GlyphUvProvider<'_>,
+) -> SceneGeometry {
     let mut geometry = SceneGeometry::default();
+
+    // Container frames (any object that parents another) must not paint their
+    // structural-default fill over their children. Precompute the parent-id set ONCE
+    // so the per-object container test stays O(1), keeping the build O(objects).
+    let parent_ids: std::collections::HashSet<&str> = scene
+        .objects
+        .iter()
+        .filter_map(|o| o.parent.as_deref())
+        .collect();
 
     for obj in &scene.objects {
         let state = visual_state_for(scene, &obj.id);
         let resolved = resolve_visual(obj, state);
 
-        let subpaths = flatten_object_subpaths(obj, scene.camera.zoom);
+        // A hidden object emits zero-vertex geometry (empty subpaths) while still
+        // pushing its index-aligned instance + ObjectDraw slot below — never skipped,
+        // so the buffers stay aligned with `draws` (and a follower anchored to it
+        // still reprojects). Transform-only: no tessellation cost.
+        let subpaths = if obj.hidden {
+            Vec::new()
+        } else {
+            flatten_object_subpaths(obj, scene.camera.zoom)
+        };
 
-        // An open-only path with no explicit fill is not filled (Figma convention).
-        // A skipped object still pushes a Fill/Shadow instance below so the per-object
-        // buffers stay index-aligned with `draws`.
-        let skip_fill =
-            obj.fill.is_none() && subpaths.iter().all(|(closed, _)| !closed);
+        let is_container = parent_ids.contains(obj.id.as_str());
+        // A text label's closed rect is a layout region the glyphs lay out against,
+        // not a shape: with no explicit fill OR stroke it must paint NO body — no
+        // structural-default fill (an opaque white box over the rounded panel), no
+        // default-stroke ribbon (a hairline border), and so no shadow either.
+        let text_only = obj.text.is_some() && obj.fill.is_none() && obj.stroke.is_none();
+        // A decorative-empty body declares an EXPLICIT fully-transparent fill and no
+        // stroke — a UI hit/hover target (icon-button, menu row, action body) that
+        // paints nothing at rest. Treated like a text-only label: no fill mesh, no
+        // default-stroke ribbon, no shadow. (A canvas shape never emits a transparent
+        // fill, so this carve-out can't touch the structural-default for `fill:None`.)
+        let decorative_empty = obj.stroke.is_none()
+            && obj
+                .fill
+                .as_ref()
+                .is_some_and(|f| f.opacity <= f64::EPSILON);
+        // An open-only path with no explicit fill is not filled (Figma convention),
+        // and a fill-less container frame must not paint its structural-default fill
+        // over its children. A skipped object still pushes a Fill/Shadow instance
+        // below so the per-object buffers stay index-aligned with `draws`.
+        let skip_fill = text_only
+            || decorative_empty
+            || (obj.fill.is_none()
+                && (is_container || subpaths.iter().all(|(closed, _)| !closed)));
 
         let mesh = if skip_fill {
             crate::tessellate::Mesh::default()
@@ -287,21 +414,21 @@ pub fn build_scene_geometry_themed_with_measure(
         geometry.fill_edges.extend_from_slice(&mesh.boundary_flags());
         // Vertex sub-range (distinct from the index range `push` returns) so a
         // follower's fill positions can be patched in place.
-        let fill_vertex_start = geometry.fill.vertices.len() as u32;
+        let fill_vertex_start = crate::cast::len_u32(geometry.fill.vertices.len());
         let fill_range = geometry.fill.push(&mesh);
         let fill_vertex_range = DrawRange {
             start: fill_vertex_start,
-            end: geometry.fill.vertices.len() as u32,
+            end: crate::cast::len_u32(geometry.fill.vertices.len()),
         };
         geometry.fill_instances.push(FillInstance {
             m0: matrix_col(&obj.transform, 0),
             m1: matrix_col(&obj.transform, 1),
             m2: matrix_col(&obj.transform, 2),
-            fill: paint_color(&resolved.fill.paint, resolved.fill.opacity as f32, theme),
+            fill: paint_color(&resolved.fill.paint, crate::cast::narrow_f32(resolved.fill.opacity), theme),
         });
 
         // ---- Stroke: expand each (dashed) subpath into a ribbon ------------
-        let stroke_start = geometry.stroke_vertices.len() as u32;
+        let stroke_start = crate::cast::len_u32(geometry.stroke_vertices.len());
         let cap = match resolved.stroke.cap {
             crate::render_object::RStrokeCap::Butt => Cap::Butt,
             crate::render_object::RStrokeCap::Round => Cap::Round,
@@ -314,24 +441,28 @@ pub fn build_scene_geometry_themed_with_measure(
             // closest existing geometry until a round-join arc is added.
             crate::render_object::RStrokeJoin::Round => Join::Miter,
         };
-        let width = resolved.stroke.width as f32;
+        let width = crate::cast::narrow_f32(resolved.stroke.width);
         // Keep the stroke ribbon meshes so a fill-less object can cast a shadow from
-        // its line; a filled object casts from its fill mesh instead.
+        // its line; a filled object casts from its fill mesh instead. A text-only
+        // label has no explicit stroke and its rect is a layout region, so it gets no
+        // default-stroke ribbon (and thus no shadow from one).
         let mut stroke_meshes: Vec<crate::stroke_expand::Mesh> = Vec::new();
-        for (closed, pts) in &subpaths {
-            let runs = dash_segments(pts, &dash_px(&resolved.stroke.dash));
-            for run in runs {
-                let stroke_mesh = expand_stroke(&run, *closed, width, None, cap, join);
-                append_stroke_ribbon(&mut geometry.stroke_vertices, &stroke_mesh, width);
-                stroke_meshes.push(stroke_mesh);
+        if !text_only && !decorative_empty {
+            for (closed, pts) in &subpaths {
+                let runs = dash_segments(pts, &dash_px(&resolved.stroke.dash));
+                for run in runs {
+                    let stroke_mesh = expand_stroke(&run, *closed, width, None, cap, join);
+                    append_stroke_ribbon(&mut geometry.stroke_vertices, &stroke_mesh, width);
+                    stroke_meshes.push(stroke_mesh);
+                }
             }
         }
-        let stroke_end = geometry.stroke_vertices.len() as u32;
+        let stroke_end = crate::cast::len_u32(geometry.stroke_vertices.len());
 
         // Shadow: an offset copy of the fill `mesh` (no extra tessellation). When the
         // fill is empty (open/stroke-only), cast from the stroke ribbon instead so the
         // line itself casts a shadow.
-        let shadow_start = geometry.shadow_vertices.len() as u32;
+        let shadow_start = crate::cast::len_u32(geometry.shadow_vertices.len());
         if mesh.indices.is_empty() {
             for stroke_mesh in &stroke_meshes {
                 append_shadow_quad(
@@ -343,7 +474,7 @@ pub fn build_scene_geometry_themed_with_measure(
         } else {
             append_shadow_quad(&mut geometry.shadow_vertices, &mesh.vertices, &mesh.indices);
         }
-        let shadow_end = geometry.shadow_vertices.len() as u32;
+        let shadow_end = crate::cast::len_u32(geometry.shadow_vertices.len());
         geometry.shadow_instances.push(ShadowInstance {
             m0: matrix_col(&obj.transform, 0),
             m1: matrix_col(&obj.transform, 1),
@@ -354,16 +485,23 @@ pub fn build_scene_geometry_themed_with_measure(
             m0: matrix_col(&obj.transform, 0),
             m1: matrix_col(&obj.transform, 1),
             m2: matrix_col(&obj.transform, 2),
-            stroke: paint_color(&resolved.stroke.paint, resolved.stroke.opacity as f32, theme),
+            stroke: paint_color(&resolved.stroke.paint, crate::cast::narrow_f32(resolved.stroke.opacity), theme),
         });
 
         // Text: the region bbox derives from the same flattened subpaths the fill/
         // stroke use; the per-object instance carries region-local-px -> world.
-        let text_start = geometry.text_vertices.len() as u32;
+        let text_start = crate::cast::len_u32(geometry.text_vertices.len());
         if let Some(text) = &obj.text {
-            append_text_quads(&mut geometry.text_vertices, text, &subpaths, scene.camera.zoom, measure);
+            append_text_quads(
+                &mut geometry.text_vertices,
+                text,
+                &subpaths,
+                scene.camera.zoom,
+                measure,
+                glyph_uv,
+            );
         }
-        let text_end = geometry.text_vertices.len() as u32;
+        let text_end = crate::cast::len_u32(geometry.text_vertices.len());
         geometry.text_instances.push(TextInstance {
             m0: matrix_col(&obj.transform, 0),
             m1: matrix_col(&obj.transform, 1),
@@ -511,14 +649,17 @@ fn append_stroke_ribbon(out: &mut Vec<StrokeVertex>, mesh: &crate::stroke_expand
 /// Lay out an object's text runs against its derived region and append one 6-vertex
 /// quad per visible glyph (object-local px, per-run color). The region bbox comes
 /// from the same flattened `subpaths` the fill/stroke use; run `size` is de-quantized
-/// (`/QUANT_PER_PX`) to edit-time pixels. The quad is a placement-sized cell spanning
-/// the whole atlas (`uv 0..1`) until the GPU cutover registers per-glyph atlas slots.
+/// (`/QUANT_PER_PX`) to edit-time pixels. When `glyph_uv` resolves a glyph to a real
+/// atlas slot, the quad carries that slot's corner UVs and is positioned by the
+/// glyph bearing; otherwise it falls back to a placement-sized cell spanning the whole
+/// atlas (`uv 0..1`).
 fn append_text_quads(
     out: &mut Vec<TextVertex>,
     text: &RText,
     subpaths: &[(bool, Vec<(f32, f32)>)],
     zoom: f64,
     measure: &dyn Fn(char, f32) -> f32,
+    glyph_uv: &GlyphUvProvider<'_>,
 ) {
     let bucket = crate::curve_lod::zoom_bucket(zoom);
     let flatness = crate::curve_lod::flatness_for_bucket(bucket);
@@ -535,7 +676,7 @@ fn append_text_quads(
             text: run.text.clone(),
             color: text_run_color(&run.color),
             // Wire size is quantized at `QUANT_PER_PX` units/px; divide to px.
-            size: (run.size / QUANT_PER_PX) as f32,
+            size: crate::cast::narrow_f32(run.size / QUANT_PER_PX),
             bold: run.bold,
             italic: run.italic,
             font: run.font.clone(),
@@ -556,14 +697,27 @@ fn append_text_quads(
 
     let placements = layout_runs(&runs, region_min, region_max, align, valign, measure);
     for p in &placements {
-        let x0 = p.x;
-        let y0 = p.y;
-        let x1 = p.x + p.size;
-        let y1 = p.y + p.size;
-        let tl = TextVertex { position: [x0, y0], uv: [0.0, 0.0], color: p.color };
-        let tr = TextVertex { position: [x1, y0], uv: [1.0, 0.0], color: p.color };
-        let br = TextVertex { position: [x1, y1], uv: [1.0, 1.0], color: p.color };
-        let bl = TextVertex { position: [x0, y1], uv: [0.0, 1.0], color: p.color };
+        // A real atlas slot positions the cell by the glyph bearing and carries the
+        // slot's corner UVs; an unresolved glyph keeps the placeholder full cell.
+        let (corners, uv) = match glyph_uv(p.ch, p.size) {
+            Some(entry) if entry.width > 0.0 && entry.height > 0.0 => {
+                let gx = p.x + entry.bearing_x;
+                let gy = p.y + entry.bearing_y;
+                (
+                    [gx, gy, gx + entry.width, gy + entry.height],
+                    entry.uv,
+                )
+            }
+            _ => (
+                [p.x, p.y, p.x + p.size, p.y + p.size],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            ),
+        };
+        let [x0, y0, x1, y1] = corners;
+        let tl = TextVertex { position: [x0, y0], uv: uv[0], color: p.color };
+        let tr = TextVertex { position: [x1, y0], uv: uv[1], color: p.color };
+        let br = TextVertex { position: [x1, y1], uv: uv[2], color: p.color };
+        let bl = TextVertex { position: [x0, y1], uv: uv[3], color: p.color };
         // Two triangles (tl, tr, br) + (tl, br, bl) — CCW tri-list, no index buffer.
         out.push(tl);
         out.push(tr);
@@ -584,9 +738,9 @@ fn text_run_color(value: &str) -> [f32; 4] {
 /// `mat3x3` reconstruction (`M = [m0 | m1 | m2]`).
 fn matrix_col(transform: &[[f64; 3]; 3], col: usize) -> [f32; 3] {
     [
-        transform[0][col] as f32,
-        transform[1][col] as f32,
-        transform[2][col] as f32,
+        crate::cast::narrow_f32(transform[0][col]),
+        crate::cast::narrow_f32(transform[1][col]),
+        crate::cast::narrow_f32(transform[2][col]),
     ]
 }
 
@@ -711,11 +865,11 @@ pub fn follower_patch_plan(draw: &ObjectDraw, rebuilt: &FollowerReexpand) -> Opt
         fill_token: _,
         stroke_token: _,
     } = draw;
-    if rebuilt.fill_vertices.len() as u32 != fill_vertex_range.len()
-        || rebuilt.fill_indices.len() as u32 != fill_range.len()
-        || rebuilt.stroke_vertices.len() as u32 != stroke_range.len()
-        || rebuilt.shadow_vertices.len() as u32 != shadow_range.len()
-        || rebuilt.text_vertices.len() as u32 != text_range.len()
+    if crate::cast::len_u32(rebuilt.fill_vertices.len()) != fill_vertex_range.len()
+        || crate::cast::len_u32(rebuilt.fill_indices.len()) != fill_range.len()
+        || crate::cast::len_u32(rebuilt.stroke_vertices.len()) != stroke_range.len()
+        || crate::cast::len_u32(rebuilt.shadow_vertices.len()) != shadow_range.len()
+        || crate::cast::len_u32(rebuilt.text_vertices.len()) != text_range.len()
     {
         return None;
     }
@@ -788,7 +942,7 @@ fn parse_hex_rgb(value: &str) -> [f32; 3] {
 /// Convert a stroke dash pattern (px lengths) for the CPU dash split. An empty
 /// pattern stays empty (solid).
 fn dash_px(dash: &[f64]) -> Vec<f32> {
-    dash.iter().map(|&d| d as f32).collect()
+    dash.iter().map(|&d| crate::cast::narrow_f32(d)).collect()
 }
 
 #[cfg(test)]
@@ -830,6 +984,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 
@@ -863,6 +1019,30 @@ mod tests {
     }
 
     #[test]
+    fn identity_camera_maps_local_px_to_screen_px() {
+        // The screen-space UI scene rides an identity camera (x=0,y=0,zoom=1) with a
+        // CSS-px viewport, so object-local px land at screen px 1:1.
+        let scene = scene_with(vec![rect_object("ui")], None);
+        let uniform = ObjectMatrixUniform::from_scene(&scene, 800.0, 600.0);
+        assert_eq!(uniform.camera, [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(uniform.viewport, [800.0, 600.0, 0.0, 0.0]);
+
+        // A widget's pure-translate transform [[1,0,sx],[0,1,sy],[0,0,1]] places its
+        // object-local origin (0,0) at screen (sx,sy) under the documented mapping
+        // `world = M * local`, `screen = world * zoom + camera.xy` (zoom 1, camera 0,0).
+        let (sx, sy) = (24.0_f64, 24.0_f64);
+        let m = [[1.0, 0.0, sx], [0.0, 1.0, sy], [0.0, 0.0, 1.0]];
+        let (lx, ly) = (0.0_f64, 0.0_f64);
+        let world_x = m[0][0] * lx + m[0][1] * ly + m[0][2];
+        let world_y = m[1][0] * lx + m[1][1] * ly + m[1][2];
+        let zoom = f64::from(uniform.camera[2]);
+        let (cam_x, cam_y) = (f64::from(uniform.camera[0]), f64::from(uniform.camera[1]));
+        let screen_x = world_x * zoom + cam_x;
+        let screen_y = world_y * zoom + cam_y;
+        assert_eq!((screen_x, screen_y), (sx, sy));
+    }
+
+    #[test]
     fn vertex_and_instance_layout_sizes_match_shader_contract() {
         // FillVertex: vec2 position + f32 edge = 3 floats = 12 bytes.
         assert_eq!(std::mem::size_of::<FillVertex>(), 12);
@@ -891,7 +1071,7 @@ mod tests {
         // The rect fill tessellates to a non-empty index range in the megabuffer.
         assert!(!draw.fill_range.is_empty(), "rect fill must tessellate");
         assert_eq!(draw.fill_range.start, 0);
-        assert_eq!(draw.fill_range.end, geo.fill.indices.len() as u32);
+        assert_eq!(draw.fill_range.end, crate::cast::len_u32(geo.fill.indices.len()));
         // The closed square stroke expands to a non-empty ribbon.
         assert!(!draw.stroke_range.is_empty(), "rect border must expand");
         assert_eq!(draw.stroke_range.end as usize, geo.stroke_vertices.len());
@@ -921,6 +1101,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         };
 
         let open = fill_less("brush", "M0 0 L80 40 L20 90");
@@ -952,6 +1134,162 @@ mod tests {
         assert_eq!(geo.fill_instances.len(), geo.draws.len());
         assert_eq!(geo.shadow_instances.len(), geo.draws.len());
         assert_eq!(geo.stroke_instances.len(), geo.draws.len());
+    }
+
+    /// A text-only label as the ui-core shell emits it: a CLOSED rect layout region
+    /// with `fill: None`, `stroke: None`, and `text: Some(..)`. Same geometry the
+    /// white-box defect rode in on.
+    fn text_label(id: &str, fill: Option<RFill>) -> RenderObject {
+        RenderObject {
+            id: id.to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: identity(),
+            geometry_d: "M0 0 L800 0 L800 800 L0 800 Z".to_string(),
+            fill,
+            stroke: None,
+            text: Some(RText {
+                runs: vec![RTextRun {
+                    text: "Label".to_string(),
+                    color: "#111111".to_string(),
+                    size: 16.0 * crate::render_object::QUANT_PER_PX,
+                    bold: false,
+                    italic: false,
+                    font: String::new(),
+                }],
+                align: RTextAlign::Start,
+                valign: RTextValign::Middle,
+            }),
+            anchors: Vec::new(),
+            clip: false,
+            hidden: false,
+            locked: false,
+        }
+    }
+
+    #[test]
+    fn text_only_label_paints_no_body_fill_stroke_or_shadow() {
+        // The keystone regression: before the fix a text-only label fell through to
+        // the structural white default fill (an opaque box over the rounded panel)
+        // AND a default-stroke hairline ribbon, with a shadow cast from one of them.
+        let scene = scene_with(vec![text_label("title", None)], None);
+        let geo = build_scene_geometry(&scene);
+
+        let draw = &geo.draws[0];
+        assert!(
+            draw.fill_range.is_empty(),
+            "a text-only label must paint NO body fill (the white box bug)"
+        );
+        assert!(
+            draw.stroke_range.is_empty(),
+            "a text-only label must paint NO default-stroke border ribbon"
+        );
+        assert!(
+            draw.shadow_range.is_empty(),
+            "a text-only label with no body casts NO shadow"
+        );
+        // The glyphs themselves still lay out against the region rect.
+        assert!(!draw.text_range.is_empty(), "the label's glyphs still render");
+        // Per-object instance slots stay index-aligned even when the body is skipped.
+        assert_eq!(geo.fill_instances.len(), geo.draws.len());
+        assert_eq!(geo.stroke_instances.len(), geo.draws.len());
+        assert_eq!(geo.shadow_instances.len(), geo.draws.len());
+    }
+
+    #[test]
+    fn closed_no_fill_no_text_shape_keeps_default_fill() {
+        // Guard the precise boundary: a CLOSED unfilled shape with NO text is still a
+        // shape, so it keeps the structural white default fill (and casts a shadow).
+        // Only the text-only case loses its body.
+        let shape = RenderObject {
+            id: "rect".to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: identity(),
+            geometry_d: "M0 0 L800 0 L800 800 L0 800 Z".to_string(),
+            fill: None,
+            stroke: None,
+            text: None,
+            anchors: Vec::new(),
+            clip: false,
+            hidden: false,
+            locked: false,
+        };
+        let scene = scene_with(vec![shape], None);
+        let geo = build_scene_geometry(&scene);
+
+        let draw = &geo.draws[0];
+        assert!(
+            !draw.fill_range.is_empty(),
+            "a closed no-text shape with no fill keeps the default white fill"
+        );
+        assert!(!draw.shadow_range.is_empty(), "the defaulted-fill rect casts a shadow");
+    }
+
+    #[test]
+    fn explicitly_filled_text_object_keeps_its_fill() {
+        // An EXPLICIT inline fill on a text object is honored — the text-only skip
+        // only suppresses the STRUCTURAL default, never an author's chosen paint.
+        let fill = Some(RFill {
+            paint: RPaint::Solid {
+                color: "#ff0000".to_string(),
+            },
+            opacity: 1.0,
+        });
+        let scene = scene_with(vec![text_label("chip", fill)], None);
+        let geo = build_scene_geometry(&scene);
+
+        let draw = &geo.draws[0];
+        assert!(
+            !draw.fill_range.is_empty(),
+            "an explicitly-filled text object keeps its fill"
+        );
+        // The explicit red survives resolution (not the white default).
+        assert_eq!(geo.fill_instances[0].fill, [1.0, 0.0, 0.0, 1.0]);
+        assert!(!draw.text_range.is_empty(), "its glyphs still render over the fill");
+    }
+
+    #[test]
+    fn container_frame_with_no_fill_skips_the_white_default_so_children_show_through() {
+        // A CLOSED rect 'frame' (fill:None) that PARENTS a child — a container by the
+        // structural definition. It must skip its structural white default fill so the
+        // children show through (Figma frame semantics). FAILS today: the frame
+        // tessellates an opaque white fill (non-empty fill_range) over its children.
+        let frame = RenderObject {
+            id: "frame".to_string(),
+            parent: None,
+            order: "a0".to_string(),
+            transform: identity(),
+            geometry_d: "M0 0 L800 0 L800 800 L0 800 Z".to_string(),
+            fill: None,
+            stroke: None,
+            text: None,
+            anchors: Vec::new(),
+            clip: false,
+            hidden: false,
+            locked: false,
+        };
+        let mut child = rect_object("child");
+        child.parent = Some("frame".to_string());
+
+        // Control: the SAME closed fill-less rect with NO children still defaults to
+        // the white fill (its contract is unchanged — pinned by the open-path test).
+        let mut control = frame.clone();
+        control.id = "control".to_string();
+
+        let scene = scene_with(vec![frame, child, control], None);
+        let geo = build_scene_geometry(&scene);
+
+        let frame_draw = geo.draws.iter().find(|d| d.id == "frame").unwrap();
+        let control_draw = geo.draws.iter().find(|d| d.id == "control").unwrap();
+        assert!(
+            frame_draw.fill_range.is_empty(),
+            "a fill-less container frame must not tessellate its structural white fill"
+        );
+        assert!(
+            !control_draw.fill_range.is_empty(),
+            "a childless closed fill-less rect still keeps the default white fill"
+        );
     }
 
     #[test]
@@ -995,7 +1333,7 @@ mod tests {
         let b = geo.draws[1].fill_range;
         assert_eq!(a.start, 0);
         assert_eq!(a.end, b.start, "object ranges are contiguous");
-        assert_eq!(b.end, geo.fill.indices.len() as u32);
+        assert_eq!(b.end, crate::cast::len_u32(geo.fill.indices.len()));
         // The second object's indices are rebased into the merged vertex array,
         // so the highest index is >= the first object's vertex count.
         let max_index = geo.fill.indices.iter().copied().max().unwrap();
@@ -1397,7 +1735,7 @@ mod tests {
             assert_eq!(geo.text_instances[i].m1, geo.fill_instances[i].m1);
             assert_eq!(geo.text_instances[i].m2, geo.fill_instances[i].m2);
         }
-        assert_eq!(geo.draws[0].text_range.end, geo.text_vertices.len() as u32);
+        assert_eq!(geo.draws[0].text_range.end, crate::cast::len_u32(geo.text_vertices.len()));
     }
 
     #[test]
@@ -1437,6 +1775,122 @@ mod tests {
         assert_eq!(
             geo.text_vertices, edited_geo.text_vertices,
             "committed text == the 16px edit-overlay intent (single de-quant site)"
+        );
+    }
+
+    /// DEFECT 3 (ii): with a populated atlas the emitted glyph quads carry their REAL
+    /// per-glyph atlas-slot UVs, NOT the placeholder full-atlas [0,0]/[1,1]. A run
+    /// with size:None (defaulted to 16px) + non-empty text must map at least one glyph
+    /// to a real sub-unit slot. FAILS while every quad still spans uv 0..1.
+    #[test]
+    fn text_quads_carry_real_atlas_slot_uvs_not_placeholder() {
+        // Populate a real atlas from the bundled fonts for "AB" at the 16px default.
+        let engine = crate::text::TextEngine::new().expect("bundled fonts load");
+        let mut atlas = crate::text_layout::MsdfAtlasPlan::new(2048, 2048, 4.0);
+        let mut entries: std::collections::HashMap<(u32, u32), crate::text_layout::MsdfGlyphEntry> =
+            std::collections::HashMap::new();
+        for ch in "AB".chars() {
+            let cov = engine.glyph_coverage(ch, 16.0, 1.0).expect("rasterizes");
+            let entry = atlas
+                .generate_glyph(&crate::text_layout::GlyphCoverage {
+                    key: crate::text_layout::MsdfGlyphKey {
+                        font_index: cov.font_index,
+                        glyph_id: cov.glyph_id,
+                        px: cov.px,
+                    },
+                    coverage: &cov.coverage,
+                    width: cov.width,
+                    height: cov.height,
+                    bearing_x: cov.bearing_x,
+                    bearing_y: cov.bearing_y,
+                    oversample: cov.oversample,
+                })
+                .expect("atlas room");
+            entries.insert((ch as u32, 16), entry);
+        }
+        let glyph_uv = |ch: char, size: f32| -> Option<crate::text_layout::MsdfGlyphEntry> {
+            entries.get(&(ch as u32, crate::cast::round_u32(size))).copied()
+        };
+        let real_measure = |ch: char, size: f32| engine.char_advance(ch, size);
+
+        // Wire size 128 = 16px default; the object carries non-empty text.
+        let obj = text_rect("t-uv", "AB", 128.0, "#ffffff");
+        let scene = scene_with(vec![obj], None);
+        let geo = build_scene_geometry_themed_with_text(
+            &scene,
+            Theme::light(),
+            &real_measure,
+            &glyph_uv,
+        );
+
+        assert!(!geo.text_vertices.is_empty(), "committed text emits quads");
+        // The placeholder spans uv 0..1; a real slot is sub-unit. Assert NOT every
+        // quad is the placeholder — at least one vertex carries a non-trivial UV.
+        let all_placeholder = geo.text_vertices.iter().all(|v| {
+            (v.uv == [0.0, 0.0]) || (v.uv == [1.0, 0.0]) || (v.uv == [1.0, 1.0]) || (v.uv == [0.0, 1.0])
+        });
+        assert!(
+            !all_placeholder,
+            "glyph quads must carry real sub-unit atlas UVs, not the full-atlas placeholder"
+        );
+        // And every UV stays inside the atlas (a real slot, well-formed).
+        for v in &geo.text_vertices {
+            assert!((0.0..=1.0).contains(&v.uv[0]) && (0.0..=1.0).contains(&v.uv[1]));
+        }
+    }
+
+    /// DEFECT 3 (the populate decision, in the DEFAULT gate): the GPU-free populate
+    /// seam packs committed glyphs (grew=true), is idempotent per `(char,px)` on a
+    /// re-feed (grew=false => no re-upload on pan/zoom), and feeds the build real atlas
+    /// slots end-to-end. FAILS if the grew flag is dropped or the `(char,px)` key
+    /// regresses. This is the same code path renderer-wgpu's `ObjectTextAtlas` delegates
+    /// to, so the single glyph-pack impl is asserted on a host with no GPU.
+    #[test]
+    fn populate_atlas_from_scene_grows_on_commit_and_is_idempotent() {
+        let engine = crate::text::TextEngine::new().expect("bundled fonts load");
+        let mut plan = crate::text_layout::MsdfAtlasPlan::new(
+            crate::text::TEXT_ATLAS_WIDTH,
+            crate::text::TEXT_ATLAS_HEIGHT,
+            4.0,
+        );
+        let mut entries: std::collections::HashMap<
+            (u32, u32),
+            crate::text_layout::MsdfGlyphEntry,
+        > = std::collections::HashMap::new();
+
+        // One text object, run "AB" at the 16px default (wire = 16 * QUANT_PER_PX).
+        let scene = scene_with(vec![text_rect("t", "AB", 16.0 * QUANT_PER_PX, "#ffffff")], None);
+
+        // First populate packs both glyphs (grew=true).
+        assert!(
+            populate_atlas_from_scene(&mut plan, &mut entries, &engine, &scene, 1.0),
+            "first populate grows the atlas"
+        );
+        assert!(plan.glyph_count() >= 2, "both glyphs packed, got {}", plan.glyph_count());
+        let count_after_first = plan.glyph_count();
+
+        // Re-feeding the same scene packs nothing new (grew=false): the zero-rebake /
+        // no-re-upload-on-pan-zoom contract, keyed on (char, px).
+        assert!(
+            !populate_atlas_from_scene(&mut plan, &mut entries, &engine, &scene, 1.0),
+            "re-populate of the same scene packs no new glyph"
+        );
+        assert_eq!(plan.glyph_count(), count_after_first, "glyph count unchanged on re-feed");
+
+        // The populated entries feed the build real atlas slots end-to-end: not every
+        // quad carries the placeholder full-atlas uv 0..1.
+        let measure = |ch: char, size: f32| engine.char_advance(ch, size);
+        let glyph_uv = |ch: char, size: f32| -> Option<crate::text_layout::MsdfGlyphEntry> {
+            entries.get(&(ch as u32, crate::cast::round_u32(size))).copied()
+        };
+        let geo = build_scene_geometry_themed_with_text(&scene, Theme::light(), &measure, &glyph_uv);
+        assert!(!geo.text_vertices.is_empty(), "committed text emits quads");
+        let all_placeholder = geo.text_vertices.iter().all(|v| {
+            (v.uv == [0.0, 0.0]) || (v.uv == [1.0, 0.0]) || (v.uv == [1.0, 1.0]) || (v.uv == [0.0, 1.0])
+        });
+        assert!(
+            !all_placeholder,
+            "populate fed real sub-unit slots into the build, not the placeholder"
         );
     }
 
@@ -1651,7 +2105,7 @@ mod tests {
         );
         assert_eq!(
             light.draws[1].shadow_range.end,
-            light.shadow_vertices.len() as u32
+            crate::cast::len_u32(light.shadow_vertices.len())
         );
 
         let light_shadow = light.shadow_instances[0].shadow;
@@ -1821,7 +2275,7 @@ mod tests {
         assert!(!fill_mesh.indices.is_empty(), "rect fills");
         assert_eq!(
             fdraw.shadow_range.len(),
-            fill_mesh.indices.len() as u32,
+            crate::cast::len_u32(fill_mesh.indices.len()),
             "a filled object's shadow is its fill-mesh silhouette (unchanged)"
         );
 
@@ -1952,6 +2406,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 
@@ -1968,9 +2424,9 @@ mod tests {
         let rebuilt = reexpand_single_object(&moved, Theme::light(), scene.camera.clone());
 
         // The COUNTS must match the baked ranges, so the in-place patch is size-safe.
-        assert_eq!(rebuilt.stroke_vertices.len() as u32, draw.stroke_range.len());
-        assert_eq!(rebuilt.fill_vertices.len() as u32, draw.fill_vertex_range.len());
-        assert_eq!(rebuilt.fill_indices.len() as u32, draw.fill_range.len());
+        assert_eq!(crate::cast::len_u32(rebuilt.stroke_vertices.len()), draw.stroke_range.len());
+        assert_eq!(crate::cast::len_u32(rebuilt.fill_vertices.len()), draw.fill_vertex_range.len());
+        assert_eq!(crate::cast::len_u32(rebuilt.fill_indices.len()), draw.fill_range.len());
         // And the patch plan is produced (Some), with the stroke offset at the baked
         // range start (a lone object => start 0).
         let plan = follower_patch_plan(draw, &rebuilt).expect("size-safe patch");
@@ -1996,7 +2452,7 @@ mod tests {
         // A 3-node re-expand changes the vertex count, so the guard must refuse it.
         let three_nodes = open_stroke_object("f", "M0 0 L800 0 L800 400");
         let rebuilt = reexpand_single_object(&three_nodes, Theme::light(), scene.camera.clone());
-        assert_ne!(rebuilt.stroke_vertices.len() as u32, draw.stroke_range.len());
+        assert_ne!(crate::cast::len_u32(rebuilt.stroke_vertices.len()), draw.stroke_range.len());
         assert!(
             follower_patch_plan(draw, &rebuilt).is_none(),
             "a topology/LOD count change must SKIP the patch, not corrupt the buffer"
@@ -2089,8 +2545,8 @@ mod tests {
                 &Transform3x3 { m: target_base },
                 &Transform3x3 { m: delta },
                 LocalPoint {
-                    x: anchor.at.x.round() as i32,
-                    y: anchor.at.y.round() as i32,
+                    x: crate::cast::round_i32(anchor.at.x),
+                    y: crate::cast::round_i32(anchor.at.y),
                 },
                 i32::try_from(anchor.node_index).unwrap_or(i32::MAX),
                 &obj.geometry_d,

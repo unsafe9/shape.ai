@@ -460,48 +460,93 @@ pub struct Anchor {
     pub at: LocalPoint,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
-pub enum LayoutDirection {
-    Row,
-    Column,
+pub enum LayoutAxis {
+    Horizontal,
+    Vertical,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `Count { value >= 1 }`: 1 = single list track, N = N-track grid. `Fill` =
+/// wrap-as-fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Lanes {
+    Count { value: u32 },
+    Fill,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
-pub enum LayoutAlign {
+pub enum MainAlign {
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
+#[serde(rename_all = "camelCase")]
+pub enum CrossAlign {
     Start,
     Center,
     End,
     Stretch,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
-pub enum LayoutSizing {
-    Hug,
-    Fixed,
-    Fill,
+pub struct Align {
+    pub main: MainAlign,
+    pub cross: CrossAlign,
 }
 
 /// Auto-layout inputs on a children group; output positions are derived (not
-/// stored/synced).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// stored/synced). `spacing` (quantized) is BOTH the inter-child gap AND the
+/// uniform container edge inset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
 #[serde(rename_all = "camelCase")]
 pub struct Layout {
-    pub direction: LayoutDirection,
-    pub gap: i32,
-    pub padding: i32,
-    pub align: LayoutAlign,
-    pub sizing: LayoutSizing,
+    pub axis: LayoutAxis,
+    pub lanes: Lanes,
+    pub spacing: i32,
+    pub align: Align,
+}
+
+/// value quantized (object-local units).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AxisSizing {
+    Hug,
+    Fill,
+    Fixed { value: i32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export, export_to = "object-wire.ts"))]
+#[serde(rename_all = "camelCase")]
+pub struct Sizing {
+    pub w: AxisSizing,
+    pub h: AxisSizing,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +617,9 @@ pub struct Object {
     pub anchors: Vec<Anchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<Layout>,
+    /// Per-object layout sizing (Hug/Fill/Fixed per axis). `None` => Hug/Hug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizing: Option<Sizing>,
     /// Clip children to this object's region/bounds (Figma frame clip).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip: Option<bool>,
@@ -580,6 +628,15 @@ pub struct Object {
     /// Tag ids; name/color registry lives in `ObjectScene.tags`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Panel header display name; `None` => fall back to a derived label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Hidden from render + hit-test (panel eye toggle).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    /// Locked against selection/edit (panel lock toggle).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_of: Option<ObjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -606,9 +663,13 @@ impl Object {
             text: None,
             anchors: Vec::new(),
             layout: None,
+            sizing: None,
             clip: None,
             comments: Vec::new(),
             tags: Vec::new(),
+            name: None,
+            hidden: false,
+            locked: false,
             component_of: None,
             content: None,
             meta: None,

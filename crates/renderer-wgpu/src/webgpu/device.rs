@@ -24,8 +24,8 @@ pub async fn probe_web_gpu(
     height: f64,
     device_pixel_ratio: f64,
 ) -> Result<JsValue, JsValue> {
-    let pixel_width = ((width.max(1.0) * device_pixel_ratio.max(1.0)).round() as u32).max(1);
-    let pixel_height = ((height.max(1.0) * device_pixel_ratio.max(1.0)).round() as u32).max(1);
+    let pixel_width = device_dim_u32(width, device_pixel_ratio);
+    let pixel_height = device_dim_u32(height, device_pixel_ratio);
     let enabled_backends = format!("{:?}", wgpu::Instance::enabled_backend_features());
 
     if !wgpu::util::is_browser_webgpu_supported().await {
@@ -130,6 +130,18 @@ pub async fn probe_web_gpu(
     })
 }
 
+/// A surface dimension in physical px (logical * DPR), rounded to a `u32` of at
+/// least 1. The product is a clamped-positive screen size, in range by construction.
+fn device_dim_u32(logical: f64, device_pixel_ratio: f64) -> u32 {
+    let physical = (logical.max(1.0) * device_pixel_ratio.max(1.0)).round();
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "clamped-positive screen dimension; a surface larger than u32::MAX px is impossible, so the rounded value is in range"
+    )]
+    let dim = physical.clamp(0.0, f64::from(u32::MAX)) as u32;
+    dim.max(1)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[wasm_bindgen(js_name = probeWebGpu)]
 pub async fn probe_web_gpu(
@@ -149,8 +161,8 @@ pub async fn probe_web_gpu(
         enabled_backends: "native-test".to_string(),
         format: None,
         present_mode: None,
-        width: ((width.max(1.0) * device_pixel_ratio.max(1.0)).round() as u32).max(1),
-        height: ((height.max(1.0) * device_pixel_ratio.max(1.0)).round() as u32).max(1),
+        width: device_dim_u32(width, device_pixel_ratio),
+        height: device_dim_u32(height, device_pixel_ratio),
         detail: "Browser WebGPU canvas surfaces are only available in wasm32 builds.".to_string(),
     })
 }
@@ -166,8 +178,8 @@ impl ShapeWebGpuRenderer {
         height: f64,
         device_pixel_ratio: f64,
     ) -> Result<ShapeWebGpuRenderer, JsValue> {
-        let pixel_width = ((width.max(1.0) * device_pixel_ratio.max(1.0)).round() as u32).max(1);
-        let pixel_height = ((height.max(1.0) * device_pixel_ratio.max(1.0)).round() as u32).max(1);
+        let pixel_width = device_dim_u32(width, device_pixel_ratio);
+        let pixel_height = device_dim_u32(height, device_pixel_ratio);
         canvas.set_width(pixel_width);
         canvas.set_height(pixel_height);
 
@@ -354,7 +366,7 @@ impl ShapeWebGpuRenderer {
             config.format,
             config.width,
             config.height,
-            device_pixel_ratio.max(1.0) as f32,
+            shape_renderer_core::cast::narrow_f32(device_pixel_ratio.max(1.0)),
         );
 
         let renderer = ShapeWebGpuRenderer {
@@ -407,20 +419,29 @@ impl ShapeWebGpuRenderer {
             input_drag: None,
             active_tool: ActiveTool::default(),
             coarse_rotate: false,
+            active_container: None,
             multi_select: Vec::new(),
             last_hit: None,
             last_lod_tiers: HashMap::new(),
             object_pipeline: None,
             object_renderer: None,
+            object_text: None,
             object_scene: None,
             object_regions: Vec::new(),
+            ui_renderer: None,
+            ui_regions: Vec::new(),
+            ui_runtime: None,
+            ui_model: None,
             object_patch_count: 0,
             object_rebuild_count: 0,
+            ui_patch_count: 0,
+            ui_rebuild_count: 0,
             preview_deformed: std::collections::HashSet::new(),
             endpoint_preview: None,
             object_bindings: shape_scene_core::object::move_together::BindingGraph::default(),
             object_theme: shape_renderer_core::object_theme::Theme::light(),
             shadow_blur,
+            backdrop_gate: shape_renderer_core::backdrop_blur::BackdropBlurGate::new(),
         };
         renderer.write_uniform();
         Ok(renderer)
@@ -430,8 +451,8 @@ impl ShapeWebGpuRenderer {
         self.width = width.max(1.0);
         self.height = height.max(1.0);
         self.device_pixel_ratio = device_pixel_ratio.max(1.0);
-        self.config.width = ((self.width * self.device_pixel_ratio).round() as u32).max(1);
-        self.config.height = ((self.height * self.device_pixel_ratio).round() as u32).max(1);
+        self.config.width = device_dim_u32(self.width, self.device_pixel_ratio);
+        self.config.height = device_dim_u32(self.height, self.device_pixel_ratio);
         self.canvas.set_width(self.config.width);
         self.canvas.set_height(self.config.height);
         self.surface.configure(&self.device, &self.config);
@@ -444,7 +465,7 @@ impl ShapeWebGpuRenderer {
                 self.config.format,
                 self.config.width,
                 self.config.height,
-                self.device_pixel_ratio as f32,
+                shape_renderer_core::cast::narrow_f32(self.device_pixel_ratio),
             );
         }
         self.write_uniform();

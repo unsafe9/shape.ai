@@ -4,7 +4,8 @@
 
 use crate::fractional::{generate_n_keys_between, next_order_key};
 use crate::object::model::{
-    FillRule, Geometry, Object, ObjectId, ObjectScene, Transform3x3,
+    Align, CrossAlign, FillRule, Geometry, Lanes, Layout, LayoutAxis, MainAlign, Object, ObjectId,
+    ObjectScene, ObjectSelection, Transform3x3,
 };
 use crate::object::op::ObjectOp;
 use crate::object::primitives::rect_path;
@@ -31,6 +32,25 @@ pub fn double_click_action(scene: &ObjectScene, id: &str) -> DoubleClickAction {
         DoubleClickAction::DrillInContainer
     } else {
         DoubleClickAction::EditLeaf
+    }
+}
+
+/// Whether `selection` still belongs to the active drill-in `container` scope: true
+/// for the container itself or one of its DIRECT children, false otherwise (canvas,
+/// multi, an unknown id, or any object parented elsewhere). The shell mirrors this in
+/// lockstep — it retracts the active-container token exactly when this is false. The
+/// positive form sidesteps a negation-naming trap.
+pub fn object_selection_in_scope(
+    scene: &ObjectScene,
+    selection: &ObjectSelection,
+    container: &str,
+) -> bool {
+    match selection {
+        ObjectSelection::Object { id } => {
+            id == container
+                || scene.get(id).and_then(|o| o.parent.as_deref()) == Some(container)
+        }
+        _ => false,
     }
 }
 
@@ -97,6 +117,20 @@ pub fn group_ops(scene: &ObjectScene, ids: &[ObjectId], frame_id: &str) -> Optio
     let mut frame = Object::new(frame_id.to_string(), next_order_key(scene), geometry);
     frame.transform = Transform3x3::translate(min_x, min_y);
     frame.clip = Some(false);
+    // Default a new frame to Flow, axis inferred from the children's spatial
+    // spread: a wider horizontal spread reads as a row, a taller one as a column.
+    // `spacing: 0` keeps the frame geometry/transform identical to the union AABB.
+    let axis = if (max_x - min_x) >= (max_y - min_y) {
+        LayoutAxis::Horizontal
+    } else {
+        LayoutAxis::Vertical
+    };
+    frame.layout = Some(Layout {
+        axis,
+        lanes: Lanes::Count { value: 1 },
+        spacing: 0,
+        align: Align { main: MainAlign::Start, cross: CrossAlign::Start },
+    });
 
     let mut ops = vec![ObjectOp::InsertObject { object: frame }];
 
@@ -237,6 +271,44 @@ mod tests {
     }
 
     #[test]
+    fn object_selection_in_scope_membership_table() {
+        let scene = scene_of(vec![
+            obj("frame", None, "a0"),
+            obj("child", Some("frame"), "a0"),
+            obj("leaf", None, "a0"),
+        ]);
+        let object = |id: &str| ObjectSelection::Object { id: id.into() };
+        assert!(
+            object_selection_in_scope(&scene, &object("frame"), "frame"),
+            "the container itself stays in scope"
+        );
+        assert!(
+            object_selection_in_scope(&scene, &object("child"), "frame"),
+            "a direct child stays in scope"
+        );
+        assert!(
+            !object_selection_in_scope(&scene, &object("leaf"), "frame"),
+            "an outside object exits scope"
+        );
+        assert!(
+            !object_selection_in_scope(&scene, &object("ghost"), "frame"),
+            "an unknown id exits scope"
+        );
+        assert!(
+            !object_selection_in_scope(&scene, &ObjectSelection::Canvas, "frame"),
+            "canvas exits scope"
+        );
+        assert!(
+            !object_selection_in_scope(
+                &scene,
+                &ObjectSelection::Multi { ids: vec!["child".into()] },
+                "frame"
+            ),
+            "multi exits scope even when a member is in scope"
+        );
+    }
+
+    #[test]
     fn double_click_action_container_vs_leaf() {
         let scene = scene_of(vec![
             obj("frame", None, "a0"),
@@ -297,6 +369,40 @@ mod tests {
         assert_eq!(frame.transform.m[1][2], 10.0);
         assert_eq!(frame.clip, Some(false));
         // A wrong AABB would shift the corner or resize the rect; pin both.
+    }
+
+    #[test]
+    fn group_ops_defaults_to_flow_with_inferred_axis() {
+        // Wider horizontal spread (x span 80 > y span 30) => Horizontal.
+        let wide = scene_of(vec![
+            rect("a", "a0", 0.0, 0.0, 10, 10),
+            rect("b", "a1", 80.0, 20.0, 10, 10),
+        ]);
+        let wide_ops = group_ops(&wide, &["a".into(), "b".into()], "frame").expect("ops");
+        let wide_frame = frame_op(&wide_ops);
+        assert_eq!(
+            wide_frame.layout,
+            Some(Layout {
+                axis: LayoutAxis::Horizontal,
+                lanes: Lanes::Count { value: 1 },
+                spacing: 0,
+                align: Align { main: MainAlign::Start, cross: CrossAlign::Start },
+            }),
+            "wide spread defaults to a horizontal flow",
+        );
+
+        // Taller spread (y span 80 > x span 30) => Vertical.
+        let tall = scene_of(vec![
+            rect("a", "a0", 0.0, 0.0, 10, 10),
+            rect("b", "a1", 20.0, 80.0, 10, 10),
+        ]);
+        let tall_ops = group_ops(&tall, &["a".into(), "b".into()], "frame").expect("ops");
+        let tall_frame = frame_op(&tall_ops);
+        assert_eq!(
+            tall_frame.layout.map(|l| l.axis),
+            Some(LayoutAxis::Vertical),
+            "tall spread defaults to a vertical flow",
+        );
     }
 
     #[test]

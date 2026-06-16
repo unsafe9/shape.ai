@@ -12,11 +12,21 @@ pub use kernel::{apply, model, op, selection, undo, validate};
 pub use authoring::{deform, drawing, edit, merge, primitives, recognize, templates};
 
 pub use binding::{
-    anchor_follow, anchors, cascade, grouping, layout_solve, move_together, region,
+    affine, anchor_follow, anchors, cascade, grouping, inspector_edit, layout_solve, move_together,
+    region,
 };
 
-pub use catalog::{commands, gestures, theme};
+pub use catalog::{commands, gestures, inspector, theme};
 
+pub use affine::{
+    canonicalize_orientation, compose_affine, decompose_affine, rehome_anchor_local,
+    AffineDecomposition,
+};
+pub use inspector::{
+    inspector_view, object_inspector_catalog, object_inspector_catalog_json, resize_axis,
+    AppliesTo, Axis, InspectorControl, InspectorControlValue, InspectorRole, InspectorSection,
+    InspectorSectionView, InspectorView, InspectorWidget, Placement,
+};
 pub use anchor_follow::{
     anchor_follow_ops, geometry_follow_ops, local_nodes, reproject_geometry_node,
     resolve_create_release, synthesize_create_anchors, synthesize_create_anchors_both,
@@ -47,12 +57,13 @@ pub use gestures::{
     ObjectGestureCategory,
 };
 pub use grouping::{
-    double_click_action, group_ops, has_children, pop_out_op, ungroup_enabled, ungroup_ops,
-    DoubleClickAction,
+    double_click_action, group_ops, has_children, object_selection_in_scope, pop_out_op,
+    ungroup_enabled, ungroup_ops, DoubleClickAction,
 };
+pub use inspector_edit::inspector_edit_op;
 pub use primitives::{
-    build_primitive, build_primitive_from_drag, build_set_style_op, paint_for_color, DragSpan,
-    PrimitiveKind, THEME_DEFAULT_COLOR,
+    build_primitive, build_primitive_from_drag, build_set_style_op, default_inspector_stroke,
+    paint_for_color, DragSpan, PrimitiveKind, THEME_DEFAULT_COLOR,
 };
 pub use layout_solve::solve_layout;
 pub use templates::{
@@ -62,14 +73,15 @@ pub use templates::{
 pub use selection::{select_all, valid_selection};
 pub use undo::{UndoEntry, UndoStack};
 pub use validate::{
-    validate_anchor_targets, validate_geometry, validate_no_parent_cycle, validate_object,
-    validate_scene, ValidationError,
+    validate_anchor_targets, validate_geometry, validate_layout, validate_no_parent_cycle,
+    validate_object, validate_scene, validate_sizing, ValidationError,
 };
 pub use model::{
-    Anchor, Comment, CommentAnchor, ContentEmbed, Fill, FillRule, Geometry, GradientStop,
-    HandlePoint, Layout, LayoutAlign, LayoutDirection, LayoutSizing, LineCap, LineJoin, LocalPoint,
-    Object, ObjectId, ObjectMeta, ObjectScene, ObjectSelection, Paint, PathNode, Stroke, SubPath,
-    TagDef, Text, TextAlign, TextRun, TextVAlign, Transform3x3, Warp, GEOMETRY_QUANTUM_PER_PX,
+    Align, Anchor, AxisSizing, Comment, CommentAnchor, ContentEmbed, CrossAlign, Fill, FillRule,
+    Geometry, GradientStop, HandlePoint, Lanes, Layout, LayoutAxis, LineCap, LineJoin, LocalPoint,
+    MainAlign, Object, ObjectId, ObjectMeta, ObjectScene, ObjectSelection, Paint, PathNode, Sizing,
+    Stroke, SubPath, TagDef, Text, TextAlign, TextRun, TextVAlign, Transform3x3, Warp,
+    GEOMETRY_QUANTUM_PER_PX,
 };
 pub use op::{FeatureRequest, FeatureResponse, FieldEdit, ObjectOp};
 pub use theme::{resolve_token, Token, ALL_TOKENS};

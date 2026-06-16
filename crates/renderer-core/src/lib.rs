@@ -2,6 +2,8 @@
 //! `web_sys` — the GPU pipelines and `#[wasm_bindgen]` surface live in the
 //! `shape_canvas_core` (renderer-wgpu) crate, which depends on this one by path.
 
+pub mod backdrop_blur;
+pub mod cast;
 pub mod frame_budget;
 pub mod lod;
 pub mod model;
@@ -34,16 +36,17 @@ pub use stats::CoreNearestOutlinePoint;
 
 #[allow(unused_imports)]
 pub use object_pipeline::{
-    build_scene_geometry, preview_instance_columns, FillInstance, FillVertex, ObjectDraw,
-    ObjectMatrixUniform, SceneGeometry, StrokeInstance, StrokeParamsUniform, StrokeVertex,
+    build_scene_geometry, build_scene_geometry_themed_with_text, preview_instance_columns,
+    FillInstance, FillVertex, GlyphUvProvider, ObjectDraw, ObjectMatrixUniform, SceneGeometry,
+    StrokeInstance, StrokeParamsUniform, StrokeVertex,
 };
 
 // FramePlan IR: platform-neutral, diffable draw-plan contract between this crate
 // (what to draw) and renderer-wgpu (GPU submission).
 #[allow(unused_imports)]
 pub use plan::{
-    build_frame_plan, diff_plans, geometry_revision, pass_order, DrawPass, FramePlan, PlanDiff,
-    PlanEntry, PlanInstance, PlanPatch, ResourceHandle, StyleSlot,
+    build_frame_plan, build_frame_plan_with_text, diff_plans, geometry_revision, pass_order,
+    DrawPass, FramePlan, PlanDiff, PlanEntry, PlanInstance, PlanPatch, ResourceHandle, StyleSlot,
 };
 
 #[allow(unused_imports)]

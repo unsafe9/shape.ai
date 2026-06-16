@@ -20,9 +20,13 @@ impl ShapeWebGpuRenderer {
     pub fn render_frame(&mut self) -> Result<JsValue, JsValue> {
         self.write_uniform();
         self.flush_text_atlas();
-        let overlay_vertex_count = self.write_marquee_overlay();
-        let handle_vertex_count = self.write_handle_overlay();
-        let multi_select_vertex_count = self.write_multi_select_overlay();
+        // The overlay writers return a vertex count bounded by the fixed
+        // `*_OVERLAY_VERTEX_CAPACITY` (well under u32::MAX); narrow once here for the
+        // `pass.draw` range, which takes a `u32`.
+        let overlay_vertex_count = shape_renderer_core::cast::len_u32(self.write_marquee_overlay());
+        let handle_vertex_count = shape_renderer_core::cast::len_u32(self.write_handle_overlay());
+        let multi_select_vertex_count =
+            shape_renderer_core::cast::len_u32(self.write_multi_select_overlay());
         let mut draw_list = self.build_draw_list();
         // Carry this frame's per-object tiers forward so next frame's hysteresis
         // resolves against them.
@@ -50,12 +54,8 @@ impl ShapeWebGpuRenderer {
         if let (Some(pipeline), Some(renderer)) =
             (self.object_pipeline.as_ref(), self.object_renderer.as_ref())
         {
-            renderer.update_camera(
-                &self.queue,
-                &self.camera,
-                self.width as f32,
-                self.height as f32,
-            );
+            let (sw, sh) = self.surface_px_f32();
+            renderer.update_camera(&self.queue, &self.camera, sw, sh);
             // Render the shadow silhouette into the offscreen mask, blur it (H then
             // V), then composite it onto the surface FIRST (also clearing to
             // canvas-bg) so fill/stroke/text draw on top. An isolated underlay: the
@@ -92,7 +92,7 @@ impl ShapeWebGpuRenderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.multi_select_overlay_vertex_buffer.slice(..));
-                pass.draw(0..multi_select_vertex_count as u32, 0..1);
+                pass.draw(0..multi_select_vertex_count, 0..1);
             }
             // Selection-handle overlay, drawn on top with the legacy world-space
             // pipeline (LoadOp::Load preserves the object pass). Screen-fixed world
@@ -118,7 +118,7 @@ impl ShapeWebGpuRenderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.handle_vertex_buffer.slice(..));
-                pass.draw(0..handle_vertex_count as u32, 0..1);
+                pass.draw(0..handle_vertex_count, 0..1);
             }
             // The drag marquee in object mode: the object pass replaces the legacy 2D
             // pass that drew it, so draw it here too. Same world-space pipeline,
@@ -144,7 +144,18 @@ impl ShapeWebGpuRenderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.overlay_vertex_buffer.slice(..));
-                pass.draw(0..overlay_vertex_count as u32, 0..1);
+                pass.draw(0..overlay_vertex_count, 0..1);
+            }
+            // Screen-space UI pass, drawn LAST so panels composite ABOVE selection
+            // chrome (the P1 design call). Identity camera + CSS-px viewport map the
+            // UI scene's object-local px to screen px 1:1 (no pan/zoom). LoadOp::Load
+            // in the same encoder — no extra acquire/submit/present, no UI shadow.
+            if let (Some(pipeline), Some(ui)) =
+                (self.object_pipeline.as_ref(), self.ui_renderer.as_ref())
+            {
+                let (uw, uh) = self.surface_px_f32();
+                ui.update_camera(&self.queue, &UI_IDENTITY_CAMERA, uw, uh);
+                ui.render(&mut encoder, &view, pipeline, false);
             }
         } else {
             let color_attachments = [Some(wgpu::RenderPassColorAttachment {
@@ -183,7 +194,7 @@ impl ShapeWebGpuRenderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.overlay_vertex_buffer.slice(..));
-                pass.draw(0..overlay_vertex_count as u32, 0..1);
+                pass.draw(0..overlay_vertex_count, 0..1);
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -271,6 +282,8 @@ impl ShapeWebGpuRenderer {
                 .unwrap_or(0),
             object_patch_count: self.object_patch_count,
             object_rebuild_count: self.object_rebuild_count,
+            ui_patch_count: self.ui_patch_count,
+            ui_rebuild_count: self.ui_rebuild_count,
             backend: "rust-wgpu-visible".to_string(),
         })
     }
@@ -488,15 +501,27 @@ impl ShapeWebGpuRenderer {
         }
     }
 
+    /// The CSS-px surface size as the `f32` pair the GPU camera/viewport uniforms
+    /// take. The single device-boundary downcast for surface dimensions: a surface
+    /// larger than f32's exact-integer range (~16M px) is impossible, so the cast is
+    /// lossless here. Every width/height→f32 site routes through this.
+    pub(crate) fn surface_px_f32(&self) -> (f32, f32) {
+        (
+            shape_renderer_core::cast::narrow_f32(self.width),
+            shape_renderer_core::cast::narrow_f32(self.height),
+        )
+    }
+
     pub(crate) fn write_uniform(&self) {
+        let (vw, vh) = self.surface_px_f32();
         let uniform = ViewUniform {
             camera: [
-                self.camera.x as f32,
-                self.camera.y as f32,
-                self.camera.zoom as f32,
+                shape_renderer_core::cast::narrow_f32(self.camera.x),
+                shape_renderer_core::cast::narrow_f32(self.camera.y),
+                shape_renderer_core::cast::narrow_f32(self.camera.zoom),
                 0.0,
             ],
-            viewport: [self.width as f32, self.height as f32, 0.0, 0.0],
+            viewport: [vw, vh, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));

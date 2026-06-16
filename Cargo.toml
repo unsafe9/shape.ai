@@ -6,14 +6,25 @@ members = [
     "crates/server",
     "crates/coordination",
     "crates/renderer-core",
+    "crates/ui-core",
+    "crates/ui",
     "crates/platform-contract",
     "crates/client-runtime",
+    "extensions/extension-contract",
+    "extensions/todo-kanban",
+    "extensions/structure-diagram",
 ]
 # renderer-wgpu stays standalone: member-izing it would fold its pinned wgpu
 # lockfile into the workspace lock.
 exclude = [
     "crates/renderer-wgpu",
 ]
+
+# We never run a debugger; the Makefile builds/tests/serves with --release only.
+# This strips debuginfo from any stray dev build (IDE / rust-analyzer) so an
+# accidental target/debug stays small instead of multi-GB.
+[profile.dev]
+debug = false
 
 # Pointer-width-agnostic discipline for the pure cores — see CLAUDE.md Conventions.
 # Opt in per-crate with `[lints] workspace = true`; surfaces 32-bit address assumptions.

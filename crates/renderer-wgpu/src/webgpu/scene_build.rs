@@ -277,9 +277,9 @@ pub(crate) fn build_group_vertices(
     let mut text_stats = add_text_line(
         &mut vertices,
         &group.title,
-        (group.bounds.x + style.spacing.group_padding_x) as f32,
-        (group.bounds.y + style.spacing.group_padding_y) as f32,
-        (group.bounds.width - style.spacing.group_padding_x * 2.0) as f32,
+        shape_renderer_core::cast::narrow_f32(group.bounds.x + style.spacing.group_padding_x),
+        shape_renderer_core::cast::narrow_f32(group.bounds.y + style.spacing.group_padding_y),
+        shape_renderer_core::cast::narrow_f32(group.bounds.width - style.spacing.group_padding_x * 2.0),
         style.typography.group_title_size,
         color_with_alpha(style.text, 0.86),
         text_layout_cache,
@@ -289,12 +289,14 @@ pub(crate) fn build_group_vertices(
         text_stats.add(add_text_line(
             &mut vertices,
             &group.summary,
-            (group.bounds.x + style.spacing.group_padding_x) as f32,
-            (group.bounds.y
-                + style.spacing.group_padding_y
-                + style.typography.group_title_size as f64
-                + 28.0) as f32,
-            (group.bounds.width - style.spacing.group_padding_x * 2.0) as f32,
+            shape_renderer_core::cast::narrow_f32(group.bounds.x + style.spacing.group_padding_x),
+            shape_renderer_core::cast::narrow_f32(
+                group.bounds.y
+                    + style.spacing.group_padding_y
+                    + style.typography.group_title_size as f64
+                    + 28.0,
+            ),
+            shape_renderer_core::cast::narrow_f32(group.bounds.width - style.spacing.group_padding_x * 2.0),
             style.typography.group_summary_size,
             color_with_alpha(style.muted_text, 0.78),
             text_layout_cache,
@@ -349,16 +351,16 @@ pub(crate) fn build_edge_vertices(
         add_cubic_edge(
             &mut vertices,
             &route,
-            (stroke_width + style.stroke_width.focus_ring) as f32,
+            shape_renderer_core::cast::narrow_f32(stroke_width + style.stroke_width.focus_ring),
             color_with_alpha(style.focus, style.state.focus_alpha),
         );
     }
     let stroke = color_with_alpha(edge_base, stroke_alpha);
-    add_cubic_edge(&mut vertices, &route, stroke_width as f32, stroke);
+    add_cubic_edge(&mut vertices, &route, shape_renderer_core::cast::narrow_f32(stroke_width), stroke);
     add_arrowhead(
         &mut vertices,
-        [route.cp2.x as f32, route.cp2.y as f32],
-        [route.end.x as f32, route.end.y as f32],
+        [shape_renderer_core::cast::narrow_f32(route.cp2.x), shape_renderer_core::cast::narrow_f32(route.cp2.y)],
+        [shape_renderer_core::cast::narrow_f32(route.end.x), shape_renderer_core::cast::narrow_f32(route.end.y)],
         color_with_alpha(edge_base, if selected { 0.98 } else { 0.62 }),
     );
     let mut text_stats = TextBuildStats::default();
@@ -369,11 +371,12 @@ pub(crate) fn build_edge_vertices(
             .measure_text_width(&edge.label, label_font_size)
             .min(label_max_width)
             .max(24.0);
-        let label_padding = style.spacing.label_padding_x as f32;
-        let label_x =
-            ((route.start.x + route.end.x) * 0.5) as f32 - label_width * 0.5 - label_padding;
-        let label_y =
-            ((route.start.y + route.end.y) * 0.5) as f32 - style.spacing.edge_label_height as f32;
+        let label_padding = shape_renderer_core::cast::narrow_f32(style.spacing.label_padding_x);
+        let label_x = shape_renderer_core::cast::narrow_f32((route.start.x + route.end.x) * 0.5)
+            - label_width * 0.5
+            - label_padding;
+        let label_y = shape_renderer_core::cast::narrow_f32((route.start.y + route.end.y) * 0.5)
+            - shape_renderer_core::cast::narrow_f32(style.spacing.edge_label_height);
         let label_rect = WorldRect {
             x: label_x as f64,
             y: label_y as f64,
@@ -515,9 +518,9 @@ pub(crate) fn build_card_vertices(
     text_stats.add(add_text_line(
         &mut vertices,
         &node_label,
-        (badge.x + style.spacing.badge_padding_x) as f32,
-        (badge.y + 5.0) as f32,
-        (badge.width - style.spacing.badge_padding_x * 2.0) as f32,
+        shape_renderer_core::cast::narrow_f32(badge.x + style.spacing.badge_padding_x),
+        shape_renderer_core::cast::narrow_f32(badge.y + 5.0),
+        shape_renderer_core::cast::narrow_f32(badge.width - style.spacing.badge_padding_x * 2.0),
         style.typography.badge_size,
         color_with_alpha(style.accent, style.badge.text_alpha),
         text_layout_cache,
@@ -526,9 +529,9 @@ pub(crate) fn build_card_vertices(
     text_stats.add(add_text_line(
         &mut vertices,
         &card.title,
-        text_layout.content_x as f32,
-        text_layout.title_y as f32,
-        text_layout.content_width as f32,
+        shape_renderer_core::cast::narrow_f32(text_layout.content_x),
+        shape_renderer_core::cast::narrow_f32(text_layout.title_y),
+        shape_renderer_core::cast::narrow_f32(text_layout.content_width),
         text_layout.title_font_size,
         color_with_alpha(style.text, 0.92),
         text_layout_cache,
@@ -537,11 +540,11 @@ pub(crate) fn build_card_vertices(
     text_stats.add(add_wrapped_text(
         &mut vertices,
         &card.summary,
-        text_layout.content_x as f32,
-        text_layout.summary_y as f32,
-        text_layout.content_width as f32,
+        shape_renderer_core::cast::narrow_f32(text_layout.content_x),
+        shape_renderer_core::cast::narrow_f32(text_layout.summary_y),
+        shape_renderer_core::cast::narrow_f32(text_layout.content_width),
         text_layout.summary_font_size,
-        text_layout.summary_line_height as f32,
+        shape_renderer_core::cast::narrow_f32(text_layout.summary_line_height),
         text_layout.summary_max_lines,
         color_with_alpha(style.muted_text, 0.84),
         text_layout_cache,
@@ -551,11 +554,11 @@ pub(crate) fn build_card_vertices(
         text_stats.add(add_wrapped_text(
             &mut vertices,
             &card.detail,
-            text_layout.content_x as f32,
-            text_layout.detail_y as f32,
-            text_layout.content_width as f32,
+            shape_renderer_core::cast::narrow_f32(text_layout.content_x),
+            shape_renderer_core::cast::narrow_f32(text_layout.detail_y),
+            shape_renderer_core::cast::narrow_f32(text_layout.content_width),
             text_layout.detail_font_size,
-            text_layout.detail_line_height as f32,
+            shape_renderer_core::cast::narrow_f32(text_layout.detail_line_height),
             text_layout.detail_max_lines,
             color_with_alpha(style.muted_text, 0.68),
             text_layout_cache,
@@ -668,10 +671,10 @@ pub(crate) fn transparent_vertex() -> GpuVertex {
 
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn add_rect(vertices: &mut Vec<GpuVertex>, rect: &WorldRect, color: [f32; 4]) {
-    let x = rect.x as f32;
-    let y = rect.y as f32;
-    let w = rect.width as f32;
-    let h = rect.height as f32;
+    let x = shape_renderer_core::cast::narrow_f32(rect.x);
+    let y = shape_renderer_core::cast::narrow_f32(rect.y);
+    let w = shape_renderer_core::cast::narrow_f32(rect.width);
+    let h = shape_renderer_core::cast::narrow_f32(rect.height);
     add_quad(
         vertices,
         [x, y],
@@ -684,9 +687,11 @@ pub(crate) fn add_rect(vertices: &mut Vec<GpuVertex>, rect: &WorldRect, color: [
 
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn add_rounded_rect(vertices: &mut Vec<GpuVertex>, rect: &WorldRect, radius: f64, color: [f32; 4]) {
-    let w = rect.width.max(0.0) as f32;
-    let h = rect.height.max(0.0) as f32;
-    let r = (radius.max(0.0) as f32).min(w * 0.5).min(h * 0.5);
+    let w = shape_renderer_core::cast::narrow_f32(rect.width.max(0.0));
+    let h = shape_renderer_core::cast::narrow_f32(rect.height.max(0.0));
+    let r = shape_renderer_core::cast::narrow_f32(radius.max(0.0))
+        .min(w * 0.5)
+        .min(h * 0.5);
     if r <= 0.5 || w <= 1.0 || h <= 1.0 {
         add_rect(vertices, rect, color);
         return;
@@ -724,7 +729,7 @@ pub(crate) fn add_rounded_rect(vertices: &mut Vec<GpuVertex>, rect: &WorldRect, 
     );
     add_corner_fan(
         vertices,
-        [rect.x as f32 + r, rect.y as f32 + r],
+        [shape_renderer_core::cast::narrow_f32(rect.x) + r, shape_renderer_core::cast::narrow_f32(rect.y) + r],
         r,
         PI,
         PI * 1.5,
@@ -732,7 +737,7 @@ pub(crate) fn add_rounded_rect(vertices: &mut Vec<GpuVertex>, rect: &WorldRect, 
     );
     add_corner_fan(
         vertices,
-        [rect.x as f32 + w - r, rect.y as f32 + r],
+        [shape_renderer_core::cast::narrow_f32(rect.x) + w - r, shape_renderer_core::cast::narrow_f32(rect.y) + r],
         r,
         PI * 1.5,
         PI * 2.0,
@@ -740,7 +745,7 @@ pub(crate) fn add_rounded_rect(vertices: &mut Vec<GpuVertex>, rect: &WorldRect, 
     );
     add_corner_fan(
         vertices,
-        [rect.x as f32 + w - r, rect.y as f32 + h - r],
+        [shape_renderer_core::cast::narrow_f32(rect.x) + w - r, shape_renderer_core::cast::narrow_f32(rect.y) + h - r],
         r,
         0.0,
         PI * 0.5,
@@ -748,7 +753,7 @@ pub(crate) fn add_rounded_rect(vertices: &mut Vec<GpuVertex>, rect: &WorldRect, 
     );
     add_corner_fan(
         vertices,
-        [rect.x as f32 + r, rect.y as f32 + h - r],
+        [shape_renderer_core::cast::narrow_f32(rect.x) + r, shape_renderer_core::cast::narrow_f32(rect.y) + h - r],
         r,
         PI * 0.5,
         PI,
@@ -1410,12 +1415,12 @@ pub(crate) fn metric(value: Option<f64>, fallback: f64) -> f64 {
 
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn font_metric(value: Option<f64>, fallback: f64) -> f32 {
-    metric(value, fallback) as f32
+    shape_renderer_core::cast::narrow_f32(metric(value, fallback))
 }
 
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn opacity(value: Option<f64>, fallback: f64) -> f32 {
-    value.unwrap_or(fallback).clamp(0.0, 1.0) as f32
+    shape_renderer_core::cast::narrow_f32(value.unwrap_or(fallback).clamp(0.0, 1.0))
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -1481,8 +1486,8 @@ pub(crate) fn add_cubic_edge(
         let current = cubic_point(route, t);
         add_line(
             vertices,
-            [previous.x as f32, previous.y as f32],
-            [current.x as f32, current.y as f32],
+            [shape_renderer_core::cast::narrow_f32(previous.x), shape_renderer_core::cast::narrow_f32(previous.y)],
+            [shape_renderer_core::cast::narrow_f32(current.x), shape_renderer_core::cast::narrow_f32(current.y)],
             thickness,
             color,
         );
@@ -1640,11 +1645,11 @@ pub(crate) fn marquee_rect(start: WorldPoint, current: WorldPoint) -> WorldRect 
 pub(crate) fn build_marquee_overlay_vertices(rect: &WorldRect, zoom: f64) -> Vec<GpuVertex> {
     let mut vertices = Vec::with_capacity(MARQUEE_OVERLAY_VERTEX_CAPACITY);
     add_rect(&mut vertices, rect, MARQUEE_FILL_COLOR);
-    let thickness = (1.5 / zoom.max(0.025)) as f32;
-    let x = rect.x as f32;
-    let y = rect.y as f32;
-    let w = rect.width as f32;
-    let h = rect.height as f32;
+    let thickness = shape_renderer_core::cast::narrow_f32(1.5 / zoom.max(0.025));
+    let x = shape_renderer_core::cast::narrow_f32(rect.x);
+    let y = shape_renderer_core::cast::narrow_f32(rect.y);
+    let w = shape_renderer_core::cast::narrow_f32(rect.width);
+    let h = shape_renderer_core::cast::narrow_f32(rect.height);
     add_line(&mut vertices, [x, y], [x + w, y], thickness, MARQUEE_STROKE_COLOR);
     add_line(
         &mut vertices,
@@ -1762,8 +1767,8 @@ pub(crate) fn build_multi_select_overlay_vertices(
     use shape_renderer_core::hit_test_object::{apply_3x3, HANDLE_SIZE_PX};
     let mut vertices = Vec::new();
     let z = zoom.max(0.025);
-    let thickness = (2.0 / z) as f32;
-    let dot_radius = (HANDLE_SIZE_PX / z / 2.0) as f32;
+    let thickness = shape_renderer_core::cast::narrow_f32(2.0 / z);
+    let dot_radius = shape_renderer_core::cast::narrow_f32(HANDLE_SIZE_PX / z / 2.0);
     for id in ids {
         let Some(region) = regions.iter().find(|region| &region.id == id) else {
             continue;
@@ -1792,10 +1797,10 @@ pub(crate) fn build_multi_select_overlay_vertices(
         let Some(bounds) = region_world_bounds(region, preview_t.as_ref()) else {
             continue;
         };
-        let x = bounds.x as f32;
-        let y = bounds.y as f32;
-        let w = bounds.width as f32;
-        let h = bounds.height as f32;
+        let x = shape_renderer_core::cast::narrow_f32(bounds.x);
+        let y = shape_renderer_core::cast::narrow_f32(bounds.y);
+        let w = shape_renderer_core::cast::narrow_f32(bounds.width);
+        let h = shape_renderer_core::cast::narrow_f32(bounds.height);
         add_line(&mut vertices, [x, y], [x + w, y], thickness, MULTI_SELECT_OUTLINE_COLOR);
         add_line(&mut vertices, [x + w, y], [x + w, y + h], thickness, MULTI_SELECT_OUTLINE_COLOR);
         add_line(&mut vertices, [x + w, y + h], [x, y + h], thickness, MULTI_SELECT_OUTLINE_COLOR);
@@ -2045,6 +2050,8 @@ pub(crate) fn derive_object_regions(scene: &RenderObjectScene) -> Vec<ObjectRegi
             closed: region.closed,
             outline: region.outline,
             open_endpoints: derive_open_endpoints(&obj.geometry_d),
+            hidden: obj.hidden,
+            locked: obj.locked,
         });
     }
     regions
@@ -2095,7 +2102,50 @@ pub(crate) fn hit_object_in_regions(
         .iter()
         .rev()
         .find(|region| {
-            hit_test_object_or_bbox(
+            // Hidden (non-render => non-hittable) or locked (non-interactive) regions
+            // are inert; the region is kept for index/lookup, just skipped here.
+            !region.hidden
+                && !region.locked
+                && hit_test_object_or_bbox(
+                    &region.transform,
+                    &region.outline,
+                    region.closed,
+                    BODY_BBOX_GRAB_PAD_PX,
+                    world.x,
+                    world.y,
+                )
+        })
+        .map(|region| region.id.clone())
+}
+
+/// Scoped pick for an active drill-in container: when `active_container` is `Some(c)`,
+/// resolve a pointer-down to the DIRECT CHILD under the pointer (top-most region whose
+/// `RenderObject.parent == Some(c)`); if no child is hit, return `Some(c)` when the
+/// point is inside the container's own region (empty-inside click keeps the container),
+/// else `None` (a click outside the scope). When `None`, delegate to the unscoped
+/// [`hit_object_in_regions`]. A pure pick-filter on the existing `parent` metadata —
+/// allocation-free, transform-only-safe. Hidden/locked regions stay inert here too.
+#[cfg(feature = "wgpu-probe")]
+pub(crate) fn hit_object_scoped(
+    regions: &[ObjectRegion],
+    objects: &[RenderObject],
+    camera: &CameraState,
+    screen: WorldPoint,
+    active_container: Option<&str>,
+) -> Option<String> {
+    let Some(container) = active_container else {
+        return hit_object_in_regions(regions, camera, screen);
+    };
+    let world = screen_to_world(screen, camera);
+    let is_child = |id: &str| {
+        objects
+            .iter()
+            .any(|o| o.id == id && o.parent.as_deref() == Some(container))
+    };
+    let hit = |region: &ObjectRegion| {
+        !region.hidden
+            && !region.locked
+            && hit_test_object_or_bbox(
                 &region.transform,
                 &region.outline,
                 region.closed,
@@ -2103,7 +2153,20 @@ pub(crate) fn hit_object_in_regions(
                 world.x,
                 world.y,
             )
-        })
+    };
+    // Top-most direct child under the pointer wins.
+    if let Some(child) = regions
+        .iter()
+        .rev()
+        .find(|region| is_child(&region.id) && hit(region))
+    {
+        return Some(child.id.clone());
+    }
+    // No child hit: keep the container when the click is inside its own body; a click
+    // outside the scope returns None (the shell forwards null to exit the scope).
+    regions
+        .iter()
+        .find(|region| region.id == container && hit(region))
         .map(|region| region.id.clone())
 }
 
@@ -2125,16 +2188,18 @@ pub(crate) fn swept_erase_in_regions(
         .iter()
         .rev()
         .filter(|region| {
-            swept_segment_hits_object(
-                &region.transform,
-                &region.outline,
-                region.closed,
-                BODY_BBOX_GRAB_PAD_PX,
-                a.x,
-                a.y,
-                b.x,
-                b.y,
-            )
+            !region.hidden
+                && !region.locked
+                && swept_segment_hits_object(
+                    &region.transform,
+                    &region.outline,
+                    region.closed,
+                    BODY_BBOX_GRAB_PAD_PX,
+                    a.x,
+                    a.y,
+                    b.x,
+                    b.y,
+                )
         })
         .map(|region| region.id.clone())
         .collect()
@@ -2154,6 +2219,10 @@ pub(crate) fn selection_handles(
 ) -> Option<(SelectionHandles, WorldRect)> {
     let id = selection?;
     let region = regions.iter().find(|region| region.id == id)?;
+    // A hidden/locked region shows no resize/rotate handles (non-interactive).
+    if region.hidden || region.locked {
+        return None;
+    }
     // An open-class selection has NO bbox transform surface — its two endpoint
     // handles are the whole manipulation surface.
     if region.open_endpoints.is_some() {
@@ -2242,7 +2311,7 @@ pub(crate) fn build_endpoint_handle_overlay_vertices(
     use shape_renderer_core::hit_test_object::HANDLE_SIZE_PX;
     let mut vertices = Vec::with_capacity(2 * ENDPOINT_HANDLE_SEGMENTS * 3);
     let z = zoom.max(0.025);
-    let radius = (HANDLE_SIZE_PX / z / 2.0) as f32;
+    let radius = shape_renderer_core::cast::narrow_f32(HANDLE_SIZE_PX / z / 2.0);
     for point in world {
         push_endpoint_dot_vertices(&mut vertices, point, radius);
     }
@@ -2255,8 +2324,8 @@ pub(crate) fn build_endpoint_handle_overlay_vertices(
 /// dots, so the two visuals can't drift.
 #[cfg(feature = "wgpu-probe")]
 fn push_endpoint_dot_vertices(vertices: &mut Vec<GpuVertex>, center: &WorldPoint, radius: f32) {
-    let cx = center.x as f32;
-    let cy = center.y as f32;
+    let cx = shape_renderer_core::cast::narrow_f32(center.x);
+    let cy = shape_renderer_core::cast::narrow_f32(center.y);
     let rim = |segment: usize| {
         let angle = segment as f32 / ENDPOINT_HANDLE_SEGMENTS as f32 * std::f32::consts::TAU;
         [cx + radius * angle.cos(), cy + radius * angle.sin()]
@@ -2316,8 +2385,10 @@ pub(crate) fn hover_affordance_at(
 pub(crate) fn step_object_pointer(
     event: &CanvasInputEvent,
     regions: &[ObjectRegion],
+    objects: &[RenderObject],
     active_tool: ActiveTool,
     coarse_rotate: bool,
+    active_container: Option<&str>,
     selection: Option<&str>,
     camera: &mut CameraState,
     input_drag: &mut Option<InputDragState>,
@@ -2388,7 +2459,7 @@ pub(crate) fn step_object_pointer(
                     return;
                 }
             }
-            match hit_object_in_regions(regions, camera, screen) {
+            match hit_object_scoped(regions, objects, camera, screen, active_container) {
                 Some(id) => {
                     object_out.selection = Some(id.clone());
                     *input_drag = Some(InputDragState::Object {
@@ -2564,6 +2635,7 @@ pub(crate) fn object_double_click(
 pub(crate) fn object_regions_in_marquee(regions: &[ObjectRegion], rect: &WorldRect) -> Vec<String> {
     regions
         .iter()
+        .filter(|region| !region.hidden && !region.locked)
         .filter_map(|region| {
             let bounds = region_world_bounds(region, None)?;
             rects_intersect(&bounds, rect).then(|| region.id.clone())
@@ -2669,7 +2741,7 @@ pub(crate) fn nearest_outline_point(
             continue;
         };
         let Some((local_pt, _local_d2)) =
-            nearest_point_on_polyline(&region.outline, region.closed, lx as f32, ly as f32)
+            nearest_point_on_polyline(&region.outline, region.closed, shape_renderer_core::cast::narrow_f32(lx), shape_renderer_core::cast::narrow_f32(ly))
         else {
             continue;
         };
@@ -2889,9 +2961,14 @@ pub(crate) fn overlay_max_lines(field: &str) -> u8 {
 
 #[cfg(feature = "wgpu-probe")]
 pub(crate) fn css_color(color: [f32; 4]) -> String {
-    let red = (color[0].clamp(0.0, 1.0) * 255.0).round() as u8;
-    let green = (color[1].clamp(0.0, 1.0) * 255.0).round() as u8;
-    let blue = (color[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "clamped to [0.0, 1.0] then scaled by 255 and rounded; the value is an exact integer in u8 range"
+    )]
+    let channel = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let red = channel(color[0]);
+    let green = channel(color[1]);
+    let blue = channel(color[2]);
     format!(
         "rgba({red}, {green}, {blue}, {:.3})",
         color[3].clamp(0.0, 1.0)
@@ -3031,9 +3108,18 @@ pub(crate) fn card_text_layout(card: &WorldRect, style: &ShapeRenderStyle, selec
     let detail_y = (content_bottom - detail_line_height).max(summary_y + summary_line_height);
     let summary_available =
         (detail_y - summary_y - style.spacing.card_gap).max(summary_line_height);
+    // Non-negative line counts, each immediately clamped to a tiny range.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "non-negative floored line count, clamped to a tiny range below; exact integer in range"
+    )]
     let summary_max_lines =
         ((summary_available / summary_line_height).floor() as usize).clamp(1, 3);
     let detail_available = (content_bottom - detail_y).max(0.0);
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "non-negative floored line count, clamped to a tiny range below; exact integer in range"
+    )]
     let detail_max_lines =
         ((detail_available / detail_line_height + 0.001).floor() as usize).min(6);
     CardTextLayout {
@@ -4023,6 +4109,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 
@@ -4037,8 +4125,8 @@ mod tests {
         let cy = q(h / 2);
         let rx = w * 8 / 2;
         let ry = h * 8 / 2;
-        let kx = (rx as f32 * 0.5523).round() as i32;
-        let ky = (ry as f32 * 0.5523).round() as i32;
+        let kx = shape_renderer_core::cast::round_i32(f64::from(rx) * 0.5523);
+        let ky = shape_renderer_core::cast::round_i32(f64::from(ry) * 0.5523);
         let d = format!(
             "M 0 {cy} C 0 {} {} 0 {cx} 0 C {} 0 {qw} {} {qw} {cy} \
              C {qw} {} {} {qh} {cx} {qh} C {} {qh} 0 {} 0 {cy} Z",
@@ -4062,6 +4150,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 
@@ -4080,6 +4170,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 
@@ -4103,6 +4195,119 @@ mod tests {
             y: 0.0,
             zoom: 1.0,
         }
+    }
+
+    #[test]
+    fn hidden_object_is_not_hittable_or_drawn() {
+        // A hidden rect must not be hit (non-render => non-interactive) and must
+        // tessellate ZERO fill vertices. FAILS today: the flag was dropped, so the
+        // region was built (hittable) and the fill tessellated.
+        let mut hidden = rect_object("h", 0.0, 0.0, 20);
+        hidden.hidden = true;
+        let scene = object_scene(vec![hidden]);
+        let regions = derive_object_regions(&scene);
+        let camera = identity_camera();
+
+        // A point inside the bbox misses the hidden region.
+        assert_eq!(
+            hit_object_in_regions(&regions, &camera, WorldPoint { x: 10.0, y: 10.0 }),
+            None,
+            "a hidden object is not hittable"
+        );
+
+        // The geometry build emits zero fill vertices over the hidden object's range.
+        let geo = shape_renderer_core::build_scene_geometry(&scene);
+        let draw = geo.draws.iter().find(|d| d.id == "h").expect("draw slot kept");
+        assert!(
+            draw.fill_range.is_empty() && draw.fill_vertex_range.is_empty(),
+            "a hidden object tessellates no fill"
+        );
+    }
+
+    #[test]
+    fn locked_object_pointer_down_does_not_select_or_drag() {
+        // A locked rect: a PointerDown inside it must NOT select it and must NOT start
+        // an Object drag — it falls through to a Marquee. FAILS today: the locked flag
+        // was dropped, so the region was hit and an Object drag started.
+        let mut locked = rect_object("l", 0.0, 0.0, 20);
+        locked.locked = true;
+        let scene = object_scene(vec![locked]);
+        let regions = derive_object_regions(&scene);
+        let mut camera = identity_camera();
+        let mut drag: Option<InputDragState> = None;
+        let mut out = ObjectInputOut::default();
+
+        step_object_pointer(
+            &CanvasInputEvent::PointerDown {
+                pointer_id: 1,
+                screen: WorldPoint { x: 10.0, y: 10.0 },
+            },
+            &regions,
+            &scene.objects,
+            ActiveTool::Select,
+            false,
+            None,
+            None,
+            &mut camera,
+            &mut drag,
+            &mut out,
+        );
+        assert!(out.selection.is_none(), "a locked object is not selectable");
+        assert!(
+            matches!(drag, Some(InputDragState::Marquee { .. })),
+            "a locked-object pointer-down falls through to a Marquee, not an Object drag"
+        );
+    }
+
+    #[test]
+    fn pointer_down_inside_active_container_selects_child_not_frame() {
+        // A container frame `f` spanning [0,40]² placed LAST (top-most) + a child `c`
+        // (parent=f) spanning [5,15]² placed first (under the frame at the shared
+        // point). With no scope, a click resolves to the top-most `f` (status quo).
+        // With `f` as the active scope, the SAME click resolves to the direct child
+        // `c`; a click inside `f` but outside `c` keeps `f`. FAILS today: the scope is
+        // ignored and the top-most `f` always wins.
+        let mut child = rect_object("c", 5.0, 5.0, 10); // local 10px @ (5,5) => [5,15]
+        child.parent = Some("f".to_string());
+        let frame = rect_object("f", 0.0, 0.0, 40); // [0,40], LAST => top-most
+        let scene = object_scene(vec![child, frame]);
+        let regions = derive_object_regions(&scene);
+        let camera = identity_camera();
+        let inside_child = WorldPoint { x: 10.0, y: 10.0 };
+        let frame_only = WorldPoint { x: 35.0, y: 35.0 };
+
+        // No active container: the top-most frame wins (pins status quo).
+        assert_eq!(
+            hit_object_scoped(&regions, &scene.objects, &camera, inside_child, None).as_deref(),
+            Some("f"),
+            "unscoped click selects the top-level container"
+        );
+
+        // Scope = f: the same click drills to the direct child under the pointer.
+        assert_eq!(
+            hit_object_scoped(&regions, &scene.objects, &camera, inside_child, Some("f"))
+                .as_deref(),
+            Some("c"),
+            "a scoped click inside the container selects the direct child"
+        );
+        // A click inside the container but outside any child keeps the container.
+        assert_eq!(
+            hit_object_scoped(&regions, &scene.objects, &camera, frame_only, Some("f")).as_deref(),
+            Some("f"),
+            "an empty-inside click selects the container (does not exit)"
+        );
+        // A click entirely outside the container returns None (the shell exits scope).
+        assert_eq!(
+            hit_object_scoped(
+                &regions,
+                &scene.objects,
+                &camera,
+                WorldPoint { x: 100.0, y: 100.0 },
+                Some("f")
+            ),
+            None,
+            "a click outside the scope returns None"
+        );
     }
 
     #[test]
@@ -4311,8 +4516,10 @@ mod tests {
                 screen: WorldPoint { x: 10.0, y: 10.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             None,
             &mut camera,
             &mut drag,
@@ -4331,8 +4538,10 @@ mod tests {
                 screen: WorldPoint { x: 18.0, y: 13.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             None,
             &mut camera,
             &mut drag,
@@ -4356,8 +4565,10 @@ mod tests {
                 edge_id: None,
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             None,
             &mut camera,
             &mut drag,
@@ -4385,8 +4596,10 @@ mod tests {
                 screen: WorldPoint { x: -5.0, y: -5.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             None,
             &mut camera,
             &mut drag,
@@ -4403,8 +4616,10 @@ mod tests {
                 edge_id: None,
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             None,
             &mut camera,
             &mut drag,
@@ -4429,18 +4644,18 @@ mod tests {
         // Down bottom-right of "near" on empty space.
         step_object_pointer(
             &CanvasInputEvent::PointerDown { pointer_id: 4, screen: WorldPoint { x: 15.0, y: 15.0 } },
-            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
+            &regions, &scene.objects, ActiveTool::Select, false, None, None, &mut camera, &mut drag, &mut out,
         );
         assert!(matches!(drag, Some(InputDragState::Marquee { .. })));
         // Move toward top-left through an intermediate point (real drags emit moves).
         step_object_pointer(
             &CanvasInputEvent::PointerMove { pointer_id: 4, screen: WorldPoint { x: 5.0, y: 5.0 } },
-            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
+            &regions, &scene.objects, ActiveTool::Select, false, None, None, &mut camera, &mut drag, &mut out,
         );
         // Up at (-5,-5): reversed rect [-5,15]² covers "near" only.
         step_object_pointer(
             &CanvasInputEvent::PointerUp { pointer_id: 4, screen: WorldPoint { x: -5.0, y: -5.0 }, edge_id: None },
-            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
+            &regions, &scene.objects, ActiveTool::Select, false, None, None, &mut camera, &mut drag, &mut out,
         );
         assert_eq!(out.marquee_ids, Some(vec!["near".to_string()]));
     }
@@ -4465,7 +4680,7 @@ mod tests {
         // Down on empty canvas -> must start a Marquee, not an Object drag.
         step_object_pointer(
             &CanvasInputEvent::PointerDown { pointer_id: 7, screen: WorldPoint { x: -5.0, y: -5.0 } },
-            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
+            &regions, &scene.objects, ActiveTool::Select, false, None, None, &mut camera, &mut drag, &mut out,
         );
         assert!(matches!(drag, Some(InputDragState::Marquee { .. })),
             "empty-canvas down starts a Marquee, not an Object move");
@@ -4474,12 +4689,12 @@ mod tests {
         // Drag across both bodies (the move only grows the live overlay).
         step_object_pointer(
             &CanvasInputEvent::PointerMove { pointer_id: 7, screen: WorldPoint { x: 55.0, y: 25.0 } },
-            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
+            &regions, &scene.objects, ActiveTool::Select, false, None, None, &mut camera, &mut drag, &mut out,
         );
         // Up at (55,25): rect [-5,55] x [-5,25] (anchor + up corner) covers BOTH.
         step_object_pointer(
             &CanvasInputEvent::PointerUp { pointer_id: 7, screen: WorldPoint { x: 55.0, y: 25.0 }, edge_id: None },
-            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
+            &regions, &scene.objects, ActiveTool::Select, false, None, None, &mut camera, &mut drag, &mut out,
         );
         let mut ids = out.marquee_ids.take().expect("pointer-up on a Marquee yields ids");
         ids.sort();
@@ -4503,6 +4718,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         };
         let scene = object_scene(vec![l_shape]);
         let regions = derive_object_regions(&scene);
@@ -4523,7 +4740,7 @@ mod tests {
         let mut out = ObjectInputOut::default();
         step_object_pointer(
             &CanvasInputEvent::PointerDown { pointer_id: 8, screen: WorldPoint { x: 5.0, y: 15.0 } },
-            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
+            &regions, &scene.objects, ActiveTool::Select, false, None, None, &mut camera, &mut drag, &mut out,
         );
         assert!(matches!(drag, Some(InputDragState::Marquee { .. })),
             "notch down starts a Marquee, not an Object move");
@@ -4552,11 +4769,11 @@ mod tests {
         // Down on empty space then a move grows an in-flight marquee.
         step_object_pointer(
             &CanvasInputEvent::PointerDown { pointer_id: 5, screen: WorldPoint { x: -20.0, y: -20.0 } },
-            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
+            &regions, &scene.objects, ActiveTool::Select, false, None, None, &mut camera, &mut drag, &mut out,
         );
         step_object_pointer(
             &CanvasInputEvent::PointerMove { pointer_id: 5, screen: WorldPoint { x: 30.0, y: 30.0 } },
-            &regions, ActiveTool::Select, false, None, &mut camera, &mut drag, &mut out,
+            &regions, &scene.objects, ActiveTool::Select, false, None, None, &mut camera, &mut drag, &mut out,
         );
         assert!(matches!(drag, Some(InputDragState::Marquee { .. })));
         // The shared source the object pass draws must produce a full overlay
@@ -4639,8 +4856,10 @@ mod tests {
                 screen: WorldPoint { x: 10.0, y: 10.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -4661,8 +4880,10 @@ mod tests {
                 screen: WorldPoint { x: 14.0, y: 12.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -5025,8 +5246,10 @@ mod tests {
                 screen: WorldPoint { x: 20.0, y: 0.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -5045,8 +5268,10 @@ mod tests {
                 screen: WorldPoint { x: 40.0, y: -20.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -5067,8 +5292,10 @@ mod tests {
                 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             Some("o1"),
             &mut camera,
             &mut drag2,
@@ -5102,8 +5329,10 @@ mod tests {
                 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             true,
+            None,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -5124,8 +5353,10 @@ mod tests {
                 screen: world_now,
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             true,
+            None,
             Some("o1"),
             &mut camera,
             &mut drag,
@@ -5178,6 +5409,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 
@@ -5325,8 +5558,10 @@ mod tests {
                 screen: WorldPoint { x: 40.0, y: 0.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             Some("l"),
             &mut camera,
             &mut drag,
@@ -5345,8 +5580,10 @@ mod tests {
                 screen: WorldPoint { x: 55.0, y: 7.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             Some("l"),
             &mut camera,
             &mut drag,
@@ -5366,8 +5603,10 @@ mod tests {
                 edge_id: None,
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             Some("l"),
             &mut camera,
             &mut drag,
@@ -5382,8 +5621,10 @@ mod tests {
                 screen: WorldPoint { x: 0.0, y: 0.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Select,
             false,
+            None,
             Some("l"),
             &mut camera,
             &mut drag,
@@ -5445,8 +5686,10 @@ mod tests {
                 screen: WorldPoint { x: 10.0, y: 10.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Hand,
             false,
+            None,
             None,
             &mut camera,
             &mut drag,
@@ -5461,8 +5704,10 @@ mod tests {
                 screen: WorldPoint { x: 40.0, y: 30.0 },
             },
             &regions,
+            &scene.objects,
             ActiveTool::Hand,
             false,
+            None,
             None,
             &mut camera,
             &mut drag,
@@ -5506,7 +5751,7 @@ mod tests {
             zoom: 2.5,
         };
         let live = ObjectMatrixUniform {
-            camera: [camera.x as f32, camera.y as f32, camera.zoom as f32, 0.0],
+            camera: [shape_renderer_core::cast::narrow_f32(camera.x), shape_renderer_core::cast::narrow_f32(camera.y), shape_renderer_core::cast::narrow_f32(camera.zoom), 0.0],
             viewport: [1280.0, 720.0, 0.0, 0.0],
         };
         // Same viewport packing; camera differs because the live camera moved.
@@ -5536,15 +5781,15 @@ mod tests {
         // Pointer path: a logical screen point becomes world via the camera.
         let screen = (210.0_f32, 140.0_f32);
         let world = (
-            (screen.0 - camera.x as f32) / camera.zoom as f32,
-            (screen.1 - camera.y as f32) / camera.zoom as f32,
+            (screen.0 - shape_renderer_core::cast::narrow_f32(camera.x)) / shape_renderer_core::cast::narrow_f32(camera.zoom),
+            (screen.1 - shape_renderer_core::cast::narrow_f32(camera.y)) / shape_renderer_core::cast::narrow_f32(camera.zoom),
         );
 
         // Shader path (object_fill.wgsl world_to_clip): screen = world*zoom+cam,
         // then NDC against the uniform viewport.
         let to_ndc = |viewport: [f32; 4]| {
-            let sx = world.0 * camera.zoom as f32 + camera.x as f32;
-            let sy = world.1 * camera.zoom as f32 + camera.y as f32;
+            let sx = world.0 * shape_renderer_core::cast::narrow_f32(camera.zoom) + shape_renderer_core::cast::narrow_f32(camera.x);
+            let sy = world.1 * shape_renderer_core::cast::narrow_f32(camera.zoom) + shape_renderer_core::cast::narrow_f32(camera.y);
             (
                 (sx / viewport[0]) * 2.0 - 1.0,
                 1.0 - (sy / viewport[1]) * 2.0,

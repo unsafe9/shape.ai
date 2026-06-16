@@ -326,7 +326,12 @@ pub struct MsdfGlyphEntry {
 }
 
 /// A glyph's fontdue coverage raster + placement metrics, the generator input.
-/// `coverage` is row-major 8-bit alpha, `width`×`height` px.
+/// `coverage` is row-major 8-bit alpha, `width`×`height` texels. When the host
+/// oversamples (rasterizes at `font_size * oversample` px so the SDF source grid is
+/// finer than the on-screen glyph — sharp retina text), `coverage`/`width`/`height`
+/// and the bearings are in those high-res texels; `oversample` rescales the emitted
+/// quad geometry back to logical px so layout stays resolution-independent. `1.0`
+/// means no oversample (texels == logical px).
 #[derive(Clone, Debug)]
 pub struct GlyphCoverage<'a> {
     pub key: MsdfGlyphKey,
@@ -336,6 +341,8 @@ pub struct GlyphCoverage<'a> {
     /// Bearing from pen origin to glyph left (fontdue `xmin`).
     pub bearing_x: f32,
     pub bearing_y: f32,
+    /// Raster-texels-per-logical-px (≥ 1.0); divides the emitted entry geometry.
+    pub oversample: f32,
 }
 
 /// The shader-facing SDF atlas: dimensions, distance range, glyph->slot mapping, and
@@ -398,9 +405,9 @@ impl MsdfAtlasPlan {
         }
 
         // Pad each cell by `distance_range` texels so the field has room to ramp.
-        let pad = self.distance_range.ceil().max(1.0) as u32;
-        let glyph_w = glyph.width as u32;
-        let glyph_h = glyph.height as u32;
+        let pad = crate::cast::round_u32(self.distance_range.ceil().max(1.0));
+        let glyph_w = u32::try_from(glyph.width).unwrap_or(u32::MAX);
+        let glyph_h = u32::try_from(glyph.height).unwrap_or(u32::MAX);
         let cell_w = glyph_w + pad * 2;
         let cell_h = glyph_h + pad * 2;
 
@@ -417,6 +424,10 @@ impl MsdfAtlasPlan {
         for row in 0..cell_h {
             for col in 0..cell_w {
                 let value = sdf[(row * cell_w + col) as usize];
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "clamped to [0.0, 255.0] then rounded; the value is an exact integer in u8 range"
+                )]
                 let texel = (value * 255.0).round().clamp(0.0, 255.0) as u8;
                 let index = (((origin_y + row) * atlas_w + (origin_x + col)) * 4) as usize;
                 self.pixels[index] = texel;
@@ -428,18 +439,22 @@ impl MsdfAtlasPlan {
 
         // The quad covers the full padded cell (AA ramp visible); bearings shift
         // left/up by `pad` to keep the glyph's ink registered against the pen origin.
+        // The cell/bearings are in high-res texels; dividing by `oversample` emits the
+        // quad in logical px so an oversampled (sharper) atlas slot still lays out at
+        // the same size — the layout is resolution-independent, only the SDF is finer.
         let aw = self.atlas_width as f32;
         let ah = self.atlas_height as f32;
         let left = origin_x as f32 / aw;
         let right = (origin_x + cell_w) as f32 / aw;
         let top = origin_y as f32 / ah;
         let bottom = (origin_y + cell_h) as f32 / ah;
+        let inv_oversample = 1.0 / glyph.oversample.max(1.0);
         let entry = MsdfGlyphEntry {
             uv: [[left, top], [right, top], [right, bottom], [left, bottom]],
-            bearing_x: glyph.bearing_x - pad as f32,
-            bearing_y: glyph.bearing_y - pad as f32,
-            width: cell_w as f32,
-            height: cell_h as f32,
+            bearing_x: (glyph.bearing_x - pad as f32) * inv_oversample,
+            bearing_y: (glyph.bearing_y - pad as f32) * inv_oversample,
+            width: cell_w as f32 * inv_oversample,
+            height: cell_h as f32 * inv_oversample,
         };
         self.entries.insert(glyph.key, entry);
         Some(entry)
@@ -477,9 +492,13 @@ impl MsdfAtlasPlan {
 }
 
 /// Build a single-channel signed distance field from a glyph coverage raster.
-/// Coverage is thresholded at 0.5 into an inside/outside mask in a `pad`-padded
-/// cell, converted via the 8SSEDT dead-reckoning transform, then normalized so 0.5
-/// sits on the outline and ±`distance_range` texels map to the [0,1] ends. Pure.
+/// The continuous coverage ramp (not a 1-bit threshold) places the outline at the
+/// 0.5 crossing with sub-texel precision: each boundary texel contributes a
+/// fractional offset `(0.5 - coverage)/|∇coverage|` along the coverage gradient,
+/// which the 8SSEDT dead-reckoning transform carries with the nearest-feature
+/// offset so the zero crossing lands between texels instead of snapping to one.
+/// Normalized so 0.5 sits on the outline and ±`distance_range` texels map to
+/// [0, 1]. Pure.
 fn coverage_to_sdf(
     coverage: &[u8],
     width: usize,
@@ -491,27 +510,37 @@ fn coverage_to_sdf(
     let cell_h = height + pad * 2;
     let n = cell_w * cell_h;
 
-    // Inside mask in the padded cell: coverage >= 128 is "inside the glyph".
+    // Continuous coverage in the padded cell, plus the inside/outside mask the
+    // sign comes from. The padding stays at 0 (fully outside).
+    let mut cov = vec![0.0_f32; n];
     let mut inside = vec![false; n];
     for y in 0..height {
         for x in 0..width {
-            if coverage[y * width + x] >= 128 {
-                inside[(y + pad) * cell_w + (x + pad)] = true;
-            }
+            let c = f32::from(coverage[y * width + x]) / 255.0;
+            let idx = (y + pad) * cell_w + (x + pad);
+            cov[idx] = c;
+            inside[idx] = c >= 0.5;
         }
     }
 
-    // One distance transform per side, combined into a signed distance.
-    let dist_inside = euclidean_distance_to_other(&inside, cell_w, cell_h, true);
-    let dist_outside = euclidean_distance_to_other(&inside, cell_w, cell_h, false);
+    // Per-boundary-texel sub-texel edge offset, measured from the texel center
+    // along the coverage gradient: how far (in texels, unsigned) the true 0.5
+    // crossing sits from this feature point. Non-boundary texels get 0.
+    let frac = boundary_subtexel_offset(&cov, &inside, cell_w, cell_h);
+
+    // One distance transform per side, each carrying the nearest feature's
+    // fractional offset so the integer hop is corrected to the real crossing.
+    let dist_inside = euclidean_distance_to_other(&inside, &frac, cell_w, cell_h, true);
+    let dist_outside = euclidean_distance_to_other(&inside, &frac, cell_w, cell_h, false);
 
     let mut out = vec![0.0_f32; n];
     for i in 0..n {
-        // Positive inside, negative outside; the half-texel centers the zero crossing.
+        // Positive inside, negative outside; the carried fractional offset (not a
+        // constant half-texel) places the zero crossing at the coverage 0.5 edge.
         let signed = if inside[i] {
-            dist_inside[i] - 0.5
+            dist_inside[i]
         } else {
-            -(dist_outside[i] - 0.5)
+            -dist_outside[i]
         };
         // Map [-range, +range] texels -> [0, 1], 0.5 = outline.
         out[i] = (signed / (2.0 * distance_range) + 0.5).clamp(0.0, 1.0);
@@ -519,35 +548,89 @@ fn coverage_to_sdf(
     out
 }
 
+/// For every texel adjacent to the 0.5 coverage crossing, the unsigned sub-texel
+/// distance from its center to the crossing, reconstructed from the anti-aliased
+/// coverage ramp: `|0.5 - coverage| / |∇coverage|` (central differences). This
+/// recovers the true outline position discarded by a 1-bit threshold. Texels not
+/// straddling the crossing — and any with a flat local gradient — get 0, falling
+/// back to the integer feature distance. Result is in [0, 0.5].
+fn boundary_subtexel_offset(cov: &[f32], inside: &[bool], w: usize, h: usize) -> Vec<f32> {
+    let mut frac = vec![0.0_f32; w * h];
+    let at = |x: usize, y: usize| cov[y * w + x];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            // A feature point is a texel with at least one opposite-side 4-neighbour.
+            let here = inside[i];
+            let boundary = (x > 0 && inside[i - 1] != here)
+                || (x + 1 < w && inside[i + 1] != here)
+                || (y > 0 && inside[i - w] != here)
+                || (y + 1 < h && inside[i + w] != here);
+            if !boundary {
+                continue;
+            }
+            // Central-difference gradient (clamped one-sided at the border).
+            let xr = (x + 1).min(w - 1);
+            let xl = x.saturating_sub(1);
+            let yd = (y + 1).min(h - 1);
+            let yu = y.saturating_sub(1);
+            let dx = (at(xr, y) - at(xl, y)) * 0.5;
+            let dy = (at(x, yd) - at(x, yu)) * 0.5;
+            let grad = (dx * dx + dy * dy).sqrt();
+            // Flat ramp -> no reliable sub-texel info; leave 0 (integer fallback).
+            if grad > 1e-4 {
+                // Distance to the 0.5 crossing along the gradient, in texels.
+                frac[i] = ((0.5 - cov[i]).abs() / grad).min(0.5);
+            }
+        }
+    }
+    frac
+}
+
 /// Euclidean distance from every `target`-side cell to the nearest opposite-side
-/// cell (others get 0). Dead-reckoning 8SSEDT: store the offset to the nearest
-/// boundary feature point and relax it in a forward then backward sweep.
+/// outline crossing (others get 0). Dead-reckoning 8SSEDT: store the offset to the
+/// nearest boundary feature point and relax it in a forward then backward sweep.
+/// Each feature carries its sub-texel `frac` (distance from its center to the 0.5
+/// crossing along the coverage gradient); the returned distance subtracts the
+/// nearest feature's `frac`, so the zero crossing lands on the real outline rather
+/// than snapping to the feature texel's center.
 fn euclidean_distance_to_other(
     inside: &[bool],
+    frac: &[f32],
     w: usize,
     h: usize,
     target: bool,
 ) -> Vec<f32> {
     const INF: f32 = 1.0e9;
     let n = w * h;
-    // Per-cell nearest-feature offset (dx, dy); distance is its hypot.
+    // Per-cell nearest-feature offset (dx, dy) and that feature's sub-texel frac.
     let mut dx = vec![0_i32; n];
     let mut dy = vec![0_i32; n];
+    let mut frac_at = vec![0.0_f32; n];
     let mut dist = vec![INF; n];
 
-    // Seed: a cell of the OPPOSITE side is a boundary feature point at distance 0.
+    // Seed: a cell of the OPPOSITE side is a boundary feature point at distance 0,
+    // carrying its own coverage-derived sub-texel offset to the true crossing.
     for i in 0..n {
         if inside[i] != target {
             dist[i] = 0.0;
             dx[i] = 0;
             dy[i] = 0;
+            frac_at[i] = frac[i];
         }
     }
 
     let hypot = |x: i32, y: i32| -> f32 { ((x * x + y * y) as f32).sqrt() };
 
     // Relax cell `i` against neighbour `j` offset by (ox, oy).
-    let relax = |i: usize, j: usize, ox: i32, oy: i32, dx: &mut [i32], dy: &mut [i32], dist: &mut [f32]| {
+    let relax = |i: usize,
+                 j: usize,
+                 ox: i32,
+                 oy: i32,
+                 dx: &mut [i32],
+                 dy: &mut [i32],
+                 frac_at: &mut [f32],
+                 dist: &mut [f32]| {
         let cand_x = dx[j] + ox;
         let cand_y = dy[j] + oy;
         let cand = hypot(cand_x, cand_y);
@@ -555,6 +638,7 @@ fn euclidean_distance_to_other(
             dist[i] = cand;
             dx[i] = cand_x;
             dy[i] = cand_y;
+            frac_at[i] = frac_at[j];
         }
     };
 
@@ -563,15 +647,15 @@ fn euclidean_distance_to_other(
         for x in 0..w {
             let i = y * w + x;
             if x > 0 {
-                relax(i, i - 1, 1, 0, &mut dx, &mut dy, &mut dist);
+                relax(i, i - 1, 1, 0, &mut dx, &mut dy, &mut frac_at, &mut dist);
             }
             if y > 0 {
-                relax(i, i - w, 0, 1, &mut dx, &mut dy, &mut dist);
+                relax(i, i - w, 0, 1, &mut dx, &mut dy, &mut frac_at, &mut dist);
                 if x > 0 {
-                    relax(i, i - w - 1, 1, 1, &mut dx, &mut dy, &mut dist);
+                    relax(i, i - w - 1, 1, 1, &mut dx, &mut dy, &mut frac_at, &mut dist);
                 }
                 if x + 1 < w {
-                    relax(i, i - w + 1, 1, 1, &mut dx, &mut dy, &mut dist);
+                    relax(i, i - w + 1, 1, 1, &mut dx, &mut dy, &mut frac_at, &mut dist);
                 }
             }
         }
@@ -581,23 +665,27 @@ fn euclidean_distance_to_other(
         for x in (0..w).rev() {
             let i = y * w + x;
             if x + 1 < w {
-                relax(i, i + 1, 1, 0, &mut dx, &mut dy, &mut dist);
+                relax(i, i + 1, 1, 0, &mut dx, &mut dy, &mut frac_at, &mut dist);
             }
             if y + 1 < h {
-                relax(i, i + w, 0, 1, &mut dx, &mut dy, &mut dist);
+                relax(i, i + w, 0, 1, &mut dx, &mut dy, &mut frac_at, &mut dist);
                 if x + 1 < w {
-                    relax(i, i + w + 1, 1, 1, &mut dx, &mut dy, &mut dist);
+                    relax(i, i + w + 1, 1, 1, &mut dx, &mut dy, &mut frac_at, &mut dist);
                 }
                 if x > 0 {
-                    relax(i, i + w - 1, 1, 1, &mut dx, &mut dy, &mut dist);
+                    relax(i, i + w - 1, 1, 1, &mut dx, &mut dy, &mut frac_at, &mut dist);
                 }
             }
         }
     }
 
-    for d in &mut dist {
-        if *d >= INF {
-            *d = 0.0;
+    // The true outline sits `frac_at` texels short of the feature center along the
+    // gradient, so subtract it (the old fixed half-texel, now reconstructed).
+    for i in 0..n {
+        if dist[i] >= INF {
+            dist[i] = 0.0;
+        } else {
+            dist[i] = (dist[i] - frac_at[i]).max(0.0);
         }
     }
     dist
@@ -883,6 +971,7 @@ mod tests {
                 height: side,
                 bearing_x: 2.0,
                 bearing_y: 3.0,
+                oversample: 1.0,
             })
             .expect("atlas has room");
 
@@ -900,15 +989,55 @@ mod tests {
 
         // The field reads "inside" (>0.5) at the cell center and "outside" (<0.5)
         // at a far corner of the padded cell — a real signed distance ramp.
-        let origin_x = (entry.uv[0][0] * plan.atlas_width as f32).round() as u32;
-        let origin_y = (entry.uv[0][1] * plan.atlas_height as f32).round() as u32;
-        let cell_w = entry.width as u32;
-        let cell_h = entry.height as u32;
+        let origin_x = crate::cast::round_u32(entry.uv[0][0] * plan.atlas_width as f32);
+        let origin_y = crate::cast::round_u32(entry.uv[0][1] * plan.atlas_height as f32);
+        let cell_w = crate::cast::round_u32(entry.width);
+        let cell_h = crate::cast::round_u32(entry.height);
         let center = sampled_distance(&plan, origin_x + cell_w / 2, origin_y + cell_h / 2);
         let corner = sampled_distance(&plan, origin_x, origin_y);
         assert!(center > 0.5, "glyph interior is inside the outline: {center}");
         assert!(corner < 0.5, "padded corner is outside the outline: {corner}");
         assert!(center > corner, "distance ramps from corner to center");
+    }
+
+    /// Oversampling raises the SDF source resolution (the host rasterizes the
+    /// coverage at `size * oversample` px for sharp retina text) WITHOUT changing
+    /// layout: `generate_glyph` divides the emitted quad geometry by `oversample`, so
+    /// the same coverage fills the same atlas slot but lays out at the logical size.
+    /// Fails if the division is dropped — text would render `oversample`× too big.
+    #[test]
+    fn oversample_keeps_layout_logical_while_slot_stays_high_res() {
+        let side = 16;
+        let coverage = solid_block(side);
+        let make = |oversample: f32| {
+            let mut plan = MsdfAtlasPlan::new(256, 256, 4.0);
+            let entry = plan
+                .generate_glyph(&GlyphCoverage {
+                    key: glyph_key(1),
+                    coverage: &coverage,
+                    width: side,
+                    height: side,
+                    bearing_x: 10.0,
+                    bearing_y: 10.0,
+                    oversample,
+                })
+                .expect("atlas has room");
+            entry
+        };
+        let e1 = make(1.0);
+        let e2 = make(2.0);
+
+        // Same source coverage => identical atlas-slot footprint: the SDF stays
+        // high-res, the slot is NOT shrunk by oversampling.
+        let span = |e: &MsdfGlyphEntry| (e.uv[1][0] - e.uv[0][0], e.uv[2][1] - e.uv[0][1]);
+        assert!((span(&e1).0 - span(&e2).0).abs() < 1e-6);
+        assert!((span(&e1).1 - span(&e2).1).abs() < 1e-6);
+
+        // ...but the emitted quad geometry is HALVED at oversample=2 (logical layout
+        // is resolution-independent). A dropped division leaves e2 == e1 and fails.
+        assert!((e2.width - e1.width / 2.0).abs() < 1e-3, "width halves: {} vs {}", e2.width, e1.width);
+        assert!((e2.height - e1.height / 2.0).abs() < 1e-3, "height halves");
+        assert!((e2.bearing_x - e1.bearing_x / 2.0).abs() < 1e-3, "bearing halves");
     }
 
     #[test]
@@ -922,6 +1051,7 @@ mod tests {
             height: 12,
             bearing_x: 0.0,
             bearing_y: 0.0,
+            oversample: 1.0,
         };
         let first = plan.generate_glyph(&g).unwrap();
         let pixels_after_first = plan.pixels().to_vec();
@@ -943,6 +1073,7 @@ mod tests {
                 height: 0,
                 bearing_x: 5.0,
                 bearing_y: 6.0,
+                oversample: 1.0,
             })
             .expect("blank always fits");
         // No quad (zero size), bearings preserved (e.g. a space advance).
@@ -964,9 +1095,62 @@ mod tests {
             height: 16,
             bearing_x: 0.0,
             bearing_y: 0.0,
+            oversample: 1.0,
         });
         assert!(result.is_none(), "no room: caller falls back to fontdue raster");
         assert_eq!(plan.glyph_count(), 0);
+    }
+
+    /// DEFECT 3 (i): the populated atlas has REAL non-zero coverage for a committed
+    /// run's glyphs, sourced from the bundled fonts via the host coverage seam. The
+    /// blank `MsdfAtlasPlan::new` upload the live path shipped is all-zero, so the
+    /// shader's `median3` was 0 and every glyph painted fully transparent — this
+    /// FAILS against that all-zero atlas and passes once real coverage is packed.
+    #[test]
+    fn generate_glyph_from_real_font_coverage_has_nonzero_texels() {
+        let engine = crate::text::TextEngine::new().expect("bundled fonts load");
+        let mut plan = MsdfAtlasPlan::new(2048, 2048, 4.0);
+
+        // A committed run "AB" at the size:None default (16px after de-quant).
+        let mut packed_any = false;
+        for ch in "AB".chars() {
+            let cov = engine
+                .glyph_coverage(ch, 16.0, 1.0)
+                .unwrap_or_else(|| panic!("glyph '{ch}' rasterizes"));
+            let entry = plan
+                .generate_glyph(&GlyphCoverage {
+                    key: MsdfGlyphKey {
+                        font_index: cov.font_index,
+                        glyph_id: cov.glyph_id,
+                        px: cov.px,
+                    },
+                    coverage: &cov.coverage,
+                    width: cov.width,
+                    height: cov.height,
+                    bearing_x: cov.bearing_x,
+                    bearing_y: cov.bearing_y,
+                    oversample: cov.oversample,
+                })
+                .expect("atlas has room");
+
+            // The glyph's slot must contain at least one texel above 0 (real ink),
+            // not the all-zero blank atlas.
+            let origin_x = crate::cast::round_u32(entry.uv[0][0] * plan.atlas_width as f32);
+            let origin_y = crate::cast::round_u32(entry.uv[0][1] * plan.atlas_height as f32);
+            let cell_w = crate::cast::round_u32(entry.width);
+            let cell_h = crate::cast::round_u32(entry.height);
+            let mut has_ink = false;
+            for row in 0..cell_h {
+                for col in 0..cell_w {
+                    if sampled_distance(&plan, origin_x + col, origin_y + row) > 0.0 {
+                        has_ink = true;
+                    }
+                }
+            }
+            assert!(has_ink, "glyph '{ch}' slot has a non-zero coverage texel");
+            packed_any = true;
+        }
+        assert!(packed_any && plan.glyph_count() > 0, "atlas packed real glyphs");
     }
 
     #[test]
@@ -982,5 +1166,90 @@ mod tests {
         let corner = a[0];
         assert!(center > 0.5, "interior inside: {center}");
         assert!(corner < 0.5, "padding outside: {corner}");
+    }
+
+    /// A vertical edge raster: `cols` columns are solid inside (255), one transition
+    /// column carries `edge_cov`, the rest are fully outside (0). The transition
+    /// column's anti-aliased coverage pins the true 0.5 crossing at a sub-texel
+    /// position. `width`/`height` chosen so the gradient at the edge is well-defined.
+    fn vertical_edge(edge_cov: u8) -> (Vec<u8>, usize, usize) {
+        let width = 6;
+        let height = 4;
+        let inside_cols = 2; // cols 0,1 solid inside; col 2 is the AA transition.
+        let mut cov = vec![0_u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                cov[y * width + x] = if x < inside_cols {
+                    255
+                } else if x == inside_cols {
+                    edge_cov
+                } else {
+                    0
+                };
+            }
+        }
+        (cov, width, height)
+    }
+
+    /// FALSIFIABLE: the SDF is reconstructed from the anti-aliased coverage ramp,
+    /// NOT a 1-bit threshold. Two rasters whose transition column both threshold to
+    /// "inside" (>=128) but carry DIFFERENT anti-aliased coverage place the 0.5
+    /// crossing at different sub-texel positions, so they MUST yield different
+    /// fields. The old `coverage >= 128` path collapses both to the same inside mask
+    /// and produces byte-identical fields — this test fails on that path.
+    #[test]
+    fn coverage_to_sdf_reconstructs_subtexel_edge_from_coverage_ramp() {
+        let pad = 4;
+        // Both transition coverages are >= 128 (same 1-bit threshold), but one sits
+        // barely inside the crossing and the other deep inside it.
+        let (near, w, h) = vertical_edge(135); // ~0.53: edge just past the texel center
+        let (far, _, _) = vertical_edge(250); // ~0.98: edge a near-full texel away
+        let field_near = coverage_to_sdf(&near, w, h, pad, 4.0);
+        let field_far = coverage_to_sdf(&far, w, h, pad, 4.0);
+
+        assert_ne!(
+            field_near, field_far,
+            "sub-texel edge must move with the AA ramp; the 1-bit path makes these identical"
+        );
+
+        // The deeper-inside transition pushes the outline farther right; sampling an
+        // OUTSIDE cell just past the edge, whose nearest feature is that transition
+        // column, reads LESS far outside (larger SDF) for `far`.
+        let cell_w = w + pad * 2;
+        let row = pad + h / 2;
+        let sample = row * cell_w + (pad + 3); // first fully-outside column's cell.
+        assert!(
+            field_far[sample] > field_near[sample],
+            "stronger coverage -> edge farther out -> less-outside SDF: far={} near={}",
+            field_far[sample],
+            field_near[sample]
+        );
+    }
+
+    /// FALSIFIABLE: moving the sub-texel edge by sweeping the transition coverage
+    /// across the 0.5 crossing moves the reconstructed zero crossing monotonically.
+    /// A 1-bit threshold would step exactly once (at 128) and stay flat either side,
+    /// so the strictly-monotone progression below cannot hold on that path.
+    #[test]
+    fn coverage_to_sdf_zero_crossing_moves_monotonically_with_subtexel_coverage() {
+        let pad = 4;
+        let cell_w = 6 + pad * 2;
+        let row = pad + 2;
+        let sample = row * cell_w + (pad + 3); // first fully-outside column's cell.
+        let mut last = f32::NEG_INFINITY;
+        // Sweep the transition coverage across the unsaturated sub-texel band (the
+        // crossing stays within ±0.5 texel of the feature center). All >= 128, so
+        // the 1-bit threshold is constant and the field would be flat on that path.
+        for edge_cov in [130_u8, 150, 170, 188] {
+            let (cov, w, h) = vertical_edge(edge_cov);
+            let field = coverage_to_sdf(&cov, w, h, pad, 4.0);
+            let v = field[sample];
+            assert!(
+                v > last,
+                "edge SDF must rise as coverage rises (sub-texel edge moves out): \
+                 edge_cov={edge_cov} v={v} prev={last}"
+            );
+            last = v;
+        }
     }
 }

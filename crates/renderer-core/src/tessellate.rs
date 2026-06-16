@@ -374,7 +374,7 @@ pub struct ParsedSubpath {
 /// Convert one quantized integer coordinate to `f32` pixels (8 units/px). Done in
 /// `f64` then narrowed, so large magnitudes keep full integer precision.
 pub fn quantized_to_px(q: i32) -> f32 {
-    (f64::from(q) / f64::from(GEOMETRY_UNITS_PER_PX)) as f32
+    crate::cast::narrow_f32(f64::from(q) / f64::from(GEOMETRY_UNITS_PER_PX))
 }
 
 /// Parse an SVG-subset path-string (`M`/`L`/`C`/`Z`, case-insensitive, absolute
@@ -549,7 +549,7 @@ mod tests {
             "rect is at least 2 triangles, got {}",
             mesh.triangle_count()
         );
-        let vcount = mesh.vertices.len() as u32;
+        let vcount = crate::cast::len_u32(mesh.vertices.len());
         assert!(
             mesh.indices.iter().all(|&i| i < vcount),
             "every index addresses a real vertex"

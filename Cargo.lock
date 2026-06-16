@@ -1343,6 +1343,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "shape_ext_structure_diagram"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shape_extension_contract",
+ "shape_scene_core",
+]
+
+[[package]]
+name = "shape_ext_todo_kanban"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shape_extension_contract",
+ "shape_scene_core",
+]
+
+[[package]]
+name = "shape_extension_contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shape_scene_core",
+]
+
+[[package]]
 name = "shape_platform_contract"
 version = "0.1.0"
 dependencies = [
@@ -1386,6 +1415,9 @@ dependencies = [
  "serde",
  "serde_json",
  "shape_coordination",
+ "shape_ext_structure_diagram",
+ "shape_ext_todo_kanban",
+ "shape_extension_contract",
  "shape_scene_core",
  "shape_storage_core",
  "tokio",
@@ -1407,6 +1439,25 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "zstd",
+]
+
+[[package]]
+name = "shape_ui"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shape_renderer_core",
+ "shape_scene_core",
+ "shape_ui_core",
+]
+
+[[package]]
+name = "shape_ui_core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "shape_renderer_core",
 ]
 
 [[package]]

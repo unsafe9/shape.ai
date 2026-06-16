@@ -57,6 +57,10 @@ pub struct WebGpuFrameStats {
     pub object_draw_count: usize,
     pub object_patch_count: usize,
     pub object_rebuild_count: usize,
+    // Screen-space UI re-feed diagnostics: `ui_patch_count` rides the partial-update
+    // path (a widget state change), `ui_rebuild_count` the full-build fallback.
+    pub ui_patch_count: usize,
+    pub ui_rebuild_count: usize,
     pub backend: String,
 }
 

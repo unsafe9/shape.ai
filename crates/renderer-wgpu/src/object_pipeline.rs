@@ -10,12 +10,14 @@ use shape_renderer_core::model::CameraState;
 use shape_renderer_core::object_theme::{resolve_token_f32, Theme};
 #[cfg(feature = "wgpu-probe")]
 use shape_renderer_core::plan::{
-    build_frame_plan, diff_plans, FramePlan, PlanDiff, PlanPatch, StyleSlot,
+    build_frame_plan_with_text, diff_plans, FramePlan, PlanDiff, PlanPatch, StyleSlot,
 };
 #[cfg(feature = "wgpu-probe")]
 use shape_renderer_core::render_object::RenderObjectScene;
 #[cfg(feature = "wgpu-probe")]
-use shape_renderer_core::text_layout::MsdfAtlasPlan;
+use shape_renderer_core::text::TextEngine;
+#[cfg(feature = "wgpu-probe")]
+use shape_renderer_core::text_layout::{MsdfAtlasPlan, MsdfGlyphEntry};
 #[cfg(feature = "wgpu-probe")]
 use crate::shaders::{MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_SHADOW_WGSL, OBJECT_STROKE_WGSL};
 
@@ -486,6 +488,129 @@ fn text_instance_attributes() -> [wgpu::VertexAttribute; 3] {
     ]
 }
 
+/// The ONE object-text MSDF atlas + the host text shaper that feeds it, plus the
+/// GPU texture/view/sampler backing them. Completes the deferred "GPU cutover": the
+/// bundled-font [`TextEngine`] rasterizes each committed glyph; the pure
+/// [`MsdfAtlasPlan`] packs it into a real signed-distance slot. The dimensions match
+/// the legacy text path (2048²) so the shader's `screenPxRange` math is consistent.
+/// Re-population only adds NEWLY-committed glyphs (atlas grow on text-content change),
+/// keeping the atlas refresh off the pan/zoom hot path.
+///
+/// Owned ONCE by the wrapper and shared by both the world and UI [`ObjectRenderer`]s
+/// (`ui-architecture.md` decision #1: no duplicate atlas) — each renderer borrows it
+/// to populate/upload and builds its own text bind group over the shared view+sampler
+/// (binding 0 is the renderer's own camera uniform, so the bind group stays
+/// per-renderer; the 16 MB texture + font shaper do not duplicate).
+#[cfg(feature = "wgpu-probe")]
+pub struct SharedObjectText {
+    engine: TextEngine,
+    plan: MsdfAtlasPlan,
+    /// `(char, rounded px) -> slot`, the key the glyph-UV provider resolves. The
+    /// pure core's `GlyphPlacement` carries only `(ch, size)`, not the run font.
+    entries: std::collections::HashMap<(u32, u32), MsdfGlyphEntry>,
+    /// Raster-texels-per-logical-px for the SDF source (= device pixel ratio): glyphs
+    /// rasterize at `size * oversample` px so retina text stays sharp. The atlas key
+    /// stays logical, so this is fixed at construction from the live dpr.
+    oversample: f32,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+
+/// The MSDF atlas distance-range spread (texels); matches `MsdfAtlasPlan::new`.
+#[cfg(feature = "wgpu-probe")]
+const OBJECT_ATLAS_DISTANCE_RANGE: f32 = 4.0;
+
+#[cfg(feature = "wgpu-probe")]
+impl SharedObjectText {
+    pub fn new(device: &wgpu::Device, oversample: f32) -> Result<Self, String> {
+        let plan = MsdfAtlasPlan::new(
+            shape_renderer_core::text::TEXT_ATLAS_WIDTH,
+            shape_renderer_core::text::TEXT_ATLAS_HEIGHT,
+            OBJECT_ATLAS_DISTANCE_RANGE,
+        );
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shape.ai object msdf atlas"),
+            size: wgpu::Extent3d {
+                width: plan.atlas_width,
+                height: plan.atlas_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shape.ai object msdf sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        Ok(SharedObjectText {
+            engine: TextEngine::new()?,
+            plan,
+            entries: std::collections::HashMap::new(),
+            oversample: oversample.max(1.0),
+            texture,
+            view,
+            sampler,
+        })
+    }
+
+    /// Pack every glyph of the scene's committed text not yet in the atlas, and
+    /// upload the texture only when a NEW glyph was packed (the zero-rebake /
+    /// no-re-upload-on-pan-zoom contract, keyed on `(char, px)`). Delegates the
+    /// populate decision to the single renderer-core seam so it lives GPU-free.
+    fn populate_and_upload(&mut self, queue: &wgpu::Queue, scene: &RenderObjectScene) {
+        if populate_atlas_from_scene(
+            &mut self.plan,
+            &mut self.entries,
+            &self.engine,
+            scene,
+            self.oversample,
+        ) {
+            self.upload(queue);
+        }
+    }
+
+    /// Build the scene's [`FramePlan`] with the real per-char advance + the populated
+    /// atlas's per-glyph UV slots injected (the core stays pure: it calls neither).
+    fn build_plan(&self, scene: &RenderObjectScene, theme: Theme) -> FramePlan {
+        let measure = |ch: char, size: f32| self.engine.char_advance(ch, size);
+        let glyph_uv = |ch: char, size: f32| -> Option<MsdfGlyphEntry> {
+            self.entries.get(&(ch as u32, shape_renderer_core::cast::round_u32(size))).copied()
+        };
+        build_frame_plan_with_text(scene, theme, &measure, &glyph_uv)
+    }
+
+    /// Upload the populated atlas pixels into the shared texture (full 2048² extent).
+    fn upload(&self, queue: &wgpu::Queue) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            self.plan.pixels(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.plan.atlas_width * 4),
+                rows_per_image: Some(self.plan.atlas_height),
+            },
+            wgpu::Extent3d {
+                width: self.plan.atlas_width,
+                height: self.plan.atlas_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+}
+
 /// Owns the CPU-built object draw data, the GPU buffers it uploads to, and the
 /// object render pass recorder.
 #[cfg(feature = "wgpu-probe")]
@@ -504,7 +629,9 @@ pub struct ObjectRenderer {
     pub text_vertex_buffer: wgpu::Buffer,
     pub text_instance_buffer: wgpu::Buffer,
     pub text_params_buffer: wgpu::Buffer,
-    pub msdf_atlas_texture: wgpu::Texture,
+    /// The per-renderer text bind group: binding 0 is this renderer's camera uniform,
+    /// bindings 1/2 are the SHARED [`SharedObjectText`] atlas view + sampler (no
+    /// duplicate texture), binding 3 is this renderer's text params.
     pub text_bind_group: wgpu::BindGroup,
     draws: Vec<ObjectDraw>,
     fill_index_count: u32,
@@ -538,14 +665,18 @@ impl ObjectRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         pipeline: &ObjectPipeline,
+        text: &mut SharedObjectText,
         scene: &RenderObjectScene,
         pixel_width: f32,
         pixel_height: f32,
         theme: Theme,
     ) -> Self {
-        // Build the FramePlan (the single tessellation entry) and upload from its
-        // geometry store; retained so a later re-feed diffs against it.
-        let plan = build_frame_plan(scene, theme);
+        // Pack the scene's committed glyphs into the SHARED MSDF atlas (re-uploaded
+        // only when it grew), then build the FramePlan with the shared shaper +
+        // per-glyph UV slots so glyph quads carry real atlas coverage (the GPU
+        // cutover). The atlas + shaper live on the wrapper, shared by world + UI.
+        text.populate_and_upload(queue, scene);
+        let plan = text.build_plan(scene, theme);
         let build = &plan.geometry;
 
         let uniform = ObjectMatrixUniform::from_scene(scene, pixel_width, pixel_height);
@@ -680,50 +811,11 @@ impl ObjectRenderer {
             );
         }
 
-        // ---- MSDF text atlas + params + bind group ------------------------
-        // An empty MsdfAtlasPlan giving a valid, uploadable RGBA8 texture +
-        // distance_range; real glyph coverage is populated at the GPU cutover.
-        let atlas_plan = MsdfAtlasPlan::new(256, 256, 4.0);
-        let msdf_atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("shape.ai object msdf atlas"),
-            size: wgpu::Extent3d {
-                width: atlas_plan.atlas_width,
-                height: atlas_plan.atlas_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &msdf_atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            atlas_plan.pixels(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas_plan.atlas_width * 4),
-                rows_per_image: Some(atlas_plan.atlas_height),
-            },
-            wgpu::Extent3d {
-                width: atlas_plan.atlas_width,
-                height: atlas_plan.atlas_height,
-                depth_or_array_layers: 1,
-            },
-        );
-        let msdf_atlas_view = msdf_atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let msdf_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("shape.ai object msdf sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        // ---- MSDF text params + bind group --------------------------------
+        // The SHARED atlas texture holds the real glyph coverage; `text_params` feeds
+        // the SAME dimensions/range so the shader's screenPxRange AA math matches the
+        // data. The bind group is per-renderer (binding 0 = this camera uniform) but
+        // points at the shared atlas view + sampler — no duplicate 16 MB texture.
         let text_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shape.ai object text params uniform"),
             size: std::mem::size_of::<TextUniform>() as u64,
@@ -732,9 +824,9 @@ impl ObjectRenderer {
         });
         let text_params = TextUniform {
             atlas: [
-                atlas_plan.distance_range,
-                atlas_plan.atlas_width as f32,
-                atlas_plan.atlas_height as f32,
+                text.plan.distance_range,
+                text.plan.atlas_width as f32,
+                text.plan.atlas_height as f32,
                 0.0,
             ],
         };
@@ -749,11 +841,11 @@ impl ObjectRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&msdf_atlas_view),
+                    resource: wgpu::BindingResource::TextureView(&text.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&msdf_sampler),
+                    resource: wgpu::BindingResource::Sampler(&text.sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -777,12 +869,11 @@ impl ObjectRenderer {
             text_vertex_buffer,
             text_instance_buffer,
             text_params_buffer,
-            msdf_atlas_texture,
             text_bind_group,
-            fill_index_count: build.fill.indices.len() as u32,
-            shadow_vertex_count: build.shadow_vertices.len() as u32,
-            stroke_vertex_count: build.stroke_vertices.len() as u32,
-            text_vertex_count: build.text_vertices.len() as u32,
+            fill_index_count: shape_renderer_core::cast::len_u32(build.fill.indices.len()),
+            shadow_vertex_count: shape_renderer_core::cast::len_u32(build.shadow_vertices.len()),
+            stroke_vertex_count: shape_renderer_core::cast::len_u32(build.stroke_vertices.len()),
+            text_vertex_count: shape_renderer_core::cast::len_u32(build.text_vertices.len()),
             draws: build.draws.clone(),
             plan,
             theme,
@@ -820,9 +911,14 @@ impl ObjectRenderer {
     pub fn apply_plan_diff(
         &mut self,
         queue: &wgpu::Queue,
+        text: &mut SharedObjectText,
         scene: &RenderObjectScene,
     ) -> PlanApplyStats {
-        let next = build_frame_plan(scene, self.theme);
+        // Pack any NEWLY-committed glyphs into the SHARED atlas (re-uploaded only when
+        // it grew — off the pan/zoom hot path). Then build the next plan with the
+        // shared shaper's real per-char advance + per-glyph UV slots.
+        text.populate_and_upload(queue, scene);
+        let next = text.build_plan(scene, self.theme);
         let diff = diff_plans(&self.plan, &next);
         let patches = match diff {
             PlanDiff::Rebuild => {
@@ -856,10 +952,10 @@ impl ObjectRenderer {
         }
         // Adopt the new plan and refresh the mirror state the render loops read.
         self.draws = next.geometry.draws.clone();
-        self.fill_index_count = next.geometry.fill.indices.len() as u32;
-        self.shadow_vertex_count = next.geometry.shadow_vertices.len() as u32;
-        self.stroke_vertex_count = next.geometry.stroke_vertices.len() as u32;
-        self.text_vertex_count = next.geometry.text_vertices.len() as u32;
+        self.fill_index_count = shape_renderer_core::cast::len_u32(next.geometry.fill.indices.len());
+        self.shadow_vertex_count = shape_renderer_core::cast::len_u32(next.geometry.shadow_vertices.len());
+        self.stroke_vertex_count = shape_renderer_core::cast::len_u32(next.geometry.stroke_vertices.len());
+        self.text_vertex_count = shape_renderer_core::cast::len_u32(next.geometry.text_vertices.len());
         self.plan = next;
         PlanApplyStats {
             patch_count,
@@ -958,7 +1054,7 @@ impl ObjectRenderer {
         pixel_height: f32,
     ) {
         let uniform = ObjectMatrixUniform {
-            camera: [camera.x as f32, camera.y as f32, camera.zoom as f32, 0.0],
+            camera: [shape_renderer_core::cast::narrow_f32(camera.x), shape_renderer_core::cast::narrow_f32(camera.y), shape_renderer_core::cast::narrow_f32(camera.zoom), 0.0],
             viewport: [pixel_width, pixel_height, 0.0, 0.0],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
@@ -1218,7 +1314,7 @@ impl ObjectRenderer {
                 if draw.fill_range.is_empty() {
                     continue;
                 }
-                let instance = instance as u32;
+                let instance = shape_renderer_core::cast::len_u32(instance);
                 pass.draw_indexed(
                     draw.fill_range.start..draw.fill_range.end,
                     0,
@@ -1237,7 +1333,7 @@ impl ObjectRenderer {
                 if draw.stroke_range.is_empty() {
                     continue;
                 }
-                let instance = instance as u32;
+                let instance = shape_renderer_core::cast::len_u32(instance);
                 pass.draw(
                     draw.stroke_range.start..draw.stroke_range.end,
                     instance..instance + 1,
@@ -1257,7 +1353,7 @@ impl ObjectRenderer {
                 if draw.text_range.is_empty() {
                     continue;
                 }
-                let instance = instance as u32;
+                let instance = shape_renderer_core::cast::len_u32(instance);
                 pass.draw(
                     draw.text_range.start..draw.text_range.end,
                     instance..instance + 1,
@@ -1305,7 +1401,7 @@ impl ObjectRenderer {
             if draw.shadow_range.is_empty() {
                 continue;
             }
-            let instance = instance as u32;
+            let instance = shape_renderer_core::cast::len_u32(instance);
             pass.draw(
                 draw.shadow_range.start..draw.shadow_range.end,
                 instance..instance + 1,
@@ -1401,6 +1497,7 @@ fn create_index_buffer(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu
 #[cfg(all(test, feature = "wgpu-probe"))]
 mod tests {
     use super::*;
+    use shape_renderer_core::plan::build_frame_plan;
 
     #[test]
     fn fill_and_stroke_instance_attributes_match_shader_contract() {
@@ -1459,6 +1556,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 
@@ -1504,6 +1603,128 @@ mod tests {
         assert!(
             follower_patch_plan(plan_b, &geometry_reexpand(&plan, 1)).is_some(),
             "a plan slice fills its own object's ranges exactly"
+        );
+    }
+
+    use shape_renderer_core::render_object::{RText, RTextAlign, RTextRun, RTextValign, QUANT_PER_PX};
+
+    /// A committed text object: a wide rect frame with one run at the 16px default.
+    fn text_object(id: &str, run_text: &str) -> RenderObject {
+        let mut obj = rect(id, "M0 0 L1600 0 L1600 800 L0 800 Z");
+        obj.text = Some(RText {
+            runs: vec![RTextRun {
+                text: run_text.to_string(),
+                color: "#ffffff".to_string(),
+                size: 16.0 * QUANT_PER_PX,
+                bold: false,
+                italic: false,
+                font: String::new(),
+            }],
+            align: RTextAlign::Start,
+            valign: RTextValign::Top,
+        });
+        obj
+    }
+
+    /// DEFECT 3 (the GPU cutover, host-side data half): the object-text atlas the GPU
+    /// samples must carry REAL glyph coverage and the glyph quads must carry REAL atlas
+    /// slots — the two halves that were blank/placeholder before. Drives the SAME
+    /// populate + build seam `SharedObjectText` (and so `ObjectRenderer::new`/
+    /// `apply_plan_diff`) delegates to, GPU-free (the texture upload needs a device but
+    /// the data decision does not). FAILS against the old empty `MsdfAtlasPlan::new`
+    /// upload + placeholder uv 0..1.
+    #[test]
+    fn object_text_atlas_populates_real_coverage_and_glyph_uvs() {
+        let s = scene(vec![text_object("t", "AB")]);
+        let engine = TextEngine::new().expect("bundled fonts load");
+        let mut plan = MsdfAtlasPlan::new(
+            shape_renderer_core::text::TEXT_ATLAS_WIDTH,
+            shape_renderer_core::text::TEXT_ATLAS_HEIGHT,
+            OBJECT_ATLAS_DISTANCE_RANGE,
+        );
+        let mut entries: std::collections::HashMap<(u32, u32), MsdfGlyphEntry> =
+            std::collections::HashMap::new();
+
+        // First populate packs new glyphs (returns grew=true, which gates the texture
+        // upload); a second populate of the same scene is a no-op (off the pan/zoom hot
+        // path) — the exact decision `SharedObjectText::populate_and_upload` rides.
+        assert!(
+            populate_atlas_from_scene(&mut plan, &mut entries, &engine, &s, 1.0),
+            "committed glyphs pack into the atlas"
+        );
+        assert!(
+            !populate_atlas_from_scene(&mut plan, &mut entries, &engine, &s, 1.0),
+            "no new glyphs => no re-pack (zero-rebake on pan/zoom)"
+        );
+        assert!(plan.glyph_count() > 0, "atlas has packed glyphs");
+        assert!(
+            plan.pixels().iter().any(|&p| p > 0),
+            "atlas pixels carry real coverage, not the all-zero blank atlas"
+        );
+
+        // The built plan's glyph quads carry sub-unit atlas UVs, not the full-atlas
+        // placeholder (uv 0..1) the blank pipeline shipped.
+        let measure = |ch: char, size: f32| engine.char_advance(ch, size);
+        let glyph_uv = |ch: char, size: f32| -> Option<MsdfGlyphEntry> {
+            entries.get(&(ch as u32, shape_renderer_core::cast::round_u32(size))).copied()
+        };
+        let built = build_frame_plan_with_text(&s, Theme::light(), &measure, &glyph_uv);
+        let text_vertices = &built.geometry.text_vertices;
+        assert!(!text_vertices.is_empty(), "committed text emits glyph quads");
+        let all_placeholder = text_vertices.iter().all(|v| {
+            (v.uv == [0.0, 0.0]) || (v.uv == [1.0, 0.0]) || (v.uv == [1.0, 1.0]) || (v.uv == [0.0, 1.0])
+        });
+        assert!(
+            !all_placeholder,
+            "glyph quads carry real sub-unit atlas UVs, not the full-atlas placeholder"
+        );
+    }
+
+    /// SHARED atlas (decision #1: no duplicate atlas): a glyph packed while serving the
+    /// WORLD scene must already be in the atlas when the UI scene reuses it — the UI
+    /// build resolves it to a REAL sub-unit slot with NO re-populate. A duplicate
+    /// per-renderer atlas would start empty for the UI, re-pack the glyph (grew=true),
+    /// and the UI quad would carry the full-atlas placeholder until then. Drives the
+    /// one populate/entries/build seam `SharedObjectText` shares across both renderers.
+    #[test]
+    fn shared_atlas_serves_ui_glyphs_committed_by_the_world_scene() {
+        let engine = TextEngine::new().expect("bundled fonts load");
+        let mut plan = MsdfAtlasPlan::new(
+            shape_renderer_core::text::TEXT_ATLAS_WIDTH,
+            shape_renderer_core::text::TEXT_ATLAS_HEIGHT,
+            OBJECT_ATLAS_DISTANCE_RANGE,
+        );
+        let mut entries: std::collections::HashMap<(u32, u32), MsdfGlyphEntry> =
+            std::collections::HashMap::new();
+
+        // World scene commits "AB"; the UI scene reuses the SAME glyphs at the SAME size.
+        let world = scene(vec![text_object("w", "AB")]);
+        let ui = scene(vec![text_object("u", "AB")]);
+        assert!(
+            populate_atlas_from_scene(&mut plan, &mut entries, &engine, &world, 1.0),
+            "world commit packs its glyphs"
+        );
+        // The UI feed into the SAME atlas packs nothing new: the world already did.
+        assert!(
+            !populate_atlas_from_scene(&mut plan, &mut entries, &engine, &ui, 1.0),
+            "UI reuses the shared atlas — no re-pack of glyphs the world committed"
+        );
+
+        // The UI plan, built from the shared entries, resolves to real sub-unit slots
+        // (not the full-atlas placeholder), proving the world's glyphs serve the UI.
+        let measure = |ch: char, size: f32| engine.char_advance(ch, size);
+        let glyph_uv = |ch: char, size: f32| -> Option<MsdfGlyphEntry> {
+            entries.get(&(ch as u32, shape_renderer_core::cast::round_u32(size))).copied()
+        };
+        let built = build_frame_plan_with_text(&ui, Theme::light(), &measure, &glyph_uv);
+        let text_vertices = &built.geometry.text_vertices;
+        assert!(!text_vertices.is_empty(), "UI text emits glyph quads");
+        let all_placeholder = text_vertices.iter().all(|v| {
+            (v.uv == [0.0, 0.0]) || (v.uv == [1.0, 0.0]) || (v.uv == [1.0, 1.0]) || (v.uv == [0.0, 1.0])
+        });
+        assert!(
+            !all_placeholder,
+            "UI quads carry the world-committed sub-unit slots, not the empty-atlas placeholder"
         );
     }
 

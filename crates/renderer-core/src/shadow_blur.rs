@@ -133,7 +133,12 @@ mod tests {
 
     #[test]
     fn blur_radius_fits_shader_loop_bound() {
-        let radius_px = (SHADOW_BLUR_RADIUS_PX * 3.0).round() as usize; // 3x DPR
+        // 3x DPR; the small positive product rounds to a handful of px.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "small positive constant product; rounds to an exact in-range integer"
+        )]
+        let radius_px = (SHADOW_BLUR_RADIUS_PX * 3.0).round() as usize;
         let radius = radius_px.clamp(1, SHADOW_BLUR_MAX_RADIUS);
         assert!(radius <= SHADOW_BLUR_MAX_RADIUS);
         assert!(radius + 1 <= SHADOW_BLUR_MAX_RADIUS + 1);

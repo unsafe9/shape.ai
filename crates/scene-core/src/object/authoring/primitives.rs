@@ -144,6 +144,14 @@ fn solid_stroke(hex: &str, width_px: f64) -> Stroke {
     }
 }
 
+/// The default stroke a borderless object gains from an inspector stroke edit —
+/// the SAME stroke [`build_set_style_op`] gives a borderless open path. The single
+/// source of the default-stroke convention, so the shell never invents the color /
+/// width / attributes for a newly-bordered object.
+pub fn default_inspector_stroke() -> Stroke {
+    solid_stroke("#5b6472", 2.0)
+}
+
 fn primitive_spec(kind: PrimitiveKind) -> PrimitiveSpec {
     match kind {
         PrimitiveKind::Rectangle => PrimitiveSpec {
@@ -285,7 +293,7 @@ fn drag_geometry(kind: PrimitiveKind, span: DragSpan) -> (String, f64, f64) {
 pub fn build_set_style_op(object: &Object, color: &str) -> ObjectOp {
     let paint = paint_for_color(color);
     if is_open_class(&object.geometry) {
-        let mut stroke = object.stroke.clone().unwrap_or_else(|| solid_stroke("#5b6472", 2.0));
+        let mut stroke = object.stroke.clone().unwrap_or_else(default_inspector_stroke);
         stroke.paint = paint;
         return ObjectOp::SetStyle {
             id: object.id.clone(),

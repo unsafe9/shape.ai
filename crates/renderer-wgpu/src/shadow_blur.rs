@@ -334,7 +334,12 @@ mod gpu {
 
         fn upload_blur_params(&self, queue: &wgpu::Queue, dpr: f32) {
             let radius_px = (SHADOW_BLUR_RADIUS_PX * dpr.max(1.0)).round();
-            let radius = (radius_px as usize).clamp(1, SHADOW_BLUR_MAX_RADIUS);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "small clamped-positive blur radius (px); rounds to an exact in-range integer"
+            )]
+            let radius_usize = radius_px.max(0.0) as usize;
+            let radius = radius_usize.clamp(1, SHADOW_BLUR_MAX_RADIUS);
             // sigma ~= radius/3 keeps the tails inside the kernel support.
             let sigma = (radius as f32 / 3.0).max(0.5);
             let kernel = gaussian_kernel(radius, sigma);

@@ -7,14 +7,35 @@ use shape_renderer_core::hit_test_object::HoverAffordance;
 use shape_renderer_core::model::{
     ActiveTool, CameraState, CanvasInputEvent, RenderScenePatch, SceneSelection, WorldPoint,
 };
+use shape_renderer_core::render_object::RenderObject;
 use crate::serde_wasm;
 use shape_renderer_core::stats::{
     CoreHitResult, CoreInputBatchResult, CoreMarqueeResult, CoreNearestOutlinePoint,
     CoreOverlayRequest, CoreOverlayTarget, WebGpuDebugSnapshot,
 };
+use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
 use super::*;
+
+/// The neutral key the shell forwards as JSON. Mirrors `shape_ui_core::KeyInput`;
+/// `text` is the inserted printable char(s), absent for control keys; `ctrl`/`meta`/
+/// `alt` carry the OS modifier state so the core can tell a shortcut chord from a
+/// bare control key (a chord must fall through, not be swallowed by a focused field).
+/// The modifier flags default to false so an older shell payload still deserializes.
+#[cfg(feature = "wgpu-probe")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireKeyInput {
+    key: String,
+    text: Option<String>,
+    #[serde(default)]
+    ctrl: bool,
+    #[serde(default)]
+    meta: bool,
+    #[serde(default)]
+    alt: bool,
+}
 
 #[cfg(feature = "wgpu-probe")]
 #[cfg(target_arch = "wasm32")]
@@ -96,6 +117,14 @@ impl ShapeWebGpuRenderer {
         self.coarse_rotate = active;
     }
 
+    /// Set the active drill-in container scope (or `None` to exit), callable as a
+    /// one-off (equivalent to a `set-active-container` inputBatch event). The shell
+    /// forwards the canonical container id; the core resolves the scoped child pick.
+    #[wasm_bindgen(js_name = setActiveContainer)]
+    pub fn set_active_container(&mut self, id: Option<String>) {
+        self.active_container = id;
+    }
+
     /// Replace the transient multi-select highlight set with `ids` (an empty array
     /// clears it), callable as a one-off. The persisted single-anchor selection is
     /// untouched.
@@ -118,6 +147,17 @@ impl ShapeWebGpuRenderer {
         self.object_theme = shape_renderer_core::object_theme::Theme { dark };
         if let Some(renderer) = self.object_renderer.as_mut() {
             renderer.set_theme(&self.queue, dark);
+        }
+        // The screen-space UI renderer tracks the same theme bit so its Token paints
+        // (surface/text/selection-ring) recolor with the canvas — zero rebake.
+        if let Some(ui) = self.ui_renderer.as_mut() {
+            ui.set_theme(&self.queue, dark);
+        }
+        // The runtime owns the UI scene: UI TEXT is a FIXED hex (not a token), so a
+        // theme flip must re-resolve text via the runtime + re-feed. Fills/strokes stay
+        // zero-rebake tokens (handled above); only the text scene re-feeds here.
+        if self.ui_runtime.as_mut().map(|rt| rt.set_theme(dark)).unwrap_or(false) {
+            self.refeed_ui_runtime();
         }
     }
 
@@ -174,6 +214,162 @@ impl ShapeWebGpuRenderer {
                 y: screen_y,
             },
         )
+    }
+
+    /// The id of the top-most UI widget under the SCREEN point (or null). The UI scene
+    /// is screen-space, so this picks against the IDENTITY camera (world == screen),
+    /// NOT the live world camera. The shell forwards raw canvas-local px and consumes
+    /// the core-returned id; no shell-side pick decision.
+    #[wasm_bindgen(js_name = hitUi)]
+    pub fn hit_ui(&self, screen_x: f64, screen_y: f64) -> Option<String> {
+        hit_object_in_regions(
+            &self.ui_regions,
+            &UI_IDENTITY_CAMERA,
+            WorldPoint {
+                x: screen_x,
+                y: screen_y,
+            },
+        )
+    }
+
+    /// Drive the ui-core runtime with a pointer phase (`"down"|"move"|"up"|"cancel"`)
+    /// at SCREEN px. The runtime decides everything (hit, slider value, actuation);
+    /// on `dirty` the renderer re-renders the runtime + re-feeds the UI scene through
+    /// the same `feed_ui_scene` path (so `ui_regions` track the laid-out boxes), and
+    /// the shell only forwards + lets the RAF redraw. Returns
+    /// `{ consumed, sceneChanged, actions, edit }`. A no-op without a seeded runtime.
+    #[wasm_bindgen(js_name = uiPointer)]
+    pub fn ui_pointer(&mut self, phase: &str, screen_x: f64, screen_y: f64) -> Result<JsValue, JsValue> {
+        let phase = match phase {
+            "down" => shape_ui_core::PointerPhase::Down,
+            "move" => shape_ui_core::PointerPhase::Move,
+            "up" => shape_ui_core::PointerPhase::Up,
+            "cancel" => shape_ui_core::PointerPhase::Cancel,
+            other => return Err(JsValue::from_str(&format!("unknown UI pointer phase: {other}"))),
+        };
+        let Some(runtime) = self.ui_runtime.as_mut() else {
+            return serde_wasm(crate::webgpu::ui::CoreUiDispatchResult::from_dispatch(
+                &shape_ui_core::DispatchResult::default(),
+            ));
+        };
+        let result = runtime.dispatch_pointer(phase, (screen_x, screen_y));
+        if result.dirty {
+            self.refeed_ui_runtime();
+        }
+        serde_wasm(self.dispatch_result(&result))
+    }
+
+    /// Forward a neutral key (`KeyInput` JSON: `{ key, text }`) to the focused UI
+    /// widget. The runtime decides whether it owns the key (only when a TextInput is
+    /// focused); on `dirty` the renderer re-feeds. Returns the same dispatch shape as
+    /// [`Self::ui_pointer`]. A no-op without a seeded runtime.
+    #[wasm_bindgen(js_name = uiKey)]
+    pub fn ui_key(&mut self, key_json: &str) -> Result<JsValue, JsValue> {
+        let key: WireKeyInput = serde_json::from_str(key_json)
+            .map_err(|error| JsValue::from_str(&format!("Invalid UI key: {error}")))?;
+        let Some(runtime) = self.ui_runtime.as_mut() else {
+            return serde_wasm(crate::webgpu::ui::CoreUiDispatchResult::from_dispatch(
+                &shape_ui_core::DispatchResult::default(),
+            ));
+        };
+        let result = runtime.dispatch_key(&shape_ui_core::KeyInput {
+            key: key.key,
+            text: key.text,
+            ctrl: key.ctrl,
+            meta: key.meta,
+            alt: key.alt,
+        });
+        if result.dirty {
+            self.refeed_ui_runtime();
+        }
+        serde_wasm(self.dispatch_result(&result))
+    }
+
+    /// Commit ONE finished string from the shell's IME surface into the focused UI
+    /// field, blur it, and emit the final `TextChanged`. The OS surface owns the
+    /// composition; this lands its single committed value (correct even when CJK
+    /// composition deleted/replaced in place, where a suffix diff would not be). On
+    /// `dirty` the renderer re-feeds. Same dispatch shape as [`Self::ui_key`].
+    #[wasm_bindgen(js_name = uiCommitText)]
+    pub fn ui_commit_text(&mut self, value: String) -> Result<JsValue, JsValue> {
+        let Some(runtime) = self.ui_runtime.as_mut() else {
+            return serde_wasm(crate::webgpu::ui::CoreUiDispatchResult::from_dispatch(
+                &shape_ui_core::DispatchResult::default(),
+            ));
+        };
+        let result = runtime.commit_text(value);
+        if result.dirty {
+            self.refeed_ui_runtime();
+        }
+        serde_wasm(self.dispatch_result(&result))
+    }
+
+    /// True when a ui-core widget owns text focus. The window arbiter ORs this into
+    /// its `typing` predicate so a focused ui-core TextInput suppresses the catalog
+    /// dispatcher exactly like a DOM input.
+    #[wasm_bindgen(js_name = uiHasFocus)]
+    pub fn ui_has_focus(&self) -> bool {
+        self.ui_runtime.as_ref().map(|rt| rt.has_text_focus()).unwrap_or(false)
+    }
+
+    /// Seed the renderer-owned UI runtime from the ui-core demo widget tree at the
+    /// current viewport + theme, then feed its first render. After this the runtime
+    /// OWNS the UI scene — `uiPointer`/`uiKey` re-feed it on a state change, replacing
+    /// the static `loadUiScene` feed. The widget tree still lives in `ui-core`
+    /// (`demo_ui_tree`) until P4 built-in UIs replace it. Re-seedable (rebuilds the
+    /// runtime, dropping prior interaction state) on a viewport change.
+    #[wasm_bindgen(js_name = initUiRuntime)]
+    pub fn init_ui_runtime(&mut self, viewport_w: f64, viewport_h: f64, _theme_dark: bool) {
+        // Seed the runtime from the PERSISTED canvas theme, NOT a hardcoded light seed:
+        // the shell applies the real theme via `set_object_theme` as soon as the host is
+        // wired, and that may land before this seed. Adopting `self.object_theme` here
+        // means a theme that already landed is kept, never clobbered back to light —
+        // which otherwise paints light UI fills under a dark canvas until the next theme
+        // change. When nothing set the theme yet, `object_theme` is still its light
+        // default, so the demo seeds light exactly as before.
+        let dark = self.object_theme.dark;
+        let runtime =
+            shape_ui_core::UiRuntime::new(crate::demo_ui_tree(), (viewport_w, viewport_h), dark);
+        self.ui_runtime = Some(runtime);
+        self.refeed_ui_runtime();
+    }
+
+    /// Feed the built-in UI model (toolbar + inspector) from the shell. `model_json`
+    /// carries the shell-owned UI state (theme/viewport/active-tool/create-kind) and
+    /// the dynamic inspector view (from scene-core's `objectInspectorView`); the
+    /// command catalog is constant in-core, so it is not carried. The renderer
+    /// composes `shape_ui::build_root` from it and seeds (or re-trees, preserving
+    /// interaction caches so an in-progress field edit / dragged value survives the
+    /// re-derive) the runtime, then re-feeds. A model change that only flips a
+    /// toggle/recolors rides the existing partial-patch path, NOT a re-tessellation.
+    /// After this, `uiPointer`/`uiKey` resolve fired actions into typed intents.
+    #[wasm_bindgen(js_name = setUiModel)]
+    pub fn set_ui_model(&mut self, model_json: &str) -> Result<(), JsValue> {
+        let model: crate::webgpu::ui::UiModelInput = serde_json::from_str(model_json)
+            .map_err(|error| JsValue::from_str(&format!("Invalid UI model: {error}")))?;
+        // Keep the persisted theme bit in lock-step so a later `setObjectTheme` diff
+        // doesn't double-flip the freshly-fed runtime.
+        self.object_theme = shape_renderer_core::object_theme::Theme { dark: model.theme_dark };
+        let tree = model.build_tree();
+        match self.ui_runtime.as_mut() {
+            // A live runtime keeps its interaction caches across the re-derive (a
+            // focused field / dragged value survives). Sync theme/viewport too.
+            Some(runtime) => {
+                runtime.set_tree(tree);
+                runtime.set_viewport((model.viewport[0], model.viewport[1]));
+                runtime.set_theme(model.theme_dark);
+            }
+            None => {
+                self.ui_runtime = Some(shape_ui_core::UiRuntime::new(
+                    tree,
+                    (model.viewport[0], model.viewport[1]),
+                    model.theme_dark,
+                ));
+            }
+        }
+        self.ui_model = Some(model);
+        self.refeed_ui_runtime();
+        Ok(())
     }
 
     /// Swept erase: every object crossed by the eraser between two consecutive SCREEN
@@ -290,6 +486,7 @@ impl ShapeWebGpuRenderer {
             input_drag: self.input_drag.clone(),
             active_tool: self.active_tool,
             coarse_rotate: self.coarse_rotate,
+            active_container: self.active_container.clone(),
             multi_select: self.multi_select.clone(),
             last_hit: self.last_hit.clone(),
             text_layout_cache: self.text_layout_cache.clone(),
@@ -304,6 +501,7 @@ impl ShapeWebGpuRenderer {
         self.input_drag = state.input_drag;
         self.active_tool = state.active_tool;
         self.coarse_rotate = state.coarse_rotate;
+        self.active_container = state.active_container;
         self.multi_select = state.multi_select;
         self.last_hit = state.last_hit;
         self.object_scene = state.object_scene;
@@ -320,6 +518,32 @@ impl ShapeWebGpuRenderer {
         self.text_layout_cache = state.text_layout_cache;
         self.restore_mutation_counters(state.counters);
         self.write_uniform();
+    }
+
+    /// Re-render the seeded UI runtime and re-feed its scene through the shared
+    /// `feed_ui_scene` path, so a state-change dispatch refreshes the GPU geometry +
+    /// `ui_regions`. Rendering returns an owned scene, so the immutable runtime borrow
+    /// is dropped before the `&mut self` feed. A no-op without a seeded runtime.
+    fn refeed_ui_runtime(&mut self) {
+        let Some(scene) = self.ui_runtime.as_ref().map(|rt| rt.render()) else {
+            return;
+        };
+        self.feed_ui_scene(&scene);
+    }
+
+    /// Wrap a dispatch into the wire shape, resolving fired actions to typed intents
+    /// when a UI model is set (the built-in UI binding); on the demo path (no model)
+    /// it forwards actions only. The pure mapping/resolution lives in `webgpu::ui`.
+    fn dispatch_result(
+        &self,
+        result: &shape_ui_core::DispatchResult,
+    ) -> crate::webgpu::ui::CoreUiDispatchResult {
+        match &self.ui_model {
+            Some(model) => {
+                crate::webgpu::ui::CoreUiDispatchResult::from_dispatch_resolved(result, model)
+            }
+            None => crate::webgpu::ui::CoreUiDispatchResult::from_dispatch(result),
+        }
     }
 
     fn mutation_counters(&self) -> MutationCounters {
@@ -663,6 +887,9 @@ impl ShapeWebGpuRenderer {
             CanvasInputEvent::SetMultiSelect { ids } => {
                 self.set_multi_select_ids(ids);
             }
+            CanvasInputEvent::SetActiveContainer { id } => {
+                self.active_container = id;
+            }
             CanvasInputEvent::ContextPick { screen } => {
                 // Right-click pick: report the hit without mutating selection or
                 // starting a drag, so the shell can open a context menu.
@@ -696,11 +923,21 @@ impl ShapeWebGpuRenderer {
             .object_scene
             .as_ref()
             .and_then(|scene| scene.selection.clone());
+        // Direct-field borrows of disjoint fields: the scoped pick reads
+        // `object_scene.objects` + `active_container` while camera/input_drag are
+        // mutated. The scope is a forwarded token the core resolves against.
+        let objects: &[RenderObject] = self
+            .object_scene
+            .as_ref()
+            .map(|scene| scene.objects.as_slice())
+            .unwrap_or(&[]);
         step_object_pointer(
             &event,
             &self.object_regions,
+            objects,
             self.active_tool,
             self.coarse_rotate,
+            self.active_container.as_deref(),
             selection.as_deref(),
             &mut self.camera,
             &mut self.input_drag,
@@ -719,6 +956,9 @@ impl ShapeWebGpuRenderer {
             if let Some(scene) = &mut self.object_scene {
                 scene.selection = None;
             }
+            // A scoped pick that resolved to None is a click OUTSIDE the active
+            // container, so exit the drill-in scope (the core owns the exit rule).
+            self.active_container = None;
         }
         Ok(())
     }

@@ -93,6 +93,14 @@ pub fn object_command_catalog() -> Vec<ObjectCommand> {
             "Arm the pen/draw tool.",
             None,
         ),
+        ObjectCommand::new(
+            "erase",
+            "Eraser",
+            Tool,
+            Some("E"),
+            "Arm the eraser tool (hold Alt to erase partial geometry).",
+            None,
+        ),
         // Insert — the shell lowers the picked kind to an insert-object op, so
         // these carry no direct op kind.
         ObjectCommand::new(
@@ -394,6 +402,38 @@ pub fn object_command_catalog() -> Vec<ObjectCommand> {
             "Open the template library.",
             None,
         ),
+        ObjectCommand::new(
+            "toggle-theme",
+            "Toggle Theme",
+            View,
+            None,
+            "Switch between the light and dark theme.",
+            None,
+        ),
+        ObjectCommand::new(
+            "export",
+            "Export",
+            View,
+            None,
+            "Export the current selection.",
+            None,
+        ),
+        ObjectCommand::new(
+            "toggle-fullscreen",
+            "Fullscreen",
+            View,
+            None,
+            "Toggle fullscreen.",
+            None,
+        ),
+        ObjectCommand::new(
+            "toggle-diagnostics",
+            "Diagnostics",
+            View,
+            None,
+            "Toggle the diagnostics panel.",
+            None,
+        ),
     ]
 }
 
@@ -449,6 +489,7 @@ mod tests {
             "select-move",
             "hand-pan",
             "draw",
+            "erase",
             "insert-rectangle",
             "insert-ellipse",
             "insert-line",
@@ -460,6 +501,10 @@ mod tests {
             "zoom-fit",
             "open-settings",
             "open-template-library",
+            "toggle-theme",
+            "export",
+            "toggle-fullscreen",
+            "toggle-diagnostics",
             "copy",
             "paste",
             "duplicate",
@@ -545,6 +590,19 @@ mod tests {
                 clip: None,
             }
             .kind(),
+            ObjectOp::SetSizing {
+                id: "x".into(),
+                sizing: None,
+            }
+            .kind(),
+            ObjectOp::SetMeta {
+                id: "x".into(),
+                name: None,
+                hidden: None,
+                locked: None,
+            }
+            .kind(),
+            ObjectOp::Canonicalize { id: "x".into() }.kind(),
             ObjectOp::AddComment {
                 id: "x".into(),
                 comment: crate::object::model::Comment {
@@ -606,6 +664,19 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_is_not_a_command() {
+        // canonicalize is a property-panel action (inspector Action button), not a
+        // shortcut/command — it must NOT appear here, or the settings modal lists a
+        // dead, non-functional row. Single source: the inspector catalog.
+        let catalog = object_command_catalog();
+        assert!(
+            !catalog.iter().any(|c| c.id == "canonicalize"
+                || c.op_kind.as_deref() == Some("canonicalize")),
+            "canonicalize must live only in the inspector catalog, not the command catalog"
+        );
+    }
+
+    #[test]
     fn shell_only_commands_have_no_op_kind() {
         for id in [
             "copy",
@@ -617,6 +688,7 @@ mod tests {
             "select-move",
             "hand-pan",
             "draw",
+            "erase",
             "insert-rectangle",
             "insert-ellipse",
             "insert-line",
@@ -628,6 +700,10 @@ mod tests {
             "zoom-fit",
             "open-settings",
             "open-template-library",
+            "toggle-theme",
+            "export",
+            "toggle-fullscreen",
+            "toggle-diagnostics",
         ] {
             assert!(
                 find(id).op_kind.is_none(),

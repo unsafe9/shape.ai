@@ -373,7 +373,7 @@ pub fn hit_test_object(
     let Some((lx, ly)) = world_to_local(transform, world_x, world_y) else {
         return false;
     };
-    point_in_polygon(region_outline, lx as f32, ly as f32)
+    point_in_polygon(region_outline, crate::cast::narrow_f32(lx), crate::cast::narrow_f32(ly))
 }
 
 /// Object-local AABB of an outline as `(min_x, min_y, max_x, max_y)`; `None` when
@@ -415,7 +415,7 @@ pub fn hit_test_object_or_bbox(
     let Some((lx, ly)) = world_to_local(transform, world_x, world_y) else {
         return false;
     };
-    let (lx, ly) = (lx as f32, ly as f32);
+    let (lx, ly) = (crate::cast::narrow_f32(lx), crate::cast::narrow_f32(ly));
     if closed && point_in_polygon(region_outline, lx, ly) {
         return true;
     }
@@ -541,7 +541,12 @@ pub fn swept_segment_hits_object(
     let Some((lbx, lby)) = world_to_local(transform, world_bx, world_by) else {
         return false;
     };
-    let (lax, lay, lbx, lby) = (lax as f32, lay as f32, lbx as f32, lby as f32);
+    let (lax, lay, lbx, lby) = (
+        crate::cast::narrow_f32(lax),
+        crate::cast::narrow_f32(lay),
+        crate::cast::narrow_f32(lbx),
+        crate::cast::narrow_f32(lby),
+    );
     if closed {
         return segment_hits_polygon(region_outline, lax, lay, lbx, lby);
     }

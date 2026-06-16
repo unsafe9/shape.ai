@@ -13,8 +13,8 @@
 
 use crate::model::CameraState;
 use crate::object_pipeline::{
-    build_scene_geometry_themed, FillInstance, ObjectDraw, SceneGeometry, ShadowInstance,
-    StrokeInstance, TextInstance,
+    build_scene_geometry_themed, build_scene_geometry_themed_with_text, FillInstance,
+    GlyphUvProvider, ObjectDraw, SceneGeometry, ShadowInstance, StrokeInstance, TextInstance,
 };
 use crate::object_theme::Theme;
 use crate::render_object::{RenderObject, RenderObjectScene, RStroke, RText};
@@ -131,7 +131,27 @@ pub enum PlanDiff {
 /// Build the [`FramePlan`] for `scene` under `theme`. Runs the merged geometry
 /// build once, then records each object's handle + instance attributes + ranges.
 pub fn build_frame_plan(scene: &RenderObjectScene, theme: Theme) -> FramePlan {
-    let geometry = build_scene_geometry_themed(scene, theme);
+    frame_plan_from(scene, build_scene_geometry_themed(scene, theme))
+}
+
+/// As [`build_frame_plan`], with an injected real text shaper + glyph-UV provider
+/// (the GPU cutover supplies them) so glyph quads carry real atlas slots. The plan
+/// machinery (handles/instances/ranges) is identical — only the text geometry differs.
+pub fn build_frame_plan_with_text(
+    scene: &RenderObjectScene,
+    theme: Theme,
+    measure: &dyn Fn(char, f32) -> f32,
+    glyph_uv: &GlyphUvProvider<'_>,
+) -> FramePlan {
+    frame_plan_from(
+        scene,
+        build_scene_geometry_themed_with_text(scene, theme, measure, glyph_uv),
+    )
+}
+
+/// Record each object's handle + instance attributes + ranges over an already-built
+/// `geometry` (index-aligned with `scene.objects`).
+fn frame_plan_from(scene: &RenderObjectScene, geometry: SceneGeometry) -> FramePlan {
     let mut entries = Vec::with_capacity(geometry.draws.len());
     for (i, draw) in geometry.draws.iter().enumerate() {
         // `draws`/`*_instances`/`scene.objects` are all index-aligned in scene order,
@@ -414,6 +434,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         }
     }
 

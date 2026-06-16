@@ -42,6 +42,24 @@ impl TextBuildStats {
     }
 }
 
+/// One char's fontdue coverage raster + atlas-slot key + pen-origin bearings, the
+/// host-side input to the pure SDF generator. `coverage` is row-major 8-bit alpha,
+/// `width`×`height` px at the quantized `px` cell size.
+#[derive(Clone)]
+pub struct GlyphCoverageData {
+    pub font_index: usize,
+    pub glyph_id: u16,
+    pub px: u16,
+    pub coverage: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub bearing_x: f32,
+    pub bearing_y: f32,
+    /// Raster-texels-per-logical-px the source was rasterized at (the dpr, ≥ 1.0). The
+    /// emitted quad geometry divides by exactly this to keep layout at logical px.
+    pub oversample: f32,
+}
+
 #[derive(Clone)]
 pub struct CachedTextGlyph {
     pub offset_x: f32,
@@ -170,6 +188,66 @@ impl TextEngine {
 
     pub fn measure_text_width(&self, value: &str, font_size: f32) -> f32 {
         self.shape_width(value, font_size)
+    }
+
+    /// Per-char advance width in px (the measure seam the object-text build injects
+    /// in place of `stub_measure`). Honors font fallback (Latin/Korean) via shaping.
+    pub fn char_advance(&self, ch: char, font_size: f32) -> f32 {
+        let mut buf = [0_u8; 4];
+        self.shape_width(ch.encode_utf8(&mut buf), font_size)
+    }
+
+    /// Rasterize one char at `font_size` px into a fontdue coverage raster + glyph
+    /// metrics — the input the pure SDF generator ([`MsdfAtlasPlan::generate_glyph`])
+    /// turns into an atlas slot. `None` for an unmapped/blank glyph (whitespace,
+    /// control). Honors Latin/Korean font fallback; `font_index`/`glyph_id` key the
+    /// atlas slot. The pure core never calls this — it lives behind the host seam.
+    pub fn glyph_coverage(
+        &self,
+        ch: char,
+        font_size: f32,
+        oversample: f32,
+    ) -> Option<GlyphCoverageData> {
+        if ch.is_control() || ch.is_whitespace() {
+            return None;
+        }
+        let mut buf = [0_u8; 4];
+        let grapheme = ch.encode_utf8(&mut buf);
+        let font_index = self.select_font_for_grapheme(grapheme)?;
+        let font = self.fonts.get(font_index)?;
+        let shaped = self.shape_run_positions(grapheme, font_index, font_size);
+        let glyph_id = shaped.first().map(|g| g.glyph_id)?;
+        // Rasterize the SDF source at `font_size * oversample` px so the coverage grid
+        // (and thus the distance field) is finer than the on-screen glyph; the emitted
+        // quad geometry is divided back by `oversample` downstream, keeping layout at
+        // logical px. This is what makes text sharp on HiDPI/retina (oversample = dpr).
+        // The source factor must be exactly the divisor the quad later divides by, so
+        // raster scale == layout scale per glyph — otherwise a per-glyph rounding split
+        // jitters glyph size/baseline within a single word (ransom-note text).
+        let effective_oversample = oversample.max(1.0);
+        let px = quantize_font_size(font_size * effective_oversample);
+        let (metrics, bitmap) = font.raster.rasterize_indexed(glyph_id, px as f32);
+        if metrics.width == 0 || metrics.height == 0 || bitmap.is_empty() {
+            return None;
+        }
+        let baseline = font
+            .raster
+            .horizontal_line_metrics(px as f32)
+            .map(|m| m.ascent)
+            .unwrap_or(px as f32 * 0.86);
+        Some(GlyphCoverageData {
+            font_index,
+            glyph_id,
+            px,
+            coverage: bitmap,
+            width: metrics.width,
+            height: metrics.height,
+            // Pen-origin -> glyph ink: x by fontdue xmin, y from the line top down to
+            // the glyph's top edge (baseline - ascent of this glyph).
+            bearing_x: metrics.xmin as f32,
+            bearing_y: baseline - metrics.ymin as f32 - metrics.height as f32,
+            oversample: effective_oversample,
+        })
     }
 
     fn layout_text_line(&mut self, value: &str, max_width: f32, font_size: f32) -> CachedTextLine {
@@ -331,7 +409,9 @@ impl TextEngine {
             .iter()
             .zip(shaped.glyph_positions())
             .map(|(info, position)| ShapedGlyph {
-                glyph_id: info.glyph_id as u16,
+                // OpenType glyph ids are 16-bit; a value past u16 is impossible for a
+                // valid face, so a saturating conversion is exact in practice.
+                glyph_id: u16::try_from(info.glyph_id).unwrap_or(u16::MAX),
                 x_advance: position.x_advance as f32 * scale,
                 x_offset: position.x_offset as f32 * scale,
                 y_offset: -(position.y_offset as f32) * scale,
@@ -475,8 +555,8 @@ impl TextAtlas {
         baseline: f32,
     ) -> Option<AtlasGlyph> {
         let padding = 1;
-        let width = metrics.width as u32;
-        let height = metrics.height as u32;
+        let width = u32::try_from(metrics.width).unwrap_or(u32::MAX);
+        let height = u32::try_from(metrics.height).unwrap_or(u32::MAX);
         let packed_width = width + padding * 2;
         let packed_height = height + padding * 2;
         if self.cursor_x + packed_width >= self.width {
@@ -555,11 +635,16 @@ fn wrapped_lines_cache_key(
 }
 
 fn quantize_text_metric(value: f32) -> i32 {
-    (value * 100.0).round() as i32
+    crate::cast::round_i32(f64::from(value) * 100.0)
 }
 
 fn quantize_font_size(value: f32) -> u16 {
-    value.clamp(1.0, 256.0).round() as u16
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "clamped to [1.0, 256.0] then rounded; the value is an exact integer in u16 range"
+    )]
+    let size = value.clamp(1.0, 256.0).round() as u16;
+    size
 }
 
 fn wrap_text_lines(
@@ -905,5 +990,111 @@ mod tests {
         assert_eq!(line.stats.glyph_count, 0);
         assert!(line.stats.atlas_overflow_glyph_count > 0);
         assert_eq!(line.stats.missing_raster_glyph_count, 0);
+    }
+
+    /// Build the emitted SDF quad for one char at one logical size through the real
+    /// raster -> coverage -> atlas path (the same seam `object_pipeline` drives).
+    fn emit_glyph_quad(ch: char, font_size: f32) -> crate::text_layout::MsdfGlyphEntry {
+        let engine = TextEngine::new().expect("bundled fonts load");
+        let cov = engine
+            .glyph_coverage(ch, font_size, 1.0)
+            .unwrap_or_else(|| panic!("{ch:?} rasterizes at {font_size}px"));
+        let mut plan = crate::text_layout::MsdfAtlasPlan::new(2048, 2048, 4.0);
+        plan.generate_glyph(&crate::text_layout::GlyphCoverage {
+            key: crate::text_layout::MsdfGlyphKey {
+                font_index: cov.font_index,
+                glyph_id: cov.glyph_id,
+                px: cov.px,
+            },
+            coverage: &cov.coverage,
+            width: cov.width,
+            height: cov.height,
+            bearing_x: cov.bearing_x,
+            bearing_y: cov.bearing_y,
+            oversample: cov.oversample,
+        })
+        .expect("atlas room")
+    }
+
+    /// FALSIFIABLE (ransom-note regression A): every glyph of a small word, laid out
+    /// through the real raster -> coverage -> SDF-atlas quad path at dpr=1, emits a quad
+    /// whose logical size is its TRUE logical size — the un-oversampled padded source
+    /// cell, `cov.height + 2*pad` (and `cov.width + 2*pad`). With no oversample the
+    /// raster scale == the layout scale, so the divide-back is the identity and every
+    /// glyph in the word renders at one consistent logical scale + baseline.
+    ///
+    /// The fix-4 min-source-raster floor broke this: it raised the effective oversample
+    /// to ~2.9x for a small label, rasterized the source at ~32px, then divided the quad
+    /// back by that continuous ~2.9 — shrinking each glyph's padded cell ~3x toward the
+    /// pad and amplifying every glyph's integer-raster metric slop. One word's letters
+    /// rendered at jumping sizes/baselines ("Pl-ace-m-ent"). Asserting the quad equals
+    /// the exact un-oversampled logical cell fails on the floored path (every glyph's
+    /// height/width is off by the ~2.9 divide) and passes on the restored logical path.
+    #[test]
+    fn word_glyphs_lay_out_at_true_logical_size() {
+        let size = 11.0_f32; // a small UI label, where the floor fired hardest.
+        let engine = TextEngine::new().expect("bundled fonts load");
+        let pad = 4.0_f32; // distance_range.ceil() for the 4.0 plan emit_glyph_quad uses.
+        for ch in "Placement".chars() {
+            let cov = engine
+                .glyph_coverage(ch, size, 1.0)
+                .unwrap_or_else(|| panic!("{ch:?} rasterizes"));
+            // At dpr=1 with no floor, the source is rasterized at the logical px, so the
+            // quad is the padded source cell verbatim — no shrink.
+            assert!(
+                (cov.oversample - 1.0).abs() < 1e-6,
+                "dpr=1 small label {ch:?} must not be oversampled: ov={}",
+                cov.oversample
+            );
+            let entry = emit_glyph_quad(ch, size);
+            let expect_h =
+                crate::cast::narrow_f32(f64::from(crate::cast::len_u32(cov.height))) + 2.0 * pad;
+            let expect_w =
+                crate::cast::narrow_f32(f64::from(crate::cast::len_u32(cov.width))) + 2.0 * pad;
+            assert!(
+                (entry.height - expect_h).abs() < 0.01,
+                "{ch:?} quad height {} != true logical cell {expect_h} (floored shrink)",
+                entry.height
+            );
+            assert!(
+                (entry.width - expect_w).abs() < 0.01,
+                "{ch:?} quad width {} != true logical cell {expect_w} (floored shrink)",
+                entry.width
+            );
+        }
+    }
+
+    /// FALSIFIABLE (ransom-note regression A, baseline half): every glyph of a small
+    /// word with no descender ("Placement") sits on ONE baseline — each glyph's emitted
+    /// cell bottom `bearing_y + height` is the glyph's ink bottom == the line baseline.
+    /// On a correct dpr=1 layout these cluster within a sub-pixel band AND the band sits
+    /// at the true logical baseline (≈ ascent + a pad below the line top), not a shrunk
+    /// ~3x-smaller position. The floor shrank the whole word's box ~3x toward the pad,
+    /// pulling the baseline far above its true logical position. Asserting the baseline
+    /// band lands near the un-oversampled ascent fails on the floored (shrunk) path.
+    #[test]
+    fn word_baseline_lands_at_true_logical_position() {
+        let size = 11.0_f32;
+        let mut bottoms = Vec::new();
+        for ch in "Placement".chars() {
+            let entry = emit_glyph_quad(ch, size);
+            bottoms.push((ch, entry.bearing_y + entry.height));
+        }
+        let min = bottoms.iter().map(|(_, b)| *b).fold(f32::MAX, f32::min);
+        let max = bottoms.iter().map(|(_, b)| *b).fold(f32::MIN, f32::max);
+        // The word shares one baseline (tight band) ...
+        assert!(
+            max - min < 2.0,
+            "word baseline spread {:.2}px — ransom-note hop: {bottoms:?}",
+            max - min
+        );
+        // ... and that baseline is the TRUE logical one, not the floored ~3x-smaller
+        // position. At 11px the ascent baseline + pad lands ~15-18px below the line top;
+        // the floored shrink pulled it to ~14px. A floor that fired would drag the whole
+        // band below this bound.
+        assert!(
+            min > 15.0,
+            "baseline band min {min:.2}px is shrunk below the true logical baseline (floored)"
+        );
     }
 }

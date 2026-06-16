@@ -8,11 +8,12 @@
 
 use crate::fractional::generate_key_between;
 
+use crate::object::affine::{canonicalize_orientation, rehome_anchor_local};
 use crate::object::model::{
     Anchor, Comment, Geometry, Layout, Object, ObjectId, ObjectScene, SubPath,
 };
 use crate::object::op::{FieldEdit, ObjectOp};
-use crate::object::validate::{validate_geometry, ValidationError};
+use crate::object::validate::{validate_geometry, validate_layout, validate_sizing, ValidationError};
 
 /// Geometry defects collapse to `BadGeometry`; structural ones keep their
 /// dedicated variant.
@@ -21,7 +22,9 @@ fn apply_error_from_validation(e: ValidationError) -> ApplyError {
         ValidationError::EmptyGeometry
         | ValidationError::DegenerateSubpath { .. }
         | ValidationError::AnchorNodeOutOfRange { .. }
-        | ValidationError::CommentNodeOutOfRange { .. } => ApplyError::BadGeometry(e.to_string()),
+        | ValidationError::CommentNodeOutOfRange { .. }
+        | ValidationError::NegativeSizing { .. }
+        | ValidationError::ZeroLanes => ApplyError::BadGeometry(e.to_string()),
         ValidationError::ParentCycle { id } => ApplyError::Cycle(id),
         ValidationError::MissingAnchorTarget { target, .. } => {
             ApplyError::MissingAnchorTarget(target)
@@ -167,8 +170,11 @@ fn apply_inner(scene: &mut ObjectScene, op: ObjectOp) -> Result<ObjectOp, ApplyE
         }
 
         ObjectOp::SetLayout { id, layout } => {
+            if let Some(l) = &layout {
+                validate_layout(l).map_err(apply_error_from_validation)?;
+            }
             let idx = index_of(scene, &id)?;
-            let old: Option<Layout> = scene.objects[idx].layout.clone();
+            let old: Option<Layout> = scene.objects[idx].layout;
             scene.objects[idx].layout = layout;
             Ok(ObjectOp::SetLayout { id, layout: old })
         }
@@ -178,6 +184,91 @@ fn apply_inner(scene: &mut ObjectScene, op: ObjectOp) -> Result<ObjectOp, ApplyE
             let old = scene.objects[idx].clip;
             scene.objects[idx].clip = clip;
             Ok(ObjectOp::SetClip { id, clip: old })
+        }
+
+        ObjectOp::SetSizing { id, sizing } => {
+            if let Some(s) = &sizing {
+                validate_sizing(s).map_err(apply_error_from_validation)?;
+            }
+            let idx = index_of(scene, &id)?;
+            let old = scene.objects[idx].sizing;
+            scene.objects[idx].sizing = sizing;
+            Ok(ObjectOp::SetSizing { id, sizing: old })
+        }
+
+        ObjectOp::SetMeta { id, name, hidden, locked } => {
+            let idx = index_of(scene, &id)?;
+            // Each present field captures its prior value into the inverse; an
+            // absent field is never touched, so its inverse stays absent too.
+            let inv_name = name.map(|edit| {
+                let old = scene.objects[idx].name.clone();
+                scene.objects[idx].name = edit.resolve(old.clone());
+                FieldEdit::from_option(old)
+            });
+            let inv_hidden = hidden.map(|v| {
+                let old = scene.objects[idx].hidden;
+                scene.objects[idx].hidden = v;
+                old
+            });
+            let inv_locked = locked.map(|v| {
+                let old = scene.objects[idx].locked;
+                scene.objects[idx].locked = v;
+                old
+            });
+            Ok(ObjectOp::SetMeta { id, name: inv_name, hidden: inv_hidden, locked: inv_locked })
+        }
+
+        ObjectOp::Canonicalize { id } => {
+            let idx = index_of(scene, &id)?;
+            // Capture the pre-state for a faithful (restore-by-reverse-op) inverse.
+            let old_geometry = scene.objects[idx].geometry.clone();
+            let old_transform = scene.objects[idx].transform;
+
+            // Already axis-aligned / freeform => nothing to extract; a no-op with a
+            // no-op inverse so no bogus undo step is pushed (mirrors SetText).
+            let Some((new_transform, mut new_geometry)) =
+                canonicalize_orientation(&old_transform, &old_geometry)
+            else {
+                return Ok(ObjectOp::Batch { ops: Vec::new() });
+            };
+
+            // Re-validate the rewritten geometry before committing (the rewrite is
+            // a deliberate geometry rebake, gated like every other geometry edit).
+            new_geometry.ensure_parsed().map_err(ApplyError::BadGeometry)?;
+            validate_geometry(&new_geometry).map_err(apply_error_from_validation)?;
+
+            // Snapshot peer anchors addressing this object BEFORE re-homing, so the
+            // inverse restores them verbatim (like Split/Merge).
+            let peer_before = capture_peer_anchors(scene, &[id.as_str()]);
+
+            scene.objects[idx].geometry = new_geometry;
+            scene.objects[idx].transform = new_transform;
+
+            // Canonicalize holds every world point fixed but rewrites this object's
+            // local space, so any peer anchored onto it must re-home its `at` from
+            // the OLD local space into the NEW one (else the endpoint silently
+            // desyncs). Re-projection preserves the bound world position.
+            for peer in &mut scene.objects {
+                if peer.id == id {
+                    continue;
+                }
+                for anchor in &mut peer.anchors {
+                    if anchor.target == id {
+                        anchor.at = rehome_anchor_local(&old_transform, &new_transform, anchor.at);
+                    }
+                }
+            }
+
+            // Faithful inverse: restore geometry then transform via ordinary ops,
+            // then restore each peer's pre-canonicalize anchor array verbatim.
+            let mut inverse_ops = vec![
+                ObjectOp::EditGeometry { id: id.clone(), geometry: old_geometry },
+                ObjectOp::SetTransform { id, transform: old_transform },
+            ];
+            for (peer_id, anchors) in peer_before {
+                inverse_ops.push(ObjectOp::SetAnchor { id: peer_id, anchors });
+            }
+            Ok(ObjectOp::Batch { ops: inverse_ops })
         }
 
         ObjectOp::AddComment { id, comment } => {
@@ -582,6 +673,20 @@ fn touched_properties(op: &ObjectOp) -> Vec<(ObjectId, &'static str)> {
         ObjectOp::SetAnchor { id, .. } => vec![(id.clone(), "anchors")],
         ObjectOp::SetLayout { id, .. } => vec![(id.clone(), "layout")],
         ObjectOp::SetClip { id, .. } => vec![(id.clone(), "clip")],
+        ObjectOp::SetSizing { id, .. } => vec![(id.clone(), "sizing")],
+        ObjectOp::SetMeta { id, name, hidden, locked } => {
+            let mut v = Vec::new();
+            if name.is_some() {
+                v.push((id.clone(), "name"));
+            }
+            if hidden.is_some() {
+                v.push((id.clone(), "hidden"));
+            }
+            if locked.is_some() {
+                v.push((id.clone(), "locked"));
+            }
+            v
+        }
         ObjectOp::AddComment { id, .. } | ObjectOp::SetComments { id, .. } => {
             vec![(id.clone(), "comments")]
         }
@@ -592,6 +697,10 @@ fn touched_properties(op: &ObjectOp) -> Vec<(ObjectId, &'static str)> {
         | ObjectOp::Delete { .. }
         | ObjectOp::Split { .. }
         | ObjectOp::Merge { .. }
+        // Canonicalize is a structural geometry+transform rewrite spanning two
+        // properties atomically; the server orders it by global seq, not per
+        // property (it is an explicit user click, not a high-frequency write).
+        | ObjectOp::Canonicalize { .. }
         | ObjectOp::Batch { .. } => Vec::new(),
     }
 }

@@ -3,11 +3,13 @@
 //! golden vector: it is embedded inline below, not derived from a TS oracle.
 
 use shape_scene_core::object::{
-    apply_object_op, apply_sequence, reproject_object_anchors, solve_layout, Anchor, Fill,
-    FillRule, Geometry, HandlePoint, Layout, LayoutAlign, LayoutDirection, LayoutSizing, LocalPoint,
-    Object, ObjectOp, ObjectScene, OutlineDeriver, Paint, PathNode, Stroke, StubOutlineDeriver,
-    SubPath, Text, TextRun, Transform3x3, UndoStack,
+    apply_object_op, apply_sequence, decompose_affine, reproject_object_anchors, solve_layout,
+    Align, Anchor, ApplyError, AxisSizing, CrossAlign, Fill, FillRule, Geometry, HandlePoint,
+    Lanes, Layout, LayoutAxis, LocalPoint, MainAlign, Object, ObjectOp, ObjectScene,
+    OutlineDeriver, Paint, PathNode, Sizing, Stroke, StubOutlineDeriver, SubPath, Text, TextRun,
+    Transform3x3, UndoStack,
 };
+use shape_scene_core::object::FieldEdit;
 use shape_scene_core::object::region::point_in_polygon;
 
 /// A closed axis-aligned rect with corners (x0,y0)-(x1,y1).
@@ -458,17 +460,17 @@ fn ob53_split_inverse_then_inverse_round_trips_identity_three_tier() {
 
 #[test]
 fn ob53_auto_layout_spaces_children_deterministically() {
-    // A row group of three unit-rects (80x40 quantized = 10x5 px), gap 16q = 2px,
-    // padding 0. solve_layout spaces them along x by width(10) + gap(2) = 12px,
-    // and the result is order-stable + repeatable.
+    // A horizontal group of three unit-rects (80x40 quantized = 10x5 px),
+    // spacing 16q = 2px (both inset and gap). solve_layout insets the first child
+    // 2px then spaces along x by width(10) + spacing(2) => x 2, 14, 26, with a 2px
+    // cross inset; the result is order-stable + repeatable.
     let mut scene = ObjectScene::default();
     let mut group = Object::new("grp", "g0", Geometry::default());
     group.layout = Some(Layout {
-        direction: LayoutDirection::Row,
-        gap: 16,
-        padding: 0,
-        align: LayoutAlign::Start,
-        sizing: LayoutSizing::Hug,
+        axis: LayoutAxis::Horizontal,
+        lanes: Lanes::Count { value: 1 },
+        spacing: 16,
+        align: Align { main: MainAlign::Start, cross: CrossAlign::Start },
     });
     scene.objects.push(group);
     for (id, order) in [("c", "a2"), ("a", "a0"), ("b", "a1")] {
@@ -484,9 +486,9 @@ fn ob53_auto_layout_spaces_children_deterministically() {
     assert_eq!(ids, vec!["a", "b", "c"]);
 
     let xs: Vec<f64> = out.iter().map(|(_, t)| t.m[0][2]).collect();
-    assert!((xs[0] - 0.0).abs() < 1e-9, "first x = {}", xs[0]);
-    assert!((xs[1] - 12.0).abs() < 1e-9, "second x = {}", xs[1]);
-    assert!((xs[2] - 24.0).abs() < 1e-9, "third x = {}", xs[2]);
+    assert!((xs[0] - 2.0).abs() < 1e-9, "first x = {}", xs[0]);
+    assert!((xs[1] - 14.0).abs() < 1e-9, "second x = {}", xs[1]);
+    assert!((xs[2] - 26.0).abs() < 1e-9, "third x = {}", xs[2]);
 
     // Deterministic: re-solving the same scene yields an identical layout.
     let again = solve_layout(&scene, "grp", &StubOutlineDeriver);
@@ -604,4 +606,308 @@ fn ob53_hit_test_point_in_polygon_rotated_outline() {
     // A point in the AABB but outside the diamond (near a clipped corner) misses.
     assert!(!point_in_polygon(&diamond, LocalPoint { x: 5, y: 5 }));
     assert!(!point_in_polygon(&diamond, LocalPoint { x: 95, y: 95 }));
+}
+
+// ---- Ops phase: SetSizing / SetMeta / Canonicalize -----------------------
+
+fn rect_scene() -> ObjectScene {
+    let mut scene = ObjectScene::default();
+    apply_object_op(
+        &mut scene,
+        ObjectOp::InsertObject { object: Object::new("r", "a0", rect(0, 0, 80, 40)) },
+    )
+    .expect("insert rect");
+    scene
+}
+
+#[test]
+fn set_sizing_round_trips() {
+    let mut scene = rect_scene();
+    assert_eq!(scene.get("r").unwrap().sizing, None);
+
+    let sizing = Sizing { w: AxisSizing::Fill, h: AxisSizing::Fixed { value: 240 } };
+    let inverse =
+        apply_object_op(&mut scene, ObjectOp::SetSizing { id: "r".into(), sizing: Some(sizing) })
+            .expect("set sizing");
+    assert_eq!(scene.get("r").unwrap().sizing, Some(sizing));
+    // The inverse restores the prior (absent) sizing exactly.
+    assert_eq!(inverse, ObjectOp::SetSizing { id: "r".into(), sizing: None });
+
+    apply_object_op(&mut scene, inverse).expect("apply inverse");
+    assert_eq!(scene.get("r").unwrap().sizing, None);
+}
+
+#[test]
+fn set_sizing_rejects_negative_fixed() {
+    let mut scene = rect_scene();
+    let err = apply_object_op(
+        &mut scene,
+        ObjectOp::SetSizing {
+            id: "r".into(),
+            sizing: Some(Sizing { w: AxisSizing::Fixed { value: -1 }, h: AxisSizing::Hug }),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, ApplyError::BadGeometry(_)), "negative fixed sizing rejected: {err:?}");
+    // Scene untouched on the rejected write.
+    assert_eq!(scene.get("r").unwrap().sizing, None);
+}
+
+#[test]
+fn set_meta_per_field_inverse() {
+    let mut scene = rect_scene();
+
+    // Set name + hidden together; locked left absent (untouched).
+    let inverse = apply_object_op(
+        &mut scene,
+        ObjectOp::SetMeta {
+            id: "r".into(),
+            name: Some(FieldEdit::Set { value: "Header".into() }),
+            hidden: Some(true),
+            locked: None,
+        },
+    )
+    .expect("set meta");
+    let o = scene.get("r").unwrap();
+    assert_eq!(o.name.as_deref(), Some("Header"));
+    assert!(o.hidden);
+    assert!(!o.locked, "absent locked field stays default");
+
+    // The inverse restores the prior name (Clear, since it was None) + hidden
+    // (false); it carries no `locked` because that field was never touched.
+    assert_eq!(
+        inverse,
+        ObjectOp::SetMeta {
+            id: "r".into(),
+            name: Some(FieldEdit::Clear),
+            hidden: Some(false),
+            locked: None,
+        }
+    );
+    apply_object_op(&mut scene, inverse).expect("apply inverse");
+    let o = scene.get("r").unwrap();
+    assert_eq!(o.name, None);
+    assert!(!o.hidden);
+
+    // A second op touching ONLY locked leaves name/hidden intact.
+    apply_object_op(
+        &mut scene,
+        ObjectOp::SetMeta { id: "r".into(), name: None, hidden: None, locked: Some(true) },
+    )
+    .expect("lock only");
+    let o = scene.get("r").unwrap();
+    assert!(o.locked);
+    assert_eq!(o.name, None, "name untouched by a locked-only edit");
+    assert!(!o.hidden, "hidden untouched by a locked-only edit");
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "test fixture quantizes a rotated px coordinate: .round() then narrow, the canonical de/quantize semantic"
+)]
+fn round_to_i32(v: f64) -> i32 {
+    v.round() as i32
+}
+
+/// A closed quad whose nodes are pre-rotated by `deg` about the origin in
+/// object-local quantized space, identity transform.
+fn rotated_quad(deg: f64) -> Object {
+    let angle = deg.to_radians();
+    let (cos, sin) = (angle.cos(), angle.sin());
+    let base = [(0, 0), (480, 0), (480, 240), (0, 240)];
+    let nodes: Vec<PathNode> = base
+        .iter()
+        .map(|(x, y)| {
+            let (fx, fy) = (f64::from(*x), f64::from(*y));
+            PathNode::corner(round_to_i32(cos * fx - sin * fy), round_to_i32(sin * fx + cos * fy))
+        })
+        .collect();
+    let geom = Geometry::from_subpaths(vec![SubPath { closed: true, nodes }], FillRule::EvenOdd);
+    Object::new("q", "a0", geom)
+}
+
+#[test]
+fn canonicalize_extracts_angle_and_inverse_restores() {
+    let mut scene = ObjectScene::default();
+    let q = rotated_quad(30.0);
+    let before_geometry = q.geometry.clone();
+    let before_transform = q.transform;
+    apply_object_op(&mut scene, ObjectOp::InsertObject { object: q }).expect("insert quad");
+
+    let inverse =
+        apply_object_op(&mut scene, ObjectOp::Canonicalize { id: "q".into() }).expect("canonicalize");
+
+    // The transform now honestly reads ~30deg (folded; rotation lives in transform).
+    let t = scene.get("q").unwrap().transform;
+    let d = decompose_affine(&t);
+    assert!(
+        (d.rotation_rad.abs() - 30.0_f64.to_radians()).abs() < 2e-2,
+        "extracted rotation {} expected ~30deg",
+        d.rotation_rad.to_degrees()
+    );
+
+    // The rewritten geometry is axis-aligned: every edge is horizontal or vertical
+    // within a quantization tolerance.
+    let sp = &scene.get("q").unwrap().geometry.subpaths[0];
+    for i in 0..sp.nodes.len() {
+        let a = &sp.nodes[i];
+        let b = &sp.nodes[(i + 1) % sp.nodes.len()];
+        let dx = (a.x - b.x).abs();
+        let dy = (a.y - b.y).abs();
+        assert!(dx <= 1 || dy <= 1, "edge {i} not axis-aligned: d=({dx},{dy})");
+    }
+
+    // The inverse is a Batch that restores the EXACT prior geometry + transform.
+    assert!(matches!(inverse, ObjectOp::Batch { .. }));
+    apply_object_op(&mut scene, inverse).expect("apply inverse");
+    let restored = scene.get("q").unwrap();
+    assert_eq!(
+        restored.geometry.path_string, before_geometry.path_string,
+        "geometry restored exactly"
+    );
+    assert_eq!(restored.transform, before_transform, "transform restored exactly");
+}
+
+#[test]
+fn canonicalize_axis_aligned_is_noop() {
+    // An already axis-aligned rect has nothing to extract: a no-op with an
+    // empty-Batch inverse, so no bogus undo step lands.
+    let mut scene = rect_scene();
+    let before = scene.get("r").unwrap().clone();
+    let inverse =
+        apply_object_op(&mut scene, ObjectOp::Canonicalize { id: "r".into() }).expect("canonicalize");
+    assert_eq!(inverse, ObjectOp::Batch { ops: Vec::new() }, "no-op inverse");
+    assert_eq!(scene.get("r").unwrap().geometry, before.geometry, "geometry unchanged");
+    assert_eq!(scene.get("r").unwrap().transform, before.transform, "transform unchanged");
+}
+
+#[test]
+fn canonicalize_freeform_blob_reads_rotation_zero() {
+    // A tiny freeform scribble whose longest edge is well under 1px (8 quantized
+    // units) has no dominant orientation => no-op, honestly reading rotation 0.
+    let mut scene = ObjectScene::default();
+    let blob = Geometry::from_subpaths(
+        vec![SubPath {
+            closed: false,
+            nodes: vec![
+                PathNode::corner(0, 0),
+                PathNode::corner(3, 2),
+                PathNode::corner(1, 4),
+                PathNode::corner(4, 5),
+            ],
+        }],
+        FillRule::NonZero,
+    );
+    apply_object_op(&mut scene, ObjectOp::InsertObject { object: Object::new("b", "a0", blob) })
+        .expect("insert blob");
+    let before = scene.get("b").unwrap().clone();
+
+    let inverse =
+        apply_object_op(&mut scene, ObjectOp::Canonicalize { id: "b".into() }).expect("canonicalize");
+    assert_eq!(inverse, ObjectOp::Batch { ops: Vec::new() }, "freeform no-op inverse");
+    assert_eq!(scene.get("b").unwrap().geometry, before.geometry);
+    assert_eq!(decompose_affine(&scene.get("b").unwrap().transform).rotation_rad, 0.0);
+}
+
+/// The world position of `obj`'s geometry node `i` under its transform (logical px).
+fn world_node_of(obj: &Object, i: usize) -> (f64, f64) {
+    let node = &obj.geometry.subpaths[0].nodes[i];
+    let q = f64::from(shape_scene_core::object::GEOMETRY_QUANTUM_PER_PX);
+    obj.transform.apply_point(f64::from(node.x) / q, f64::from(node.y) / q)
+}
+
+#[test]
+fn canonicalize_rehomes_peer_anchor_and_inverse_restores() {
+    // A peer anchored onto a rotated object must still resolve to the SAME world
+    // point after the target is canonicalized (canonicalize holds world points
+    // fixed but rewrites the target's local space, so the anchor `at` must re-home).
+    let mut scene = ObjectScene::default();
+    let target = rotated_quad(30.0); // id "q"
+    apply_object_op(&mut scene, ObjectOp::InsertObject { object: target }).expect("insert target");
+
+    // The peer's single node sits at the target's node-0 world point; its anchor
+    // binds to that node with `at` in the target's CURRENT (pre-canonicalize) local
+    // space — node 0 of rotated_quad's base is local (0,0).
+    let target_obj = scene.get("q").unwrap();
+    let (wx0, wy0) = world_node_of(target_obj, 0);
+    let mut peer = Object::new("edge", "a1", connector(0, 0, 40, 40));
+    peer.anchors = vec![Anchor { node_index: 1, target: "q".into(), at: LocalPoint { x: 0, y: 0 } }];
+    apply_object_op(&mut scene, ObjectOp::InsertObject { object: peer }).expect("insert peer");
+
+    // The anchor's bound world point before canonicalize: at=(0,0) carried through
+    // the target's transform.
+    let resolve_world = |scene: &ObjectScene| {
+        let p = scene.get("edge").unwrap();
+        let a = &p.anchors[0];
+        let t = scene.get(&a.target).unwrap().transform;
+        let q = f64::from(shape_scene_core::object::GEOMETRY_QUANTUM_PER_PX);
+        t.apply_point(f64::from(a.at.x) / q, f64::from(a.at.y) / q)
+    };
+    let (bx, by) = resolve_world(&scene);
+    assert!((bx - wx0).abs() < 1e-6 && (by - wy0).abs() < 1e-6, "anchor world pre ({bx},{by})");
+    let before_anchors = scene.get("edge").unwrap().anchors.clone();
+
+    let inverse =
+        apply_object_op(&mut scene, ObjectOp::Canonicalize { id: "q".into() }).expect("canonicalize");
+
+    // The anchor `at` changed (local space was rewritten) but its resolved WORLD
+    // point is preserved within a quantization tolerance.
+    let (ax, ay) = resolve_world(&scene);
+    assert!(
+        (ax - bx).abs() < 0.5 && (ay - by).abs() < 0.5,
+        "anchor world preserved across canonicalize: was ({bx},{by}) now ({ax},{ay})"
+    );
+
+    // The inverse Batch restores the peer's pre-canonicalize anchor array verbatim.
+    assert!(matches!(inverse, ObjectOp::Batch { .. }));
+    apply_object_op(&mut scene, inverse).expect("apply inverse");
+    assert_eq!(
+        scene.get("edge").unwrap().anchors,
+        before_anchors,
+        "inverse restored the peer's original anchor `at`"
+    );
+}
+
+// ---- SetLayout (reshaped Layout) validation + inverse round-trip ----------
+
+fn flow_layout() -> Layout {
+    Layout {
+        axis: LayoutAxis::Vertical,
+        lanes: Lanes::Count { value: 3 },
+        spacing: 16,
+        align: Align { main: MainAlign::Center, cross: CrossAlign::Stretch },
+    }
+}
+
+#[test]
+fn set_layout_round_trips() {
+    let mut scene = rect_scene();
+    assert_eq!(scene.get("r").unwrap().layout, None);
+
+    let layout = flow_layout();
+    let inverse =
+        apply_object_op(&mut scene, ObjectOp::SetLayout { id: "r".into(), layout: Some(layout) })
+            .expect("set layout");
+    assert_eq!(scene.get("r").unwrap().layout, Some(layout));
+    // The inverse restores the prior (absent) layout exactly.
+    assert_eq!(inverse, ObjectOp::SetLayout { id: "r".into(), layout: None });
+
+    apply_object_op(&mut scene, inverse).expect("apply inverse");
+    assert_eq!(scene.get("r").unwrap().layout, None);
+}
+
+#[test]
+fn set_layout_rejects_zero_lanes() {
+    let mut scene = rect_scene();
+    let bad = Layout {
+        axis: LayoutAxis::Horizontal,
+        lanes: Lanes::Count { value: 0 },
+        spacing: 0,
+        align: Align { main: MainAlign::Start, cross: CrossAlign::Start },
+    };
+    let err = apply_object_op(&mut scene, ObjectOp::SetLayout { id: "r".into(), layout: Some(bad) })
+        .unwrap_err();
+    assert!(matches!(err, ApplyError::BadGeometry(_)), "zero lanes rejected: {err:?}");
+    // Scene untouched on the rejected write.
+    assert_eq!(scene.get("r").unwrap().layout, None);
 }

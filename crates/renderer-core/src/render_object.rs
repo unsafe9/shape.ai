@@ -8,9 +8,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+
 use shape_scene_core::object::model::{
-    self, GEOMETRY_QUANTUM_PER_PX, Object, ObjectScene, ObjectSelection,
+    self, GEOMETRY_QUANTUM_PER_PX, Object, ObjectScene, ObjectSelection, Transform3x3,
 };
+use shape_scene_core::object::{solve_layout, StubOutlineDeriver};
 
 use crate::model::CameraState;
 
@@ -45,6 +48,14 @@ pub struct RenderObject {
     /// Figma-style clip flag: children render clipped to this object's region/bounds.
     #[serde(default)]
     pub clip: bool,
+    /// Hidden from render + hit-test. Carried (not dropped) so the index-aligned
+    /// instance/draw slots and id lookups stay intact; consumers gate on it.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Non-interactive (no select/drag/marquee/erase/handles). Carried, not dropped,
+    /// for the same index-alignment reason as `hidden`.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 /// Per-node attachment binding node `node_index` to `target` at target-local `at`.
@@ -223,12 +234,79 @@ impl RenderObjectScene {
             ObjectSelection::Multi { ids } => (None, ids.clone()),
             ObjectSelection::Canvas => (None, Vec::new()),
         };
+        let mut objects: Vec<RenderObject> =
+            scene.objects.iter().map(render_object_from).collect();
+        apply_layout_placements(scene, &mut objects);
         RenderObjectScene {
             scene_id: scene_id.into(),
             camera,
-            objects: scene.objects.iter().map(render_object_from).collect(),
+            objects,
             selection,
             multi_select,
+        }
+    }
+}
+
+/// Override each laid-out child's transform with the DERIVED auto-layout placement.
+/// The placement is derived per draw, never stored on the canonical `ObjectScene`
+/// (honors `solve_layout`'s zero-rebake contract): only the projected per-instance
+/// matrix moves, geometry is untouched. Uses the same [`StubOutlineDeriver`] (AABB
+/// from parsed subpaths) the inspector uses, so solved geometry matches the panel.
+/// Requires `scene.objects[*].geometry.subpaths` populated (caller `ensure_parsed`).
+///
+/// `solve_layout` returns each placement in the container's UNTRANSLATED local
+/// content frame; the world matrix is composed here as `base · P`, where `base` is
+/// the container's EFFECTIVE world transform: its laid-out override when it is itself
+/// a layout child, else its stored transform. Containers are processed outer->inner
+/// (ascending full parent-chain depth) so a nested container composes its children
+/// against the matrix its own ancestor laid out for it (`G_A · P_B · P_C`), not its
+/// stale stored position. The renderer's flat `view · M · local` then lands each
+/// child inside the right frame at arbitrary nesting depth.
+fn apply_layout_placements(scene: &ObjectScene, objects: &mut [RenderObject]) {
+    // Layout containers in outer->inner order: ascending full parent-chain depth
+    // (count ALL ancestors, not just layout ones), tie-broken by id for determinism.
+    // Journaled scenes are acyclic (validate_no_parent_cycle), but live wire input may
+    // be unvalidated, so cap the depth walk by objects.len() to never loop.
+    let cap = scene.objects.len();
+    let depth_of = |id: &str| -> usize {
+        let mut depth = 0;
+        let mut cur = scene.get(id).and_then(|o| o.parent.as_deref());
+        while let Some(p) = cur {
+            depth += 1;
+            if depth > cap {
+                break;
+            }
+            cur = scene.get(p).and_then(|o| o.parent.as_deref());
+        }
+        depth
+    };
+    let mut containers: Vec<&Object> =
+        scene.objects.iter().filter(|o| o.layout.is_some()).collect();
+    containers.sort_by(|a, b| {
+        depth_of(&a.id).cmp(&depth_of(&b.id)).then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut overrides: HashMap<&str, [[f64; 3]; 3]> = HashMap::new();
+    for container in containers {
+        // The effective base: the override an ancestor laid out for this container if
+        // it is itself a layout child, else its stored transform. Copy it out before
+        // the inner loop borrows the map mutably for insert.
+        let eff = overrides.get(container.id.as_str()).copied().unwrap_or(container.transform.m);
+        let eff = Transform3x3 { m: eff };
+        for (id, placed) in solve_layout(scene, &container.id, &StubOutlineDeriver) {
+            // The override map borrows the canonical id, so look it up by the owned
+            // key the solver returned against the same scene.
+            if let Some(obj) = scene.get(&id) {
+                overrides.insert(obj.id.as_str(), eff.mul(&placed).m);
+            }
+        }
+    }
+    if overrides.is_empty() {
+        return;
+    }
+    for obj in objects.iter_mut() {
+        if let Some(m) = overrides.get(obj.id.as_str()) {
+            obj.transform = *m;
         }
     }
 }
@@ -251,6 +329,8 @@ fn render_object_from(object: &Object) -> RenderObject {
         text: object.text.as_ref().map(rtext_from),
         anchors: object.anchors.iter().map(ranchor_from).collect(),
         clip: object.clip.unwrap_or(false),
+        hidden: object.hidden,
+        locked: object.locked,
     }
 }
 
@@ -670,6 +750,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         };
         let resolved = resolve_visual(&obj, VisualState::default());
         match &resolved.fill.paint {
@@ -711,6 +793,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         };
         let resolved = resolve_visual(&obj, VisualState::default());
         match &resolved.fill.paint {
@@ -736,6 +820,8 @@ mod tests {
             text: None,
             anchors: Vec::new(),
             clip: false,
+            hidden: false,
+            locked: false,
         };
         let selected = resolve_visual(
             &obj,
@@ -899,7 +985,9 @@ mod tests {
                         "valign": "bottom"
                     },
                     "anchors": [{ "nodeIndex": 2, "target": "o2", "at": { "x": 10.0, "y": 20.0 } }],
-                    "clip": true
+                    "clip": true,
+                    "hidden": false,
+                    "locked": false
                 }
             ]
         });
@@ -930,5 +1018,262 @@ mod tests {
             RenderObjectScene::from_object_scene(&scene, cam, &ObjectSelection::Canvas, "s");
         assert_eq!(canvas.selection, None);
         assert!(canvas.multi_select.is_empty());
+    }
+
+    // The projection runs the REAL `solve_layout` and overrides each laid-out child's
+    // DERIVED transform — proving the canvas reflows children, not just the inspector.
+    // The placement xs (2/14/26 px) are pinned by `layout_solve` + object_golden ob53:
+    // 3 rects 80x40q (10x5px), spacing 16q (2px), horizontal list. FAILS today (the
+    // stored child transforms pass through verbatim) and FAILS if solve_layout is
+    // skipped. Drives the real solver via the projection (no second layout impl).
+    #[test]
+    fn from_object_scene_reflows_layout_container_children() {
+        let scene_json = r##"{
+            "objects": [
+                {
+                    "id": "grp",
+                    "order": "a0",
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" },
+                    "layout": {
+                        "axis": "horizontal",
+                        "lanes": { "kind": "count", "value": 1 },
+                        "spacing": 16,
+                        "align": { "main": "start", "cross": "start" }
+                    }
+                },
+                {
+                    "id": "a", "order": "a1", "parent": "grp",
+                    "transform": [[1,0,500],[0,1,500],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" }
+                },
+                {
+                    "id": "b", "order": "a2", "parent": "grp",
+                    "transform": [[1,0,-99],[0,1,12],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" }
+                },
+                {
+                    "id": "c", "order": "a3", "parent": "grp",
+                    "transform": [[1,0,7],[0,1,-3],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" }
+                }
+            ]
+        }"##;
+        let mut scene: ObjectScene =
+            serde_json::from_str(scene_json).expect("layout scene deserializes");
+        scene.ensure_parsed().expect("hydrate subpaths");
+
+        let camera = CameraState { x: 0.0, y: 0.0, zoom: 1.0 };
+        let projected = RenderObjectScene::from_object_scene(
+            &scene,
+            camera,
+            &ObjectSelection::Canvas,
+            "s",
+        );
+
+        let tx = |id: &str| -> f64 {
+            projected
+                .objects
+                .iter()
+                .find(|o| o.id == id)
+                .expect("child present")
+                .transform[0][2]
+        };
+        // The DERIVED placement moved the children to 2/14/26, NOT their scattered
+        // stored 500/-99/7 — the projection reflowed them.
+        assert!((tx("a") - 2.0).abs() < 1e-9, "a reflowed to 2px, got {}", tx("a"));
+        assert!((tx("b") - 14.0).abs() < 1e-9, "b reflowed to 14px, got {}", tx("b"));
+        assert!((tx("c") - 26.0).abs() < 1e-9, "c reflowed to 26px, got {}", tx("c"));
+        // The container itself is not a layout child, so its transform is untouched.
+        let grp = projected.objects.iter().find(|o| o.id == "grp").unwrap();
+        assert_eq!(grp.transform, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+    }
+
+    // FIX 1: the derived child placement is composed with the container's WORLD
+    // transform (`G · P`), so a non-identity (translated + rotated) container lands
+    // its children inside the container frame, not near the viewport origin. The
+    // solver returns local-frame placements (local_tx 2/14/26, cross 2); the
+    // projection lifts each by G. FAILS today (raw local placement ~origin) and FAILS
+    // if the compose is omitted. Drives the real solver via the projection.
+    #[test]
+    fn from_object_scene_composes_layout_with_nonidentity_container_world() {
+        // G = translate(1000,500) · 90°-rot = [[0,-1,1000],[1,0,500],[0,0,1]].
+        let scene_json = r##"{
+            "objects": [
+                {
+                    "id": "grp",
+                    "order": "a0",
+                    "transform": [[0,-1,1000],[1,0,500],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" },
+                    "layout": {
+                        "axis": "horizontal",
+                        "lanes": { "kind": "count", "value": 1 },
+                        "spacing": 16,
+                        "align": { "main": "start", "cross": "start" }
+                    }
+                },
+                {
+                    "id": "a", "order": "a1", "parent": "grp",
+                    "transform": [[1,0,500],[0,1,500],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" }
+                },
+                {
+                    "id": "b", "order": "a2", "parent": "grp",
+                    "transform": [[1,0,-99],[0,1,12],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" }
+                },
+                {
+                    "id": "c", "order": "a3", "parent": "grp",
+                    "transform": [[1,0,7],[0,1,-3],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" }
+                }
+            ]
+        }"##;
+        let mut scene: ObjectScene =
+            serde_json::from_str(scene_json).expect("layout scene deserializes");
+        scene.ensure_parsed().expect("hydrate subpaths");
+
+        let projected = RenderObjectScene::from_object_scene(
+            &scene,
+            CameraState { x: 0.0, y: 0.0, zoom: 1.0 },
+            &ObjectSelection::Canvas,
+            "s",
+        );
+
+        let g = model::Transform3x3 { m: [[0.0, -1.0, 1000.0], [1.0, 0.0, 500.0], [0.0, 0.0, 1.0]] };
+        let transform_of = |id: &str| -> [[f64; 3]; 3] {
+            projected
+                .objects
+                .iter()
+                .find(|o| o.id == id)
+                .expect("child present")
+                .transform
+        };
+        // Each child's projected transform == G · translate(local_tx, 2), the local
+        // placement the solver returns lifted by the container world matrix.
+        for (id, local_tx) in [("a", 2.0), ("b", 14.0), ("c", 26.0)] {
+            let expected = g.mul(&model::Transform3x3::translate(local_tx, 2.0)).m;
+            let actual = transform_of(id);
+            for r in 0..3 {
+                for c in 0..3 {
+                    assert!(
+                        (actual[r][c] - expected[r][c]).abs() < 1e-9,
+                        "child {id} cell [{r}][{c}]: got {}, expected {}",
+                        actual[r][c],
+                        expected[r][c]
+                    );
+                }
+            }
+        }
+    }
+
+    // FIX (b): a NESTED layout container B (itself a layout child of A) must compose
+    // its grandchildren against the matrix A laid out for B (G_A · P_B), NOT B's stale
+    // stored transform. B's stored transform is set to an arbitrary STALE value so the
+    // old `B.transform_stored · P_C` composition lands the grandchildren far from A.
+    // Each grandchild's projected transform == G_A · P_B · P_C, where P_B comes from
+    // solve_layout(scene,'A') and P_C from solve_layout(scene,'B'). FAILS on the old
+    // scene-order, stored-base loop. Drives the real solver via the projection.
+    #[test]
+    fn from_object_scene_nested_layout_grandchildren_follow_outer_container() {
+        // G_A = translate(1000,500) · 90°-rot = [[0,-1,1000],[1,0,500],[0,0,1]].
+        let scene_json = r##"{
+            "objects": [
+                {
+                    "id": "A",
+                    "order": "a0",
+                    "transform": [[0,-1,1000],[1,0,500],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" },
+                    "layout": {
+                        "axis": "horizontal",
+                        "lanes": { "kind": "count", "value": 1 },
+                        "spacing": 16,
+                        "align": { "main": "start", "cross": "start" }
+                    }
+                },
+                {
+                    "id": "B", "order": "a1", "parent": "A",
+                    "transform": [[1,0,-300],[0,1,777],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" },
+                    "layout": {
+                        "axis": "horizontal",
+                        "lanes": { "kind": "count", "value": 1 },
+                        "spacing": 16,
+                        "align": { "main": "start", "cross": "start" }
+                    }
+                },
+                {
+                    "id": "C", "order": "a0", "parent": "B",
+                    "transform": [[1,0,42],[0,1,-9],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" }
+                },
+                {
+                    "id": "D", "order": "a1", "parent": "B",
+                    "transform": [[1,0,-7],[0,1,3],[0,0,1]],
+                    "geometry": { "d": "M 0 0 L 80 0 L 80 40 L 0 40 Z" }
+                }
+            ]
+        }"##;
+        let mut scene: ObjectScene =
+            serde_json::from_str(scene_json).expect("nested layout scene deserializes");
+        scene.ensure_parsed().expect("hydrate subpaths");
+
+        let projected = RenderObjectScene::from_object_scene(
+            &scene,
+            CameraState { x: 0.0, y: 0.0, zoom: 1.0 },
+            &ObjectSelection::Canvas,
+            "s",
+        );
+
+        let g_a =
+            model::Transform3x3 { m: [[0.0, -1.0, 1000.0], [1.0, 0.0, 500.0], [0.0, 0.0, 1.0]] };
+        let placement = |container: &str, child: &str| -> model::Transform3x3 {
+            let entry = solve_layout(&scene, container, &StubOutlineDeriver)
+                .into_iter()
+                .find(|(id, _)| id == child)
+                .expect("solver placement present")
+                .1;
+            entry
+        };
+        let p_b = placement("A", "B");
+        let transform_of = |id: &str| -> [[f64; 3]; 3] {
+            projected
+                .objects
+                .iter()
+                .find(|o| o.id == id)
+                .expect("object present")
+                .transform
+        };
+
+        // B itself is laid out against A: its override == G_A · P_B (mid-level pinned).
+        let expected_b = g_a.mul(&p_b).m;
+        let actual_b = transform_of("B");
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!(
+                    (actual_b[r][c] - expected_b[r][c]).abs() < 1e-9,
+                    "B cell [{r}][{c}]: got {}, expected {}",
+                    actual_b[r][c],
+                    expected_b[r][c]
+                );
+            }
+        }
+
+        // Each grandchild follows B's EFFECTIVE (laid-out) matrix, not its stale stored
+        // translate(-300,777): expected = G_A · P_B · P_child.
+        for child in ["C", "D"] {
+            let p_c = placement("B", child);
+            let expected = g_a.mul(&p_b).mul(&p_c).m;
+            let actual = transform_of(child);
+            for r in 0..3 {
+                for c in 0..3 {
+                    assert!(
+                        (actual[r][c] - expected[r][c]).abs() < 1e-9,
+                        "grandchild {child} cell [{r}][{c}]: got {}, expected {}",
+                        actual[r][c],
+                        expected[r][c]
+                    );
+                }
+            }
+        }
     }
 }
