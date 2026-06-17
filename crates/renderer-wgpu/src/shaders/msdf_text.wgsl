@@ -89,8 +89,11 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
   // Derivatives must be evaluated in UNIFORM control flow (WGSL/Tint rejects them
   // inside the per-vertex `mode` branch below, which blanks the canvas). Compute the
   // screen-texel size for every fragment here at the top; the coverage branch ignores
-  // it, the SDF branch uses it.
-  let screen_tex_size = vec2<f32>(1.0) / fwidth(input.uv);
+  // it, the SDF branch uses it. Floor `fwidth` at a tiny epsilon: a degenerate sub-pixel
+  // quad gives `fwidth == 0`, and `1/0 = +Inf` then makes `screen_px_range * (sd - 0.5)`
+  // an `Inf*0 = NaN` exactly on the 0.5 isoline. The clamp keeps the divisor finite.
+  let uv_fwidth = max(fwidth(input.uv), vec2<f32>(1e-6));
+  let screen_tex_size = vec2<f32>(1.0) / uv_fwidth;
 
   var coverage: f32;
   if (input.mode > 0.5) {
