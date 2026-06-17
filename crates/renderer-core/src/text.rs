@@ -221,11 +221,16 @@ impl TextEngine {
     /// turns into an atlas slot. `None` for an unmapped/blank glyph (whitespace,
     /// control). Honors Latin/Korean font fallback; `font_index`/`glyph_id` key the
     /// atlas slot. The pure core never calls this — it lives behind the host seam.
+    ///
+    /// `want_outline` gates the vector-outline extraction the world/SDF path needs:
+    /// the coverage (UI) path discards `outline`, so passing `false` skips the
+    /// contour walk+clone entirely (pure waste per unique UI glyph otherwise).
     pub fn glyph_coverage(
         &self,
         ch: char,
         font_size: f32,
         oversample: f32,
+        want_outline: bool,
     ) -> Option<GlyphCoverageData> {
         if ch.is_control() || ch.is_whitespace() {
             return None;
@@ -257,7 +262,12 @@ impl TextEngine {
         // Extract the vector outline for the true-MSDF world path from the SAME
         // ttf-parser face rustybuzz shaped with, so the glyph-id space matches. `None`
         // (no contours / unsupported table) degrades that glyph to the coverage field.
-        let outline = font.msdf_outline(glyph_id, px);
+        // Skipped for coverage(UI) glyphs, which never read it.
+        let outline = if want_outline {
+            font.msdf_outline(glyph_id, px)
+        } else {
+            None
+        };
         Some(GlyphCoverageData {
             font_index,
             glyph_id,
@@ -614,6 +624,11 @@ impl TextAtlas {
         let height = u32::try_from(metrics.height).unwrap_or(u32::MAX);
         let packed_width = width + padding * 2;
         let packed_height = height + padding * 2;
+        // A cell wider/taller than the whole atlas can never fit; returning an origin
+        // would let the pixel-write loop below index out of bounds (panic).
+        if packed_width >= self.width || packed_height >= self.height {
+            return None;
+        }
         if self.cursor_x + packed_width >= self.width {
             self.cursor_x = 2;
             self.cursor_y += self.row_height + padding;
@@ -1047,12 +1062,69 @@ mod tests {
         assert_eq!(line.stats.missing_raster_glyph_count, 0);
     }
 
+    /// FALSIFIABLE (fix-2, the mirrored coverage packer): a glyph WIDER than the atlas
+    /// but short enough to clear the height check must `insert` to `None`, not return
+    /// an origin and run the pixel-write loop out of bounds. The old guard only reset
+    /// the row on `cursor_x + packed_width >= width` and rejected on height; a 40-wide
+    /// glyph in a 32-wide atlas slipped through and PANICKED in the write loop. This
+    /// test panics on the unfixed packer and returns a clean `None` on the fix.
+    #[test]
+    fn text_atlas_rejects_glyph_wider_than_atlas_without_panic() {
+        let mut atlas = TextAtlas::with_size(32, 32);
+        let metrics = Metrics {
+            width: 40,
+            height: 4,
+            ..Metrics::default()
+        };
+        let bitmap = vec![255_u8; 40 * 4];
+        let key = GlyphRasterKey { font_index: 0, glyph_id: 1, px: 32 };
+        assert!(
+            atlas.insert(key, &metrics, &bitmap, 4.0).is_none(),
+            "a glyph wider than the atlas must be rejected, not packed out of bounds"
+        );
+        assert!(atlas.glyphs.is_empty(), "no slot registered for the over-wide glyph");
+    }
+
+    /// FALSIFIABLE (fix-1, wasted outline extraction): `want_outline=false` must NOT
+    /// walk+clone the glyph's vector outline — the coverage(UI) path discards it. The
+    /// same glyph with `want_outline=true` DOES extract a `Some(outline)`, so the only
+    /// difference is the flag. Fails if `glyph_coverage` ever extracts the outline
+    /// unconditionally (the coverage call would also read `Some`) or never (the SDF
+    /// call would read `None`). All other metrics stay byte-identical across the flag.
+    #[test]
+    fn glyph_coverage_skips_outline_extraction_for_coverage_path() {
+        let engine = TextEngine::new().unwrap();
+        // 'B' is a real contoured glyph, so the SDF path yields an outline.
+        let with = engine
+            .glyph_coverage('B', 32.0, 1.0, true)
+            .expect("'B' rasterizes");
+        let without = engine
+            .glyph_coverage('B', 32.0, 1.0, false)
+            .expect("'B' rasterizes");
+
+        assert!(
+            with.outline.is_some(),
+            "want_outline=true extracts the vector outline for the SDF path"
+        );
+        assert!(
+            without.outline.is_none(),
+            "want_outline=false skips the outline walk+clone for the coverage path"
+        );
+        // Skipping the outline must not perturb the raster/bearing/metric outputs.
+        assert_eq!(with.coverage, without.coverage);
+        assert_eq!((with.width, with.height), (without.width, without.height));
+        assert_eq!(with.bearing_x, without.bearing_x);
+        assert_eq!(with.bearing_y, without.bearing_y);
+        assert_eq!(with.glyph_id, without.glyph_id);
+        assert_eq!(with.px, without.px);
+    }
+
     /// Build the emitted SDF quad for one char at one logical size through the real
     /// raster -> coverage -> atlas path (the same seam `object_pipeline` drives).
     fn emit_glyph_quad(ch: char, font_size: f32) -> crate::text_layout::MsdfGlyphEntry {
         let engine = TextEngine::new().expect("bundled fonts load");
         let cov = engine
-            .glyph_coverage(ch, font_size, 1.0)
+            .glyph_coverage(ch, font_size, 1.0, true)
             .unwrap_or_else(|| panic!("{ch:?} rasterizes at {font_size}px"));
         let mut plan = crate::text_layout::MsdfAtlasPlan::new(2048, 2048, 4.0);
         plan.generate_glyph(&crate::text_layout::GlyphCoverage {
@@ -1094,7 +1166,7 @@ mod tests {
         let pad = 4.0_f32; // distance_range.ceil() for the 4.0 plan emit_glyph_quad uses.
         for ch in "Placement".chars() {
             let cov = engine
-                .glyph_coverage(ch, size, 1.0)
+                .glyph_coverage(ch, size, 1.0, false)
                 .unwrap_or_else(|| panic!("{ch:?} rasterizes"));
             // At dpr=1 with no floor, the source is rasterized at the logical px, so the
             // quad is the padded source cell verbatim — no shrink.

@@ -519,23 +519,14 @@ impl MsdfAtlasPlan {
         // The cell/bearings are in high-res texels; dividing by `oversample` emits the
         // quad in logical px so an oversampled (sharper) atlas slot still lays out at
         // the same size — the layout is resolution-independent, only the SDF is finer.
-        let aw = self.atlas_width as f32;
-        let ah = self.atlas_height as f32;
-        let left = origin_x as f32 / aw;
-        let right = (origin_x + cell_w) as f32 / aw;
-        let top = origin_y as f32 / ah;
-        let bottom = (origin_y + cell_h) as f32 / ah;
-        let inv_oversample = 1.0 / glyph.oversample.max(1.0);
-        let entry = MsdfGlyphEntry {
-            uv: [[left, top], [right, top], [right, bottom], [left, bottom]],
-            bearing_x: (glyph.bearing_x - pad as f32) * inv_oversample,
-            bearing_y: (glyph.bearing_y - pad as f32) * inv_oversample,
-            width: cell_w as f32 * inv_oversample,
-            height: cell_h as f32 * inv_oversample,
-            coverage: false,
-        };
-        self.entries.insert(glyph.key, entry);
-        Some(entry)
+        Some(self.finalize_entry(
+            glyph.key,
+            (origin_x, origin_y),
+            (cell_w, cell_h),
+            (glyph.bearing_x - pad as f32, glyph.bearing_y - pad as f32),
+            glyph.oversample,
+            false,
+        ))
     }
 
     /// Pack one glyph's RAW fontdue coverage (NOT an SDF) into the atlas and register
@@ -543,7 +534,10 @@ impl MsdfAtlasPlan {
     /// pixels (the host rasterizes at `font_size * dpr`), so the shader samples it
     /// directly as alpha and the glyph stays crisp at its fixed size — the browser-blit
     /// behavior. No distance-range pad, no `coverage_to_sdf`: a 1px guard band only, so
-    /// linear sampling never bleeds a neighbor. Idempotent per (coverage-keyed) slot.
+    /// linear sampling never bleeds a neighbor. The guard is whole-cell — `allocate_cell`
+    /// starts/resets rows at cursor (1,1) for the LEFT/TOP edge and advances `+1` past
+    /// each cell for the RIGHT/BOTTOM — NOT an interior pad, so the ink stays crisp.
+    /// Idempotent per (coverage-keyed) slot.
     pub fn generate_coverage_glyph(&mut self, glyph: &GlyphCoverage<'_>) -> Option<MsdfGlyphEntry> {
         if let Some(entry) = self.entries.get(&glyph.key) {
             return Some(*entry);
@@ -581,27 +575,60 @@ impl MsdfAtlasPlan {
         // against the pen origin. Cell/bearings are in device texels; dividing by
         // `oversample` (the dpr the host rasterized at) emits the quad in logical px so
         // layout stays resolution-independent while the texels stay device-resolution.
+        Some(self.finalize_entry(
+            glyph.key,
+            (origin_x, origin_y),
+            (glyph_w, glyph_h),
+            (glyph.bearing_x, glyph.bearing_y),
+            glyph.oversample,
+            true,
+        ))
+    }
+
+    /// Build a packed glyph's atlas entry from its already-allocated `origin` and
+    /// `cell`=`(w, h)` footprint: the four corner UVs, the `oversample`-divided
+    /// `bearing`/size, and the `coverage` flag. Registers it under `key` and returns it.
+    /// The shared finalize tail of both `generate_glyph` (SDF, padded cell, bearing
+    /// pre-shifted by `-pad`) and `generate_coverage_glyph` (raw ink cell) — they differ
+    /// only in the inputs, not this UV/insert math.
+    fn finalize_entry(
+        &mut self,
+        key: MsdfGlyphKey,
+        origin: (u32, u32),
+        cell: (u32, u32),
+        bearing: (f32, f32),
+        oversample: f32,
+        coverage: bool,
+    ) -> MsdfGlyphEntry {
+        let (origin_x, origin_y) = origin;
+        let (cell_w, cell_h) = cell;
+        let (bearing_x, bearing_y) = bearing;
         let aw = self.atlas_width as f32;
         let ah = self.atlas_height as f32;
         let left = origin_x as f32 / aw;
-        let right = (origin_x + glyph_w) as f32 / aw;
+        let right = (origin_x + cell_w) as f32 / aw;
         let top = origin_y as f32 / ah;
-        let bottom = (origin_y + glyph_h) as f32 / ah;
-        let inv_oversample = 1.0 / glyph.oversample.max(1.0);
+        let bottom = (origin_y + cell_h) as f32 / ah;
+        let inv_oversample = 1.0 / oversample.max(1.0);
         let entry = MsdfGlyphEntry {
             uv: [[left, top], [right, top], [right, bottom], [left, bottom]],
-            bearing_x: glyph.bearing_x * inv_oversample,
-            bearing_y: glyph.bearing_y * inv_oversample,
-            width: glyph_w as f32 * inv_oversample,
-            height: glyph_h as f32 * inv_oversample,
-            coverage: true,
+            bearing_x: bearing_x * inv_oversample,
+            bearing_y: bearing_y * inv_oversample,
+            width: cell_w as f32 * inv_oversample,
+            height: cell_h as f32 * inv_oversample,
+            coverage,
         };
-        self.entries.insert(glyph.key, entry);
-        Some(entry)
+        self.entries.insert(key, entry);
+        entry
     }
 
-    /// Shelf-allocate a `w`×`h` cell; `None` when no row has vertical room left.
+    /// Shelf-allocate a `w`×`h` cell; `None` when no row has vertical room left, or
+    /// when the cell is itself wider/taller than the whole atlas (it can never fit, so
+    /// returning an origin would let the pixel-write loop index out of bounds).
     fn allocate_cell(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        if w >= self.atlas_width || h >= self.atlas_height {
+            return None;
+        }
         if self.cursor_x + w >= self.atlas_width {
             self.cursor_x = 1;
             self.cursor_y += self.row_height + 1;
@@ -1171,7 +1198,7 @@ mod tests {
         let engine = crate::text::TextEngine::new().expect("bundled fonts load");
         // A large 'B' so the interior is solidly covered and the edges anti-aliased.
         let cov = engine
-            .glyph_coverage('B', 48.0, 1.0)
+            .glyph_coverage('B', 48.0, 1.0, false)
             .expect("'B' rasterizes");
         let mut plan = MsdfAtlasPlan::new(256, 256, 4.0);
         let entry = plan
@@ -1232,7 +1259,9 @@ mod tests {
     #[test]
     fn coverage_and_sdf_slots_for_one_glyph_coexist() {
         let engine = crate::text::TextEngine::new().expect("bundled fonts load");
-        let cov = engine.glyph_coverage('A', 24.0, 1.0).expect("'A' rasterizes");
+        let cov = engine
+            .glyph_coverage('A', 24.0, 1.0, true)
+            .expect("'A' rasterizes");
         let mut plan = MsdfAtlasPlan::new(256, 256, 4.0);
         let mk = |coverage: bool| GlyphCoverage {
             key: MsdfGlyphKey {
@@ -1416,6 +1445,45 @@ mod tests {
         assert_eq!(plan.glyph_count(), 0);
     }
 
+    /// FALSIFIABLE (fix-2, allocate_cell width guard): a cell WIDER than the atlas but
+    /// short enough to clear the height check must return `None`, not an origin. The
+    /// old guard checked only `cursor_x + w >= atlas_width` (which resets the row) and
+    /// then `cursor_y + h >= atlas_height` — a wide-short cell cleared both, returned
+    /// `Some`, and the pixel-write loop then indexed out of bounds → panic. `width=40`
+    /// in a 32-wide atlas exercises exactly that. The test PANICS (not just asserts) on
+    /// the unfixed code; the guard turns it into a clean `None`.
+    #[test]
+    fn wide_but_short_cell_returns_none_not_panic() {
+        let mut plan = MsdfAtlasPlan::new(32, 32, 4.0);
+        // 40 wide, 4 tall: the padded cell is wider than the 32px atlas but well under
+        // its height — the exact shape that slipped past the height-only guard.
+        let coverage = vec![255_u8; 40 * 4];
+        let coverage_result = plan.generate_coverage_glyph(&GlyphCoverage {
+            key: MsdfGlyphKey { font_index: 0, glyph_id: 1, px: 32, coverage: true },
+            coverage: &coverage,
+            width: 40,
+            height: 4,
+            bearing_x: 0.0,
+            bearing_y: 0.0,
+            oversample: 1.0,
+            outline: None,
+        });
+        assert!(coverage_result.is_none(), "an over-wide coverage cell can't fit");
+
+        let sdf_result = plan.generate_glyph(&GlyphCoverage {
+            key: MsdfGlyphKey { font_index: 0, glyph_id: 2, px: 32, coverage: false },
+            coverage: &coverage,
+            width: 40,
+            height: 4,
+            bearing_x: 0.0,
+            bearing_y: 0.0,
+            oversample: 1.0,
+            outline: None,
+        });
+        assert!(sdf_result.is_none(), "an over-wide SDF cell can't fit");
+        assert_eq!(plan.glyph_count(), 0, "neither over-wide cell registers a slot");
+    }
+
     /// DEFECT 3 (i): the populated atlas has REAL non-zero coverage for a committed
     /// run's glyphs, sourced from the bundled fonts via the host coverage seam. The
     /// blank `MsdfAtlasPlan::new` upload the live path shipped is all-zero, so the
@@ -1430,7 +1498,7 @@ mod tests {
         let mut packed_any = false;
         for ch in "AB".chars() {
             let cov = engine
-                .glyph_coverage(ch, 16.0, 1.0)
+                .glyph_coverage(ch, 16.0, 1.0, true)
                 .unwrap_or_else(|| panic!("glyph '{ch}' rasterizes"));
             let entry = plan
                 .generate_glyph(&GlyphCoverage {
@@ -1577,7 +1645,7 @@ mod tests {
     fn build_sdf_slot(ch: char, size: f32, with_outline: bool) -> (MsdfAtlasPlan, MsdfGlyphEntry) {
         let engine = crate::text::TextEngine::new().expect("bundled fonts load");
         let cov = engine
-            .glyph_coverage(ch, size, 1.0)
+            .glyph_coverage(ch, size, 1.0, with_outline)
             .unwrap_or_else(|| panic!("{ch:?} rasterizes at {size}px"));
         if with_outline {
             assert!(cov.outline.is_some(), "{ch:?} must yield a vector outline");
@@ -1737,5 +1805,86 @@ mod tests {
         let corner = median(0, 0);
         assert!(stroke > 0.5, "glyph stroke reads inside the outline: {stroke}");
         assert!(corner < 0.5, "padded corner reads outside the outline: {corner}");
+    }
+
+    /// FALSIFIABLE (fix-4, MSDF sign/winding): the true MSDF baked through the REAL
+    /// core (`outline_to_msdf` -> fdsm `correct_sign_msdf(FillRule::Nonzero)`) must
+    /// assign the field's sign by the font's actual winding. A coverage-confirmed
+    /// INTERIOR texel must reconstruct as "inside" (median3 > 0.5) and a
+    /// coverage-confirmed EXTERIOR texel as "outside" (median3 < 0.5). If the font's
+    /// winding disagreed with Nonzero, the sign would invert and the glyph would render
+    /// inside-out — the interior texel would read < 0.5 and this fails. Texels are
+    /// located from the same fontdue coverage raster the cell is padded from, so the
+    /// probe lands on genuinely-interior / genuinely-exterior ink, not a guess.
+    #[test]
+    fn world_msdf_sign_matches_font_winding() {
+        let engine = crate::text::TextEngine::new().expect("bundled fonts load");
+        // 'B' has a solid vertical bar on its left: a column of unambiguous interior.
+        let cov = engine
+            .glyph_coverage('B', 64.0, 1.0, true)
+            .expect("'B' rasterizes");
+        assert!(cov.outline.is_some(), "'B' yields a vector outline");
+        let (plan, entry) = build_sdf_slot('B', 64.0, true);
+
+        // The padded cell offsets the coverage raster by `pad` on each side.
+        let pad = crate::cast::round_u32(plan.distance_range.ceil().max(1.0));
+        let cw = crate::cast::len_u32(cov.width);
+        let ch = crate::cast::len_u32(cov.height);
+        let median = |col: u32, row: u32| -> f32 {
+            let (r, g, b) = slot_rgb(&plan, &entry, col, row);
+            let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+            (r.min(g)).max(b.min(r.max(g)))
+        };
+
+        // Locate a deep-interior coverage texel (255, with 255 4-neighbours so it is
+        // well clear of the AA edge) and a deep-exterior texel (0, all-0 neighbours).
+        let at = |x: u32, y: u32| cov.coverage[(y * cw + x) as usize];
+        let solid = |x: u32, y: u32| {
+            x > 0
+                && y > 0
+                && x + 1 < cw
+                && y + 1 < ch
+                && at(x, y) == 255
+                && at(x - 1, y) == 255
+                && at(x + 1, y) == 255
+                && at(x, y - 1) == 255
+                && at(x, y + 1) == 255
+        };
+        let empty = |x: u32, y: u32| {
+            x > 0
+                && y > 0
+                && x + 1 < cw
+                && y + 1 < ch
+                && at(x, y) == 0
+                && at(x - 1, y) == 0
+                && at(x + 1, y) == 0
+                && at(x, y - 1) == 0
+                && at(x, y + 1) == 0
+        };
+        let mut interior = None;
+        let mut exterior = None;
+        for y in 0..ch {
+            for x in 0..cw {
+                if interior.is_none() && solid(x, y) {
+                    interior = Some((x, y));
+                }
+                if exterior.is_none() && empty(x, y) {
+                    exterior = Some((x, y));
+                }
+            }
+        }
+        let (ix, iy) = interior.expect("'B' has a deep-interior coverage texel");
+        let (ex, ey) = exterior.expect("'B' has a deep-exterior coverage texel");
+
+        let inside = median(ix + pad, iy + pad);
+        let outside = median(ex + pad, ey + pad);
+        assert!(
+            inside > 0.5,
+            "interior texel must reconstruct as inside (sign not inverted): {inside}"
+        );
+        assert!(
+            outside < 0.5,
+            "exterior texel must reconstruct as outside (sign not inverted): {outside}"
+        );
     }
 }

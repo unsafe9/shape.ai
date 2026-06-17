@@ -335,10 +335,21 @@ fn hash_text(h: &mut Fnv, text: Option<&RText>) {
                 h.u8(u8::from(run.bold));
                 h.u8(u8::from(run.italic));
                 h.bytes(run.font.as_bytes());
+                // Mode (Sdf/Coverage) picks the atlas slot + shader path, so an
+                // in-place flip is a geometry edit — fold it or stale quads survive.
+                h.u8(text_mode_tag(run));
             }
             h.u8(text_align_tag(t));
             h.u8(text_valign_tag(t));
         }
+    }
+}
+
+fn text_mode_tag(run: &crate::render_object::RTextRun) -> u8 {
+    use crate::render_object::RTextMode::*;
+    match run.mode {
+        Sdf => 0,
+        Coverage => 1,
     }
 }
 
@@ -757,6 +768,30 @@ mod tests {
             s.dash = vec![4.0, 4.0];
         }
         assert_ne!(geometry_revision(&redashed, &camera), base_rev, "dash included");
+    }
+
+    /// FALSIFIABLE (fix-5, run.mode in the revision): two text runs differing ONLY in
+    /// `mode` (Sdf vs Coverage) must hash to DIFFERENT geometry revisions. An in-place
+    /// mode flip changes the atlas slot (coverage vs SDF texels) and the shader path,
+    /// so a shared revision would keep the stale geometry and the wrong sampler. The
+    /// pre-fix `hash_text` folded text/color/size/bold/italic/font but NOT the mode,
+    /// so both runs collided on one revision — this assertion fails on that path.
+    #[test]
+    fn revision_tracks_text_run_mode() {
+        let camera = CameraState { x: 0.0, y: 0.0, zoom: 1.0 };
+        let mut sdf = text_rect("t");
+        if let Some(text) = sdf.text.as_mut() {
+            text.runs[0].mode = RTextMode::Sdf;
+        }
+        let mut coverage = sdf.clone();
+        if let Some(text) = coverage.text.as_mut() {
+            text.runs[0].mode = RTextMode::Coverage;
+        }
+        assert_ne!(
+            geometry_revision(&sdf, &camera),
+            geometry_revision(&coverage, &camera),
+            "a Sdf->Coverage mode flip must change the geometry revision"
+        );
     }
 
     #[test]
