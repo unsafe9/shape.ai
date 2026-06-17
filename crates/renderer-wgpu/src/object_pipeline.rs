@@ -55,13 +55,16 @@ pub const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Stencil8;
 /// stencil clears to 0, so unclipped objects (`clip_ref==0`) pass everywhere; a clipped
 /// descendant passes only inside the region its ancestors incremented to its depth.
 /// `write_mask: 0` keeps it read-only.
+/// Shared front==back stencil state with `compare: Equal` (the clip invariant). The
+/// TEST and WRITE variants differ only in `pass_op` (read-only Keep vs IncrementClamp)
+/// and `write_mask` (0 vs 0xff).
 #[cfg(feature = "wgpu-probe")]
-fn stencil_test() -> wgpu::DepthStencilState {
+fn stencil_state(pass_op: wgpu::StencilOperation, write_mask: u32) -> wgpu::DepthStencilState {
     let face = wgpu::StencilFaceState {
         compare: wgpu::CompareFunction::Equal,
         fail_op: wgpu::StencilOperation::Keep,
         depth_fail_op: wgpu::StencilOperation::Keep,
-        pass_op: wgpu::StencilOperation::Keep,
+        pass_op,
     };
     wgpu::DepthStencilState::stencil(
         STENCIL_FORMAT,
@@ -69,9 +72,14 @@ fn stencil_test() -> wgpu::DepthStencilState {
             front: face,
             back: face,
             read_mask: 0xff,
-            write_mask: 0x00,
+            write_mask,
         },
     )
+}
+
+#[cfg(feature = "wgpu-probe")]
+fn stencil_test() -> wgpu::DepthStencilState {
+    stencil_state(wgpu::StencilOperation::Keep, 0x00)
 }
 
 /// Stencil WRITE for the clip pipeline: where the stencil already equals the parent
@@ -81,21 +89,7 @@ fn stencil_test() -> wgpu::DepthStencilState {
 /// ancestors. `write_mask: 0xff` lets the increment land.
 #[cfg(feature = "wgpu-probe")]
 fn stencil_write() -> wgpu::DepthStencilState {
-    let face = wgpu::StencilFaceState {
-        compare: wgpu::CompareFunction::Equal,
-        fail_op: wgpu::StencilOperation::Keep,
-        depth_fail_op: wgpu::StencilOperation::Keep,
-        pass_op: wgpu::StencilOperation::IncrementClamp,
-    };
-    wgpu::DepthStencilState::stencil(
-        STENCIL_FORMAT,
-        wgpu::StencilState {
-            front: face,
-            back: face,
-            read_mask: 0xff,
-            write_mask: 0xff,
-        },
-    )
+    stencil_state(wgpu::StencilOperation::IncrementClamp, 0xff)
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -1506,13 +1500,18 @@ impl ObjectRenderer {
         // this `render` runs (see `render_shadow_mask` / `frame.rs`); this pass starts
         // with the fill so the composited shadow stays beneath fill/stroke/text.
 
+        // When nothing clips, every `clip_ref` is 0 and the pass default stencil
+        // reference (0) already matches, so the per-draw `set_stencil_reference` calls
+        // below are skipped — no wasted pass commands on the dominant unclipped path.
+        let has_clips = !self.clip_draws.is_empty();
+
         // Stencil-WRITE pass: rasterize each clip container's region into the stencil
         // before any color draw, so descendants can test against it. Color is masked
         // off by the clip pipeline; only the stencil increments. Reuses the fill
         // instance buffer (the container's matrix). Containers are ordered outer→inner,
         // each writing at its parent depth so a nested increment lands in the
         // intersection. Skipped entirely when nothing clips.
-        if !self.clip_draws.is_empty() {
+        if has_clips {
             pass.set_pipeline(&pipeline.clip_pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_vertex_buffer(0, self.clip_vertex_buffer.slice(..));
@@ -1542,7 +1541,9 @@ impl ObjectRenderer {
                     continue;
                 }
                 // Test against this object's clip depth; 0 (unclipped) passes everywhere.
-                pass.set_stencil_reference(u32::from(draw.clip_ref));
+                if has_clips {
+                    pass.set_stencil_reference(u32::from(draw.clip_ref));
+                }
                 let instance = shape_renderer_core::cast::len_u32(instance);
                 pass.draw_indexed(
                     draw.fill_range.start..draw.fill_range.end,
@@ -1562,7 +1563,9 @@ impl ObjectRenderer {
                 if draw.stroke_range.is_empty() {
                     continue;
                 }
-                pass.set_stencil_reference(u32::from(draw.clip_ref));
+                if has_clips {
+                    pass.set_stencil_reference(u32::from(draw.clip_ref));
+                }
                 let instance = shape_renderer_core::cast::len_u32(instance);
                 pass.draw(
                     draw.stroke_range.start..draw.stroke_range.end,
@@ -1583,7 +1586,9 @@ impl ObjectRenderer {
                 if draw.text_range.is_empty() {
                     continue;
                 }
-                pass.set_stencil_reference(u32::from(draw.clip_ref));
+                if has_clips {
+                    pass.set_stencil_reference(u32::from(draw.clip_ref));
+                }
                 let instance = shape_renderer_core::cast::len_u32(instance);
                 pass.draw(
                     draw.text_range.start..draw.text_range.end,
