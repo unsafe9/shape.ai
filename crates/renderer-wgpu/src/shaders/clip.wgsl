@@ -51,6 +51,10 @@ fn world_to_clip(world: vec2<f32>) -> vec2<f32> {
 fn vs_main(input: VertexIn) -> VertexOut {
   let world = world_from_local(input.position, input.m0, input.m1, input.m2);
   var out: VertexOut;
+  // If live QA shows single-pixel cracks at clip boundaries (Equal-compare across the
+  // separate clip vs fill pipelines computing this same position), the fix is
+  // `@invariant @builtin(position)` on BOTH clip.wgsl and object_fill.wgsl. Not added
+  // pre-emptively: a speculative shader edit risks a blank canvas with no host signal.
   out.position = vec4<f32>(world_to_clip(world), 0.0, 1.0);
   return out;
 }

@@ -193,12 +193,36 @@ pub struct ObjectDraw {
     pub stroke_instance: StrokeInstance,
     /// Glyph-quad vertex range; empty when no text (or whitespace). Drawn after stroke.
     pub text_range: DrawRange,
+    /// Stencil reference this object's fragments must `Equal` to render: the number of
+    /// `clip==true` ancestors above it (0 = unclipped). The stencil is cleared to 0, so
+    /// `Equal(0)` passes everywhere for unclipped objects; a clipped descendant only
+    /// passes inside the intersection its ancestors incremented to its depth.
+    pub clip_ref: u8,
     pub focus_ring: bool,
     /// The token name backing this object's fill, if a [`RPaint::Token`]. `Some` =>
     /// the color re-resolves on a theme flip (raw hex/gradient/image is invariant),
     /// so a theme toggle writes only token-backed colors with zero re-tessellation.
     pub fill_token: Option<String>,
     pub stroke_token: Option<String>,
+}
+
+/// One clip container's stencil-write draw: where its synthesized region mesh lives
+/// in the shared clip megabuffer, the instance index whose matrix places it (the
+/// container's own [`FillInstance`] slot), and the stencil reference to write AT.
+///
+/// `parent_depth` is the container's own [`ObjectDraw::clip_ref`] — the count of its
+/// strict `clip==true` ancestors, which equals the parent region's post-write stencil
+/// value (each clip increments exactly once from the 0-clear). Writing at that ref
+/// makes `IncrementClamp` land only inside the parent clip, so a nested clip marks the
+/// intersection. Containers are pushed outer→inner (parent before child in scene
+/// order) so a child's write tests against its parent's already-written depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipDraw {
+    /// INDEX range into [`SceneGeometry::clip`]'s merged indices (like `fill_range`).
+    pub clip_range: DrawRange,
+    /// Instance index (shared with the container's fill instance) supplying the matrix.
+    pub instance: u32,
+    pub parent_depth: u8,
 }
 
 /// The renderer-default shadow color is the theme `shadow` token — wired, never
@@ -236,6 +260,13 @@ pub struct SceneGeometry {
     /// `draws[i].text_range`.
     pub text_vertices: Vec<TextVertex>,
     pub text_instances: Vec<TextInstance>,
+    /// Synthesized clip-region meshes for `clip==true` containers, merged like `fill`.
+    /// Distinct from `fill` because a clip container's own fill is intentionally empty
+    /// (it must not paint over its children), yet its silhouette must rasterize into
+    /// the stencil. The fill instance buffer (not a separate one) places these.
+    pub clip: MegaBuffer,
+    /// One stencil-write draw per clip container, outer→inner. Empty when no clip.
+    pub clip_draws: Vec<ClipDraw>,
     pub draws: Vec<ObjectDraw>,
 }
 
@@ -392,9 +423,16 @@ pub fn build_scene_geometry_themed_with_text(
         .filter_map(|o| o.parent.as_deref())
         .collect();
 
+    // Per-object clip reference = number of `clip==true` STRICT ancestors. Pure scene
+    // topology (parent chains + clip flags), so it rides the geometry rebuild, never the
+    // transform path. Precompute the `id -> (parent, clip)` lookup once, then walk
+    // ancestors per object (memoized) to keep the build O(objects).
+    let clip_refs = compute_clip_refs(scene);
+
     for obj in &scene.objects {
         let state = visual_state_for(scene, &obj.id);
         let resolved = resolve_visual(obj, state);
+        let clip_ref = clip_refs[obj.id.as_str()];
 
         // A hidden object emits zero-vertex geometry (empty subpaths) while still
         // pushing its index-aligned instance + ObjectDraw slot below — never skipped,
@@ -456,6 +494,31 @@ pub fn build_scene_geometry_themed_with_text(
             m2: matrix_col(&obj.transform, 2),
             fill: paint_color(&resolved.fill.paint, crate::cast::narrow_f32(resolved.fill.opacity), theme),
         });
+
+        // ---- Clip region: synthesize a stencil-write mesh for a clipper -----
+        // A `clip==true` container masks its descendants to its silhouette. Its own
+        // fill is intentionally empty (it must not paint over children), so the
+        // silhouette is tessellated SEPARATELY here from the same flattened `subpaths`,
+        // with the SAME NonZero fill rule — which collapses any self-overlap into
+        // single-coverage triangles, so the IncrementClamp stencil op fires at most once
+        // per pixel (a double-wound region would increment twice and punch a hole). The
+        // container's own `FillInstance` (index `instance`) places it on the GPU.
+        if obj.clip && !subpaths.is_empty() {
+            let clip_input: Vec<(bool, Vec<(f32, f32)>)> = subpaths
+                .iter()
+                .map(|(closed, pts)| (*closed, pts.clone()))
+                .collect();
+            let clip_mesh = tessellate_fill(&clip_input, FillRuleKind::NonZero);
+            if !clip_mesh.indices.is_empty() {
+                let clip_range = geometry.clip.push(&clip_mesh);
+                let instance = crate::cast::len_u32(geometry.fill_instances.len() - 1);
+                geometry.clip_draws.push(ClipDraw {
+                    clip_range,
+                    instance,
+                    parent_depth: clip_ref,
+                });
+            }
+        }
 
         // ---- Stroke: expand each (dashed) subpath into a ribbon ------------
         let stroke_start = crate::cast::len_u32(geometry.stroke_vertices.len());
@@ -567,6 +630,7 @@ pub fn build_scene_geometry_themed_with_text(
                 start: text_start,
                 end: text_end,
             },
+            clip_ref,
             focus_ring: resolved.focus_ring.is_some(),
             fill_token: paint_token_name(&resolved.fill.paint),
             stroke_token: paint_token_name(&resolved.stroke.paint),
@@ -574,6 +638,52 @@ pub fn build_scene_geometry_themed_with_text(
     }
 
     geometry
+}
+
+/// Each object's `clip_ref`: the count of its strict `clip==true` ancestors. The
+/// stencil clears to 0, each clip increments exactly once (its descendants test
+/// `Equal(parent_clip_count + 1)`), so an object's stencil reference is the number of
+/// clip ancestors above it. A clip container's OWN `clip_ref` is this count (its
+/// descendants get +1 from the container's stencil write). Walks parent chains over the
+/// `id -> (parent, clip)` lookup, memoizing each id so the whole pass is O(objects).
+fn compute_clip_refs(scene: &RenderObjectScene) -> HashMap<&str, u8> {
+    let lookup: HashMap<&str, (Option<&str>, bool)> = scene
+        .objects
+        .iter()
+        .map(|o| (o.id.as_str(), (o.parent.as_deref(), o.clip)))
+        .collect();
+    let mut refs: HashMap<&str, u8> = HashMap::with_capacity(scene.objects.len());
+    for obj in &scene.objects {
+        clip_ref_for(obj.id.as_str(), &lookup, &mut refs);
+    }
+    refs
+}
+
+/// Memoized strict-clip-ancestor count for `id`. A `clip==true` parent contributes 1
+/// plus the parent's own count; the parent's own clip flag does NOT count toward the
+/// parent itself. A cycle/missing parent terminates the walk at the broken link
+/// (degrades to a shallower depth, never loops).
+fn clip_ref_for<'a>(
+    id: &'a str,
+    lookup: &HashMap<&'a str, (Option<&'a str>, bool)>,
+    refs: &mut HashMap<&'a str, u8>,
+) -> u8 {
+    if let Some(&cached) = refs.get(id) {
+        return cached;
+    }
+    // Insert a 0 sentinel before recursing so a parent cycle resolves to 0, not a stack
+    // overflow (the pure core must never diverge on malformed input).
+    refs.insert(id, 0);
+    let value = match lookup.get(id) {
+        Some((Some(parent), _)) => {
+            let parent_count = clip_ref_for(parent, lookup, refs);
+            let parent_is_clip = lookup.get(parent).is_some_and(|&(_, clip)| clip);
+            parent_count.saturating_add(u8::from(parent_is_clip))
+        }
+        _ => 0,
+    };
+    refs.insert(id, value);
+    value
 }
 
 /// Resolve the visual state (selected via single anchor or multi-select) for an
@@ -861,6 +971,9 @@ pub fn reexpand_single_object(
         stroke_instances: _,
         text_vertices,
         text_instances: _,
+        // Clip meshes/draws are whole-scene stencil state, not a follower-patch concern.
+        clip: _,
+        clip_draws: _,
         draws: _,
     } = build_scene_geometry_themed(&scene, theme);
     let fill_vertices: Vec<FillVertex> = fill
@@ -909,6 +1022,10 @@ pub fn follower_patch_plan(draw: &ObjectDraw, rebuilt: &FollowerReexpand) -> Opt
         stroke_range,
         stroke_instance: _,
         text_range,
+        // Clip topology is not a follower-drag concern (a position-only drag never
+        // changes an object's clip-ancestor depth, and clip meshes are not patched by
+        // follower re-expansion), so the clip ref is inert here.
+        clip_ref: _,
         focus_ring: _,
         fill_token: _,
         stroke_token: _,
@@ -2785,6 +2902,138 @@ mod tests {
         assert_ne!(
             fc_rebuilt.text_vertices, fc_canonical_text,
             "the reprojected region min must move the glyphs"
+        );
+    }
+
+    // ---- GPU stencil clip: clip_ref scoping + synthesized region mesh -------
+
+    /// A child rect parented to `parent` (so the parent counts as a container frame).
+    fn child_rect(id: &str, parent: &str) -> RenderObject {
+        let mut obj = rect_object(id);
+        obj.parent = Some(parent.to_string());
+        obj
+    }
+
+    /// A fill-less clip container: `clip==true`, no explicit fill, parents its
+    /// children. Its own fill is `skip_fill`'d (must not paint over children), so its
+    /// `fill_range` is empty while the synthesized clip mesh must still exist.
+    fn clip_container(id: &str) -> RenderObject {
+        let mut obj = rect_object(id);
+        obj.fill = None;
+        obj.stroke = None;
+        obj.clip = true;
+        obj
+    }
+
+    /// FALSIFIABLE (single-level scoping): a clip container with 2 descendants and 1
+    /// outside sibling. Descendants must carry `clip_ref==1`, the sibling and the
+    /// container itself `clip_ref==0`, and exactly one `ClipDraw` (parent_depth 0,
+    /// non-empty range) must be synthesized. Fails if the ancestor walk mis-scopes the
+    /// subtree (e.g. a flat or off-by-one depth) or the clip mesh is not synthesized.
+    #[test]
+    fn clip_ref_scopes_descendants_not_siblings() {
+        let scene = scene_with(
+            vec![
+                clip_container("c"),
+                child_rect("d1", "c"),
+                child_rect("d2", "c"),
+                rect_object("s"),
+            ],
+            None,
+        );
+        let build = build_scene_geometry_themed(&scene, Theme::light());
+        let by_id = |id: &str| build.draws.iter().find(|d| d.id == id).unwrap();
+
+        assert_eq!(by_id("c").clip_ref, 0, "the container itself is unclipped");
+        assert_eq!(by_id("d1").clip_ref, 1, "a descendant tests inside the clip");
+        assert_eq!(by_id("d2").clip_ref, 1, "every descendant is scoped");
+        assert_eq!(by_id("s").clip_ref, 0, "an outside sibling is never clipped");
+
+        assert_eq!(build.clip_draws.len(), 1, "one clip container, one write draw");
+        assert_eq!(build.clip_draws[0].parent_depth, 0, "top-level writes at depth 0");
+        assert!(
+            !build.clip_draws[0].clip_range.is_empty(),
+            "the clip region mesh is non-empty"
+        );
+    }
+
+    /// FALSIFIABLE (H2 single-coverage + synthesize-not-reuse): the fill-less clip
+    /// container's own `fill_range` is EMPTY (it must not paint over children), yet a
+    /// clip mesh is synthesized. That mesh must be byte-identical to a direct NonZero
+    /// `tessellate_fill` of the container contour (the same single-coverage triangulation
+    /// the fill path uses, so IncrementClamp fires at most once per pixel — no
+    /// double-wound hole), and its index count a positive multiple of 3 (whole triangles).
+    #[test]
+    fn clip_mesh_is_synthesized_single_coverage_not_fill_reuse() {
+        let scene = scene_with(
+            vec![clip_container("c"), child_rect("d", "c")],
+            None,
+        );
+        let build = build_scene_geometry_themed(&scene, Theme::light());
+        let container = build.draws.iter().find(|d| d.id == "c").unwrap();
+
+        assert!(
+            container.fill_range.is_empty(),
+            "the fill-less clip container paints no fill (skip_fill)"
+        );
+        assert_eq!(build.clip_draws.len(), 1);
+        let range = build.clip_draws[0].clip_range;
+        assert!(!range.is_empty(), "but its clip silhouette IS rasterized");
+        assert_eq!(range.len() % 3, 0, "whole triangles only");
+
+        // Single-coverage: the clip mesh equals the fill tessellation of the same
+        // contour, so it inherits NonZero's overlap-collapse (one increment per pixel).
+        let subpaths = flatten_object_subpaths(&scene.objects[0], scene.camera.zoom);
+        let fill_input: Vec<(bool, Vec<(f32, f32)>)> = subpaths
+            .iter()
+            .map(|(closed, pts)| (*closed, pts.clone()))
+            .collect();
+        let direct = tessellate_fill(&fill_input, FillRuleKind::NonZero);
+        assert_eq!(
+            build.clip.vertices,
+            direct.vertices,
+            "clip mesh is the NonZero fill tessellation of the contour"
+        );
+        assert_eq!(
+            crate::cast::len_u32(direct.indices.len()),
+            range.len(),
+            "clip index count matches the direct tessellation"
+        );
+    }
+
+    /// FALSIFIABLE (B2 nested math): a 2-level nested clip (outer > inner > leaf). The
+    /// depths must be 0/1/2 and the two `ClipDraw`s ordered outer→inner with
+    /// `parent_depth` 0 then 1 — the exact references the IncrementClamp write needs so
+    /// the inner increment lands only inside the outer region (the intersection). Fails
+    /// if nesting flattens depths or emits the writes in the wrong order/reference.
+    #[test]
+    fn nested_clip_refs_and_write_order() {
+        let mut inner = clip_container("inner");
+        inner.parent = Some("outer".to_string());
+        let scene = scene_with(
+            vec![
+                clip_container("outer"),
+                inner,
+                child_rect("leaf", "inner"),
+            ],
+            None,
+        );
+        let build = build_scene_geometry_themed(&scene, Theme::light());
+        let by_id = |id: &str| build.draws.iter().find(|d| d.id == id).unwrap();
+
+        assert_eq!(by_id("outer").clip_ref, 0, "outer container at depth 0");
+        assert_eq!(by_id("inner").clip_ref, 1, "inner is inside outer");
+        assert_eq!(by_id("leaf").clip_ref, 2, "leaf is inside both");
+
+        assert_eq!(build.clip_draws.len(), 2, "two clip containers, two writes");
+        // Scene order is parent-before-child, so the draws are already outer→inner.
+        assert_eq!(
+            build.clip_draws[0].parent_depth, 0,
+            "outer writes at depth 0 (against the 0-clear)"
+        );
+        assert_eq!(
+            build.clip_draws[1].parent_depth, 1,
+            "inner writes at depth 1 so its increment lands only inside outer"
         );
     }
 }

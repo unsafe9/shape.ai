@@ -19,7 +19,9 @@ use shape_renderer_core::text::TextEngine;
 #[cfg(feature = "wgpu-probe")]
 use shape_renderer_core::text_layout::{MsdfAtlasPlan, MsdfGlyphEntry};
 #[cfg(feature = "wgpu-probe")]
-use crate::shaders::{MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_SHADOW_WGSL, OBJECT_STROKE_WGSL};
+use crate::shaders::{
+    CLIP_WGSL, MSDF_TEXT_WGSL, OBJECT_FILL_WGSL, OBJECT_SHADOW_WGSL, OBJECT_STROKE_WGSL,
+};
 
 pub use shape_renderer_core::object_pipeline::*;
 
@@ -35,6 +37,65 @@ pub struct ObjectPipeline {
     pub shadow_pipeline: wgpu::RenderPipeline,
     pub stroke_pipeline: wgpu::RenderPipeline,
     pub text_pipeline: wgpu::RenderPipeline,
+    /// Stencil-WRITE pipeline: rasterizes a clip container's region into the stencil
+    /// (IncrementClamp), no color. The fill/stroke/text pipelines carry the matching
+    /// stencil-TEST state so descendants render only where their `clip_ref` matches.
+    pub clip_pipeline: wgpu::RenderPipeline,
+}
+
+/// Shared stencil format for the clip mask. `Stencil8` is WebGPU-mandated renderable
+/// at `Features::empty()`, has no depth aspect (so the attachment sets `depth_ops:
+/// None`), and is 1 byte. Every pipeline in the stenciled object pass must declare a
+/// `DepthStencilState` with this format, and the stencil texture must use it.
+#[cfg(feature = "wgpu-probe")]
+pub const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Stencil8;
+
+/// Read-only stencil TEST for fill/stroke/text: a fragment passes only where the
+/// stencil equals the draw's `set_stencil_reference` (the object's `clip_ref`). The
+/// stencil clears to 0, so unclipped objects (`clip_ref==0`) pass everywhere; a clipped
+/// descendant passes only inside the region its ancestors incremented to its depth.
+/// `write_mask: 0` keeps it read-only.
+#[cfg(feature = "wgpu-probe")]
+fn stencil_test() -> wgpu::DepthStencilState {
+    let face = wgpu::StencilFaceState {
+        compare: wgpu::CompareFunction::Equal,
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: wgpu::StencilOperation::Keep,
+        pass_op: wgpu::StencilOperation::Keep,
+    };
+    wgpu::DepthStencilState::stencil(
+        STENCIL_FORMAT,
+        wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: 0xff,
+            write_mask: 0x00,
+        },
+    )
+}
+
+/// Stencil WRITE for the clip pipeline: where the stencil already equals the parent
+/// clip depth (`set_stencil_reference(parent_depth)`), IncrementClamp marks the
+/// region. Each clip increments exactly once from the 0-clear, so a descendant at depth
+/// N tests `Equal(N)` and passes only inside the intersection of all its clip
+/// ancestors. `write_mask: 0xff` lets the increment land.
+#[cfg(feature = "wgpu-probe")]
+fn stencil_write() -> wgpu::DepthStencilState {
+    let face = wgpu::StencilFaceState {
+        compare: wgpu::CompareFunction::Equal,
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: wgpu::StencilOperation::Keep,
+        pass_op: wgpu::StencilOperation::IncrementClamp,
+    };
+    wgpu::DepthStencilState::stencil(
+        STENCIL_FORMAT,
+        wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: 0xff,
+            write_mask: 0xff,
+        },
+    )
 }
 
 #[cfg(feature = "wgpu-probe")]
@@ -198,7 +259,7 @@ impl ObjectPipeline {
                 buffers: &fill_buffers,
             },
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: Some(stencil_test()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &fill_shader,
@@ -322,7 +383,7 @@ impl ObjectPipeline {
                 buffers: &stroke_buffers,
             },
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: Some(stencil_test()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &stroke_shader,
@@ -388,13 +449,90 @@ impl ObjectPipeline {
                 buffers: &text_buffers,
             },
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: Some(stencil_test()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &text_shader,
                 entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &color_targets,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // ---- Clip pipeline (stencil write) --------------------------------
+        // Reuses the fill vertex + instance BUFFERS (same `FillVertex`/`FillInstance`
+        // strides) but binds only what clip.wgsl reads: `position@0` (the `edge` flag
+        // unbound) and the matrix columns `m0/m1/m2` at locations 1/2/3 (the `fill`
+        // color at offset 36 unbound). Camera-only bind group, identical to fill.
+        let clip_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shape.ai clip shader"),
+            source: wgpu::ShaderSource::Wgsl(CLIP_WGSL.into()),
+        });
+        let clip_vertex_attrs = [wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x2,
+        }];
+        let vec3 = std::mem::size_of::<[f32; 3]>() as u64;
+        let clip_instance_attrs = [
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: vec3,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: vec3 * 2,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+        ];
+        let clip_buffers = [
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<FillVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &clip_vertex_attrs,
+            },
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<FillInstance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &clip_instance_attrs,
+            },
+        ];
+        let clip_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shape.ai clip pipeline layout"),
+            bind_group_layouts: &[Some(&camera_bind_group_layout)],
+            immediate_size: 0,
+        });
+        // Color is masked OFF (`write_mask: empty()`): this pass only writes the stencil.
+        let clip_color_targets = [Some(wgpu::ColorTargetState {
+            format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::empty(),
+        })];
+        let clip_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shape.ai clip pipeline"),
+            layout: Some(&clip_layout),
+            vertex: wgpu::VertexState {
+                module: &clip_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &clip_buffers,
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(stencil_write()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &clip_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &clip_color_targets,
             }),
             multiview_mask: None,
             cache: None,
@@ -408,6 +546,7 @@ impl ObjectPipeline {
             shadow_pipeline,
             stroke_pipeline,
             text_pipeline,
+            clip_pipeline,
         }
     }
 }
@@ -647,12 +786,21 @@ pub struct ObjectRenderer {
     pub stroke_instance_buffer: wgpu::Buffer,
     pub text_vertex_buffer: wgpu::Buffer,
     pub text_instance_buffer: wgpu::Buffer,
+    /// Synthesized clip-region mesh (indexed, like fill) for `clip==true` containers.
+    /// Placed by the SHARED `fill_instance_buffer` (the container's own matrix), so no
+    /// separate instance buffer. Empty buffer + empty `clip_draws` when no clip.
+    pub clip_vertex_buffer: wgpu::Buffer,
+    pub clip_index_buffer: wgpu::Buffer,
     pub text_params_buffer: wgpu::Buffer,
     /// The per-renderer text bind group: binding 0 is this renderer's camera uniform,
     /// bindings 1/2 are the SHARED [`SharedObjectText`] atlas view + sampler (no
     /// duplicate texture), binding 3 is this renderer's text params.
     pub text_bind_group: wgpu::BindGroup,
     draws: Vec<ObjectDraw>,
+    /// The clip-write draw list mirrored from the plan's geometry, read by the stencil
+    /// sub-loop in `render`. Re-uploaded only on a Rebuild (a clip toggle forces one),
+    /// so the targeted-patch path never touches it.
+    clip_draws: Vec<ClipDraw>,
     fill_index_count: u32,
     shadow_vertex_count: u32,
     stroke_vertex_count: u32,
@@ -769,6 +917,24 @@ impl ObjectRenderer {
             create_vertex_buffer(device, "object text vertices", &build.text_vertices);
         let text_instance_buffer =
             create_vertex_buffer(device, "object text instances", &build.text_instances);
+
+        // Clip region mesh: widen the megabuffer positions to `FillVertex` (the clip
+        // layout binds only `position`, so `edge` is inert padding). Placed by the
+        // shared fill instance buffer.
+        let clip_vertices: Vec<FillVertex> = build
+            .clip
+            .vertices
+            .iter()
+            .map(|&position| FillVertex { position, edge: 0.0 })
+            .collect();
+        let clip_vertex_buffer = create_vertex_buffer(device, "object clip vertices", &clip_vertices);
+        let clip_index_buffer = create_index_buffer(device, "object clip indices", &build.clip.indices);
+        if !clip_vertices.is_empty() {
+            queue.write_buffer(&clip_vertex_buffer, 0, bytemuck::cast_slice(&clip_vertices));
+        }
+        if !build.clip.indices.is_empty() {
+            queue.write_buffer(&clip_index_buffer, 0, bytemuck::cast_slice(&build.clip.indices));
+        }
 
         if !fill_vertices.is_empty() {
             queue.write_buffer(&fill_vertex_buffer, 0, bytemuck::cast_slice(&fill_vertices));
@@ -887,6 +1053,8 @@ impl ObjectRenderer {
             stroke_instance_buffer,
             text_vertex_buffer,
             text_instance_buffer,
+            clip_vertex_buffer,
+            clip_index_buffer,
             text_params_buffer,
             text_bind_group,
             fill_index_count: shape_renderer_core::cast::len_u32(build.fill.indices.len()),
@@ -894,6 +1062,7 @@ impl ObjectRenderer {
             stroke_vertex_count: shape_renderer_core::cast::len_u32(build.stroke_vertices.len()),
             text_vertex_count: shape_renderer_core::cast::len_u32(build.text_vertices.len()),
             draws: build.draws.clone(),
+            clip_draws: build.clip_draws.clone(),
             plan,
             theme,
             preview_transforms: Vec::new(),
@@ -969,8 +1138,11 @@ impl ObjectRenderer {
         for patch in &patches {
             self.apply_patch(queue, &next, patch);
         }
-        // Adopt the new plan and refresh the mirror state the render loops read.
+        // Adopt the new plan and refresh the mirror state the render loops read. A clip
+        // toggle forces a Rebuild (never a patch), so `clip_draws` is byte-identical
+        // here — mirrored anyway to keep the renderer state a faithful plan copy.
         self.draws = next.geometry.draws.clone();
+        self.clip_draws = next.geometry.clip_draws.clone();
         self.fill_index_count = shape_renderer_core::cast::len_u32(next.geometry.fill.indices.len());
         self.shadow_vertex_count = shape_renderer_core::cast::len_u32(next.geometry.shadow_vertices.len());
         self.stroke_vertex_count = shape_renderer_core::cast::len_u32(next.geometry.stroke_vertices.len());
@@ -1284,6 +1456,7 @@ impl ObjectRenderer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
+        stencil: &wgpu::TextureView,
         pipeline: &ObjectPipeline,
         clear: bool,
     ) {
@@ -1312,7 +1485,18 @@ impl ObjectRenderer {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("shape.ai object render pass"),
             color_attachments: &color_attachments,
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: stencil,
+                // `Stencil8` has no depth aspect, so no depth op.
+                depth_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    // Fresh mask every pass: clears to 0 so unclipped objects (clip_ref 0)
+                    // pass `Equal(0)` everywhere. The world + UI passes share this view,
+                    // each re-clearing at its own pass start.
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Store,
+                }),
+            }),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
@@ -1321,6 +1505,30 @@ impl ObjectRenderer {
         // The drop shadow is rendered + blurred + composited UNDER the fill before
         // this `render` runs (see `render_shadow_mask` / `frame.rs`); this pass starts
         // with the fill so the composited shadow stays beneath fill/stroke/text.
+
+        // Stencil-WRITE pass: rasterize each clip container's region into the stencil
+        // before any color draw, so descendants can test against it. Color is masked
+        // off by the clip pipeline; only the stencil increments. Reuses the fill
+        // instance buffer (the container's matrix). Containers are ordered outer→inner,
+        // each writing at its parent depth so a nested increment lands in the
+        // intersection. Skipped entirely when nothing clips.
+        if !self.clip_draws.is_empty() {
+            pass.set_pipeline(&pipeline.clip_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.clip_vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.fill_instance_buffer.slice(..));
+            pass.set_index_buffer(self.clip_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            for cd in &self.clip_draws {
+                // `parent_depth` widens to u32 (never narrows); the increment lands only
+                // inside the parent clip region (stencil already == parent_depth).
+                pass.set_stencil_reference(u32::from(cd.parent_depth));
+                pass.draw_indexed(
+                    cd.clip_range.start..cd.clip_range.end,
+                    0,
+                    cd.instance..cd.instance + 1,
+                );
+            }
+        }
 
         // Fill pass: one indexed instanced draw per object over the shared megabuffer.
         if self.fill_index_count > 0 {
@@ -1333,6 +1541,8 @@ impl ObjectRenderer {
                 if draw.fill_range.is_empty() {
                     continue;
                 }
+                // Test against this object's clip depth; 0 (unclipped) passes everywhere.
+                pass.set_stencil_reference(u32::from(draw.clip_ref));
                 let instance = shape_renderer_core::cast::len_u32(instance);
                 pass.draw_indexed(
                     draw.fill_range.start..draw.fill_range.end,
@@ -1352,6 +1562,7 @@ impl ObjectRenderer {
                 if draw.stroke_range.is_empty() {
                     continue;
                 }
+                pass.set_stencil_reference(u32::from(draw.clip_ref));
                 let instance = shape_renderer_core::cast::len_u32(instance);
                 pass.draw(
                     draw.stroke_range.start..draw.stroke_range.end,
@@ -1372,6 +1583,7 @@ impl ObjectRenderer {
                 if draw.text_range.is_empty() {
                     continue;
                 }
+                pass.set_stencil_reference(u32::from(draw.clip_ref));
                 let instance = shape_renderer_core::cast::len_u32(instance);
                 pass.draw(
                     draw.text_range.start..draw.text_range.end,
