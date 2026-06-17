@@ -11,8 +11,9 @@ pub const SHADOW_BLUR_MAX_RADIUS: usize = 12;
 
 /// Default blur radius in PHYSICAL pixels (zoom-independent). Scaled by the DPR at
 /// upload so the screen feather is constant across DPRs. Blur targets render at
-/// quarter resolution, so each tap steps 4 physical px.
-pub const SHADOW_BLUR_RADIUS_PX: f32 = 12.0;
+/// quarter resolution, so each tap steps 4 physical px. Tuned for a tight macOS-card
+/// elevation rather than a wide diffuse halo.
+pub const SHADOW_BLUR_RADIUS_PX: f32 = 8.0;
 
 /// Quarter resolution of the surface for the blur targets. Floored at 1 so a tiny
 /// surface never yields a zero-sized texture. The texel step `4/full` assumes /4.
@@ -129,6 +130,13 @@ mod tests {
         for n in [8u32, 64, 256, 4096] {
             assert_eq!(quarter_dim(n), n / 4);
         }
+    }
+
+    #[test]
+    fn default_blur_radius_is_the_tight_elevation_value() {
+        // Pinned exact: a tight macOS-card elevation, not the old wide diffuse halo.
+        // A regression back up toward the heavy default fails here.
+        assert_eq!(SHADOW_BLUR_RADIUS_PX, 8.0);
     }
 
     #[test]

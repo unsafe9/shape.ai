@@ -83,8 +83,8 @@ impl ThemeToken {
             (ThemeToken::Text, false) => [0x1d, 0x1d, 0x1f, 0xff],
             (ThemeToken::Text, true) => [0xf5, 0xf5, 0xf7, 0xff],
 
-            (ThemeToken::Shadow, false) => [0x00, 0x00, 0x00, 0x55],
-            (ThemeToken::Shadow, true) => [0xff, 0xff, 0xff, 0xa8],
+            (ThemeToken::Shadow, false) => [0x00, 0x00, 0x00, 0x40],
+            (ThemeToken::Shadow, true) => [0xff, 0xff, 0xff, 0x66],
 
             (ThemeToken::SelectionRing, false) => [0x00, 0x7a, 0xff, 0xff],
             (ThemeToken::SelectionRing, true) => [0x0a, 0x84, 0xff, 0xff],
@@ -194,8 +194,8 @@ mod tests {
         assert_eq!(resolve_token("default-stroke", true), Some([0x54, 0x54, 0x56, 0xff]));
         assert_eq!(resolve_token("text", false), Some([0x1d, 0x1d, 0x1f, 0xff]));
         assert_eq!(resolve_token("text", true), Some([0xf5, 0xf5, 0xf7, 0xff]));
-        assert_eq!(resolve_token("shadow", false), Some([0x00, 0x00, 0x00, 0x55]));
-        assert_eq!(resolve_token("shadow", true), Some([0xff, 0xff, 0xff, 0xa8]));
+        assert_eq!(resolve_token("shadow", false), Some([0x00, 0x00, 0x00, 0x40]));
+        assert_eq!(resolve_token("shadow", true), Some([0xff, 0xff, 0xff, 0x66]));
         assert_eq!(resolve_token("selection-ring", false), Some([0x00, 0x7a, 0xff, 0xff]));
         assert_eq!(resolve_token("selection-ring", true), Some([0x0a, 0x84, 0xff, 0xff]));
     }
@@ -207,13 +207,13 @@ mod tests {
     }
 
     #[test]
-    fn dark_shadow_is_a_visible_white_halo() {
-        // Dark shadow is a white veil with alpha high enough to read over the
-        // near-black canvas through the wide quarter-res blur.
+    fn dark_shadow_is_a_subtle_white_elevation() {
+        // Dark shadow is a white veil that reads over the near-black canvas, but kept
+        // low enough to be a macOS-card elevation, not a glowing halo. Pinned exact so
+        // a regression back toward the old heavy 0xa8 glow fails here.
         let [r, g, b, a] = resolve_token("shadow", true).unwrap();
         assert_eq!([r, g, b], [0xff, 0xff, 0xff], "dark shadow must be white");
-        assert!(a >= 0x99, "dark shadow alpha must be raised (got {a:#x})");
-        assert!(a < 0xff, "dark shadow stays translucent");
+        assert_eq!(a, 0x66, "dark shadow alpha is the subtle-elevation value");
     }
 
     #[test]
