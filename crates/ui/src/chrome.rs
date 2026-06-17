@@ -79,6 +79,7 @@ fn icon_chrome_button(id: &str, glyph_id: &str, x: f64, y: f64, size: f64) -> Wi
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }
@@ -188,6 +189,7 @@ pub(crate) fn canvas_switcher(model: &UiModel) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }

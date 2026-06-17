@@ -171,6 +171,7 @@ pub(crate) fn demo_ui_tree() -> shape_ui_core::Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: vec![
             // Theme-aware header: a `text` token flips light↔dark on a theme change.
             Widget::Text(Text {

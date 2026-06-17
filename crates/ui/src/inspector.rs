@@ -11,8 +11,8 @@ use shape_scene_core::object::catalog::inspector::{
     InspectorControlValue, InspectorSection, InspectorSectionView, InspectorView, InspectorWidget,
 };
 use shape_ui_core::{
-    Axis, Container, CrossAlign, Edges, MainAlign, Text, TextPaint, Widget, PANEL_RADIUS, ROW_H,
-    SPACE_LG, SPACE_MD, SPACE_SM,
+    measure, Axis, Container, CrossAlign, Edges, MainAlign, Text, TextPaint, Widget, PANEL_RADIUS,
+    ROW_H, SPACE_LG, SPACE_MD, SPACE_SM,
 };
 
 use crate::composites;
@@ -32,10 +32,11 @@ const SEGMENT_W: f64 = PANEL_W - PANEL_MARGIN * 2.0;
 /// minus the label column and the inter-column gap. Derived ONCE here so the inspector
 /// and the composites never drift two different control widths apart.
 const CONTROL_W: f64 = SEGMENT_W - LABEL_W - SPACE_SM;
-/// The bottom band the centered toolbar reserves: its tray height (`PADDING*2 + BTN`
-/// = 44) + `BOTTOM_MARGIN` (24) + a breathing gap, so the panel's last section never
-/// crosses the tray's top edge. Mirrors `toolbar.rs`'s `ty = vh - tray_h - BOTTOM_MARGIN`.
-const TOOLBAR_RESERVE: f64 = 44.0 + 24.0 + 16.0;
+/// The bottom band the centered toolbar reserves: its real tray height + bottom margin
+/// (read straight from `toolbar.rs`, so a tray geometry change auto-updates this) plus
+/// a `SPACE_LG` breathing gap, so the panel's last section never crosses the tray's top
+/// edge. Mirrors `toolbar.rs`'s `ty = vh - tray_h - BOTTOM_MARGIN`.
+const TOOLBAR_RESERVE: f64 = crate::toolbar::TRAY_H + crate::toolbar::BOTTOM_MARGIN + SPACE_LG;
 
 /// Build the inspector panel anchored top-right of the viewport. Caller guarantees
 /// the view is non-empty (`intent::view_is_empty` gates it). The panel content is one
@@ -51,26 +52,31 @@ pub(crate) fn build(view: &InspectorView, viewport: (f64, f64)) -> Widget {
 
     // Grow to fit content, but never past the band above the bottom toolbar. The
     // content top is always pinned at the panel margin so the first section header
-    // sits below the rounded corner — there is no clip, so lifting the rows up would
-    // spill the top row under the corner (the panel body's radius), the regression
-    // this avoids. On overflow the cap bounds the body; the surplus extends past the
-    // bottom edge (toward the tray), never above the top inset.
+    // sits below the rounded corner. On overflow the cap bounds the body and the
+    // content container CLIPS its rows to the visible band, so the surplus sections
+    // are masked at the panel's bottom inset instead of painting over the toolbar
+    // tray below — the rows still stack at full height, the clip just bounds them.
     let content_h = content_inner_h + PANEL_MARGIN * 2.0;
     let max_h = (vh - PANEL_MARGIN - TOOLBAR_RESERVE).max(0.0);
     let panel_h = content_h.min(max_h);
 
-    // The content rides ONE vertical flex inset by the panel margin on every side.
+    // The content rides ONE vertical flex inset by the panel margin on every side. Its
+    // box height is the VISIBLE band (panel minus the two margins), which is also the
+    // clip region — the children stack at their full extent but are masked to it on
+    // overflow.
+    let visible_inner_h = (panel_h - PANEL_MARGIN * 2.0).max(0.0);
     let content = Widget::Container(Container {
         id: "inspector::content".to_string(),
         x: PANEL_MARGIN,
         y: PANEL_MARGIN,
         w: SEGMENT_W,
-        h: content_inner_h,
+        h: visible_inner_h,
         direction: Axis::Vertical,
         spacing: SECTION_GAP,
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: true,
         children: blocks,
     });
 
@@ -85,6 +91,7 @@ pub(crate) fn build(view: &InspectorView, viewport: (f64, f64)) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: {
             // The macOS-material panel: a soft-shadow underlay + a frosted `material`
             // body with a `hairline` border (radius 14), then the inset content.
@@ -114,29 +121,17 @@ fn section_block(section: &InspectorSectionView) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }
 
 /// The laid-out height of a vertical stack: each widget's own height + `gap` between.
-/// Mirrors what the vertical flex emits, so a container can size to its content.
+/// Mirrors what the vertical flex emits, so a container can size to its content. The
+/// per-widget height comes from the ui-core `measure` the flex itself lays out against.
 fn stack_height(items: &[Widget], gap: f64) -> f64 {
-    items.iter().map(widget_height).sum::<f64>() + (items.len().saturating_sub(1)) as f64 * gap
-}
-
-fn widget_height(w: &Widget) -> f64 {
-    match w {
-        Widget::Container(c) => c.h,
-        Widget::Rect(r) => r.h,
-        Widget::Text(t) => t.h,
-        Widget::Button(b) => b.h,
-        Widget::Swatch(s) => s.h,
-        Widget::Toggle(t) => t.h,
-        Widget::Slider(s) => s.h,
-        Widget::Segment(s) => s.h,
-        Widget::TextInput(t) => t.h,
-        Widget::Icon(i) => i.h,
-    }
+    items.iter().map(|w| measure(w).1).sum::<f64>()
+        + (items.len().saturating_sub(1)) as f64 * gap
 }
 
 fn section_title(section: InspectorSection) -> Widget {
@@ -210,7 +205,7 @@ fn control_row(control: &InspectorControlValue) -> Widget {
     };
     // The row is as tall as its tallest child (a stacked segment / align grid runs
     // taller than one row), so the parent section-stack reserves its real extent.
-    let h = children.iter().map(widget_height).fold(0.0_f64, f64::max);
+    let h = children.iter().map(|w| measure(w).1).fold(0.0_f64, f64::max);
     Widget::Container(Container {
         id: format!("inspector::row::{}", control.id),
         x: 0.0,
@@ -225,6 +220,7 @@ fn control_row(control: &InspectorControlValue) -> Widget {
         main_align: MainAlign::SpaceBetween,
         padding: Edges::all(0.0),
         align: CrossAlign::Center,
+        clip: false,
         children,
     })
 }
@@ -318,6 +314,7 @@ fn stack_labeled(control_id: &str, label: &str, body: Widget) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }
@@ -338,6 +335,7 @@ fn stack_fixed_companion(control: &InspectorControlValue, seg: Widget, px: f64) 
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: vec![seg, companion],
     })
 }

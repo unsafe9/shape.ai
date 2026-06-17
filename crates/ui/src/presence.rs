@@ -46,6 +46,7 @@ pub(crate) fn build(peers: &[PeerCursor]) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }
@@ -66,6 +67,7 @@ fn cursor(peer: &PeerCursor) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: vec![
             // The cursor glyph: a Text-as-glyph in the peer's literal color.
             Widget::Text(Text {

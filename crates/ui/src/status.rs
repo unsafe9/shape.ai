@@ -38,6 +38,7 @@ pub(crate) fn build(model: &UiModel) -> Option<Widget> {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: strip.into_iter().chain(toast).collect(),
     }))
 }
@@ -113,6 +114,7 @@ fn strip(model: &UiModel) -> Option<Widget> {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     }))
 }
@@ -169,6 +171,7 @@ pub(crate) fn diagnostics(model: &UiModel) -> Option<Widget> {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     }))
 }
@@ -194,6 +197,7 @@ fn toast(model: &UiModel) -> Option<Widget> {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: vec![
             // A muted `surface-muted` pill with a `hairline` border — the macOS toast.
             Widget::Rect(Rect {

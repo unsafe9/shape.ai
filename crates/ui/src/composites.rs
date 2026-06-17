@@ -82,6 +82,7 @@ pub(crate) fn badge(id: &str, label: &str, x: f64, y: f64, w: f64, h: f64) -> Wi
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: vec![
             Widget::Rect(shape_ui_core::Rect {
                 id: format!("{id}::badge-bg"),
@@ -137,6 +138,7 @@ pub(crate) fn number_field(
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Center,
+        clip: false,
         children: vec![
             text_input(control_id, value, "", input_w, h),
             Widget::Text(Text {
@@ -179,6 +181,7 @@ pub(crate) fn paint_field(control_id: &str, hex: &str, x: f64, y: f64, w: f64, h
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Center,
+        clip: false,
         children: vec![
             Widget::Swatch(Swatch {
                 id: format!("{control_id}::paint-swatch"),
@@ -225,6 +228,7 @@ pub(crate) fn lanes_field(
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Center,
+        clip: false,
         children: vec![
             text_input(&format!("{control_id}::count"), &count_str, "1", count_w, h),
             Widget::Toggle(Toggle {
@@ -309,6 +313,7 @@ pub(crate) fn align9(control_id: &str, main: &str, cross: &str, x: f64, y: f64) 
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }

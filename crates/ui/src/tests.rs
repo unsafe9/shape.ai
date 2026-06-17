@@ -2368,6 +2368,75 @@ fn inspector_first_section_clears_the_panel_top_inset() {
     );
 }
 
+/// (F'') The inspector content CLIPS its overflow on a short viewport: the rendered
+/// scene carries an `inspector::content` object with `clip == true`, its clip box is
+/// strictly SHORTER than the full laid-out content (so the surplus sections are
+/// masked, not painted), and an overflowing section title is parented INTO that clip
+/// subtree (so the renderer's stencil pass masks it). Drives the live path: the
+/// tallest inspector on a deliberately short viewport → `build_root` → render. FAILS
+/// against the old hardcoded `clip: false` (no clip object emitted) or a clip box
+/// sized to the full content height (overflow would never be bounded).
+#[test]
+fn inspector_content_clips_overflow_on_a_short_viewport() {
+    const QUANT_PER_PX: f64 = 8.0;
+    let catalog = object_command_catalog();
+    // The flow-child view is the tallest inspector; a short viewport forces overflow.
+    let scene_obj = flow_scene();
+    let view = view_of(&scene_obj, "c");
+    let viewport = (1280.0, 360.0);
+    let m = UiModel {
+        viewport,
+        ..model(&catalog, &view)
+    };
+    let scene = shape_ui_core::render(&build_root(&m), viewport, false);
+
+    // The content container emits a clip-region object (no paint, `clip: true`).
+    let clip = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "inspector::content")
+        .expect("the inspector content emits a clip object");
+    assert!(clip.clip, "the content clip object carries clip: true");
+    assert!(
+        clip.fill.is_none() && clip.stroke.is_none(),
+        "the clip region paints nothing — it only masks"
+    );
+
+    // The clip box height (geometry token 2: `M 0 0 L w 0 L w h …`) in screen px.
+    let clip_box_h = clip
+        .geometry_d
+        .split(" L ")
+        .nth(2)
+        .and_then(|seg| seg.split_whitespace().nth(1))
+        .and_then(|n| n.parse::<f64>().ok())
+        .expect("clip box height token")
+        / QUANT_PER_PX;
+    let clip_top = clip.transform[1][2];
+    let clip_bottom = clip_top + clip_box_h;
+
+    // An overflowing section sits BELOW the clip box bottom (its full-extent stack
+    // runs past the capped band) — proving the box genuinely bounds the overflow and
+    // is not just sized to the full content. The Actions title is the last section.
+    let overflow = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "inspector::section::action")
+        .expect("the Actions section title is laid out");
+    assert!(
+        overflow.transform[1][2] > clip_bottom,
+        "an overflowing section ({}px) must extend past the clip box bottom ({clip_bottom}px)",
+        overflow.transform[1][2]
+    );
+
+    // That overflowing section is parented INTO the clip subtree, so the renderer's
+    // stencil clip pass masks it to the box rather than letting it paint over the tray.
+    assert_eq!(
+        overflow.parent.as_deref(),
+        Some("inspector::content"),
+        "overflowing rows fall inside the clip subtree"
+    );
+}
+
 /// (D) The watermark is a borderless Text mark with NO backing rect: the rendered
 /// scene has no `watermark`-prefixed sibling rect (`::bg`/`::box`/`::shadow`), the
 /// `watermark` object is fill-less + stroke-less, and its text box clears the run

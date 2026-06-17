@@ -51,8 +51,28 @@ pub fn render(tree: &Widget, _viewport_px: (f64, f64), theme_dark: bool) -> Rend
 fn emit(widget: &Widget, off_x: f64, off_y: f64, theme_dark: bool, out: &mut Vec<RenderObject>) {
     match widget {
         Widget::Container(c) => {
-            for (child, cx, cy) in layout_children(c) {
-                emit(child, off_x + cx, off_y + cy, theme_dark, out);
+            if c.clip {
+                // A clipping container masks its descendants to its own box (the
+                // renderer's stencil clip pass rasterizes this object's region). Emit
+                // the clip object first (an invisible region — no fill/stroke), then
+                // parent every descendant to it so they fall inside the clip subtree.
+                let clip_id = c.id.clone();
+                out.push(clip_object(clip_id.clone(), next_order(out.len()), off_x, off_y, c.w, c.h));
+                let start = out.len();
+                for (child, cx, cy) in layout_children(c) {
+                    emit(child, off_x + cx, off_y + cy, theme_dark, out);
+                }
+                // Chain the immediate subtree roots (those still parent-less) up to the
+                // clipper; deeper descendants already carry their own parent.
+                for obj in &mut out[start..] {
+                    if obj.parent.is_none() {
+                        obj.parent = Some(clip_id.clone());
+                    }
+                }
+            } else {
+                for (child, cx, cy) in layout_children(c) {
+                    emit(child, off_x + cx, off_y + cy, theme_dark, out);
+                }
             }
         }
         Widget::Rect(r) => {
@@ -502,6 +522,26 @@ fn rect_object(
     }
 }
 
+/// A clip-region object: the container's box geometry carrying `clip: true` and no
+/// paint, so the renderer's stencil pass masks this object's descendants to the box
+/// without painting anything itself.
+fn clip_object(id: String, order: String, sx: f64, sy: f64, w: f64, h: f64) -> RenderObject {
+    RenderObject {
+        id,
+        parent: None,
+        order,
+        transform: translate(sx, sy),
+        geometry_d: rect_path(w, h),
+        fill: None,
+        stroke: None,
+        text: None,
+        anchors: Vec::new(),
+        clip: true,
+        hidden: false,
+        locked: false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn text_object(
     id: String,
@@ -696,6 +736,7 @@ mod tests {
             main_align: MainAlign::Start,
             padding: Edges::all(0.0),
             align: CrossAlign::Start,
+            clip: false,
             children,
         }
     }
@@ -956,6 +997,7 @@ mod tests {
             main_align: MainAlign::Start,
             padding: Edges::all(8.0),
             align: CrossAlign::Start,
+            clip: false,
             children: vec![
                 Widget::Rect(Rect {
                     id: "a".to_string(),

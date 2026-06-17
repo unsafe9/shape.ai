@@ -63,7 +63,12 @@ const SEP_W: f64 = 1.0;
 const PADDING: f64 = 6.0;
 const TRAY_RADIUS: f64 = 14.0;
 const BTN_RADIUS: f64 = 8.0;
-const BOTTOM_MARGIN: f64 = 24.0;
+/// The bottom-center tray's own height (top/bottom padding + one button). Exposed so
+/// the inspector can reserve exactly this band above the tray without re-hardcoding it.
+pub(crate) const TRAY_H: f64 = PADDING * 2.0 + BTN;
+/// The gap between the tray's bottom edge and the viewport bottom. Exposed for the same
+/// reason — a tray geometry change auto-updates the inspector's reserve.
+pub(crate) const BOTTOM_MARGIN: f64 = 24.0;
 
 /// Build the bottom-center toolbar: ONE rounded `material` tray (soft-shadow
 /// underlay → frosted body → `hairline` group separators → icon buttons → inline
@@ -106,7 +111,7 @@ pub(crate) fn build(model: &UiModel) -> Widget {
     let inner_w = cmd_w + trail_sep + chips_w + chip_swatch_join + swatches_w;
 
     let tray_w = PADDING * 2.0 + inner_w;
-    let tray_h = PADDING * 2.0 + BTN;
+    let tray_h = TRAY_H;
     let (vw, vh) = model.viewport;
     let tx = ((vw - tray_w) / 2.0).max(0.0);
     let ty = (vh - tray_h - BOTTOM_MARGIN).max(0.0);
@@ -171,6 +176,7 @@ pub(crate) fn build(model: &UiModel) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }

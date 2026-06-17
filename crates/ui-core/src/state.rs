@@ -578,6 +578,7 @@ mod tests {
             main_align: MainAlign::Start,
             padding: Edges::all(0.0),
             align: CrossAlign::Start,
+            clip: false,
             children,
         })
     }
@@ -1012,6 +1013,7 @@ mod tests {
                 main_align: MainAlign::Start,
                 padding: Edges::all(0.0),
                 align: CrossAlign::Start,
+                clip: false,
                 children,
             })
         };
