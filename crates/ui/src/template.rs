@@ -60,6 +60,7 @@ pub(crate) fn build(model: &UiModel) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }
@@ -80,6 +81,7 @@ fn row(entry: &TemplateEntry, y: f64) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: vec![
             // The hit body is fill-less so the frosted `material` panel shows through;
             // it keeps the `template:<id>` id as the press/resolve target and takes the

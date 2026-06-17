@@ -5,7 +5,7 @@ use crate::widget::{Axis, Container, CrossAlign, MainAlign, Widget};
 
 /// Intrinsic box size of a widget for the layout cursor. Boxes carry explicit
 /// w/h (no text measurement in P2); a Container reports its own w/h.
-pub(crate) fn measure(w: &Widget) -> (f64, f64) {
+pub fn measure(w: &Widget) -> (f64, f64) {
     match w {
         Widget::Container(c) => (c.w, c.h),
         Widget::Rect(r) => (r.w, r.h),
@@ -144,6 +144,7 @@ mod tests {
             main_align: MainAlign::Start,
             padding: Edges::all(8.0),
             align,
+            clip: false,
             children,
         }
     }

@@ -260,6 +260,10 @@ pub struct Container {
     pub padding: Edges,
     /// Cross-axis alignment of children.
     pub align: CrossAlign,
+    /// Clip children to this container's box (Figma-style clip-to-region). `false`
+    /// is the default for every existing surface; a capped panel that must not let
+    /// overflowing sections paint past its bottom edge sets it `true`.
+    pub clip: bool,
     pub children: Vec<Widget>,
 }
 

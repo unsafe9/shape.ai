@@ -12,6 +12,7 @@ mod theme;
 mod widget;
 
 pub use hit::hit;
+pub use layout::measure;
 pub use metric::{GRID, PANEL_RADIUS, ROW_H, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XS};
 pub use render::render;
 pub use state::{Action, DispatchResult, KeyInput, PointerPhase, UiRuntime};

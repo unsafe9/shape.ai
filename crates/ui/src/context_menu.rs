@@ -12,7 +12,7 @@
 use serde::Deserialize;
 use shape_ui_core::{
     Axis, Button, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Text, TextPaint,
-    Widget,
+    Widget, SPACE_SM,
 };
 
 use crate::composites::{button_style, material_panel};
@@ -54,7 +54,10 @@ pub struct ContextMenuModel {
 const MENU_W: f64 = 200.0;
 const ROW_H: f64 = 30.0;
 const TITLE_H: f64 = 26.0;
-const SEP_H: f64 = 9.0;
+/// The vertical slot a separator row occupies (the hairline is centered in it). On
+/// the spacing scale (`SPACE_SM`) so it reads on the same 4px grid as the toolbar's
+/// group separator (`SEP_GAP`), not the old off-grid `9.0`.
+const SEP_H: f64 = SPACE_SM;
 const PAD: f64 = 6.0;
 
 /// Build the menu: a dismiss scrim + an anchored panel. Each non-separator row is a
@@ -102,6 +105,7 @@ pub(crate) fn build(menu: &ContextMenuModel, model: &UiModel) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: vec![scrim(vw, vh), panel(x, y, menu_h, rows)],
     })
 }
@@ -147,6 +151,7 @@ fn panel(x: f64, y: f64, h: f64, rows: Vec<Widget>) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }

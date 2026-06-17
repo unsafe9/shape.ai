@@ -10,8 +10,8 @@
 use shape_scene_core::object::catalog::commands::{ObjectCommand, ObjectCommandCategory};
 use shape_scene_core::object::catalog::gestures::{HoldInput, ObjectGesture};
 use shape_ui_core::{
-    Axis, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Text, TextPaint, Widget,
-    PANEL_RADIUS, SPACE_LG, SPACE_MD, SPACE_XS,
+    measure, Axis, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Text, TextPaint,
+    Widget, PANEL_RADIUS, SPACE_LG, SPACE_MD, SPACE_XS,
 };
 
 use crate::composites;
@@ -40,7 +40,18 @@ pub(crate) fn build(model: &UiModel) -> Widget {
 
     let mut blocks: Vec<Widget> = Vec::new();
     blocks.push(title("settings::title", "Keyboard Shortcuts", TITLE_H));
-    blocks.push(note());
+    blocks.push(Widget::Text(Text {
+        id: "settings::note".to_string(),
+        x: 0.0,
+        y: 0.0,
+        w: CONTENT_W,
+        h: NOTE_H,
+        label: "Shortcuts are read-only here.".to_string(),
+        size_px: 11.0,
+        // The note is a muted caption (`text-secondary`); the title stays primary.
+        color: TextPaint::Token("text-secondary".to_string()),
+        align_center: false,
+    }));
 
     // Commands grouped by category in first-seen (catalog) order — the same grouping
     // the Svelte modal did, now reading the catalog directly.
@@ -77,23 +88,18 @@ pub(crate) fn build(model: &UiModel) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: vec![scrim(vw, vh), panel(panel_x, panel_y, panel_h, blocks)],
     })
 }
 
 /// The laid-out height of a vertical stack of widgets: each own height + `gap`
 /// between. Mirrors what the vertical flex emits, so the body rect sizes to content.
+/// Heights come from the ui-core `measure` (the same one the flex lays out against),
+/// so a rich row (Swatch/Toggle/Slider/…) contributes its real extent, not zero.
 fn stack_height(items: &[Widget], gap: f64) -> f64 {
-    items.iter().map(widget_height).sum::<f64>() + (items.len().saturating_sub(1)) as f64 * gap
-}
-
-fn widget_height(w: &Widget) -> f64 {
-    match w {
-        Widget::Container(c) => c.h,
-        Widget::Text(t) => t.h,
-        Widget::Rect(r) => r.h,
-        _ => 0.0,
-    }
+    items.iter().map(|w| measure(w).1).sum::<f64>()
+        + (items.len().saturating_sub(1)) as f64 * gap
 }
 
 /// One titled block: a section-title Text above its rows, stacked tight (`SPACE_XS`)
@@ -114,6 +120,7 @@ fn section(label: &str, rows: Vec<Widget>) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }
@@ -155,6 +162,7 @@ fn panel(x: f64, y: f64, h: f64, blocks: Vec<Widget>) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(PADDING),
         align: CrossAlign::Start,
+        clip: false,
         children: blocks,
     }));
     Widget::Container(Container {
@@ -168,6 +176,7 @@ fn panel(x: f64, y: f64, h: f64, blocks: Vec<Widget>) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children,
     })
 }
@@ -182,21 +191,6 @@ fn title(id: &str, label: &str, h: f64) -> Widget {
         label: label.to_string(),
         size_px: 16.0,
         color: TextPaint::Token("text".to_string()),
-        align_center: false,
-    })
-}
-
-fn note() -> Widget {
-    Widget::Text(Text {
-        id: "settings::note".to_string(),
-        x: 0.0,
-        y: 0.0,
-        w: CONTENT_W,
-        h: NOTE_H,
-        label: "Shortcuts are read-only here.".to_string(),
-        size_px: 11.0,
-        // The note is a muted caption (`text-secondary`); the title stays primary.
-        color: TextPaint::Token("text-secondary".to_string()),
         align_center: false,
     })
 }
@@ -256,6 +250,7 @@ fn row(id: &str, label: &str, kbd: &str) -> Widget {
         main_align: MainAlign::SpaceBetween,
         padding: Edges::all(0.0),
         align: CrossAlign::Center,
+        clip: false,
         children: vec![
             Widget::Text(Text {
                 id: format!("{id}::label"),
@@ -288,6 +283,7 @@ fn kbd_pill(id: &str, kbd: &str) -> Widget {
         main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
+        clip: false,
         children: vec![
             Widget::Rect(Rect {
                 id: format!("{id}::kbd-bg"),
