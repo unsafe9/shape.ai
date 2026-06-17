@@ -317,6 +317,9 @@ pub fn populate_atlas_from_scene(
                     // The oversample (dpr) the coverage was rasterized at divides the
                     // quad back to logical px so layout stays resolution-independent.
                     oversample: cov.oversample,
+                    // The outline feeds the world/SDF path's true MSDF; the coverage
+                    // (UI) path ignores it, so only hand it over for the SDF slot.
+                    outline: if want_coverage { None } else { cov.outline },
                 };
                 let slot = if want_coverage {
                     plan.generate_coverage_glyph(&glyph)
@@ -1844,6 +1847,7 @@ mod tests {
                     bearing_x: cov.bearing_x,
                     bearing_y: cov.bearing_y,
                     oversample: cov.oversample,
+                    outline: cov.outline,
                 })
                 .expect("atlas room");
             entries.insert((ch as u32, 16, false), entry);

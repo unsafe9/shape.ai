@@ -308,13 +308,25 @@ fn line_height_for(token: &Token, runs: &[TextRunInput]) -> f32 {
     }
 }
 
-// SDF atlas generator. Single-channel SDF, not MSDF-proper: a true MSDF needs the
-// glyph's vector contours (which fontdue does not expose), so this builds a
-// single-channel signed distance field from the fontdue coverage raster and
-// replicates it into R/G/B (the shader's `median3` returns that one distance
-// unchanged). The distance transform is the 8-points Signed Sequential Euclidean
-// Distance Transform (dead-reckoning), pure and deterministic, so the same coverage
-// always yields byte-identical atlas pixels.
+// SDF atlas generator. World/canvas text bakes a TRUE multi-channel MSDF from the
+// glyph's vector outline (via `fdsm`), so corners stay sharp at any zoom — the three
+// colored channels disagree near a corner and the shader's `median3` reconstructs it
+// crisply where a single isotropic SDF rounds it off. When no outline is threaded
+// (the host couldn't extract one for this glyph) the generator degrades per-glyph to
+// the legacy single-channel field built from the fontdue coverage raster (the 8-point
+// Signed Sequential Euclidean Distance Transform replicated into R/G/B), so a font
+// table the outliner can't reach still renders. Both paths are pure and deterministic
+// — fdsm's edge coloring takes a fixed seed — so the same input yields byte-identical
+// atlas pixels.
+
+/// The fixed edge-coloring seed: the pure core forbids randomness, so a hardcoded
+/// constant keeps the MSDF byte-deterministic across runs (same outline -> same
+/// atlas pixels). Any value works; this is fdsm's own README seed.
+const MSDF_EDGE_SEED: u64 = 69441337420;
+
+/// `sin` of the corner angle past which fdsm's edge coloring switches channels.
+/// fdsm's documented default; smaller keeps near-straight joins on one channel.
+const MSDF_CORNER_SIN: f64 = 0.03;
 
 /// Identifies a rasterized MSDF glyph in the atlas. `px` is the quantized SDF cell
 /// size (resolution-independent, but a fixed cell keeps the atlas predictable).
@@ -363,6 +375,27 @@ pub struct GlyphCoverage<'a> {
     pub bearing_y: f32,
     /// Raster-texels-per-logical-px (≥ 1.0); divides the emitted entry geometry.
     pub oversample: f32,
+    /// The glyph's vector outline, when the host extracted it: the SDF path bakes a
+    /// TRUE multi-channel MSDF from it instead of the coverage-derived single-channel
+    /// field. `None` degrades that one glyph to the legacy `coverage_to_sdf` path. The
+    /// coverage (UI) path ignores this entirely.
+    pub outline: Option<MsdfOutline>,
+}
+
+/// A glyph's vector outline plus the font-unit → atlas-cell registration the MSDF
+/// baker needs. The host (text.rs) loads the contours from the same ttf-parser face
+/// rustybuzz shaped with; the pure core scales them into the SAME padded ink cell the
+/// coverage raster occupies so the field registers against the pen-origin bearings.
+#[derive(Clone, Debug)]
+pub struct MsdfOutline {
+    /// Glyph contours in font units, y-up (the font coordinate convention).
+    pub shape: fdsm::shape::Shape<fdsm::shape::Contour>,
+    /// Font-unit ink bbox, the registration origin/extent the cell maps onto.
+    pub x_min: f32,
+    pub y_max: f32,
+    /// Font units per atlas texel (== `units_per_em / px`); the MSDF transform divides
+    /// outline coordinates by this so the ink box fills the same `width`×`height` cell.
+    pub shrinkage: f32,
 }
 
 /// The shader-facing SDF atlas: dimensions, distance range, glyph->slot mapping, and
@@ -434,27 +467,50 @@ impl MsdfAtlasPlan {
 
         let (origin_x, origin_y) = self.allocate_cell(cell_w, cell_h)?;
 
-        let sdf = coverage_to_sdf(
-            glyph.coverage,
-            glyph.width,
-            glyph.height,
-            pad as usize,
-            self.distance_range,
-        );
         let atlas_w = self.atlas_width;
-        for row in 0..cell_h {
-            for col in 0..cell_w {
-                let value = sdf[(row * cell_w + col) as usize];
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "clamped to [0.0, 255.0] then rounded; the value is an exact integer in u8 range"
-                )]
-                let texel = (value * 255.0).round().clamp(0.0, 255.0) as u8;
-                let index = (((origin_y + row) * atlas_w + (origin_x + col)) * 4) as usize;
-                self.pixels[index] = texel;
-                self.pixels[index + 1] = texel;
-                self.pixels[index + 2] = texel;
-                self.pixels[index + 3] = texel;
+        if let Some(outline) = glyph.outline.as_ref() {
+            // TRUE multi-channel MSDF: bake the three colored distance channels from
+            // the vector outline into R/G/B, A = median3 so the slot stays a valid
+            // signed field for any reader. Corners survive where the single-channel
+            // field blurs them.
+            let msdf = outline_to_msdf(outline, cell_w, cell_h, pad, self.distance_range);
+            for row in 0..cell_h {
+                for col in 0..cell_w {
+                    let texel = (row * cell_w + col) as usize * 3;
+                    let r = msdf[texel];
+                    let g = msdf[texel + 1];
+                    let b = msdf[texel + 2];
+                    let index = (((origin_y + row) * atlas_w + (origin_x + col)) * 4) as usize;
+                    self.pixels[index] = r;
+                    self.pixels[index + 1] = g;
+                    self.pixels[index + 2] = b;
+                    self.pixels[index + 3] = median3_u8(r, g, b);
+                }
+            }
+        } else {
+            // No outline for this glyph: degrade to the legacy single-channel field
+            // (R=G=B=A), which the shader's median3 returns unchanged.
+            let sdf = coverage_to_sdf(
+                glyph.coverage,
+                glyph.width,
+                glyph.height,
+                pad as usize,
+                self.distance_range,
+            );
+            for row in 0..cell_h {
+                for col in 0..cell_w {
+                    let value = sdf[(row * cell_w + col) as usize];
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "clamped to [0.0, 255.0] then rounded; the value is an exact integer in u8 range"
+                    )]
+                    let texel = (value * 255.0).round().clamp(0.0, 255.0) as u8;
+                    let index = (((origin_y + row) * atlas_w + (origin_x + col)) * 4) as usize;
+                    self.pixels[index] = texel;
+                    self.pixels[index + 1] = texel;
+                    self.pixels[index + 2] = texel;
+                    self.pixels[index + 3] = texel;
+                }
             }
         }
 
@@ -573,6 +629,62 @@ impl MsdfAtlasPlan {
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
+}
+
+/// Bake a TRUE multi-channel MSDF for one padded cell from the glyph's vector
+/// outline. Returns `cell_w * cell_h * 3` bytes (R, G, B per texel). The outline is
+/// scaled by `1/shrinkage` (font units per texel) and translated so its ink bbox lands
+/// at `(pad, pad)` with the Y axis flipped (font space is y-up, the atlas is y-down),
+/// filling the same ink region the coverage raster occupies. fdsm's `range` argument
+/// is `2*distance_range`, which maps `[-distance_range, +distance_range]` texels onto
+/// `[0,1]` with 0.5 on the outline — byte-identical calibration to `coverage_to_sdf`,
+/// so the shader's `screenPxRange` (fed `distance_range`) stays untouched. Pure: the
+/// edge coloring uses a fixed seed, so the same outline yields identical pixels.
+fn outline_to_msdf(
+    outline: &MsdfOutline,
+    cell_w: u32,
+    cell_h: u32,
+    pad: u32,
+    distance_range: f32,
+) -> Vec<u8> {
+    use fdsm::generate::generate_msdf;
+    use fdsm::render::correct_sign_msdf;
+    use fdsm::shape::Shape;
+    use fdsm::transform::Transform;
+    use image::RgbImage;
+    use nalgebra::{Affine2, Matrix3};
+
+    let inv = 1.0 / f64::from(outline.shrinkage);
+    let pad = f64::from(pad);
+    // Map font-unit (fx, fy) -> cell px: x = pad + (fx - x_min)*inv,
+    //                                    y = pad + (y_max - fy)*inv  (Y flip).
+    let tx = pad - f64::from(outline.x_min) * inv;
+    let ty = pad + f64::from(outline.y_max) * inv;
+    let transform = Affine2::from_matrix_unchecked(Matrix3::new(
+        inv, 0.0, tx, //
+        0.0, -inv, ty, //
+        0.0, 0.0, 1.0,
+    ));
+
+    let mut shape = outline.shape.clone();
+    shape.transform(&transform);
+    let colored = Shape::edge_coloring_simple(shape, MSDF_CORNER_SIN, MSDF_EDGE_SEED);
+    let prepared = colored.prepare();
+
+    let mut img = RgbImage::new(cell_w, cell_h);
+    // fdsm's range maps [-range/2, +range/2] -> [0,1]; 2*distance_range reproduces the
+    // ±distance_range -> [0,1] calibration coverage_to_sdf emits.
+    let range = 2.0 * f64::from(distance_range);
+    generate_msdf(&prepared, range, &mut img);
+    correct_sign_msdf(&mut img, &prepared, fdsm::bezier::scanline::FillRule::Nonzero);
+
+    img.into_raw()
+}
+
+/// Median of three `u8` channels — the value the shader's `median3(sample.rgb)`
+/// reconstructs, stored in A so the slot stays a valid signed field for any reader.
+fn median3_u8(r: u8, g: u8, b: u8) -> u8 {
+    r.max(g).min(b.max(r.min(g)))
 }
 
 /// Build a single-channel signed distance field from a glyph coverage raster.
@@ -1076,6 +1188,7 @@ mod tests {
                 bearing_x: cov.bearing_x,
                 bearing_y: cov.bearing_y,
                 oversample: cov.oversample,
+                outline: None,
             })
             .expect("atlas has room");
         assert!(entry.coverage, "the entry is flagged coverage-mode");
@@ -1134,6 +1247,8 @@ mod tests {
             bearing_x: cov.bearing_x,
             bearing_y: cov.bearing_y,
             oversample: cov.oversample,
+            // The coverage branch ignores this; the SDF branch bakes the true MSDF.
+            outline: if coverage { None } else { cov.outline.clone() },
         };
         let sdf = plan.generate_glyph(&mk(false)).expect("sdf slot");
         let coverage = plan.generate_coverage_glyph(&mk(true)).expect("coverage slot");
@@ -1167,6 +1282,7 @@ mod tests {
                 bearing_x: 2.0,
                 bearing_y: 3.0,
                 oversample: 1.0,
+                outline: None,
             })
             .expect("atlas has room");
 
@@ -1215,6 +1331,7 @@ mod tests {
                     bearing_x: 10.0,
                     bearing_y: 10.0,
                     oversample,
+                    outline: None,
                 })
                 .expect("atlas has room");
             entry
@@ -1247,6 +1364,7 @@ mod tests {
             bearing_x: 0.0,
             bearing_y: 0.0,
             oversample: 1.0,
+            outline: None,
         };
         let first = plan.generate_glyph(&g).unwrap();
         let pixels_after_first = plan.pixels().to_vec();
@@ -1269,6 +1387,7 @@ mod tests {
                 bearing_x: 5.0,
                 bearing_y: 6.0,
                 oversample: 1.0,
+                outline: None,
             })
             .expect("blank always fits");
         // No quad (zero size), bearings preserved (e.g. a space advance).
@@ -1291,6 +1410,7 @@ mod tests {
             bearing_x: 0.0,
             bearing_y: 0.0,
             oversample: 1.0,
+            outline: None,
         });
         assert!(result.is_none(), "no room: caller falls back to fontdue raster");
         assert_eq!(plan.glyph_count(), 0);
@@ -1326,6 +1446,7 @@ mod tests {
                     bearing_x: cov.bearing_x,
                     bearing_y: cov.bearing_y,
                     oversample: cov.oversample,
+                    outline: cov.outline,
                 })
                 .expect("atlas has room");
 
@@ -1447,5 +1568,174 @@ mod tests {
             );
             last = v;
         }
+    }
+
+    /// Build the world/SDF atlas slot for one real glyph through the FULL path
+    /// (raster -> outline extraction -> `generate_glyph`), returning the plan + entry.
+    /// When `with_outline` is false the outline is dropped, forcing the legacy
+    /// coverage-derived single-channel field — the discriminator the MSDF tests use.
+    fn build_sdf_slot(ch: char, size: f32, with_outline: bool) -> (MsdfAtlasPlan, MsdfGlyphEntry) {
+        let engine = crate::text::TextEngine::new().expect("bundled fonts load");
+        let cov = engine
+            .glyph_coverage(ch, size, 1.0)
+            .unwrap_or_else(|| panic!("{ch:?} rasterizes at {size}px"));
+        if with_outline {
+            assert!(cov.outline.is_some(), "{ch:?} must yield a vector outline");
+        }
+        let mut plan = MsdfAtlasPlan::new(512, 512, 4.0);
+        let entry = plan
+            .generate_glyph(&GlyphCoverage {
+                key: MsdfGlyphKey {
+                    font_index: cov.font_index,
+                    glyph_id: cov.glyph_id,
+                    px: cov.px,
+                    coverage: false,
+                },
+                coverage: &cov.coverage,
+                width: cov.width,
+                height: cov.height,
+                bearing_x: cov.bearing_x,
+                bearing_y: cov.bearing_y,
+                oversample: cov.oversample,
+                outline: if with_outline { cov.outline } else { None },
+            })
+            .expect("atlas has room");
+        (plan, entry)
+    }
+
+    /// Read the raw R/G/B atlas texel at the slot-local `(col, row)`.
+    fn slot_rgb(plan: &MsdfAtlasPlan, entry: &MsdfGlyphEntry, col: u32, row: u32) -> (u8, u8, u8) {
+        let origin_x = crate::cast::round_u32(entry.uv[0][0] * plan.atlas_width as f32);
+        let origin_y = crate::cast::round_u32(entry.uv[0][1] * plan.atlas_height as f32);
+        let i = (((origin_y + row) * plan.atlas_width + (origin_x + col)) * 4) as usize;
+        let px = plan.pixels();
+        (px[i], px[i + 1], px[i + 2])
+    }
+
+    /// FALSIFIABLE (the load-bearing true-MSDF discriminator): a sharp-cornered glyph
+    /// baked through the world/SDF path stores THREE DISTINCT distance channels near
+    /// its corners — `max(|R-G|,|G-B|,|R-B|)` exceeds a real spread somewhere. The old
+    /// coverage-derived path replicated ONE distance into R=G=B everywhere, so the
+    /// channel spread was 0 at every texel: this test FAILS on that path and passes
+    /// only for a true multi-channel MSDF. 'L' has a single hard right-angle corner.
+    #[test]
+    fn world_sdf_glyph_has_distinct_rgb_channels_for_true_msdf() {
+        let (plan, entry) = build_sdf_slot('L', 48.0, true);
+        let cell_w = crate::cast::round_u32(entry.width);
+        let cell_h = crate::cast::round_u32(entry.height);
+
+        let mut max_spread = 0_u8;
+        for row in 0..cell_h {
+            for col in 0..cell_w {
+                let (r, g, b) = slot_rgb(&plan, &entry, col, row);
+                let spread = r.abs_diff(g).max(g.abs_diff(b)).max(r.abs_diff(b));
+                max_spread = max_spread.max(spread);
+            }
+        }
+        // The single-channel field has spread == 0 at every texel; a true MSDF puts the
+        // colored channels meaningfully apart where edges of different orientation meet.
+        assert!(
+            max_spread > 8,
+            "world SDF slot is single-channel (R==G==B), not a true MSDF: max channel spread {max_spread}"
+        );
+    }
+
+    /// FALSIFIABLE: the true MSDF preserves a sharp corner the coverage-derived SDF
+    /// rounds. Both fields are built for the same corner glyph; just OUTSIDE the corner
+    /// tip the median3 the shader reads is LARGER (closer to the 0.5 outline) for the
+    /// MSDF than for the single-channel SDF, because the single-channel field rounds the
+    /// corner inward (reads more-outside) while median3 of the colored channels follows
+    /// the true corner. Fails if `generate_glyph` still emits a replicated channel (the
+    /// two fields would be identical and the medians equal).
+    #[test]
+    fn world_msdf_median_preserves_corner_that_single_channel_blurs() {
+        let (msdf_plan, msdf) = build_sdf_slot('L', 64.0, true);
+        let (sdf_plan, sdf) = build_sdf_slot('L', 64.0, false);
+        assert_eq!(msdf.uv, sdf.uv, "same slot geometry; only the texels differ");
+
+        let median = |plan: &MsdfAtlasPlan, e: &MsdfGlyphEntry, col: u32, row: u32| -> f32 {
+            let (r, g, b) = slot_rgb(plan, e, col, row);
+            let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+            (r.min(g)).max(b.min(r.max(g)))
+        };
+        let cell_w = crate::cast::round_u32(msdf.width);
+        let cell_h = crate::cast::round_u32(msdf.height);
+
+        // Scan the band just outside the ink for the texel where the two fields disagree
+        // most. A corner is exactly where the single-channel (isotropic) field is most
+        // pessimistic vs the corner-preserving median — the MSDF reads less-outside.
+        let mut best_gain = 0.0_f32;
+        for row in 0..cell_h {
+            for col in 0..cell_w {
+                let m = median(&msdf_plan, &msdf, col, row);
+                let s = median(&sdf_plan, &sdf, col, row);
+                // Only an outside texel (below the 0.5 outline) where MSDF is sharper.
+                if s < 0.5 && m > s {
+                    best_gain = best_gain.max(m - s);
+                }
+            }
+        }
+        assert!(
+            best_gain > 0.02,
+            "true MSDF must reconstruct a sharper corner than the single-channel SDF; \
+             max median gain just outside the ink was only {best_gain}"
+        );
+    }
+
+    /// The MSDF bake is deterministic: a fixed edge-coloring seed and pure generation
+    /// mean two runs of the same glyph produce byte-identical atlas pixels (the pure
+    /// core forbids randomness, and the old code documented this guarantee).
+    #[test]
+    fn world_msdf_is_byte_deterministic() {
+        let (plan_a, entry_a) = build_sdf_slot('R', 40.0, true);
+        let (plan_b, entry_b) = build_sdf_slot('R', 40.0, true);
+        assert_eq!(entry_a, entry_b);
+        assert_eq!(
+            plan_a.pixels(),
+            plan_b.pixels(),
+            "fixed seed -> identical MSDF pixels across runs"
+        );
+    }
+
+    /// Graceful degrade: a glyph with no threaded outline falls back to the legacy
+    /// single-channel field (R==G==B at every texel), still a valid non-empty signed
+    /// field. This guards the per-glyph fallback the host uses for an unsupported glyph.
+    #[test]
+    fn world_sdf_without_outline_degrades_to_single_channel() {
+        let (plan, entry) = build_sdf_slot('L', 48.0, false);
+        let cell_w = crate::cast::round_u32(entry.width);
+        let cell_h = crate::cast::round_u32(entry.height);
+        let mut any_ink = false;
+        for row in 0..cell_h {
+            for col in 0..cell_w {
+                let (r, g, b) = slot_rgb(&plan, &entry, col, row);
+                assert!(r == g && g == b, "fallback must replicate one channel (R==G==B)");
+                if r > 0 {
+                    any_ink = true;
+                }
+            }
+        }
+        assert!(any_ink, "fallback still packs a real non-empty field");
+    }
+
+    /// The true MSDF stays a VALID signed field: median3 reads inside (>0.5) at the
+    /// glyph center and outside (<0.5) at a padded corner — the same contract the
+    /// single-channel field upheld, so screenPxRange AA stays calibrated.
+    #[test]
+    fn world_msdf_median_is_a_valid_signed_field() {
+        let (plan, entry) = build_sdf_slot('o', 64.0, true);
+        let cell_w = crate::cast::round_u32(entry.width);
+        let cell_h = crate::cast::round_u32(entry.height);
+        let median = |col: u32, row: u32| -> f32 {
+            let (r, g, b) = slot_rgb(&plan, &entry, col, row);
+            let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+            (r.min(g)).max(b.min(r.max(g)))
+        };
+        // 'o' is a ring: its geometric center is a hole (outside), so probe a point on
+        // the stroke instead — a quarter in from the left edge at mid-height is ink.
+        let stroke = median(cell_w / 6, cell_h / 2);
+        let corner = median(0, 0);
+        assert!(stroke > 0.5, "glyph stroke reads inside the outline: {stroke}");
+        assert!(corner < 0.5, "padded corner reads outside the outline: {corner}");
     }
 }

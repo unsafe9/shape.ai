@@ -6,6 +6,8 @@ use fontdue::{Font, FontSettings, Metrics};
 use rustybuzz::{Face, UnicodeBuffer};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::text_layout::MsdfOutline;
+
 const LATIN_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansKR-RendererLatin.ttf");
 const KOREAN_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansKR-RendererKorean.ttf");
 const ELLIPSIS: &str = "...";
@@ -58,6 +60,10 @@ pub struct GlyphCoverageData {
     /// Raster-texels-per-logical-px the source was rasterized at (the dpr, ≥ 1.0). The
     /// emitted quad geometry divides by exactly this to keep layout at logical px.
     pub oversample: f32,
+    /// The glyph's vector outline for the world/SDF path's true MSDF, when the font
+    /// outliner could extract one. `None` (composite/unsupported glyph) degrades that
+    /// glyph to the coverage-derived single-channel field. Unused by the coverage path.
+    pub outline: Option<MsdfOutline>,
 }
 
 #[derive(Clone)]
@@ -248,6 +254,10 @@ impl TextEngine {
             .horizontal_line_metrics(px as f32)
             .map(|m| m.ascent)
             .unwrap_or(px as f32 * 0.86);
+        // Extract the vector outline for the true-MSDF world path from the SAME
+        // ttf-parser face rustybuzz shaped with, so the glyph-id space matches. `None`
+        // (no contours / unsupported table) degrades that glyph to the coverage field.
+        let outline = font.msdf_outline(glyph_id, px);
         Some(GlyphCoverageData {
             font_index,
             glyph_id,
@@ -260,6 +270,7 @@ impl TextEngine {
             bearing_x: metrics.xmin as f32,
             bearing_y: baseline - metrics.ymin as f32 - metrics.height as f32,
             oversample: effective_oversample,
+            outline,
         })
     }
 
@@ -483,6 +494,37 @@ impl RendererFont {
         let raster = Font::from_bytes(bytes, FontSettings::default())
             .map_err(|error| format!("Failed to parse {name} with fontdue: {error}"))?;
         Ok(RendererFont { name, face, raster })
+    }
+
+    /// The glyph's vector outline + the font-unit→texel registration for the true-MSDF
+    /// world path, at the quantized `px` cell size. `None` when the outliner produces no
+    /// contours (e.g. a blank glyph) or the glyph has no font-unit bbox — the caller
+    /// then degrades that glyph to the coverage-derived single-channel field. The face
+    /// is the ttf-parser one rustybuzz already holds, so `glyph_id` is the same space.
+    fn msdf_outline(&self, glyph_id: u16, px: u16) -> Option<MsdfOutline> {
+        // Reach ttf-parser through the bridge's own re-export so the `Face`/`GlyphId`
+        // types are exactly the ones `load_shape_from_face` expects (same locked
+        // version rustybuzz holds), without taking a second direct dependency.
+        use fdsm_ttf_parser::ttf_parser;
+        let ttf_face: &ttf_parser::Face = self.face.as_ref();
+        let gid = ttf_parser::GlyphId(glyph_id);
+        let shape = fdsm_ttf_parser::load_shape_from_face(ttf_face, gid)?;
+        if shape.contours.is_empty() {
+            return None;
+        }
+        let bbox = ttf_face.glyph_bounding_box(gid)?;
+        let units_per_em = ttf_face.units_per_em();
+        if units_per_em == 0 {
+            return None;
+        }
+        Some(MsdfOutline {
+            shape,
+            x_min: f32::from(bbox.x_min),
+            y_max: f32::from(bbox.y_max),
+            // Font units per atlas texel: the outline scaled by 1/shrinkage fills the
+            // same px ink box the coverage raster occupies.
+            shrinkage: f32::from(units_per_em) / f32::from(px),
+        })
     }
 }
 
@@ -1026,6 +1068,7 @@ mod tests {
             bearing_x: cov.bearing_x,
             bearing_y: cov.bearing_y,
             oversample: cov.oversample,
+            outline: cov.outline,
         })
         .expect("atlas room")
     }
