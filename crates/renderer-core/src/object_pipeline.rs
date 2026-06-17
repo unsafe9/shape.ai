@@ -299,7 +299,10 @@ pub fn populate_atlas_from_scene(
                 if entries.contains_key(&map_key) {
                     continue;
                 }
-                let Some(cov) = engine.glyph_coverage(ch, size_px, oversample) else {
+                // The world/SDF slot bakes the outline into a true MSDF; the coverage
+                // (UI) slot never reads it, so don't pay to extract it there.
+                let Some(cov) = engine.glyph_coverage(ch, size_px, oversample, !want_coverage)
+                else {
                     continue;
                 };
                 let glyph = GlyphCoverage {
@@ -355,14 +358,15 @@ pub fn build_scene_geometry_themed_with_measure(
     theme: Theme,
     measure: &dyn Fn(char, f32) -> f32,
 ) -> SceneGeometry {
-    // Stub/UI-core path: no real font, so the visual box equals the line height
-    // (`ascent - descent == 1` per px), keeping the legacy line-height centering.
-    build_scene_geometry_themed_with_text(scene, theme, STUB_LINE_BOX, measure, &no_glyph_uv)
+    // No-font stub triple: this overload injects `stub_measure` + `no_glyph_uv`, so
+    // there is no real font to read a metric box from. `(1.0, 0.0)` (ascent - descent
+    // == 1 per px) makes the centered visual box equal the bare line height — the
+    // companion to the stub measure, never a real-font layout. The real GPU/text path
+    // routes through `build_scene_geometry_themed_with_text` with the engine's actual
+    // `line_box_per_px()`; this literal lives inline (not a shared const) so no real
+    // `with_text` caller can pick it up by mistake.
+    build_scene_geometry_themed_with_text(scene, theme, (1.0, 0.0), measure, &no_glyph_uv)
 }
-
-/// The vertical metric box used when no real font is injected: `ascent - descent == 1`
-/// per px, so the centered box equals the line height (the pre-fix behavior).
-const STUB_LINE_BOX: (f32, f32) = (1.0, 0.0);
 
 /// As [`build_scene_geometry_themed_with_measure`], with an injected per-glyph
 /// `glyph_uv` provider so each glyph quad carries its REAL atlas-slot UVs + bearing
@@ -734,9 +738,13 @@ fn append_text_quads(
     for p in &placements {
         let coverage = run_coverage.get(p.run_index).copied().unwrap_or(false);
         // A real atlas slot positions the cell by the glyph bearing and carries the
-        // slot's corner UVs; an unresolved glyph keeps the placeholder full cell. The
-        // shader mode follows the resolved slot (its `coverage` flag), falling back to
-        // the run's requested mode for the placeholder cell.
+        // slot's corner UVs; an unresolved glyph (atlas full / unpacked / the no-font
+        // stub path) keeps a placement-sized cell but with a DEGENERATE single-texel
+        // UV. Spreading uv 0..1 across the whole atlas sampled every glyph as a smeared
+        // garbage block; collapsing all four corners to atlas (0,0) — a "fully outside"
+        // SDF texel and a non-ink coverage texel — renders nothing instead of a smear.
+        // The shader mode follows the resolved slot (its `coverage` flag), falling back
+        // to the run's requested mode for the placeholder cell.
         let (corners, uv, mode) = match glyph_uv(p.ch, p.size, coverage) {
             Some(entry) if entry.width > 0.0 && entry.height > 0.0 => {
                 let gx = p.x + entry.bearing_x;
@@ -749,7 +757,7 @@ fn append_text_quads(
             }
             _ => (
                 [p.x, p.y, p.x + p.size, p.y + p.size],
-                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                [[0.0, 0.0]; 4],
                 f32::from(u8::from(coverage)),
             ),
         };
@@ -1820,6 +1828,37 @@ mod tests {
         );
     }
 
+    /// FALSIFIABLE (fix-6, no full-atlas smear on an unresolved glyph): when `glyph_uv`
+    /// resolves NOTHING (atlas full / unpacked), the emitted placeholder quad must NOT
+    /// span uv 0..1 across the whole atlas — that sampled the entire texture as alpha,
+    /// a smeared garbage block. Every emitted quad's four UV corners must collapse to a
+    /// single texel instead. The old fallback wrote `[[0,0],[1,0],[1,1],[0,1]]`, so a
+    /// `[1,1]` corner appeared; this asserts no corner reaches the far edge.
+    #[test]
+    fn unresolved_glyph_does_not_smear_the_whole_atlas() {
+        // A real measure so glyphs lay out, but a provider that resolves nothing —
+        // the atlas-full / unpacked case the smear rode in on.
+        let none_uv = |_ch: char, _size: f32, _coverage: bool| -> Option<MsdfGlyphEntry> { None };
+        let obj = text_rect("smear", "AB", 128.0, "#ffffff");
+        let scene = scene_with(vec![obj], None);
+        let geo = build_scene_geometry_themed_with_text(
+            &scene,
+            Theme::light(),
+            (1.16, -0.288), // the real Noto line box, so layout matches the live path.
+            &unit_measure,
+            &none_uv,
+        );
+        assert!(!geo.text_vertices.is_empty(), "glyphs still lay out");
+        for v in &geo.text_vertices {
+            // No corner may reach the far atlas edge: a single-texel sample, not a
+            // full-atlas spread. (The smear path put a corner at uv (1,1).)
+            assert_eq!(
+                v.uv, [0.0, 0.0],
+                "unresolved glyph collapses to one texel, never spans the atlas"
+            );
+        }
+    }
+
     /// DEFECT 3 (ii): with a populated atlas the emitted glyph quads carry their REAL
     /// per-glyph atlas-slot UVs, NOT the placeholder full-atlas [0,0]/[1,1]. A run
     /// with size:None (defaulted to 16px) + non-empty text must map at least one glyph
@@ -1832,7 +1871,7 @@ mod tests {
         let mut entries: std::collections::HashMap<(u32, u32, bool), crate::text_layout::MsdfGlyphEntry> =
             std::collections::HashMap::new();
         for ch in "AB".chars() {
-            let cov = engine.glyph_coverage(ch, 16.0, 1.0).expect("rasterizes");
+            let cov = engine.glyph_coverage(ch, 16.0, 1.0, true).expect("rasterizes");
             let entry = atlas
                 .generate_glyph(&crate::text_layout::GlyphCoverage {
                     key: crate::text_layout::MsdfGlyphKey {
