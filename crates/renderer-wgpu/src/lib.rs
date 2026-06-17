@@ -156,8 +156,8 @@ pub fn build_p1_ui_scene(viewport_w: f64, viewport_h: f64) -> Result<String, JsV
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn demo_ui_tree() -> shape_ui_core::Widget {
     use shape_ui_core::{
-        Axis, Button, Container, CrossAlign, Edges, Paint, RectStyle, Segment, Slider, Swatch, Text,
-        TextInput, TextPaint, Toggle, Widget,
+        Axis, Button, Container, CrossAlign, Edges, MainAlign, Paint, RectStyle, Segment, Slider,
+        Swatch, Text, TextInput, TextPaint, Toggle, Widget,
     };
     Widget::Container(Container {
         id: "demo-panel".to_string(),
@@ -168,6 +168,7 @@ pub(crate) fn demo_ui_tree() -> shape_ui_core::Widget {
         h: 0.0,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children: vec![

@@ -535,6 +535,7 @@ name = "shape_canvas_core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "naga",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

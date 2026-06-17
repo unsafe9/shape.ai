@@ -335,8 +335,8 @@ impl ObjectPipeline {
         });
 
         // ---- Text pipeline ------------------------------------------------
-        // slot0: TextVertex (position @0, uv @1, color @2); slot1: instance-step
-        // matrix columns @3..5. Matches `msdf_text.wgsl`.
+        // slot0: TextVertex (position @0, uv @1, color @2, mode @3); slot1:
+        // instance-step matrix columns @4..6. Matches `msdf_text.wgsl`.
         let text_vertex_attrs = [
             wgpu::VertexAttribute {
                 offset: 0,
@@ -352,6 +352,12 @@ impl ObjectPipeline {
                 offset: (std::mem::size_of::<[f32; 2]>() * 2) as u64,
                 shader_location: 2,
                 format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: (std::mem::size_of::<[f32; 2]>() * 2 + std::mem::size_of::<[f32; 4]>())
+                    as u64,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32,
             },
         ];
         let text_instance_attrs = text_instance_attributes();
@@ -464,25 +470,26 @@ fn stroke_instance_attributes() -> [wgpu::VertexAttribute; 4] {
     ]
 }
 
-/// Instance-step attributes for text: `m0`/`m1`/`m2` at locations 3..5, NO color
-/// (color is per-glyph in [`TextVertex`]). Matches `msdf_text.wgsl`'s @location(3..5).
+/// Instance-step attributes for text: `m0`/`m1`/`m2` at locations 4..6, NO color
+/// (color is per-glyph in [`TextVertex`], `mode` is the per-vertex @3). Matches
+/// `msdf_text.wgsl`'s @location(4..6).
 #[cfg(feature = "wgpu-probe")]
 fn text_instance_attributes() -> [wgpu::VertexAttribute; 3] {
     let vec3 = std::mem::size_of::<[f32; 3]>() as u64;
     [
         wgpu::VertexAttribute {
             offset: 0,
-            shader_location: 3,
-            format: wgpu::VertexFormat::Float32x3,
-        },
-        wgpu::VertexAttribute {
-            offset: vec3,
             shader_location: 4,
             format: wgpu::VertexFormat::Float32x3,
         },
         wgpu::VertexAttribute {
-            offset: vec3 * 2,
+            offset: vec3,
             shader_location: 5,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: vec3 * 2,
+            shader_location: 6,
             format: wgpu::VertexFormat::Float32x3,
         },
     ]
@@ -505,9 +512,11 @@ fn text_instance_attributes() -> [wgpu::VertexAttribute; 3] {
 pub struct SharedObjectText {
     engine: TextEngine,
     plan: MsdfAtlasPlan,
-    /// `(char, rounded px) -> slot`, the key the glyph-UV provider resolves. The
-    /// pure core's `GlyphPlacement` carries only `(ch, size)`, not the run font.
-    entries: std::collections::HashMap<(u32, u32), MsdfGlyphEntry>,
+    /// `(char, rounded px, coverage) -> slot`, the key the glyph-UV provider resolves.
+    /// The pure core's `GlyphPlacement` carries only `(ch, size)`, not the run font;
+    /// the coverage bool namespaces the UI (coverage) and world (SDF) slots that share
+    /// this atlas so the same glyph never collides across the two modes.
+    entries: std::collections::HashMap<(u32, u32, bool), MsdfGlyphEntry>,
     /// Raster-texels-per-logical-px for the SDF source (= device pixel ratio): glyphs
     /// rasterize at `size * oversample` px so retina text stays sharp. The atlas key
     /// stays logical, so this is fixed at construction from the live dpr.
@@ -581,10 +590,12 @@ impl SharedObjectText {
     /// atlas's per-glyph UV slots injected (the core stays pure: it calls neither).
     fn build_plan(&self, scene: &RenderObjectScene, theme: Theme) -> FramePlan {
         let measure = |ch: char, size: f32| self.engine.char_advance(ch, size);
-        let glyph_uv = |ch: char, size: f32| -> Option<MsdfGlyphEntry> {
-            self.entries.get(&(ch as u32, shape_renderer_core::cast::round_u32(size))).copied()
+        let glyph_uv = |ch: char, size: f32, coverage: bool| -> Option<MsdfGlyphEntry> {
+            self.entries
+                .get(&(ch as u32, shape_renderer_core::cast::round_u32(size), coverage))
+                .copied()
         };
-        build_frame_plan_with_text(scene, theme, &measure, &glyph_uv)
+        build_frame_plan_with_text(scene, theme, self.engine.line_box_per_px(), &measure, &glyph_uv)
     }
 
     /// Upload the populated atlas pixels into the shared texture (full 2048² extent).
@@ -1516,17 +1527,20 @@ mod tests {
 
     #[test]
     fn text_pipeline_layout_matches_msdf_shader_contract() {
-        assert_eq!(std::mem::size_of::<TextVertex>(), 32);
+        // position(8) + uv(8) + color(16) + mode(4) = 36.
+        assert_eq!(std::mem::size_of::<TextVertex>(), 36);
         let attrs = text_instance_attributes();
+        // Instance matrix columns start at @4 now that `mode` rides the vertex @3.
         assert_eq!(attrs[0].offset, 0);
-        assert_eq!(attrs[0].shader_location, 3);
+        assert_eq!(attrs[0].shader_location, 4);
         assert_eq!(attrs[1].offset, 12);
-        assert_eq!(attrs[1].shader_location, 4);
+        assert_eq!(attrs[1].shader_location, 5);
         assert_eq!(attrs[2].offset, 24);
-        assert_eq!(attrs[2].shader_location, 5);
+        assert_eq!(attrs[2].shader_location, 6);
         assert_eq!(std::mem::offset_of!(TextVertex, position), 0);
         assert_eq!(std::mem::offset_of!(TextVertex, uv), 8);
         assert_eq!(std::mem::offset_of!(TextVertex, color), 16);
+        assert_eq!(std::mem::offset_of!(TextVertex, mode), 32);
     }
 
     use shape_renderer_core::model::CameraState;
@@ -1606,10 +1620,13 @@ mod tests {
         );
     }
 
-    use shape_renderer_core::render_object::{RText, RTextAlign, RTextRun, RTextValign, QUANT_PER_PX};
+    use shape_renderer_core::render_object::{
+        RText, RTextAlign, RTextMode, RTextRun, RTextValign, QUANT_PER_PX,
+    };
 
     /// A committed text object: a wide rect frame with one run at the 16px default.
-    fn text_object(id: &str, run_text: &str) -> RenderObject {
+    /// `mode` picks the atlas path (SDF for world / Coverage for screen-space UI).
+    fn text_object_mode(id: &str, run_text: &str, mode: RTextMode) -> RenderObject {
         let mut obj = rect(id, "M0 0 L1600 0 L1600 800 L0 800 Z");
         obj.text = Some(RText {
             runs: vec![RTextRun {
@@ -1619,11 +1636,17 @@ mod tests {
                 bold: false,
                 italic: false,
                 font: String::new(),
+                mode,
             }],
             align: RTextAlign::Start,
             valign: RTextValign::Top,
         });
         obj
+    }
+
+    /// The default (world/canvas, SDF) text object.
+    fn text_object(id: &str, run_text: &str) -> RenderObject {
+        text_object_mode(id, run_text, RTextMode::Sdf)
     }
 
     /// DEFECT 3 (the GPU cutover, host-side data half): the object-text atlas the GPU
@@ -1642,7 +1665,7 @@ mod tests {
             shape_renderer_core::text::TEXT_ATLAS_HEIGHT,
             OBJECT_ATLAS_DISTANCE_RANGE,
         );
-        let mut entries: std::collections::HashMap<(u32, u32), MsdfGlyphEntry> =
+        let mut entries: std::collections::HashMap<(u32, u32, bool), MsdfGlyphEntry> =
             std::collections::HashMap::new();
 
         // First populate packs new glyphs (returns grew=true, which gates the texture
@@ -1665,10 +1688,12 @@ mod tests {
         // The built plan's glyph quads carry sub-unit atlas UVs, not the full-atlas
         // placeholder (uv 0..1) the blank pipeline shipped.
         let measure = |ch: char, size: f32| engine.char_advance(ch, size);
-        let glyph_uv = |ch: char, size: f32| -> Option<MsdfGlyphEntry> {
-            entries.get(&(ch as u32, shape_renderer_core::cast::round_u32(size))).copied()
+        let glyph_uv = |ch: char, size: f32, coverage: bool| -> Option<MsdfGlyphEntry> {
+            entries
+                .get(&(ch as u32, shape_renderer_core::cast::round_u32(size), coverage))
+                .copied()
         };
-        let built = build_frame_plan_with_text(&s, Theme::light(), &measure, &glyph_uv);
+        let built = build_frame_plan_with_text(&s, Theme::light(), engine.line_box_per_px(), &measure, &glyph_uv);
         let text_vertices = &built.geometry.text_vertices;
         assert!(!text_vertices.is_empty(), "committed text emits glyph quads");
         let all_placeholder = text_vertices.iter().all(|v| {
@@ -1694,7 +1719,7 @@ mod tests {
             shape_renderer_core::text::TEXT_ATLAS_HEIGHT,
             OBJECT_ATLAS_DISTANCE_RANGE,
         );
-        let mut entries: std::collections::HashMap<(u32, u32), MsdfGlyphEntry> =
+        let mut entries: std::collections::HashMap<(u32, u32, bool), MsdfGlyphEntry> =
             std::collections::HashMap::new();
 
         // World scene commits "AB"; the UI scene reuses the SAME glyphs at the SAME size.
@@ -1713,10 +1738,12 @@ mod tests {
         // The UI plan, built from the shared entries, resolves to real sub-unit slots
         // (not the full-atlas placeholder), proving the world's glyphs serve the UI.
         let measure = |ch: char, size: f32| engine.char_advance(ch, size);
-        let glyph_uv = |ch: char, size: f32| -> Option<MsdfGlyphEntry> {
-            entries.get(&(ch as u32, shape_renderer_core::cast::round_u32(size))).copied()
+        let glyph_uv = |ch: char, size: f32, coverage: bool| -> Option<MsdfGlyphEntry> {
+            entries
+                .get(&(ch as u32, shape_renderer_core::cast::round_u32(size), coverage))
+                .copied()
         };
-        let built = build_frame_plan_with_text(&ui, Theme::light(), &measure, &glyph_uv);
+        let built = build_frame_plan_with_text(&ui, Theme::light(), engine.line_box_per_px(), &measure, &glyph_uv);
         let text_vertices = &built.geometry.text_vertices;
         assert!(!text_vertices.is_empty(), "UI text emits glyph quads");
         let all_placeholder = text_vertices.iter().all(|v| {

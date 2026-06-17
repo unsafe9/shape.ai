@@ -1,11 +1,12 @@
-// MSDF text shader: per-glyph quads (laid out on the CPU) sampling a multi-channel
-// signed distance field atlas. The median of the three channels reconstructs the
-// signed distance, staying sharp under arbitrary scaling where a single raster
-// would blur.
+// Object text shader: per-glyph quads (laid out on the CPU) sampling the shared atlas.
 //
-// screenPxRange AA: the atlas bakes a fixed distance range in texels; we convert
-// it to screen pixels via the texcoord derivative and smoothstep one screen pixel
-// around the 0.5 threshold, so the edge stays one pixel soft at any zoom.
+// Two modes, branched per glyph on the inline `mode` flag:
+//   mode 0 (SDF, world/canvas): the atlas holds a signed distance field; median3
+//     reconstructs the distance and screenPxRange AA keeps the edge one screen pixel
+//     soft at any zoom, staying sharp under arbitrary scaling where a raster blurs.
+//   mode 1 (coverage, screen-space UI): the atlas holds a raw device-resolution
+//     coverage raster; we sample it straight as the AA alpha — the browser-blit
+//     behavior — so fixed small UI text is crisp instead of distance-field-blurred.
 //
 // Camera + per-object projective transform mirror object_fill.wgsl.
 
@@ -37,16 +38,19 @@ struct VertexIn {
   @location(1) uv: vec2<f32>,
   // Per-run text color, inline.
   @location(2) color: vec4<f32>,
+  // Atlas-sampling mode: 0 = SDF (world/canvas), 1 = raw coverage (screen-space UI).
+  @location(3) mode: f32,
   // Instance-step projective matrix columns.
-  @location(3) m0: vec3<f32>,
-  @location(4) m1: vec3<f32>,
-  @location(5) m2: vec3<f32>,
+  @location(4) m0: vec3<f32>,
+  @location(5) m1: vec3<f32>,
+  @location(6) m2: vec3<f32>,
 };
 
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) color: vec4<f32>,
   @location(1) uv: vec2<f32>,
+  @location(2) @interpolate(flat) mode: f32,
 };
 
 fn world_from_local(local: vec2<f32>, m0: vec3<f32>, m1: vec3<f32>, m2: vec3<f32>) -> vec2<f32> {
@@ -75,23 +79,33 @@ fn vs_main(input: VertexIn) -> VertexOut {
   out.position = vec4<f32>(world_to_clip(world), 0.0, 1.0);
   out.color = input.color;
   out.uv = input.uv;
+  out.mode = input.mode;
   return out;
 }
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-  let msd = textureSample(msdf_atlas, msdf_sampler, input.uv).rgb;
-  // 0.5 == on the outline.
-  let sd = median3(msd);
-
-  // screenPxRange: convert the baked texel range to screen pixels at this fragment.
-  let atlas_size = vec2<f32>(text_params.atlas.y, text_params.atlas.z);
-  let unit_range = vec2<f32>(text_params.atlas.x) / atlas_size;
+  let sample = textureSample(msdf_atlas, msdf_sampler, input.uv);
+  // Derivatives must be evaluated in UNIFORM control flow (WGSL/Tint rejects them
+  // inside the per-vertex `mode` branch below, which blanks the canvas). Compute the
+  // screen-texel size for every fragment here at the top; the coverage branch ignores
+  // it, the SDF branch uses it.
   let screen_tex_size = vec2<f32>(1.0) / fwidth(input.uv);
-  let screen_px_range = max(0.5 * dot(unit_range, screen_tex_size), 1.0);
 
-  let screen_dist = screen_px_range * (sd - 0.5);
-  let coverage = clamp(screen_dist + 0.5, 0.0, 1.0);
+  var coverage: f32;
+  if (input.mode > 0.5) {
+    // Coverage mode (screen-space UI): the atlas holds raw alpha at device
+    // resolution, so sample it straight — no distance math — and it stays crisp.
+    coverage = sample.a;
+  } else {
+    // SDF mode (world/canvas): reconstruct the distance and screenPxRange-AA it.
+    let sd = median3(sample.rgb);
+    let atlas_size = vec2<f32>(text_params.atlas.y, text_params.atlas.z);
+    let unit_range = vec2<f32>(text_params.atlas.x) / atlas_size;
+    let screen_px_range = max(0.5 * dot(unit_range, screen_tex_size), 1.0);
+    let screen_dist = screen_px_range * (sd - 0.5);
+    coverage = clamp(screen_dist + 0.5, 0.0, 1.0);
+  }
 
   return vec4<f32>(input.color.rgb, input.color.a * coverage);
 }

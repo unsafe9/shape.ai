@@ -58,3 +58,9 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "console", "HtmlCanvasElement"] }
 wgpu = { version = "29.0.3", default-features = false, features = ["std", "webgpu", "wgsl"], optional = true }
+
+[dev-dependencies]
+# WGSL compiles at runtime on a live device, so a green wasm build never catches a
+# shader error. Validate every embedded shader on the host (uniformity included) so a
+# derivative in non-uniform control flow fails a test, not the live canvas.
+naga = { version = "29.0.3", features = ["wgsl-in"] }
