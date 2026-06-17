@@ -327,6 +327,49 @@ struct RendererRollbackState {
     object_scene: Option<RenderObjectScene>,
 }
 
+/// The surface-sized stencil target for GPU clip masking. Allocated only on create +
+/// resize (mirror of `ShadowBlur`), never per frame — the object pass merely references
+/// the view and clears it with a load-op. `Stencil8`, 1 byte/pixel.
+#[cfg(feature = "wgpu-probe")]
+pub struct StencilTarget {
+    pub view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(feature = "wgpu-probe")]
+impl StencilTarget {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let w = width.max(1);
+        let h = height.max(1);
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shape.ai clip stencil"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            // Must match every pipeline's MultisampleState::default() (sample_count 1).
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::object_pipeline::STENCIL_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        Self {
+            view: tex.create_view(&wgpu::TextureViewDescriptor::default()),
+            width: w,
+            height: h,
+        }
+    }
+
+    /// True when the target already matches the surface size (so resize skips realloc).
+    pub fn matches(&self, width: u32, height: u32) -> bool {
+        self.width == width.max(1) && self.height == height.max(1)
+    }
+}
+
 #[cfg(feature = "wgpu-probe")]
 #[wasm_bindgen]
 pub struct ShapeWebGpuRenderer {
@@ -456,6 +499,9 @@ pub struct ShapeWebGpuRenderer {
     // Surface-sized, recreated in `resize`. Isolated underlay — a fault drops the
     // shadow, never the fill/stroke/text on top.
     shadow_blur: crate::shadow_blur::ShadowBlur,
+    // The surface-sized stencil mask for GPU clip. Allocated on create + resize only;
+    // the object pass references its view and clears it per pass with a load-op.
+    stencil: StencilTarget,
     // The backdrop-blur gate: collapses "world behind the screen-fixed panels
     // changed?" into one host-tested bit so a future panel-frost pass never re-blurs
     // a static frame. Dormant foundation — fed by `mark_feed`, not yet consumed.

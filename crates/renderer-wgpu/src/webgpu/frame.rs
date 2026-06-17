@@ -66,7 +66,7 @@ impl ShapeWebGpuRenderer {
             renderer.render_shadow_mask(&mut encoder, pipeline, self.shadow_blur.mask_view());
             self.shadow_blur.record_blur(&mut encoder);
             self.shadow_blur.record_composite(&mut encoder, &view, theme.canvas_bg());
-            renderer.render(&mut encoder, &view, pipeline, false);
+            renderer.render(&mut encoder, &view, &self.stencil.view, pipeline, false);
             // Per-object outline highlight for the multi-select set, drawn on top with
             // the world-space pipeline (LoadOp::Load preserves the object pass). Single
             // selection keeps its 8-handle overlay below instead. World-space quads, so
@@ -155,7 +155,9 @@ impl ShapeWebGpuRenderer {
             {
                 let (uw, uh) = self.surface_px_f32();
                 ui.update_camera(&self.queue, &UI_IDENTITY_CAMERA, uw, uh);
-                ui.render(&mut encoder, &view, pipeline, false);
+                // Reuse the SAME stencil view; the UI pass's own Clear(0) resets it
+                // before drawing the inspector clip + its masked content.
+                ui.render(&mut encoder, &view, &self.stencil.view, pipeline, false);
             }
         } else {
             let color_attachments = [Some(wgpu::RenderPassColorAttachment {

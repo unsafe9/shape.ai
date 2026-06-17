@@ -369,6 +369,10 @@ impl ShapeWebGpuRenderer {
             shape_renderer_core::cast::narrow_f32(device_pixel_ratio.max(1.0)),
         );
 
+        // Surface-sized stencil mask for GPU clip; recreated in `resize` on size change.
+        let stencil =
+            crate::webgpu::StencilTarget::new(&device, config.width, config.height);
+
         let renderer = ShapeWebGpuRenderer {
             canvas,
             scene: None,
@@ -441,6 +445,7 @@ impl ShapeWebGpuRenderer {
             object_bindings: shape_scene_core::object::move_together::BindingGraph::default(),
             object_theme: shape_renderer_core::object_theme::Theme::light(),
             shadow_blur,
+            stencil,
             backdrop_gate: shape_renderer_core::backdrop_blur::BackdropBlurGate::new(),
         };
         renderer.write_uniform();
@@ -467,6 +472,11 @@ impl ShapeWebGpuRenderer {
                 self.config.height,
                 shape_renderer_core::cast::narrow_f32(self.device_pixel_ratio),
             );
+        }
+        // The stencil mask is surface-sized too; rebuild it only on a true size change.
+        if !self.stencil.matches(self.config.width, self.config.height) {
+            self.stencil =
+                crate::webgpu::StencilTarget::new(&self.device, self.config.width, self.config.height);
         }
         self.write_uniform();
     }

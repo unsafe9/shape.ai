@@ -194,6 +194,23 @@ pub fn diff_plans(old: &FramePlan, new: &FramePlan) -> PlanDiff {
         return PlanDiff::Rebuild;
     }
 
+    // Clip topology is whole-scene state: the clip megabuffer + `clip_draws` are only
+    // re-uploaded on a Rebuild (a `GeometryUpdate` patches one object's fill/stroke/text
+    // slices in place, never the clip buffers), and a clip toggle shifts every
+    // descendant's `clip_ref` (an `ObjectDraw` field no targeted patch carries). So any
+    // change to the clip draw list OR a per-object clip ref escalates to a full rebuild.
+    // This fires only on an actual clip toggle — never on transform/style/move/resize,
+    // where `clip_draws` and every `clip_ref` are identical.
+    if old.geometry.clip_draws != new.geometry.clip_draws
+        || old
+            .entries
+            .iter()
+            .zip(&new.entries)
+            .any(|(o, n)| o.draw.clip_ref != n.draw.clip_ref)
+    {
+        return PlanDiff::Rebuild;
+    }
+
     let mut patches = Vec::new();
     for (index, (old_entry, new_entry)) in old.entries.iter().zip(&new.entries).enumerate() {
         diff_entry(index, old_entry, new_entry, &mut patches);
@@ -281,6 +298,10 @@ pub fn geometry_revision(obj: &RenderObject, camera: &CameraState) -> u64 {
     // Fill presence gates `skip_fill`; the paint kind does not change geometry.
     h.u8(u8::from(obj.fill.is_some()));
     hash_text(&mut h, obj.text.as_ref());
+    // The clip flag gates synthesizing this object's stencil-write mesh, so a toggle
+    // is a geometry change. (Descendants' `clip_ref` also shifts — that whole-scene
+    // change is caught by the `clip_draws`/`clip_ref` rebuild escalation in `diff_plans`.)
+    h.u8(u8::from(obj.clip));
     h.finish()
 }
 
@@ -700,6 +721,41 @@ mod tests {
         };
         assert_eq!(patches.len(), 1, "one patch: the geometry update");
         assert!(matches!(patches[0], PlanPatch::GeometryUpdate { .. }));
+    }
+
+    /// FALSIFIABLE (M1 clip re-upload path): toggling `clip` on a container is a
+    /// whole-scene stencil-topology change — the clip megabuffer + `clip_draws` are
+    /// only re-uploaded on a Rebuild (a `GeometryUpdate` patches one object's slices in
+    /// place, never the clip buffers), and the toggle shifts the child's `clip_ref`.
+    /// So the diff MUST escalate to `Rebuild`, not a targeted patch. Fails if the clip
+    /// flag is treated as a paintable style edit (which would never re-upload the clip
+    /// buffer, leaving stale masking).
+    #[test]
+    fn clip_toggle_yields_rebuild_to_force_clip_buffer_reupload() {
+        let mut container = rect_object("c");
+        container.fill = None;
+        let mut child = rect_object("d");
+        child.parent = Some("c".to_string());
+        let scene = scene_with(vec![container, child]);
+        let unclipped = build_frame_plan(&scene, Theme::light());
+
+        let mut clipped_scene = scene.clone();
+        clipped_scene.objects[0].clip = true;
+        let clipped = build_frame_plan(&clipped_scene, Theme::light());
+
+        assert_eq!(
+            diff_plans(&unclipped, &clipped),
+            PlanDiff::Rebuild,
+            "a clip toggle must rebuild so the clip megabuffer + clip_draws re-upload"
+        );
+        // And the new plan actually carries the synthesized clip draw + shifted ref.
+        assert_eq!(clipped.geometry.clip_draws.len(), 1, "container now clips");
+        assert!(unclipped.geometry.clip_draws.is_empty(), "it did not before");
+        let child_draw = |p: &FramePlan| {
+            p.entries.iter().find(|e| e.handle.object == "d").unwrap().draw.clip_ref
+        };
+        assert_eq!(child_draw(&unclipped), 0);
+        assert_eq!(child_draw(&clipped), 1, "the child is now scoped to the clip");
     }
 
     #[test]
