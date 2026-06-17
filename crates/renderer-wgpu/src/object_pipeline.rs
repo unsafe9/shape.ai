@@ -521,6 +521,11 @@ pub struct SharedObjectText {
     /// rasterize at `size * oversample` px so retina text stays sharp. The atlas key
     /// stays logical, so this is fixed at construction from the live dpr.
     oversample: f32,
+    /// The primary font's `(ascent, descent)` vertical box per logical px, cached at
+    /// construction: the font is immutable for the engine's lifetime, so recomputing
+    /// it per `build_plan` (every drag/widget frame) would re-run fontdue metrics for
+    /// nothing.
+    line_box_per_px: (f32, f32),
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
@@ -559,11 +564,14 @@ impl SharedObjectText {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let engine = TextEngine::new()?;
+        let line_box_per_px = engine.line_box_per_px();
         Ok(SharedObjectText {
-            engine: TextEngine::new()?,
+            engine,
             plan,
             entries: std::collections::HashMap::new(),
             oversample: oversample.max(1.0),
+            line_box_per_px,
             texture,
             view,
             sampler,
@@ -595,7 +603,7 @@ impl SharedObjectText {
                 .get(&(ch as u32, shape_renderer_core::cast::round_u32(size), coverage))
                 .copied()
         };
-        build_frame_plan_with_text(scene, theme, self.engine.line_box_per_px(), &measure, &glyph_uv)
+        build_frame_plan_with_text(scene, theme, self.line_box_per_px, &measure, &glyph_uv)
     }
 
     /// Upload the populated atlas pixels into the shared texture (full 2048² extent).
