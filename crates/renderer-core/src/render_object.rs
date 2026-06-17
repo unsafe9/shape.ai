@@ -178,6 +178,23 @@ pub struct RTextRun {
     pub italic: bool,
     #[serde(default)]
     pub font: String,
+    /// How the run's glyphs sample the atlas. World/canvas text stays `Sdf` (the
+    /// default, so every scene-derived run is unchanged); screen-space UI chrome
+    /// flips to `Coverage` for crisp device-resolution alpha at fixed small sizes.
+    #[serde(default)]
+    pub mode: RTextMode,
+}
+
+/// Glyph-atlas sampling mode for a text run. `Sdf` reconstructs coverage from a
+/// signed distance field (scales sharply under zoom — the canvas/world path);
+/// `Coverage` blits a device-resolution coverage raster as alpha (crisp at the
+/// fixed UI size, like a browser blitting CSS text).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RTextMode {
+    #[default]
+    Sdf,
+    Coverage,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -391,6 +408,8 @@ fn rtext_from(text: &model::Text) -> RText {
                 bold: run.bold,
                 italic: run.italic,
                 font: run.font.clone().unwrap_or_default(),
+                // Scene-derived (world/canvas) text stays SDF.
+                mode: RTextMode::Sdf,
             })
             .collect(),
         align: match text.align {
@@ -671,6 +690,31 @@ fn default_text_size() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FALSIFIABLE: a text run that omits `mode` on the wire defaults to `Sdf`, so
+    /// every scene/world/canvas run (which never sets it) stays on the SDF path.
+    /// Fails if the default ever flips to `Coverage` — which would silently reroute
+    /// canvas text through the coverage path and change its rendering.
+    #[test]
+    fn text_run_mode_defaults_to_sdf() {
+        assert_eq!(RTextMode::default(), RTextMode::Sdf);
+        let run: RTextRun = serde_json::from_str(r#"{ "text": "AB" }"#).expect("deserializes");
+        assert_eq!(run.mode, RTextMode::Sdf, "a run with no wire mode is SDF");
+        // The scene-model -> render-object bridge emits SDF for canvas text.
+        let model_text = model::Text {
+            runs: vec![model::TextRun {
+                text: "AB".to_string(),
+                color: None,
+                size: None,
+                bold: false,
+                italic: false,
+                font: None,
+            }],
+            align: model::TextAlign::Start,
+            valign: model::TextVAlign::Middle,
+        };
+        assert_eq!(rtext_from(&model_text).runs[0].mode, RTextMode::Sdf);
+    }
 
     fn straight(x: i32, y: i32) -> RNode {
         RNode {
@@ -979,7 +1023,8 @@ mod tests {
                             "size": 128.0,
                             "bold": false,
                             "italic": false,
-                            "font": ""
+                            "font": "",
+                            "mode": "sdf"
                         }],
                         "align": "center",
                         "valign": "bottom"

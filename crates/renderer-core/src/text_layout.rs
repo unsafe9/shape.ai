@@ -71,13 +71,17 @@ struct Line {
 
 /// Flow `runs` into lines wrapped to the region width, then align horizontally and
 /// vertically. Line height is the tallest run on each line. `measure` returns the
-/// advance width of `ch` at a given pixel size.
+/// advance width of `ch` at a given pixel size. `line_box` is the font's vertical
+/// extent per logical px — `(ascent, descent)` at size 1 (descent ≤ 0, fontdue's
+/// sign) — so vertical centering aligns the true ascent..descent box rather than the
+/// bare line height; the per-glyph shader bearing pins that box's top at `pen_y`.
 pub fn layout_runs(
     runs: &[TextRunInput],
     region_min: (f32, f32),
     region_max: (f32, f32),
     align: TextAlign,
     valign: TextVAlign,
+    line_box: (f32, f32),
     measure: &dyn Fn(char, f32) -> f32,
 ) -> Vec<GlyphPlacement> {
     let region_width = (region_max.0 - region_min.0).max(0.0);
@@ -88,11 +92,21 @@ pub fn layout_runs(
         return Vec::new();
     }
 
-    let total_height: f32 = lines.iter().map(|line| line.height).sum();
+    // Each line advances the pen by `line.height` (line top -> next line top), but the
+    // glyph shader places ink so the metric box top sits at `pen_y` and its bottom at
+    // `pen_y + box_height(line)`. The block's optical extent therefore runs from the
+    // first line top through the last line's box bottom, not a bare line-height sum.
+    let (ascent_px, descent_px) = line_box;
+    let box_ratio = (ascent_px - descent_px).max(0.0);
+    let box_height = |line: &Line| line.height * box_ratio;
+    let advance_height: f32 = lines.iter().map(|line| line.height).sum();
+    let last_box = lines.last().map(box_height).unwrap_or(0.0);
+    let last_advance = lines.last().map(|line| line.height).unwrap_or(0.0);
+    let block_height = advance_height - last_advance + last_box;
     let mut pen_y = match valign {
         TextVAlign::Top => region_min.1,
-        TextVAlign::Middle => region_min.1 + (region_height - total_height) * 0.5,
-        TextVAlign::Bottom => region_max.1 - total_height,
+        TextVAlign::Middle => region_min.1 + (region_height - block_height) * 0.5,
+        TextVAlign::Bottom => region_max.1 - block_height,
     };
 
     let mut placements = Vec::new();
@@ -309,6 +323,9 @@ pub struct MsdfGlyphKey {
     pub font_index: usize,
     pub glyph_id: u16,
     pub px: u16,
+    /// A coverage slot and an SDF slot for the same glyph store different texels, so
+    /// the mode is part of the key — the two never collide in one shared atlas.
+    pub coverage: bool,
 }
 
 /// One glyph's atlas slot: four corner UVs (CCW from top-left) plus the bearing/size
@@ -323,6 +340,9 @@ pub struct MsdfGlyphEntry {
     pub bearing_y: f32,
     pub width: f32,
     pub height: f32,
+    /// True when the slot holds a raw coverage raster (sampled directly as alpha)
+    /// rather than an SDF; the quad threads this to the per-vertex shader mode flag.
+    pub coverage: bool,
 }
 
 /// A glyph's fontdue coverage raster + placement metrics, the generator input.
@@ -399,6 +419,7 @@ impl MsdfAtlasPlan {
                 bearing_y: glyph.bearing_y,
                 width: 0.0,
                 height: 0.0,
+                coverage: glyph.key.coverage,
             };
             self.entries.insert(glyph.key, entry);
             return Some(entry);
@@ -455,6 +476,69 @@ impl MsdfAtlasPlan {
             bearing_y: (glyph.bearing_y - pad as f32) * inv_oversample,
             width: cell_w as f32 * inv_oversample,
             height: cell_h as f32 * inv_oversample,
+            coverage: false,
+        };
+        self.entries.insert(glyph.key, entry);
+        Some(entry)
+    }
+
+    /// Pack one glyph's RAW fontdue coverage (NOT an SDF) into the atlas and register
+    /// its entry, for screen-space UI text. The coverage bitmap maps ~1:1 to device
+    /// pixels (the host rasterizes at `font_size * dpr`), so the shader samples it
+    /// directly as alpha and the glyph stays crisp at its fixed size — the browser-blit
+    /// behavior. No distance-range pad, no `coverage_to_sdf`: a 1px guard band only, so
+    /// linear sampling never bleeds a neighbor. Idempotent per (coverage-keyed) slot.
+    pub fn generate_coverage_glyph(&mut self, glyph: &GlyphCoverage<'_>) -> Option<MsdfGlyphEntry> {
+        if let Some(entry) = self.entries.get(&glyph.key) {
+            return Some(*entry);
+        }
+        if glyph.width == 0 || glyph.height == 0 || glyph.coverage.is_empty() {
+            let entry = MsdfGlyphEntry {
+                uv: [[0.0, 0.0]; 4],
+                bearing_x: glyph.bearing_x,
+                bearing_y: glyph.bearing_y,
+                width: 0.0,
+                height: 0.0,
+                coverage: true,
+            };
+            self.entries.insert(glyph.key, entry);
+            return Some(entry);
+        }
+
+        let glyph_w = u32::try_from(glyph.width).unwrap_or(u32::MAX);
+        let glyph_h = u32::try_from(glyph.height).unwrap_or(u32::MAX);
+        let (origin_x, origin_y) = self.allocate_cell(glyph_w, glyph_h)?;
+
+        let atlas_w = self.atlas_width;
+        for row in 0..glyph_h {
+            for col in 0..glyph_w {
+                let alpha = glyph.coverage[(row * glyph_w + col) as usize];
+                let index = (((origin_y + row) * atlas_w + (origin_x + col)) * 4) as usize;
+                self.pixels[index] = alpha;
+                self.pixels[index + 1] = alpha;
+                self.pixels[index + 2] = alpha;
+                self.pixels[index + 3] = alpha;
+            }
+        }
+
+        // The quad spans exactly the ink cell (no AA pad); bearings register the ink
+        // against the pen origin. Cell/bearings are in device texels; dividing by
+        // `oversample` (the dpr the host rasterized at) emits the quad in logical px so
+        // layout stays resolution-independent while the texels stay device-resolution.
+        let aw = self.atlas_width as f32;
+        let ah = self.atlas_height as f32;
+        let left = origin_x as f32 / aw;
+        let right = (origin_x + glyph_w) as f32 / aw;
+        let top = origin_y as f32 / ah;
+        let bottom = (origin_y + glyph_h) as f32 / ah;
+        let inv_oversample = 1.0 / glyph.oversample.max(1.0);
+        let entry = MsdfGlyphEntry {
+            uv: [[left, top], [right, top], [right, bottom], [left, bottom]],
+            bearing_x: glyph.bearing_x * inv_oversample,
+            bearing_y: glyph.bearing_y * inv_oversample,
+            width: glyph_w as f32 * inv_oversample,
+            height: glyph_h as f32 * inv_oversample,
+            coverage: true,
         };
         self.entries.insert(glyph.key, entry);
         Some(entry)
@@ -697,6 +781,10 @@ mod tests {
 
     const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
+    /// Stub line box: `ascent - descent == 1` per px, so the centered visual box equals
+    /// the line height — the geometry these unit tests assert against.
+    const STUB_BOX: (f32, f32) = (1.0, 0.0);
+
     /// Stub measure: every char is `size` wide, to exercise wrapping without fontdue.
     fn unit_measure(_ch: char, size: f32) -> f32 {
         size
@@ -730,6 +818,7 @@ mod tests {
             (30.0, 100.0),
             TextAlign::Start,
             TextVAlign::Top,
+            STUB_BOX,
             &unit_measure,
         );
 
@@ -752,6 +841,7 @@ mod tests {
             (30.0, 100.0),
             TextAlign::Start,
             TextVAlign::Top,
+            STUB_BOX,
             &unit_measure,
         );
         let line_ys = lines_of(&placements);
@@ -769,6 +859,7 @@ mod tests {
             (100.0, 100.0),
             TextAlign::Center,
             TextVAlign::Top,
+            STUB_BOX,
             &unit_measure,
         );
         assert_eq!(placements.len(), 1);
@@ -784,6 +875,7 @@ mod tests {
             (100.0, 100.0),
             TextAlign::End,
             TextVAlign::Top,
+            STUB_BOX,
             &unit_measure,
         );
         // slack 90 -> glyph origin at x=90, right edge lands at region_max.x.
@@ -800,6 +892,7 @@ mod tests {
             (100.0, 100.0),
             TextAlign::Start,
             TextVAlign::Middle,
+            STUB_BOX,
             &unit_measure,
         );
         assert!((placements[0].y - 45.0).abs() < 1e-4, "y={}", placements[0].y);
@@ -816,6 +909,7 @@ mod tests {
             (30.0, 100.0),
             TextAlign::Start,
             TextVAlign::Bottom,
+            STUB_BOX,
             &unit_measure,
         );
         let line_ys = lines_of(&placements);
@@ -835,6 +929,7 @@ mod tests {
             (50.0, 100.0),
             TextAlign::Justify,
             TextVAlign::Top,
+            STUB_BOX,
             &unit_measure,
         );
         let line_ys = lines_of(&placements);
@@ -868,6 +963,7 @@ mod tests {
             (100.0, 100.0),
             TextAlign::Start,
             TextVAlign::Top,
+            STUB_BOX,
             &unit_measure,
         );
         let line_ys = lines_of(&placements);
@@ -888,6 +984,7 @@ mod tests {
             (1000.0, 100.0),
             TextAlign::Start,
             TextVAlign::Top,
+            STUB_BOX,
             &unit_measure,
         );
         assert_eq!(placements.len(), 4);
@@ -910,6 +1007,7 @@ mod tests {
             (100.0, 100.0),
             TextAlign::Start,
             TextVAlign::Top,
+            STUB_BOX,
             &unit_measure,
         );
         assert!(placements.is_empty());
@@ -922,6 +1020,7 @@ mod tests {
             font_index: 0,
             glyph_id: 42,
             px: 64,
+            coverage: false,
         };
         let entry = MsdfGlyphEntry {
             uv: [[0.0, 0.0], [0.1, 0.0], [0.1, 0.1], [0.0, 0.1]],
@@ -929,6 +1028,7 @@ mod tests {
             bearing_y: 2.0,
             width: 40.0,
             height: 48.0,
+            coverage: false,
         };
         assert_eq!(plan.lookup(&key), None);
         plan.insert(key, entry);
@@ -944,7 +1044,102 @@ mod tests {
     }
 
     fn glyph_key(glyph_id: u16) -> MsdfGlyphKey {
-        MsdfGlyphKey { font_index: 0, glyph_id, px: 32 }
+        MsdfGlyphKey { font_index: 0, glyph_id, px: 32, coverage: false }
+    }
+
+    /// FALSIFIABLE: the coverage atlas path stores the RAW fontdue coverage — flat
+    /// opaque interior, flat-zero exterior, anti-aliased intermediate edges — NOT a
+    /// signed distance field. A distance field has a smooth ramp centered at 0.5
+    /// everywhere with no flat-255 interior; coverage has both saturated extremes.
+    /// This fails if `generate_coverage_glyph` ever routes through `coverage_to_sdf`:
+    /// the stored texels would no longer equal the source bitmap and the interior
+    /// would never read fully opaque.
+    #[test]
+    fn coverage_glyph_stores_raw_coverage_not_a_distance_field() {
+        let engine = crate::text::TextEngine::new().expect("bundled fonts load");
+        // A large 'B' so the interior is solidly covered and the edges anti-aliased.
+        let cov = engine
+            .glyph_coverage('B', 48.0, 1.0)
+            .expect("'B' rasterizes");
+        let mut plan = MsdfAtlasPlan::new(256, 256, 4.0);
+        let entry = plan
+            .generate_coverage_glyph(&GlyphCoverage {
+                key: MsdfGlyphKey {
+                    font_index: cov.font_index,
+                    glyph_id: cov.glyph_id,
+                    px: cov.px,
+                    coverage: true,
+                },
+                coverage: &cov.coverage,
+                width: cov.width,
+                height: cov.height,
+                bearing_x: cov.bearing_x,
+                bearing_y: cov.bearing_y,
+                oversample: cov.oversample,
+            })
+            .expect("atlas has room");
+        assert!(entry.coverage, "the entry is flagged coverage-mode");
+
+        // The slot has NO distance-range pad: the quad spans exactly the ink cell.
+        assert_eq!(entry.width, cov.width as f32);
+        assert_eq!(entry.height, cov.height as f32);
+
+        // Read the packed alpha channel back from the atlas at the slot origin and
+        // assert it is BYTE-IDENTICAL to the source fontdue coverage. An SDF transform
+        // would rewrite every texel, so this equality is the falsifier.
+        let origin_x = crate::cast::round_u32(entry.uv[0][0] * plan.atlas_width as f32);
+        let origin_y = crate::cast::round_u32(entry.uv[0][1] * plan.atlas_height as f32);
+        let aw = plan.atlas_width;
+        let mut max_alpha = 0_u8;
+        let mut min_alpha = 255_u8;
+        let mut has_edge = false;
+        for row in 0..crate::cast::len_u32(cov.height) {
+            for col in 0..crate::cast::len_u32(cov.width) {
+                let src = cov.coverage[(row * crate::cast::len_u32(cov.width) + col) as usize];
+                let i = (((origin_y + row) * aw + (origin_x + col)) * 4) as usize;
+                assert_eq!(
+                    plan.pixels()[i + 3],
+                    src,
+                    "stored alpha equals raw coverage (no SDF transform)"
+                );
+                max_alpha = max_alpha.max(src);
+                min_alpha = min_alpha.min(src);
+                if (1..=254).contains(&src) {
+                    has_edge = true;
+                }
+            }
+        }
+        assert_eq!(max_alpha, 255, "a fully-covered interior texel (flat opaque)");
+        assert_eq!(min_alpha, 0, "a fully-uncovered exterior texel (flat zero)");
+        assert!(has_edge, "an anti-aliased intermediate edge texel exists");
+    }
+
+    /// A coverage slot and an SDF slot for the SAME glyph never collide: the keys
+    /// differ by their `coverage` flag, so both register in one shared atlas.
+    #[test]
+    fn coverage_and_sdf_slots_for_one_glyph_coexist() {
+        let engine = crate::text::TextEngine::new().expect("bundled fonts load");
+        let cov = engine.glyph_coverage('A', 24.0, 1.0).expect("'A' rasterizes");
+        let mut plan = MsdfAtlasPlan::new(256, 256, 4.0);
+        let mk = |coverage: bool| GlyphCoverage {
+            key: MsdfGlyphKey {
+                font_index: cov.font_index,
+                glyph_id: cov.glyph_id,
+                px: cov.px,
+                coverage,
+            },
+            coverage: &cov.coverage,
+            width: cov.width,
+            height: cov.height,
+            bearing_x: cov.bearing_x,
+            bearing_y: cov.bearing_y,
+            oversample: cov.oversample,
+        };
+        let sdf = plan.generate_glyph(&mk(false)).expect("sdf slot");
+        let coverage = plan.generate_coverage_glyph(&mk(true)).expect("coverage slot");
+        assert_eq!(plan.glyph_count(), 2, "two slots, no collision");
+        assert!(!sdf.coverage && coverage.coverage);
+        assert_ne!(sdf.uv, coverage.uv, "distinct atlas regions");
     }
 
     /// Sample the median-of-3 SDF value the shader reads at atlas texel (x, y).
@@ -1123,6 +1318,7 @@ mod tests {
                         font_index: cov.font_index,
                         glyph_id: cov.glyph_id,
                         px: cov.px,
+                        coverage: false,
                     },
                     coverage: &cov.coverage,
                     width: cov.width,

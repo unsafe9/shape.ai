@@ -71,7 +71,7 @@ pub use outline::{derive_region, parse_path_string, Region, RegionCache};
 pub use render_object::{
     default_fill, default_stroke, parse_path_d, resolve_visual, FocusRing, RFill, RGradientStop,
     RHandle, RNode, RPaint, RStroke, RStrokeCap, RStrokeJoin, RSubPath, RText, RTextAlign,
-    RTextRun, RTextValign, RenderObject, RenderObjectScene, ResolvedStyle, VisualState,
+    RTextMode, RTextRun, RTextValign, RenderObject, RenderObjectScene, ResolvedStyle, VisualState,
     QUANT_PER_PX,
 };
 #[allow(unused_imports)]

@@ -11,8 +11,8 @@
 use crate::model::CameraState;
 use crate::object_theme::{resolve_token_f32, Theme};
 use crate::render_object::{
-    resolve_visual, RPaint, RText, RTextAlign, RTextValign, RenderObject, RenderObjectScene,
-    VisualState, QUANT_PER_PX,
+    resolve_visual, RPaint, RText, RTextAlign, RTextMode, RTextValign, RenderObject,
+    RenderObjectScene, VisualState, QUANT_PER_PX,
 };
 use crate::text::TextEngine;
 use crate::text_layout::{
@@ -138,17 +138,20 @@ impl StrokeParamsUniform {
 }
 
 /// Per-glyph-corner attributes matching `msdf_text.wgsl`'s `VertexIn` (`position`
-/// @0, `uv` @1, `color` @2). Color rides per-glyph (not on the instance) so one
-/// object's runs can mix colors.
+/// @0, `uv` @1, `color` @2, `mode` @3). Color rides per-glyph (not on the instance)
+/// so one object's runs can mix colors; `mode` selects the fragment path (0 = SDF,
+/// 1 = raw-coverage UI text) so a single pipeline serves both.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TextVertex {
     pub position: [f32; 2],
     pub uv: [f32; 2],
     pub color: [f32; 4],
+    /// 0.0 = SDF (median3 + screenPxRange); 1.0 = sample coverage directly as alpha.
+    pub mode: f32,
 }
 
-/// Text instance matching `msdf_text.wgsl` (`m0`/`m1`/`m2` @3..5); matrix only,
+/// Text instance matching `msdf_text.wgsl` (`m0`/`m1`/`m2` @4..6); matrix only,
 /// since color is per-glyph in [`TextVertex`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -251,14 +254,16 @@ fn stub_measure(_ch: char, size: f32) -> f32 {
 }
 
 /// Per-glyph atlas-slot lookup the GPU cutover injects: given a glyph char at a
-/// pixel size, the populated [`MsdfAtlasPlan`] returns its corner UVs + bearing.
-/// `None` (atlas not yet built, glyph unpacked, or blank) => the placeholder
-/// full-atlas cell. The pure core never rasterizes; the host supplies this.
-pub type GlyphUvProvider<'a> = dyn Fn(char, f32) -> Option<MsdfGlyphEntry> + 'a;
+/// pixel size and its run's coverage flag, the populated [`MsdfAtlasPlan`] returns
+/// its corner UVs + bearing. The flag namespaces the coverage (UI) and SDF (world)
+/// slots that share the atlas. `None` (atlas not yet built, glyph unpacked, or
+/// blank) => the placeholder full-atlas cell. The pure core never rasterizes; the
+/// host supplies this.
+pub type GlyphUvProvider<'a> = dyn Fn(char, f32, bool) -> Option<MsdfGlyphEntry> + 'a;
 
 /// A provider that maps no glyph (used by the stub/legacy path so quads keep the
 /// placeholder full-atlas `uv 0..1`).
-fn no_glyph_uv(_ch: char, _size: f32) -> Option<MsdfGlyphEntry> {
+fn no_glyph_uv(_ch: char, _size: f32, _coverage: bool) -> Option<MsdfGlyphEntry> {
     None
 }
 
@@ -271,7 +276,7 @@ fn no_glyph_uv(_ch: char, _size: f32) -> Option<MsdfGlyphEntry> {
 /// core, with a single glyph-pack implementation shared by the GPU path and tests.
 pub fn populate_atlas_from_scene(
     plan: &mut MsdfAtlasPlan,
-    entries: &mut HashMap<(u32, u32), MsdfGlyphEntry>,
+    entries: &mut HashMap<(u32, u32, bool), MsdfGlyphEntry>,
     engine: &TextEngine,
     scene: &RenderObjectScene,
     oversample: f32,
@@ -283,22 +288,26 @@ pub fn populate_atlas_from_scene(
             // Wire size is quantized at QUANT_PER_PX units/px; the layout de-quants,
             // so the atlas key uses the same rounded px the provider keys on. The key
             // stays LOGICAL (no `oversample`) so the UV lookup is dpr-independent; the
-            // oversample only raises the SDF source resolution behind that key.
+            // oversample only raises the source raster resolution behind that key.
             let size_px = crate::cast::narrow_f32(run.size / QUANT_PER_PX);
             let key_px = crate::cast::round_u32(size_px);
+            // Coverage (UI) and SDF (world) slots never share a key: the same glyph
+            // stores different texels for each, so the bool namespaces the cache.
+            let want_coverage = matches!(run.mode, RTextMode::Coverage);
             for ch in run.text.chars() {
-                let map_key = (ch as u32, key_px);
+                let map_key = (ch as u32, key_px, want_coverage);
                 if entries.contains_key(&map_key) {
                     continue;
                 }
                 let Some(cov) = engine.glyph_coverage(ch, size_px, oversample) else {
                     continue;
                 };
-                let slot = plan.generate_glyph(&GlyphCoverage {
+                let glyph = GlyphCoverage {
                     key: MsdfGlyphKey {
                         font_index: cov.font_index,
                         glyph_id: cov.glyph_id,
                         px: cov.px,
+                        coverage: want_coverage,
                     },
                     coverage: &cov.coverage,
                     width: cov.width,
@@ -308,7 +317,12 @@ pub fn populate_atlas_from_scene(
                     // The oversample (dpr) the coverage was rasterized at divides the
                     // quad back to logical px so layout stays resolution-independent.
                     oversample: cov.oversample,
-                });
+                };
+                let slot = if want_coverage {
+                    plan.generate_coverage_glyph(&glyph)
+                } else {
+                    plan.generate_glyph(&glyph)
+                };
                 // `None` = atlas full; leave the glyph unresolved so the build falls
                 // back to the placeholder cell rather than dropping it silently.
                 if let Some(entry) = slot {
@@ -338,16 +352,25 @@ pub fn build_scene_geometry_themed_with_measure(
     theme: Theme,
     measure: &dyn Fn(char, f32) -> f32,
 ) -> SceneGeometry {
-    build_scene_geometry_themed_with_text(scene, theme, measure, &no_glyph_uv)
+    // Stub/UI-core path: no real font, so the visual box equals the line height
+    // (`ascent - descent == 1` per px), keeping the legacy line-height centering.
+    build_scene_geometry_themed_with_text(scene, theme, STUB_LINE_BOX, measure, &no_glyph_uv)
 }
+
+/// The vertical metric box used when no real font is injected: `ascent - descent == 1`
+/// per px, so the centered box equals the line height (the pre-fix behavior).
+const STUB_LINE_BOX: (f32, f32) = (1.0, 0.0);
 
 /// As [`build_scene_geometry_themed_with_measure`], with an injected per-glyph
 /// `glyph_uv` provider so each glyph quad carries its REAL atlas-slot UVs + bearing
 /// (the GPU cutover supplies it from a populated [`MsdfAtlasPlan`]). A glyph the
 /// provider does not resolve falls back to the placeholder full-atlas cell.
+/// `line_box` is the font's `(ascent, descent)` per logical px (descent ≤ 0); vertical
+/// alignment centers that true ink box, not the bare line height.
 pub fn build_scene_geometry_themed_with_text(
     scene: &RenderObjectScene,
     theme: Theme,
+    line_box: (f32, f32),
     measure: &dyn Fn(char, f32) -> f32,
     glyph_uv: &GlyphUvProvider<'_>,
 ) -> SceneGeometry {
@@ -497,6 +520,7 @@ pub fn build_scene_geometry_themed_with_text(
                 text,
                 &subpaths,
                 scene.camera.zoom,
+                line_box,
                 measure,
                 glyph_uv,
             );
@@ -658,6 +682,7 @@ fn append_text_quads(
     text: &RText,
     subpaths: &[(bool, Vec<(f32, f32)>)],
     zoom: f64,
+    line_box: (f32, f32),
     measure: &dyn Fn(char, f32) -> f32,
     glyph_uv: &GlyphUvProvider<'_>,
 ) {
@@ -682,6 +707,13 @@ fn append_text_quads(
             font: run.font.clone(),
         })
         .collect();
+    // Per-run coverage flag, indexed by a placement's `run_index`, so the atlas
+    // lookup hits the right (coverage vs SDF) slot and the quad carries the mode.
+    let run_coverage: Vec<bool> = text
+        .runs
+        .iter()
+        .map(|run| matches!(run.mode, RTextMode::Coverage))
+        .collect();
 
     let align = match text.align {
         RTextAlign::Start => TextAlign::Start,
@@ -695,29 +727,34 @@ fn append_text_quads(
         RTextValign::Bottom => TextVAlign::Bottom,
     };
 
-    let placements = layout_runs(&runs, region_min, region_max, align, valign, measure);
+    let placements = layout_runs(&runs, region_min, region_max, align, valign, line_box, measure);
     for p in &placements {
+        let coverage = run_coverage.get(p.run_index).copied().unwrap_or(false);
         // A real atlas slot positions the cell by the glyph bearing and carries the
-        // slot's corner UVs; an unresolved glyph keeps the placeholder full cell.
-        let (corners, uv) = match glyph_uv(p.ch, p.size) {
+        // slot's corner UVs; an unresolved glyph keeps the placeholder full cell. The
+        // shader mode follows the resolved slot (its `coverage` flag), falling back to
+        // the run's requested mode for the placeholder cell.
+        let (corners, uv, mode) = match glyph_uv(p.ch, p.size, coverage) {
             Some(entry) if entry.width > 0.0 && entry.height > 0.0 => {
                 let gx = p.x + entry.bearing_x;
                 let gy = p.y + entry.bearing_y;
                 (
                     [gx, gy, gx + entry.width, gy + entry.height],
                     entry.uv,
+                    f32::from(u8::from(entry.coverage)),
                 )
             }
             _ => (
                 [p.x, p.y, p.x + p.size, p.y + p.size],
                 [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                f32::from(u8::from(coverage)),
             ),
         };
         let [x0, y0, x1, y1] = corners;
-        let tl = TextVertex { position: [x0, y0], uv: uv[0], color: p.color };
-        let tr = TextVertex { position: [x1, y0], uv: uv[1], color: p.color };
-        let br = TextVertex { position: [x1, y1], uv: uv[2], color: p.color };
-        let bl = TextVertex { position: [x0, y1], uv: uv[3], color: p.color };
+        let tl = TextVertex { position: [x0, y0], uv: uv[0], color: p.color, mode };
+        let tr = TextVertex { position: [x1, y0], uv: uv[1], color: p.color, mode };
+        let br = TextVertex { position: [x1, y1], uv: uv[2], color: p.color, mode };
+        let bl = TextVertex { position: [x0, y1], uv: uv[3], color: p.color, mode };
         // Two triangles (tl, tr, br) + (tl, br, bl) — CCW tri-list, no index buffer.
         out.push(tl);
         out.push(tr);
@@ -1156,6 +1193,7 @@ mod tests {
                     bold: false,
                     italic: false,
                     font: String::new(),
+                    mode: RTextMode::Sdf,
                 }],
                 align: RTextAlign::Start,
                 valign: RTextValign::Middle,
@@ -1669,6 +1707,7 @@ mod tests {
                 bold: false,
                 italic: false,
                 font: String::new(),
+                mode: RTextMode::Sdf,
             }],
             align: RTextAlign::Start,
             valign: RTextValign::Top,
@@ -1740,8 +1779,8 @@ mod tests {
 
     #[test]
     fn text_vertex_and_instance_sizes_match_shader_contract() {
-        // TextVertex: vec2 position + vec2 uv + vec4 color = 8 floats = 32 bytes.
-        assert_eq!(std::mem::size_of::<TextVertex>(), 32);
+        // TextVertex: vec2 position + vec2 uv + vec4 color + f32 mode = 9 floats = 36 bytes.
+        assert_eq!(std::mem::size_of::<TextVertex>(), 36);
         // TextInstance: 3 vec3 columns = 36 bytes, no color.
         assert_eq!(std::mem::size_of::<TextInstance>(), 36);
     }
@@ -1787,7 +1826,7 @@ mod tests {
         // Populate a real atlas from the bundled fonts for "AB" at the 16px default.
         let engine = crate::text::TextEngine::new().expect("bundled fonts load");
         let mut atlas = crate::text_layout::MsdfAtlasPlan::new(2048, 2048, 4.0);
-        let mut entries: std::collections::HashMap<(u32, u32), crate::text_layout::MsdfGlyphEntry> =
+        let mut entries: std::collections::HashMap<(u32, u32, bool), crate::text_layout::MsdfGlyphEntry> =
             std::collections::HashMap::new();
         for ch in "AB".chars() {
             let cov = engine.glyph_coverage(ch, 16.0, 1.0).expect("rasterizes");
@@ -1797,6 +1836,7 @@ mod tests {
                         font_index: cov.font_index,
                         glyph_id: cov.glyph_id,
                         px: cov.px,
+                        coverage: false,
                     },
                     coverage: &cov.coverage,
                     width: cov.width,
@@ -1806,10 +1846,10 @@ mod tests {
                     oversample: cov.oversample,
                 })
                 .expect("atlas room");
-            entries.insert((ch as u32, 16), entry);
+            entries.insert((ch as u32, 16, false), entry);
         }
-        let glyph_uv = |ch: char, size: f32| -> Option<crate::text_layout::MsdfGlyphEntry> {
-            entries.get(&(ch as u32, crate::cast::round_u32(size))).copied()
+        let glyph_uv = |ch: char, size: f32, coverage: bool| -> Option<crate::text_layout::MsdfGlyphEntry> {
+            entries.get(&(ch as u32, crate::cast::round_u32(size), coverage)).copied()
         };
         let real_measure = |ch: char, size: f32| engine.char_advance(ch, size);
 
@@ -1819,6 +1859,7 @@ mod tests {
         let geo = build_scene_geometry_themed_with_text(
             &scene,
             Theme::light(),
+            engine.line_box_per_px(),
             &real_measure,
             &glyph_uv,
         );
@@ -1854,7 +1895,7 @@ mod tests {
             4.0,
         );
         let mut entries: std::collections::HashMap<
-            (u32, u32),
+            (u32, u32, bool),
             crate::text_layout::MsdfGlyphEntry,
         > = std::collections::HashMap::new();
 
@@ -1880,10 +1921,10 @@ mod tests {
         // The populated entries feed the build real atlas slots end-to-end: not every
         // quad carries the placeholder full-atlas uv 0..1.
         let measure = |ch: char, size: f32| engine.char_advance(ch, size);
-        let glyph_uv = |ch: char, size: f32| -> Option<crate::text_layout::MsdfGlyphEntry> {
-            entries.get(&(ch as u32, crate::cast::round_u32(size))).copied()
+        let glyph_uv = |ch: char, size: f32, coverage: bool| -> Option<crate::text_layout::MsdfGlyphEntry> {
+            entries.get(&(ch as u32, crate::cast::round_u32(size), coverage)).copied()
         };
-        let geo = build_scene_geometry_themed_with_text(&scene, Theme::light(), &measure, &glyph_uv);
+        let geo = build_scene_geometry_themed_with_text(&scene, Theme::light(), engine.line_box_per_px(), &measure, &glyph_uv);
         assert!(!geo.text_vertices.is_empty(), "committed text emits quads");
         let all_placeholder = geo.text_vertices.iter().all(|v| {
             (v.uv == [0.0, 0.0]) || (v.uv == [1.0, 0.0]) || (v.uv == [1.0, 1.0]) || (v.uv == [0.0, 1.0])
@@ -1919,6 +1960,98 @@ mod tests {
         assert!(
             (g1_origin_x - 16.0).abs() < 1e-4,
             "defaulted run lays out at 16px, got advance {g1_origin_x}"
+        );
+    }
+
+    /// FALSIFIABLE (uneven top/bottom inset, the input-box/button/segment complaint):
+    /// a single-line label `Middle`-aligned in a known-height region must sit so its
+    /// TRUE vertical metric box (ascent..descent) is optically centered — top inset ==
+    /// bottom inset within a tight tolerance. Drives the real raster -> atlas ->
+    /// `build_scene_geometry_themed_with_text` place-glyphs path (the same the GPU
+    /// renderer runs), recovers the line's pen top from each emitted quad and its real
+    /// per-glyph bearing, and asserts the centered metric box. The pre-fix code centered
+    /// the bare line height (= font size) instead of `ascent - descent`, which for Noto
+    /// is strictly taller, so the same recovery yields a top inset SMALLER than the
+    /// bottom by exactly `(box - line_height)/2` — recomputed here and asserted unequal,
+    /// so this test fails on the old line-height centering and passes on the fix.
+    #[test]
+    fn middle_valign_centers_the_true_visual_box_evenly() {
+        let engine = crate::text::TextEngine::new().expect("bundled fonts load");
+        let mut plan = crate::text_layout::MsdfAtlasPlan::new(
+            crate::text::TEXT_ATLAS_WIDTH,
+            crate::text::TEXT_ATLAS_HEIGHT,
+            4.0,
+        );
+        let mut entries: std::collections::HashMap<
+            (u32, u32, bool),
+            crate::text_layout::MsdfGlyphEntry,
+        > = std::collections::HashMap::new();
+
+        // 200px-wide x 100px-tall region (8 units/px); a 16px label with an ascender
+        // ('A') and a descender ('g','y') so the metric box is exercised end to end.
+        let size_px = 16.0_f32;
+        let region_height = 100.0_f32;
+        let mut obj = text_rect("mid", "Agy", f64::from(size_px) * QUANT_PER_PX, "#ffffff");
+        if let Some(text) = obj.text.as_mut() {
+            text.valign = RTextValign::Middle;
+        }
+        let scene = scene_with(vec![obj], None);
+
+        populate_atlas_from_scene(&mut plan, &mut entries, &engine, &scene, 1.0);
+        let key_px = crate::cast::round_u32(size_px);
+        let glyph_uv = |ch: char, _size: f32, coverage: bool| -> Option<crate::text_layout::MsdfGlyphEntry> {
+            entries.get(&(ch as u32, key_px, coverage)).copied()
+        };
+        let measure = |ch: char, sz: f32| engine.char_advance(ch, sz);
+        let line_box = engine.line_box_per_px();
+
+        let geo = build_scene_geometry_themed_with_text(
+            &scene,
+            Theme::light(),
+            line_box,
+            &measure,
+            &glyph_uv,
+        );
+        assert!(!geo.text_vertices.is_empty(), "committed text emits quads");
+
+        // Recover the single line's pen top (the metric-box top): every glyph's quad
+        // top-left y is `pen_y + entry.bearing_y`, so `pen_y = quad_top - bearing_y`
+        // is identical across the line. The 6-vert quad's vertex 0 is the top-left.
+        let mut pen_tops = Vec::new();
+        for (i, ch) in "Agy".chars().enumerate() {
+            let entry = glyph_uv(ch, size_px, false).expect("real slot for visible glyph");
+            let quad_top = geo.text_vertices[i * 6].position[1];
+            pen_tops.push(quad_top - entry.bearing_y);
+        }
+        let pen_y = pen_tops[0];
+        for top in &pen_tops {
+            assert!(
+                (top - pen_y).abs() < 1e-3,
+                "single line shares one pen top: {pen_tops:?}"
+            );
+        }
+
+        // The true metric box (ascent..descent) at this size; descent ≤ 0.
+        let (ascent_px, descent_px) = line_box;
+        let box_height = (ascent_px - descent_px) * size_px;
+        let top_inset = pen_y; // region_min.y is 0.
+        let bottom_inset = region_height - (pen_y + box_height);
+        assert!(
+            (top_inset - bottom_inset).abs() < 0.5,
+            "Middle valign must center the visual box: top inset {top_inset:.3} != \
+             bottom inset {bottom_inset:.3} (box {box_height:.3})"
+        );
+
+        // The pre-fix path centered the bare line height (= size). Reconstruct the
+        // insets that centering would have produced from the SAME real metrics and
+        // assert they are NOT equal — proving the box centering is the load-bearing fix.
+        let pen_y_old = (region_height - size_px) * 0.5;
+        let old_top = pen_y_old;
+        let old_bottom = region_height - (pen_y_old + box_height);
+        assert!(
+            (old_top - old_bottom).abs() > 1.0,
+            "guard: line-height centering would leave a visible top/bottom imbalance \
+             ({old_top:.3} vs {old_bottom:.3}); if equal, the fix isn't being exercised"
         );
     }
 
@@ -2378,8 +2511,8 @@ mod tests {
         };
         let full = paint_color(&shadow, 1.0, Theme::light());
         let half = paint_color(&shadow, 0.5, Theme::light());
-        // shadow light = 00000055 -> alpha 0x55/255.
-        let base_a = 0x55 as f32 / 255.0;
+        // shadow light = 00000040 -> alpha 0x40/255.
+        let base_a = 0x40 as f32 / 255.0;
         assert!((full[3] - base_a).abs() < 1e-6);
         assert!((half[3] - base_a * 0.5).abs() < 1e-6);
     }
@@ -2487,6 +2620,7 @@ mod tests {
             position: [0.0, 0.0],
             uv: [0.0, 0.0],
             color: [0.0, 0.0, 0.0, 0.0],
+            mode: 0.0,
         });
         assert!(
             follower_patch_plan(draw, &bad_text).is_none(),

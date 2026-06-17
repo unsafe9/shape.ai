@@ -197,6 +197,19 @@ impl TextEngine {
         self.shape_width(ch.encode_utf8(&mut buf), font_size)
     }
 
+    /// The primary font's vertical metric box per logical px: `(ascent, descent)` at
+    /// `font_size = 1.0`, fontdue's sign convention (ascent ≥ 0 above the baseline,
+    /// descent ≤ 0 below it). Linear in px, so `box_height = (ascent - descent) * size`
+    /// is the true ascent..descent extent the vertical centering aligns — not the bare
+    /// em/line-height, which leaves the optical block off-center top-vs-bottom.
+    pub fn line_box_per_px(&self) -> (f32, f32) {
+        self.fonts
+            .first()
+            .and_then(|font| font.raster.horizontal_line_metrics(1.0))
+            .map(|m| (m.ascent, m.descent))
+            .unwrap_or((1.0, 0.0))
+    }
+
     /// Rasterize one char at `font_size` px into a fontdue coverage raster + glyph
     /// metrics — the input the pure SDF generator ([`MsdfAtlasPlan::generate_glyph`])
     /// turns into an atlas slot. `None` for an unmapped/blank glyph (whitespace,
@@ -1005,6 +1018,7 @@ mod tests {
                 font_index: cov.font_index,
                 glyph_id: cov.glyph_id,
                 px: cov.px,
+                coverage: false,
             },
             coverage: &cov.coverage,
             width: cov.width,

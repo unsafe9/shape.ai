@@ -134,18 +134,20 @@ pub fn build_frame_plan(scene: &RenderObjectScene, theme: Theme) -> FramePlan {
     frame_plan_from(scene, build_scene_geometry_themed(scene, theme))
 }
 
-/// As [`build_frame_plan`], with an injected real text shaper + glyph-UV provider
-/// (the GPU cutover supplies them) so glyph quads carry real atlas slots. The plan
-/// machinery (handles/instances/ranges) is identical — only the text geometry differs.
+/// As [`build_frame_plan`], with an injected real text shaper + glyph-UV provider +
+/// font vertical metric box (the GPU cutover supplies them) so glyph quads carry real
+/// atlas slots and vertical centering aligns the true ink box. The plan machinery
+/// (handles/instances/ranges) is identical — only the text geometry differs.
 pub fn build_frame_plan_with_text(
     scene: &RenderObjectScene,
     theme: Theme,
+    line_box: (f32, f32),
     measure: &dyn Fn(char, f32) -> f32,
     glyph_uv: &GlyphUvProvider<'_>,
 ) -> FramePlan {
     frame_plan_from(
         scene,
-        build_scene_geometry_themed_with_text(scene, theme, measure, glyph_uv),
+        build_scene_geometry_themed_with_text(scene, theme, line_box, measure, glyph_uv),
     )
 }
 
@@ -405,7 +407,8 @@ mod tests {
     use crate::model::CameraState;
     use crate::object_pipeline::preview_instance_columns;
     use crate::render_object::{
-        RFill, RPaint, RStroke, RStrokeCap, RStrokeJoin, RText, RTextAlign, RTextRun, RTextValign,
+        RFill, RPaint, RStroke, RStrokeCap, RStrokeJoin, RText, RTextAlign, RTextMode, RTextRun,
+        RTextValign,
     };
 
     fn identity() -> [[f64; 3]; 3] {
@@ -468,6 +471,7 @@ mod tests {
                 bold: false,
                 italic: false,
                 font: String::new(),
+                mode: RTextMode::Sdf,
             }],
             align: RTextAlign::Start,
             valign: RTextValign::Top,
