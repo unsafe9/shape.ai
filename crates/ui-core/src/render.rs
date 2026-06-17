@@ -11,8 +11,8 @@ use core::fmt::Write as _;
 
 use shape_renderer_core::model::CameraState;
 use shape_renderer_core::render_object::{
-    RFill, RPaint, RStroke, RStrokeCap, RStrokeJoin, RText, RTextAlign, RTextRun, RTextValign,
-    RenderObject, RenderObjectScene,
+    RFill, RPaint, RStroke, RStrokeCap, RStrokeJoin, RText, RTextAlign, RTextMode, RTextRun,
+    RTextValign, RenderObject, RenderObjectScene,
 };
 
 use crate::layout::{layout_children, origin};
@@ -34,7 +34,11 @@ pub fn render(tree: &Widget, _viewport_px: (f64, f64), theme_dark: bool) -> Rend
     emit(tree, ox, oy, theme_dark, &mut objects);
     RenderObjectScene {
         scene_id: "ui-scene".to_string(),
-        camera: CameraState { x: 0.0, y: 0.0, zoom: 1.0 },
+        camera: CameraState {
+            x: 0.0,
+            y: 0.0,
+            zoom: 1.0,
+        },
         objects,
         selection: None,
         multi_select: Vec::new(),
@@ -90,7 +94,15 @@ fn emit(widget: &Widget, off_x: f64, off_y: f64, theme_dark: bool, out: &mut Vec
 fn emit_button(b: &Button, off_x: f64, off_y: f64, theme_dark: bool, out: &mut Vec<RenderObject>) {
     let sx = off_x;
     let sy = off_y;
-    out.push(rect_object(b.id.clone(), next_order(out.len()), sx, sy, b.w, b.h, &b.style));
+    out.push(rect_object(
+        b.id.clone(),
+        next_order(out.len()),
+        sx,
+        sy,
+        b.w,
+        b.h,
+        &b.style,
+    ));
     out.push(text_object(
         format!("{}::label", b.id),
         next_order(out.len()),
@@ -108,10 +120,10 @@ fn emit_button(b: &Button, off_x: f64, off_y: f64, theme_dark: bool, out: &mut V
 
 fn emit_icon(i: &Icon, off_x: f64, off_y: f64, out: &mut Vec<RenderObject>) {
     let geometry_d = scale_icon_path(&i.d, i.w, i.h);
-    let fill = i
-        .fill
-        .as_ref()
-        .map(|p| RFill { paint: paint_to_rpaint(p), opacity: 1.0 });
+    let fill = i.fill.as_ref().map(|p| RFill {
+        paint: paint_to_rpaint(p),
+        opacity: 1.0,
+    });
     // Line-art glyphs are round-cap/round-join (SF-Symbols feel).
     let stroke = i.stroke.as_ref().map(|(p, width)| RStroke {
         paint: paint_to_rpaint(p),
@@ -140,29 +152,55 @@ fn emit_icon(i: &Icon, off_x: f64, off_y: f64, out: &mut Vec<RenderObject>) {
 fn emit_swatch(s: &Swatch, off_x: f64, off_y: f64, out: &mut Vec<RenderObject>) {
     let style = RectStyle {
         fill: Some(s.fill.clone()),
-        stroke: s.selected.then(|| (Paint::Token("selection-ring".to_string()), 2.0)),
+        stroke: s
+            .selected
+            .then(|| (Paint::Token("selection-ring".to_string()), 2.0)),
         corner_radius: 6.0,
         opacity: 1.0,
     };
-    out.push(rect_object(s.id.clone(), next_order(out.len()), off_x, off_y, s.w, s.h, &style));
+    out.push(rect_object(
+        s.id.clone(),
+        next_order(out.len()),
+        off_x,
+        off_y,
+        s.w,
+        s.h,
+        &style,
+    ));
 }
 
 fn emit_toggle(t: &Toggle, off_x: f64, off_y: f64, out: &mut Vec<RenderObject>) {
     let sx = off_x;
     let sy = off_y;
-    let track_token = if t.on { "selection-ring" } else { "surface-muted" };
+    let track_token = if t.on {
+        "selection-ring"
+    } else {
+        "surface-muted"
+    };
     let track_style = RectStyle {
         fill: Some(Paint::Token(track_token.to_string())),
         stroke: None,
         corner_radius: t.h / 2.0,
         opacity: 1.0,
     };
-    out.push(rect_object(t.id.clone(), next_order(out.len()), sx, sy, t.w, t.h, &track_style));
+    out.push(rect_object(
+        t.id.clone(),
+        next_order(out.len()),
+        sx,
+        sy,
+        t.w,
+        t.h,
+        &track_style,
+    ));
 
     // Knob: a circle (corner_radius == half) inset by `pad`, slid to the on/off end.
     let pad = 2.0;
     let knob = t.h - pad * 2.0;
-    let knob_x = if t.on { sx + t.w - knob - pad } else { sx + pad };
+    let knob_x = if t.on {
+        sx + t.w - knob - pad
+    } else {
+        sx + pad
+    };
     let knob_style = RectStyle {
         fill: Some(Paint::Token("surface".to_string())),
         stroke: None,
@@ -190,7 +228,15 @@ fn emit_slider(s: &Slider, off_x: f64, off_y: f64, out: &mut Vec<RenderObject>) 
         corner_radius: s.h / 2.0,
         opacity: 1.0,
     };
-    out.push(rect_object(s.id.clone(), next_order(out.len()), sx, sy, s.w, s.h, &track_style));
+    out.push(rect_object(
+        s.id.clone(),
+        next_order(out.len()),
+        sx,
+        sy,
+        s.w,
+        s.h,
+        &track_style,
+    ));
 
     let fill_style = RectStyle {
         fill: Some(Paint::Token("selection-ring".to_string())),
@@ -245,7 +291,15 @@ fn emit_segment(
         corner_radius: 8.0,
         opacity: 1.0,
     };
-    out.push(rect_object(s.id.clone(), next_order(out.len()), sx, sy, s.w, s.h, &track_style));
+    out.push(rect_object(
+        s.id.clone(),
+        next_order(out.len()),
+        sx,
+        sy,
+        s.w,
+        s.h,
+        &track_style,
+    ));
 
     let cell_count = s.labels.len().max(1);
     let cell_w = s.w / cell_count as f64;
@@ -304,17 +358,32 @@ fn emit_text_input(
     let sy = off_y;
     // Idle: a `surface-muted` field with a low-alpha `hairline` border (the macOS
     // inset-field look); focused: the `selection-ring` accent border at 2px.
-    let (stroke_token, stroke_w) =
-        if t.focused { ("selection-ring", 2.0) } else { ("hairline", 1.0) };
+    let (stroke_token, stroke_w) = if t.focused {
+        ("selection-ring", 2.0)
+    } else {
+        ("hairline", 1.0)
+    };
     let body_style = RectStyle {
         fill: Some(Paint::Token("surface-muted".to_string())),
         stroke: Some((Paint::Token(stroke_token.to_string()), stroke_w)),
         corner_radius: 6.0,
         opacity: 1.0,
     };
-    out.push(rect_object(t.id.clone(), next_order(out.len()), sx, sy, t.w, t.h, &body_style));
+    out.push(rect_object(
+        t.id.clone(),
+        next_order(out.len()),
+        sx,
+        sy,
+        t.w,
+        t.h,
+        &body_style,
+    ));
 
-    let shown = if t.value.is_empty() { &t.placeholder } else { &t.value };
+    let shown = if t.value.is_empty() {
+        &t.placeholder
+    } else {
+        &t.value
+    };
     let pad = TEXT_INPUT_PAD;
     out.push(text_object(
         format!("{}::value", t.id),
@@ -369,7 +438,9 @@ fn translate(sx: f64, sy: f64) -> [[f64; 3]; 3] {
 fn paint_to_rpaint(paint: &Paint) -> RPaint {
     match paint {
         Paint::Token(name) => RPaint::Token { name: name.clone() },
-        Paint::Solid(color) => RPaint::Solid { color: color.clone() },
+        Paint::Solid(color) => RPaint::Solid {
+            color: color.clone(),
+        },
     }
 }
 
@@ -396,8 +467,16 @@ fn rect_object(
     // shadow, and no default-stroke ribbon — while the hover/active projection still
     // swaps in an opaque token fill. Declared paints pass through untouched.
     let fill = Some(match style.fill.as_ref() {
-        Some(p) => RFill { paint: paint_to_rpaint(p), opacity: style.opacity },
-        None => RFill { paint: RPaint::Solid { color: "#000000".to_string() }, opacity: 0.0 },
+        Some(p) => RFill {
+            paint: paint_to_rpaint(p),
+            opacity: style.opacity,
+        },
+        None => RFill {
+            paint: RPaint::Solid {
+                color: "#000000".to_string(),
+            },
+            opacity: 0.0,
+        },
     });
     let stroke = style.stroke.as_ref().map(|(p, width)| RStroke {
         paint: paint_to_rpaint(p),
@@ -437,7 +516,11 @@ fn text_object(
     align_center: bool,
     theme_dark: bool,
 ) -> RenderObject {
-    let align = if align_center { RTextAlign::Center } else { RTextAlign::Start };
+    let align = if align_center {
+        RTextAlign::Center
+    } else {
+        RTextAlign::Start
+    };
     let resolved = resolve_text_paint(color, theme_dark);
     RenderObject {
         id,
@@ -458,6 +541,9 @@ fn text_object(
                 bold: false,
                 italic: false,
                 font: String::new(),
+                // Screen-space UI chrome: device-resolution coverage, not SDF, so
+                // fixed small-size text stays crisp like browser CSS text.
+                mode: RTextMode::Coverage,
             }],
             align,
             valign: RTextValign::Middle,
@@ -558,7 +644,13 @@ fn rounded_rect_path(w: f64, h: f64, r: f64) -> String {
     let _ = write!(out, " L {} 0", qw - qr);
     let _ = write!(out, " C {} 0 {qw} {} {qw} {qr}", qw - qr + k, qr - k);
     let _ = write!(out, " L {qw} {}", qh - qr);
-    let _ = write!(out, " C {qw} {} {} {qh} {} {qh}", qh - qr + k, qw - qr + k, qw - qr);
+    let _ = write!(
+        out,
+        " C {qw} {} {} {qh} {} {qh}",
+        qh - qr + k,
+        qw - qr + k,
+        qw - qr
+    );
     let _ = write!(out, " L {qr} {qh}");
     let _ = write!(out, " C {} {qh} 0 {} 0 {}", qr - k, qh - qr + k, qh - qr);
     let _ = write!(out, " L 0 {qr}");
@@ -571,7 +663,7 @@ fn rounded_rect_path(w: f64, h: f64, r: f64) -> String {
 mod tests {
     use super::*;
     use crate::hit::hit;
-    use crate::widget::{Axis, Button, Container, CrossAlign, Edges, Icon, Rect, Text};
+    use crate::widget::{Axis, Button, Container, CrossAlign, Edges, Icon, MainAlign, Rect, Text};
 
     fn proof_button() -> Widget {
         Widget::Button(Button {
@@ -601,6 +693,7 @@ mod tests {
             h: 0.0,
             direction: Axis::None,
             spacing: 0.0,
+            main_align: MainAlign::Start,
             padding: Edges::all(0.0),
             align: CrossAlign::Start,
             children,
@@ -626,7 +719,10 @@ mod tests {
         // A malformed/unknown command degrades, never panics.
         assert_eq!(scale_icon_path("Q 1 2 3 4", 24.0, 24.0), "");
         // Identity box (24×24) preserves the authored coords (q at 8u/px).
-        assert_eq!(scale_icon_path("M 3 3 L 21 21", 24.0, 24.0), "M 24 24 L 168 168");
+        assert_eq!(
+            scale_icon_path("M 3 3 L 21 21", 24.0, 24.0),
+            "M 24 24 L 168 168"
+        );
     }
 
     /// An Icon emits ONE RenderObject carrying the scaled path, a round-cap/join
@@ -648,7 +744,10 @@ mod tests {
         assert_eq!(scene.objects.len(), 1);
         let obj = &scene.objects[0];
         assert_eq!(obj.id, "cmd:draw");
-        assert_eq!(obj.transform, [[1.0, 0.0, 10.0], [0.0, 1.0, 20.0], [0.0, 0.0, 1.0]]);
+        assert_eq!(
+            obj.transform,
+            [[1.0, 0.0, 10.0], [0.0, 1.0, 20.0], [0.0, 0.0, 1.0]]
+        );
         assert_eq!(obj.geometry_d, "M 32 32 L 160 160");
         assert!(obj.fill.is_none());
         let stroke = obj.stroke.as_ref().expect("stroke");
@@ -702,7 +801,10 @@ mod tests {
 
     #[test]
     fn rect_path_is_quantized_absolute() {
-        assert_eq!(rect_path(140.0, 40.0), "M 0 0 L 1120 0 L 1120 320 L 0 320 Z");
+        assert_eq!(
+            rect_path(140.0, 40.0),
+            "M 0 0 L 1120 0 L 1120 320 L 0 320 Z"
+        );
     }
 
     #[test]
@@ -711,7 +813,10 @@ mod tests {
         assert!(p.starts_with("M "), "starts with M: {p}");
         assert!(p.ends_with(" Z"), "ends with Z: {p}");
         assert_eq!(p.matches(" C ").count(), 4, "four cubic corners: {p}");
-        assert_eq!(rounded_rect_path(20.0, 20.0, 1000.0), rounded_rect_path(20.0, 20.0, 10.0));
+        assert_eq!(
+            rounded_rect_path(20.0, 20.0, 1000.0),
+            rounded_rect_path(20.0, 20.0, 10.0)
+        );
         for tok in rounded_rect_path(20.0, 20.0, 1000.0).split_whitespace() {
             if let Ok(v) = tok.parse::<i32>() {
                 assert!(v >= 0, "no negative coord token: {tok}");
@@ -729,7 +834,10 @@ mod tests {
 
         let body = &scene.objects[0];
         assert_eq!(body.id, "ui-proof-button");
-        assert_eq!(body.transform, [[1.0, 0.0, 24.0], [0.0, 1.0, 24.0], [0.0, 0.0, 1.0]]);
+        assert_eq!(
+            body.transform,
+            [[1.0, 0.0, 24.0], [0.0, 1.0, 24.0], [0.0, 0.0, 1.0]]
+        );
         assert_eq!(body.geometry_d.matches(" C ").count(), 4);
         match body.fill.as_ref().expect("fill").paint {
             RPaint::Token { ref name } => assert_eq!(name, "surface"),
@@ -754,6 +862,26 @@ mod tests {
         assert_eq!(text.valign, RTextValign::Middle);
     }
 
+    /// FALSIFIABLE: ui-core (the screen-space UI chrome producer) emits its text in
+    /// COVERAGE mode, so it takes the crisp device-resolution path instead of the SDF
+    /// path canvas text keeps. Fails if the emit ever reverts to the SDF default —
+    /// which would re-blur the UI text this change exists to fix.
+    #[test]
+    fn rendered_ui_text_is_coverage_mode() {
+        let scene = render(&proof_button(), (800.0, 600.0), false);
+        let label = scene
+            .objects
+            .iter()
+            .find(|o| o.text.is_some())
+            .expect("button emits a label");
+        let run = &label.text.as_ref().unwrap().runs[0];
+        assert_eq!(
+            run.mode,
+            RTextMode::Coverage,
+            "UI text flips to coverage mode"
+        );
+    }
+
     #[test]
     fn rendered_label_lays_out_at_sixteen_px_through_the_build_path() {
         use shape_renderer_core::object_pipeline::build_scene_geometry_themed_with_measure;
@@ -765,7 +893,10 @@ mod tests {
         let second_glyph_origin_x = geo.text_vertices[6].position[0];
         let first_glyph_origin_x = geo.text_vertices[0].position[0];
         let advance = second_glyph_origin_x - first_glyph_origin_x;
-        assert!((advance - 16.0).abs() < 1e-4, "label lays out at 16px, got advance {advance}");
+        assert!(
+            (advance - 16.0).abs() < 1e-4,
+            "label lays out at 16px, got advance {advance}"
+        );
     }
 
     #[test]
@@ -822,6 +953,7 @@ mod tests {
             h: 40.0,
             direction: Axis::Horizontal,
             spacing: 10.0,
+            main_align: MainAlign::Start,
             padding: Edges::all(8.0),
             align: CrossAlign::Start,
             children: vec![
@@ -846,7 +978,11 @@ mod tests {
             ],
         });
         let scene = render(&tree, (400.0, 400.0), false);
-        let b = scene.objects.iter().find(|o| o.id == "b").expect("b object");
+        let b = scene
+            .objects
+            .iter()
+            .find(|o| o.id == "b")
+            .expect("b object");
         let bx = b.transform[0][2];
         let by = b.transform[1][2];
         // base (30,40) + padding.l 8 + a(20) + spacing 10 = 68 ; cross padding.t 8 = 48.
@@ -870,15 +1006,33 @@ mod tests {
         assert_eq!(ids, ["vol", "vol::fill", "vol::knob"]);
         // filled width == 0.5*w == 50 ⇒ quantized 400.
         let filled = &scene.objects[1];
-        assert!(filled.geometry_d.contains("400"), "fill width 50px: {}", filled.geometry_d);
+        assert!(
+            filled.geometry_d.contains("400"),
+            "fill width 50px: {}",
+            filled.geometry_d
+        );
         // hit inside lands on the owner, never a ::part.
         assert_eq!(hit(&s, (40.0, 10.0)), Some("vol".to_string()));
     }
 
     #[test]
     fn toggle_off_vs_on_swaps_track_token_and_knob_x() {
-        let off = Widget::Toggle(Toggle { id: "t".to_string(), x: 0.0, y: 0.0, w: 48.0, h: 24.0, on: false });
-        let on = Widget::Toggle(Toggle { id: "t".to_string(), x: 0.0, y: 0.0, w: 48.0, h: 24.0, on: true });
+        let off = Widget::Toggle(Toggle {
+            id: "t".to_string(),
+            x: 0.0,
+            y: 0.0,
+            w: 48.0,
+            h: 24.0,
+            on: false,
+        });
+        let on = Widget::Toggle(Toggle {
+            id: "t".to_string(),
+            x: 0.0,
+            y: 0.0,
+            w: 48.0,
+            h: 24.0,
+            on: true,
+        });
         let off_scene = render(&off, (200.0, 200.0), false);
         let on_scene = render(&on, (200.0, 200.0), false);
         let track_token = |o: &RenderObject| match &o.fill.as_ref().unwrap().paint {
@@ -890,7 +1044,10 @@ mod tests {
         // knob x moves right when on.
         let off_knob_x = off_scene.objects[1].transform[0][2];
         let on_knob_x = on_scene.objects[1].transform[0][2];
-        assert!(on_knob_x > off_knob_x, "knob slides right: {off_knob_x} -> {on_knob_x}");
+        assert!(
+            on_knob_x > off_knob_x,
+            "knob slides right: {off_knob_x} -> {on_knob_x}"
+        );
         assert_eq!(hit(&off, (10.0, 10.0)), Some("t".to_string()));
     }
 
@@ -908,12 +1065,24 @@ mod tests {
             label_color: TextPaint::Token("text".to_string()),
         });
         let scene = render(&seg, (400.0, 400.0), false);
-        let sel = scene.objects.iter().find(|o| o.id == "seg::sel").expect("sel fill");
+        let sel = scene
+            .objects
+            .iter()
+            .find(|o| o.id == "seg::sel")
+            .expect("sel fill");
         // cell 1 starts at 300/3 = 100; the selected pill is inset 2px within its cell
         // (the raised-pill look), so its origin is 100 + 2 = 102.
         assert_eq!(sel.transform[0][2], 102.0);
-        let labels: Vec<&str> = scene.objects.iter().filter(|o| o.id.ends_with("::label")).map(|o| o.id.as_str()).collect();
-        assert_eq!(labels, ["seg::seg0::label", "seg::seg1::label", "seg::seg2::label"]);
+        let labels: Vec<&str> = scene
+            .objects
+            .iter()
+            .filter(|o| o.id.ends_with("::label"))
+            .map(|o| o.id.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            ["seg::seg0::label", "seg::seg1::label", "seg::seg2::label"]
+        );
         // hit any cell -> owner.
         assert_eq!(hit(&seg, (250.0, 15.0)), Some("seg".to_string()));
     }
@@ -942,10 +1111,20 @@ mod tests {
         };
         assert_eq!(stroke_token(&blurred.objects[0]), "hairline");
         assert_eq!(stroke_token(&focused.objects[0]), "selection-ring");
-        assert!(blurred.objects.iter().all(|o| !o.id.ends_with("::caret")), "no caret when blurred");
-        assert!(focused.objects.iter().any(|o| o.id == "ti::caret"), "caret when focused");
+        assert!(
+            blurred.objects.iter().all(|o| !o.id.ends_with("::caret")),
+            "no caret when blurred"
+        );
+        assert!(
+            focused.objects.iter().any(|o| o.id == "ti::caret"),
+            "caret when focused"
+        );
         // value text is left-aligned.
-        let value = focused.objects.iter().find(|o| o.id == "ti::value").expect("value");
+        let value = focused
+            .objects
+            .iter()
+            .find(|o| o.id == "ti::value")
+            .expect("value");
         assert_eq!(value.text.as_ref().unwrap().align, RTextAlign::Start);
     }
 
@@ -977,12 +1156,19 @@ mod tests {
         for (case, value) in [("value", "hi"), ("placeholder", "")] {
             let scene = render(&mk(value), (400.0, 400.0), false);
             let body = scene.objects.iter().find(|o| o.id == "ti").expect("body");
-            let text = scene.objects.iter().find(|o| o.id == "ti::value").expect("text");
+            let text = scene
+                .objects
+                .iter()
+                .find(|o| o.id == "ti::value")
+                .expect("text");
             let body_x = body.transform[0][2];
             let text_x = text.transform[0][2];
             // The value/placeholder x-origin is the field body x plus a positive pad —
             // not jammed against the border (text_x == body_x is the live defect).
-            assert!(text_x > body_x, "{case} text x must be inset, not at the field border");
+            assert!(
+                text_x > body_x,
+                "{case} text x must be inset, not at the field border"
+            );
             assert_eq!(
                 text_x,
                 body_x + expect_pad,
@@ -992,7 +1178,11 @@ mod tests {
             // the glyphs (the p1 default-fill regression) — it reads in both themes.
             assert!(text.fill.is_none(), "{case} text must not paint a fill box");
             // The caret stays clear of the right border by the same pad.
-            let caret = scene.objects.iter().find(|o| o.id == "ti::caret").expect("caret");
+            let caret = scene
+                .objects
+                .iter()
+                .find(|o| o.id == "ti::caret")
+                .expect("caret");
             let caret_right = caret.transform[0][2] + 2.0;
             assert!(
                 caret_right <= body_x + 200.0 - expect_pad + 1e-9,

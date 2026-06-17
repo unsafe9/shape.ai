@@ -6,7 +6,7 @@
 //! rebake.
 
 use shape_ui_core::{
-    Axis, Container, CrossAlign, Edges, Paint, Rect, RectStyle, Text, TextPaint, Widget,
+    Axis, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Text, TextPaint, Widget,
 };
 
 use crate::UiModel;
@@ -35,6 +35,7 @@ pub(crate) fn build(model: &UiModel) -> Option<Widget> {
         h: 0.0,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children: strip.into_iter().chain(toast).collect(),
@@ -109,6 +110,7 @@ fn strip(model: &UiModel) -> Option<Widget> {
         h: STRIP_H,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,
@@ -164,6 +166,7 @@ pub(crate) fn diagnostics(model: &UiModel) -> Option<Widget> {
         h: panel_h,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,
@@ -188,6 +191,7 @@ fn toast(model: &UiModel) -> Option<Widget> {
         h: TOAST_H,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children: vec![

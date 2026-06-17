@@ -224,7 +224,11 @@ mod tests {
 
     #[test]
     fn icons_cover_every_toolbar_and_chrome_id() {
-        for id in TOOLBAR_GROUPS.iter().flat_map(|g| g.iter()).chain(CHROME_IDS.iter()) {
+        for id in TOOLBAR_GROUPS
+            .iter()
+            .flat_map(|g| g.iter())
+            .chain(CHROME_IDS.iter())
+        {
             let d = icon_path(id).unwrap_or_else(|| panic!("no icon registered for `{id}`"));
             assert!(
                 path_is_valid_24box(d),
@@ -256,13 +260,18 @@ mod tests {
             Paint::Token("text".to_string()),
         )
         .expect("undo is registered");
-        let Widget::Icon(icon) = w else { panic!("placement helper must emit an Icon") };
+        let Widget::Icon(icon) = w else {
+            panic!("placement helper must emit an Icon")
+        };
         assert_eq!(icon.id, "cmd:undo::icon");
         // Centered: (40-24)/2 = 8 inset on each axis.
         assert_eq!((icon.x, icon.y), (18.0, 28.0));
         assert_eq!((icon.w, icon.h), (ICON_BOX, ICON_BOX));
         assert_eq!(icon.d, icon_path("undo").unwrap());
-        assert!(icon.fill.is_none(), "registry glyphs are stroked, not filled");
+        assert!(
+            icon.fill.is_none(),
+            "registry glyphs are stroked, not filled"
+        );
         match icon.stroke {
             Some((Paint::Token(t), width)) => {
                 assert_eq!(t, "text");

@@ -6,7 +6,7 @@
 
 use serde::Deserialize;
 use shape_ui_core::{
-    Axis, Container, CrossAlign, Edges, Rect, RectStyle, Text, TextPaint, Widget,
+    Axis, Container, CrossAlign, Edges, MainAlign, Rect, RectStyle, Text, TextPaint, Widget,
 };
 
 use crate::composites;
@@ -57,6 +57,7 @@ pub(crate) fn build(model: &UiModel) -> Widget {
         h: panel_h,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,
@@ -76,6 +77,7 @@ fn row(entry: &TemplateEntry, y: f64) -> Widget {
         h: ROW_H,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children: vec![

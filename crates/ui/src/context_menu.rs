@@ -11,7 +11,8 @@
 
 use serde::Deserialize;
 use shape_ui_core::{
-    Axis, Button, Container, CrossAlign, Edges, Paint, Rect, RectStyle, Text, TextPaint, Widget,
+    Axis, Button, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Text, TextPaint,
+    Widget,
 };
 
 use crate::composites::{button_style, material_panel};
@@ -98,6 +99,7 @@ pub(crate) fn build(menu: &ContextMenuModel, model: &UiModel) -> Widget {
         h: 0.0,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children: vec![scrim(vw, vh), panel(x, y, menu_h, rows)],
@@ -142,6 +144,7 @@ fn panel(x: f64, y: f64, h: f64, rows: Vec<Widget>) -> Widget {
         h,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,

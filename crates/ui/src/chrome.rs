@@ -6,7 +6,8 @@
 //! (no object command), so they carry their own intent prefixes, not `cmd:`.
 
 use shape_ui_core::{
-    Axis, Button, Container, CrossAlign, Edges, Paint, Rect, RectStyle, Text, TextPaint, Widget,
+    Axis, Button, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Text, TextPaint,
+    Widget,
 };
 
 use crate::composites::button_style;
@@ -30,7 +31,13 @@ const MARGIN: f64 = 16.0;
 /// sun/moon mark that reads in both themes — the icon is theme-independent, so the
 /// flip neither rebakes geometry nor swaps the glyph the way the old ☀/☾ label did).
 pub(crate) fn theme_toggle(_model: &UiModel) -> Widget {
-    icon_chrome_button(&format!("{CMD_PREFIX}toggle-theme"), "toggle-theme", MARGIN, MARGIN, SIZE)
+    icon_chrome_button(
+        &format!("{CMD_PREFIX}toggle-theme"),
+        "toggle-theme",
+        MARGIN,
+        MARGIN,
+        SIZE,
+    )
 }
 
 /// An icon-only chrome button: a `material` body (the `id` hit/resolve target, drawn
@@ -69,6 +76,7 @@ fn icon_chrome_button(id: &str, glyph_id: &str, x: f64, y: f64, size: f64) -> Wi
         h: size,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,
@@ -125,7 +133,12 @@ pub(crate) fn canvas_switcher(model: &UiModel) -> Widget {
         h: 12.0,
         style: RectStyle {
             fill: Some(Paint::Solid(
-                if model.connection_online { "#2ea043" } else { "#8b949e" }.to_string(),
+                if model.connection_online {
+                    "#2ea043"
+                } else {
+                    "#8b949e"
+                }
+                .to_string(),
             )),
             stroke: None,
             corner_radius: 6.0,
@@ -172,6 +185,7 @@ pub(crate) fn canvas_switcher(model: &UiModel) -> Widget {
         h: SWITCH_H,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,

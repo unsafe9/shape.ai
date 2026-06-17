@@ -4,6 +4,7 @@
 
 mod hit;
 mod layout;
+mod metric;
 mod quant;
 mod render;
 mod state;
@@ -11,11 +12,13 @@ mod theme;
 mod widget;
 
 pub use hit::hit;
+pub use metric::{GRID, PANEL_RADIUS, ROW_H, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XS};
 pub use render::render;
 pub use state::{Action, DispatchResult, KeyInput, PointerPhase, UiRuntime};
 pub use widget::{
-    Axis, Button, Container, CrossAlign, EditRequest, Edges, Icon, Paint, Rect, RectStyle, Segment,
-    Slider, Swatch, Text, TextInput, TextPaint, Toggle, VisualState, Widget, WidgetId,
+    Axis, Button, Container, CrossAlign, Edges, EditRequest, Icon, MainAlign, Paint, Rect,
+    RectStyle, Segment, Slider, Swatch, Text, TextInput, TextPaint, Toggle, VisualState, Widget,
+    WidgetId,
 };
 
 #[cfg(test)]

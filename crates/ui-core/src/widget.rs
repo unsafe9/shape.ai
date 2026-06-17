@@ -35,7 +35,12 @@ pub struct RectStyle {
 
 impl Default for RectStyle {
     fn default() -> Self {
-        RectStyle { fill: None, stroke: None, corner_radius: 0.0, opacity: 1.0 }
+        RectStyle {
+            fill: None,
+            stroke: None,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        }
     }
 }
 
@@ -55,6 +60,17 @@ pub enum CrossAlign {
     End,
 }
 
+/// Main-axis distribution of a flex container's children. `Start` packs them at the
+/// leading edge with `spacing` between (today's behavior); `SpaceBetween` pins the
+/// first child to the leading edge and the last to the trailing edge, splitting the
+/// slack equally between the gaps — the label|value row layout (a left label, a
+/// right-pinned control) that otherwise needs `PANEL_W - LABEL_W - …` cursor math.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MainAlign {
+    Start,
+    SpaceBetween,
+}
+
 /// Per-side insets (left/top/right/bottom).
 #[derive(Clone, Copy, Debug)]
 pub struct Edges {
@@ -66,7 +82,12 @@ pub struct Edges {
 
 impl Edges {
     pub fn all(v: f64) -> Self {
-        Edges { l: v, t: v, r: v, b: v }
+        Edges {
+            l: v,
+            t: v,
+            r: v,
+            b: v,
+        }
     }
 }
 
@@ -231,8 +252,11 @@ pub struct Container {
     pub h: f64,
     /// `Axis::None` == absolute (back-compat).
     pub direction: Axis,
-    /// Main-axis gap between children.
+    /// Main-axis gap between children (the gap `MainAlign::Start` packs with; ignored
+    /// under `SpaceBetween`, which derives the gap from the slack).
     pub spacing: f64,
+    /// Main-axis distribution. `Start` is the default packed layout.
+    pub main_align: MainAlign,
     pub padding: Edges,
     /// Cross-axis alignment of children.
     pub align: CrossAlign,

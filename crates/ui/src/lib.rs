@@ -144,7 +144,7 @@ pub struct UiModel<'a> {
 /// dispatches it. Token paints throughout, so a theme flip is a recolor re-feed
 /// with zero geometry rebake.
 pub fn build_root(model: &UiModel) -> Widget {
-    use shape_ui_core::{Axis, Container, CrossAlign, Edges};
+    use shape_ui_core::{Axis, Container, CrossAlign, Edges, MainAlign};
 
     // Render order is paint order (later children sit on top). Chrome and presence
     // ride above the toolbar/inspector; the scrim-backed overlays (settings,
@@ -189,6 +189,7 @@ pub fn build_root(model: &UiModel) -> Widget {
         h: 0.0,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,

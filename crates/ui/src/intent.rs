@@ -112,7 +112,9 @@ fn resolve_pressed(id: &str, model: &UiModel) -> Option<Intent> {
         return inspector_edit(model, control_id, value);
     }
     // The only other pressable inspector control is the canonicalize button.
-    Some(Intent::InspectorAction { control_id: payload.to_string() })
+    Some(Intent::InspectorAction {
+        control_id: payload.to_string(),
+    })
 }
 
 /// A `ToggleChanged` carries a bool. It routes to a boolean inspector edit, except

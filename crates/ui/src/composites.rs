@@ -12,8 +12,8 @@
 //! `Pressed` action carries only the widget id.
 
 use shape_ui_core::{
-    Axis, Button, Container, CrossAlign, Edges, Paint, Rect, RectStyle, Segment, Swatch, Text,
-    TextInput, TextPaint, Toggle, Widget,
+    Axis, Button, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Segment, Swatch,
+    Text, TextInput, TextPaint, Toggle, Widget, SPACE_SM, SPACE_XS,
 };
 
 use crate::inspector::INSPECTOR_PREFIX;
@@ -79,6 +79,7 @@ pub(crate) fn badge(id: &str, label: &str, x: f64, y: f64, w: f64, h: f64) -> Wi
         h,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children: vec![
@@ -124,7 +125,7 @@ pub(crate) fn number_field(
     h: f64,
 ) -> Widget {
     let unit_w = 28.0;
-    let input_w = (w - unit_w - 4.0).max(0.0);
+    let input_w = (w - unit_w - SPACE_XS).max(0.0);
     Widget::Container(Container {
         id: format!("{control_id}::number"),
         x,
@@ -132,7 +133,8 @@ pub(crate) fn number_field(
         w,
         h,
         direction: Axis::Horizontal,
-        spacing: 4.0,
+        spacing: SPACE_XS,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Center,
         children: vec![
@@ -157,16 +159,9 @@ pub(crate) fn number_field(
 /// display; the hex input id is `insp:<control-id>` so a commit authors a solid
 /// paint (`{kind:solid,color}` in `resolve`). `hex` is the current solid color or
 /// empty (gradient/token/unset/mixed read empty).
-pub(crate) fn paint_field(
-    control_id: &str,
-    hex: &str,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-) -> Widget {
+pub(crate) fn paint_field(control_id: &str, hex: &str, x: f64, y: f64, w: f64, h: f64) -> Widget {
     let swatch_w = h;
-    let input_w = (w - swatch_w - 6.0).max(0.0);
+    let input_w = (w - swatch_w - SPACE_SM).max(0.0);
     // An empty hex shows a neutral surface swatch; a present hex shows it literally.
     let fill = if hex.is_empty() {
         Paint::Token("surface-muted".to_string())
@@ -180,7 +175,8 @@ pub(crate) fn paint_field(
         w,
         h,
         direction: Axis::Horizontal,
-        spacing: 6.0,
+        spacing: SPACE_SM,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Center,
         children: vec![
@@ -212,8 +208,12 @@ pub(crate) fn lanes_field(
     h: f64,
 ) -> Widget {
     let toggle_w = 48.0;
-    let count_w = (w - toggle_w - 8.0).max(0.0);
-    let count_str = if fill { String::new() } else { count.map(|c| c.to_string()).unwrap_or_default() };
+    let count_w = (w - toggle_w - SPACE_SM).max(0.0);
+    let count_str = if fill {
+        String::new()
+    } else {
+        count.map(|c| c.to_string()).unwrap_or_default()
+    };
     Widget::Container(Container {
         id: format!("{control_id}::lanes"),
         x,
@@ -221,7 +221,8 @@ pub(crate) fn lanes_field(
         w,
         h,
         direction: Axis::Horizontal,
-        spacing: 8.0,
+        spacing: SPACE_SM,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Center,
         children: vec![
@@ -243,13 +244,7 @@ pub(crate) fn lanes_field(
 /// Each cell is a Swatch whose id encodes its `{main,cross}` so a press resolves to
 /// the exact align value (`insp:align:main=center,cross=end`). `main`/`cross` are
 /// the current values (so the matching cell shows selected).
-pub(crate) fn align9(
-    control_id: &str,
-    main: &str,
-    cross: &str,
-    x: f64,
-    y: f64,
-) -> Widget {
+pub(crate) fn align9(control_id: &str, main: &str, cross: &str, x: f64, y: f64) -> Widget {
     const GRID: [&str; 3] = ["start", "center", "end"];
     let cell = 18.0;
     let gap = 3.0;
@@ -263,7 +258,11 @@ pub(crate) fn align9(
             // The selected cell tints `accent-soft` (the active-control language);
             // an idle cell stays `surface-muted`. The Swatch's own `selected` ring
             // still marks the choice for the press round-trip.
-            let fill = if selected { "accent-soft" } else { "surface-muted" };
+            let fill = if selected {
+                "accent-soft"
+            } else {
+                "surface-muted"
+            };
             children.push(Widget::Swatch(Swatch {
                 id: format!("{INSPECTOR_PREFIX}{control_id}:main={m},cross={c}"),
                 x: cx,
@@ -307,6 +306,7 @@ pub(crate) fn align9(
         h: toggle_y + 26.0 + 22.0,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,

@@ -36,12 +36,7 @@ pub(crate) fn resolved_box(tree: &Widget, id: &WidgetId) -> Option<(f64, f64, f6
         .map(|(_, sx, sy, w, h)| (*sx, *sy, *w, *h))
 }
 
-fn collect(
-    widget: &Widget,
-    off_x: f64,
-    off_y: f64,
-    out: &mut Vec<(WidgetId, f64, f64, f64, f64)>,
-) {
+fn collect(widget: &Widget, off_x: f64, off_y: f64, out: &mut Vec<(WidgetId, f64, f64, f64, f64)>) {
     // `off_x/off_y` is the widget's resolved screen origin (the caller added any
     // container/cursor offset). An arm records its box AT (off_x, off_y), never
     // re-adding its own x/y — mirrors the render `emit` contract exactly.
@@ -68,7 +63,8 @@ fn collect(
 mod tests {
     use super::*;
     use crate::widget::{
-        Axis, Button, Container, CrossAlign, Edges, Paint, Rect, RectStyle, Text, TextPaint,
+        Axis, Button, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Text,
+        TextPaint,
     };
 
     fn absolute(id: &str, x: f64, y: f64, children: Vec<Widget>) -> Container {
@@ -80,6 +76,7 @@ mod tests {
             h: 0.0,
             direction: Axis::None,
             spacing: 0.0,
+            main_align: MainAlign::Start,
             padding: Edges::all(0.0),
             align: CrossAlign::Start,
             children,
@@ -108,14 +105,20 @@ mod tests {
     #[test]
     fn hit_returns_top_most_button_body_id_in_screen_space() {
         let tree = button("ui-proof-button", 24.0, 24.0, 140.0, 40.0);
-        assert_eq!(hit(&tree, (30.0, 30.0)), Some("ui-proof-button".to_string()));
+        assert_eq!(
+            hit(&tree, (30.0, 30.0)),
+            Some("ui-proof-button".to_string())
+        );
         assert_eq!(hit(&tree, (10.0, 10.0)), None);
 
         let overlap = Widget::Container(absolute(
             "root",
             0.0,
             0.0,
-            vec![button("under", 0.0, 0.0, 100.0, 100.0), button("over", 0.0, 0.0, 100.0, 100.0)],
+            vec![
+                button("under", 0.0, 0.0, 100.0, 100.0),
+                button("over", 0.0, 0.0, 100.0, 100.0),
+            ],
         ));
         assert_eq!(hit(&overlap, (50.0, 50.0)), Some("over".to_string()));
 

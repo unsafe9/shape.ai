@@ -9,7 +9,7 @@
 
 use serde::Deserialize;
 use shape_ui_core::{
-    Axis, Container, CrossAlign, Edges, Paint, Rect, RectStyle, Text, TextPaint, Widget,
+    Axis, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Text, TextPaint, Widget,
 };
 
 /// One peer cursor at a projected screen point. `color` is the peer's literal
@@ -43,6 +43,7 @@ pub(crate) fn build(peers: &[PeerCursor]) -> Widget {
         h: 0.0,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,
@@ -62,6 +63,7 @@ fn cursor(peer: &PeerCursor) -> Widget {
         h: GLYPH + PILL_H + 2.0,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children: vec![

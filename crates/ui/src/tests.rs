@@ -11,7 +11,7 @@ use shape_scene_core::object::catalog::commands::object_command_catalog;
 use shape_scene_core::object::catalog::gestures::object_gesture_catalog;
 use shape_scene_core::object::catalog::inspector::{inspector_view, InspectorView};
 use shape_scene_core::object::kernel::model::{
-    Align, AxisSizing, CrossAlign, FillRule, Geometry, Layout, LayoutAxis, Lanes, MainAlign,
+    Align, AxisSizing, CrossAlign, FillRule, Geometry, Lanes, Layout, LayoutAxis, MainAlign,
     Object, ObjectScene, ObjectSelection, PathNode, Sizing, SubPath, Text, TextAlign, TextRun,
     TextVAlign,
 };
@@ -42,7 +42,10 @@ fn rect(id: &str) -> Object {
 }
 
 fn scene_with(objects: Vec<Object>) -> ObjectScene {
-    ObjectScene { objects, ..Default::default() }
+    ObjectScene {
+        objects,
+        ..Default::default()
+    }
 }
 
 /// A scene with a flow-container parent + a flow child, so views over each exercise
@@ -53,16 +56,26 @@ fn flow_scene() -> ObjectScene {
         axis: LayoutAxis::Horizontal,
         lanes: Lanes::Count { value: 2 },
         spacing: 16,
-        align: Align { main: MainAlign::Center, cross: CrossAlign::Start },
+        align: Align {
+            main: MainAlign::Center,
+            cross: CrossAlign::Start,
+        },
     });
     let mut child = rect("c");
     child.parent = Some("p".into());
-    child.sizing = Some(Sizing { w: AxisSizing::Fixed { value: 120 }, h: AxisSizing::Fill });
+    child.sizing = Some(Sizing {
+        w: AxisSizing::Fixed { value: 120 },
+        h: AxisSizing::Fill,
+    });
     scene_with(vec![parent, child])
 }
 
 fn view_of(scene: &ObjectScene, id: &str) -> InspectorView {
-    inspector_view(scene, &ObjectSelection::Object { id: id.into() }, &StubOutlineDeriver)
+    inspector_view(
+        scene,
+        &ObjectSelection::Object { id: id.into() },
+        &StubOutlineDeriver,
+    )
 }
 
 /// The empty gesture catalog reference the base fixture uses (tests that exercise the
@@ -71,7 +84,10 @@ const NO_GESTURES: &[shape_scene_core::object::catalog::gestures::ObjectGesture]
 const NO_PEERS: &[crate::PeerCursor] = &[];
 const NO_TEMPLATES: &[crate::TemplateEntry] = &[];
 
-fn model<'a>(catalog: &'a [shape_scene_core::object::catalog::commands::ObjectCommand], view: &'a InspectorView) -> UiModel<'a> {
+fn model<'a>(
+    catalog: &'a [shape_scene_core::object::catalog::commands::ObjectCommand],
+    view: &'a InspectorView,
+) -> UiModel<'a> {
     UiModel {
         theme_dark: false,
         viewport: (1280.0, 800.0),
@@ -167,7 +183,9 @@ fn inspector_emits_a_bound_widget_for_every_control_in_the_view() {
             }
             let prefix = format!("insp:{}", control.id);
             assert!(
-                ids.iter().any(|id| id == &prefix || id.starts_with(&format!("{prefix}:")) || id.starts_with(&format!("{prefix}::"))),
+                ids.iter().any(|id| id == &prefix
+                    || id.starts_with(&format!("{prefix}:"))
+                    || id.starts_with(&format!("{prefix}::"))),
                 "control {} has no bound insp: widget (ids: {:?})",
                 control.id,
                 ids
@@ -191,18 +209,36 @@ fn toolbar_buttons_are_catalog_commands_and_resolve_round_trips() {
 
     let mut ids = Vec::new();
     owner_ids(&tree, &mut ids);
-    let cmd_ids: Vec<&str> = ids.iter().filter_map(|id| id.strip_prefix("cmd:")).collect();
+    let cmd_ids: Vec<&str> = ids
+        .iter()
+        .filter_map(|id| id.strip_prefix("cmd:"))
+        .collect();
     assert!(!cmd_ids.is_empty(), "toolbar must surface commands");
 
-    let catalog_ids: std::collections::HashSet<&str> = catalog.iter().map(|c| c.id.as_str()).collect();
+    let catalog_ids: std::collections::HashSet<&str> =
+        catalog.iter().map(|c| c.id.as_str()).collect();
     for id in &cmd_ids {
-        assert!(catalog_ids.contains(id), "toolbar button {id} is not a command-catalog id (orphan)");
+        assert!(
+            catalog_ids.contains(id),
+            "toolbar button {id} is not a command-catalog id (orphan)"
+        );
         let intent = resolve(&Action::Pressed(format!("cmd:{id}")), &m);
-        assert_eq!(intent, Some(Intent::Command(id.to_string())), "cmd:{id} must resolve to Command({id})");
+        assert_eq!(
+            intent,
+            Some(Intent::Command(id.to_string())),
+            "cmd:{id} must resolve to Command({id})"
+        );
     }
 
     // The named requests the toolbar promises (undo/redo/insert/zoom) are present.
-    for expected in ["undo", "redo", "insert-rectangle", "zoom-in", "zoom-fit", "select-move"] {
+    for expected in [
+        "undo",
+        "redo",
+        "insert-rectangle",
+        "zoom-in",
+        "zoom-fit",
+        "select-move",
+    ] {
         assert!(cmd_ids.contains(&expected), "toolbar missing {expected}");
     }
 }
@@ -219,7 +255,11 @@ fn resolve_parses_the_cmd_prefix_purely() {
         resolve(&Action::Pressed("cmd:zoom-out".to_string()), &m),
         Some(Intent::Command("zoom-out".to_string()))
     );
-    assert_eq!(resolve(&Action::Focus("cmd:undo".to_string()), &m), None, "Focus authors nothing");
+    assert_eq!(
+        resolve(&Action::Focus("cmd:undo".to_string()), &m),
+        None,
+        "Focus authors nothing"
+    );
 }
 
 // ---- (3) zero-rebake theme flip ----
@@ -233,8 +273,14 @@ fn theme_flip_recolors_text_only_no_geometry_or_fill_rebake() {
     let view = view_of(&scene, "p");
     let catalog = object_command_catalog();
 
-    let light_model = UiModel { theme_dark: false, ..model(&catalog, &view) };
-    let dark_model = UiModel { theme_dark: true, ..model(&catalog, &view) };
+    let light_model = UiModel {
+        theme_dark: false,
+        ..model(&catalog, &view)
+    };
+    let dark_model = UiModel {
+        theme_dark: true,
+        ..model(&catalog, &view)
+    };
     let light = shape_ui_core::render(&build_root(&light_model), (1280.0, 800.0), false);
     let dark = shape_ui_core::render(&build_root(&dark_model), (1280.0, 800.0), true);
 
@@ -242,17 +288,29 @@ fn theme_flip_recolors_text_only_no_geometry_or_fill_rebake() {
     let mut text_changed = false;
     for (l, d) in light.objects.iter().zip(&dark.objects) {
         assert_eq!(l.id, d.id, "object order/ids identical across theme");
-        assert_eq!(l.geometry_d, d.geometry_d, "{}: geometry must not rebake on theme flip", l.id);
+        assert_eq!(
+            l.geometry_d, d.geometry_d,
+            "{}: geometry must not rebake on theme flip",
+            l.id
+        );
         // Token fills are emitted as RPaint::Token (resolved by the renderer), so they
         // are byte-identical across the flip.
-        assert_eq!(fill_repr(l), fill_repr(d), "{}: token fill must not change", l.id);
+        assert_eq!(
+            fill_repr(l),
+            fill_repr(d),
+            "{}: token fill must not change",
+            l.id
+        );
         if let (Some(lt), Some(dt)) = (&l.text, &d.text) {
             if lt.runs.first().map(|r| &r.color) != dt.runs.first().map(|r| &r.color) {
                 text_changed = true;
             }
         }
     }
-    assert!(text_changed, "a theme flip must re-resolve at least one text color");
+    assert!(
+        text_changed,
+        "a theme flip must re-resolve at least one text color"
+    );
 }
 
 fn fill_repr(o: &RenderObject) -> String {
@@ -277,9 +335,21 @@ fn inspector_segment_change_carries_catalog_metadata() {
 
     // `axis` is a Segment {Horizontal, Vertical}; picking cell 1 (Vertical) authors
     // a set-layout edit on field `axis` with value "vertical".
-    let intent = resolve(&Action::SegmentChanged { id: "insp:axis".to_string(), index: 1 }, &m);
+    let intent = resolve(
+        &Action::SegmentChanged {
+            id: "insp:axis".to_string(),
+            index: 1,
+        },
+        &m,
+    );
     match intent {
-        Some(Intent::InspectorEdit { control_id, op_kind, field, unit_scale, value }) => {
+        Some(Intent::InspectorEdit {
+            control_id,
+            op_kind,
+            field,
+            unit_scale,
+            value,
+        }) => {
             assert_eq!(control_id, "axis");
             assert_eq!(op_kind, "set-layout", "op_kind carried from the catalog");
             assert_eq!(field.as_deref(), Some("axis"));
@@ -301,12 +371,27 @@ fn inspector_sizing_segment_emits_axis_sizing_with_quantized_scale() {
     let m = model(&catalog, &view);
 
     // sizing-w options are [Hug, Fill, Fixed]; cell 2 == Fixed.
-    let intent = resolve(&Action::SegmentChanged { id: "insp:sizing-w".to_string(), index: 2 }, &m);
+    let intent = resolve(
+        &Action::SegmentChanged {
+            id: "insp:sizing-w".to_string(),
+            index: 2,
+        },
+        &m,
+    );
     match intent {
-        Some(Intent::InspectorEdit { control_id, op_kind, unit_scale, value, .. }) => {
+        Some(Intent::InspectorEdit {
+            control_id,
+            op_kind,
+            unit_scale,
+            value,
+            ..
+        }) => {
             assert_eq!(control_id, "sizing-w");
             assert_eq!(op_kind, "set-sizing");
-            assert!(unit_scale > 1.0, "sizing carries the quantized Q-scale, got {unit_scale}");
+            assert!(
+                unit_scale > 1.0,
+                "sizing carries the quantized Q-scale, got {unit_scale}"
+            );
             assert_eq!(value["kind"], Value::String("fixed".to_string()));
             assert_eq!(value["value"], Value::from(0));
         }
@@ -324,9 +409,21 @@ fn inspector_toggle_carries_catalog_metadata() {
     let catalog = object_command_catalog();
     let m = model(&catalog, &view);
 
-    let intent = resolve(&Action::ToggleChanged { id: "insp:visible".to_string(), on: false }, &m);
+    let intent = resolve(
+        &Action::ToggleChanged {
+            id: "insp:visible".to_string(),
+            on: false,
+        },
+        &m,
+    );
     match intent {
-        Some(Intent::InspectorEdit { control_id, op_kind, field, value, .. }) => {
+        Some(Intent::InspectorEdit {
+            control_id,
+            op_kind,
+            field,
+            value,
+            ..
+        }) => {
             assert_eq!(control_id, "visible");
             assert_eq!(op_kind, "set-meta");
             assert_eq!(field.as_deref(), Some("hidden"));
@@ -346,9 +443,18 @@ fn align_grid_cell_decodes_main_cross_into_an_inspector_edit() {
     let catalog = object_command_catalog();
     let m = model(&catalog, &view);
 
-    let intent = resolve(&Action::Pressed("insp:align:main=center,cross=end".to_string()), &m);
+    let intent = resolve(
+        &Action::Pressed("insp:align:main=center,cross=end".to_string()),
+        &m,
+    );
     match intent {
-        Some(Intent::InspectorEdit { control_id, op_kind, field, value, .. }) => {
+        Some(Intent::InspectorEdit {
+            control_id,
+            op_kind,
+            field,
+            value,
+            ..
+        }) => {
             assert_eq!(control_id, "align");
             assert_eq!(op_kind, "set-layout");
             assert_eq!(field.as_deref(), Some("align"));
@@ -369,7 +475,9 @@ fn canonicalize_button_resolves_to_an_inspector_action() {
     let m = model(&catalog, &view);
     assert_eq!(
         resolve(&Action::Pressed("insp:canonicalize".to_string()), &m),
-        Some(Intent::InspectorAction { control_id: "canonicalize".to_string() })
+        Some(Intent::InspectorAction {
+            control_id: "canonicalize".to_string()
+        })
     );
 }
 
@@ -391,10 +499,21 @@ fn refed_model_preserves_a_focused_inspector_field_edit() {
 
     // Find the Name field's resolved screen box and click it to focus, then type.
     let scene_objs = rt.render();
-    let name_box = scene_objs.objects.iter().find(|o| o.id == "insp:name").expect("name field");
-    let (nx, ny) = (name_box.transform[0][2] + 4.0, name_box.transform[1][2] + 4.0);
+    let name_box = scene_objs
+        .objects
+        .iter()
+        .find(|o| o.id == "insp:name")
+        .expect("name field");
+    let (nx, ny) = (
+        name_box.transform[0][2] + 4.0,
+        name_box.transform[1][2] + 4.0,
+    );
     let down = rt.dispatch_pointer(PointerPhase::Down, (nx, ny));
-    assert!(rt.has_text_focus(), "clicking the Name field grabs focus (edit: {:?})", down.edit);
+    assert!(
+        rt.has_text_focus(),
+        "clicking the Name field grabs focus (edit: {:?})",
+        down.edit
+    );
     rt.dispatch_key(&shape_ui_core::KeyInput {
         key: "X".to_string(),
         text: Some("X".to_string()),
@@ -404,12 +523,19 @@ fn refed_model_preserves_a_focused_inspector_field_edit() {
     });
 
     // Re-feed an identical tree in the DARK theme (the P4 per-change re-derive).
-    let dark = build_root(&UiModel { theme_dark: true, ..model(&catalog, &view) });
+    let dark = build_root(&UiModel {
+        theme_dark: true,
+        ..model(&catalog, &view)
+    });
     rt.set_tree(dark);
     rt.set_theme(true);
 
     let after = rt.render();
-    let name_value = after.objects.iter().find(|o| o.id == "insp:name::value").expect("name value");
+    let name_value = after
+        .objects
+        .iter()
+        .find(|o| o.id == "insp:name::value")
+        .expect("name value");
     assert_eq!(
         name_value.text.as_ref().unwrap().runs[0].text,
         "X",
@@ -429,14 +555,22 @@ fn refed_model_preserves_a_focused_inspector_field_edit() {
 fn toolbar_marks_the_active_tool_off_the_model_mirror() {
     let catalog = object_command_catalog();
     let view = view_of(&scene_with(vec![rect("r")]), "r");
-    let m = UiModel { active_tool: "draw", create_kind: Some("insert-ellipse"), ..model(&catalog, &view) };
+    let m = UiModel {
+        active_tool: "draw",
+        create_kind: Some("insert-ellipse"),
+        ..model(&catalog, &view)
+    };
     let scene = shape_ui_core::render(&build_root(&m), (1280.0, 800.0), false);
 
     // A borderless body carries an EXPLICIT fully-transparent fill (the
     // decorative-empty encoding); read that as "no active background" (`None`) so the
     // active-mark assertion stays about the `accent-soft` tint, not the transparency.
     let body_fill = |id: &str| -> Option<String> {
-        let o = scene.objects.iter().find(|o| o.id == id).unwrap_or_else(|| panic!("no {id}"));
+        let o = scene
+            .objects
+            .iter()
+            .find(|o| o.id == id)
+            .unwrap_or_else(|| panic!("no {id}"));
         o.fill.as_ref().and_then(|f| {
             if f.opacity <= f64::EPSILON {
                 return None;
@@ -448,18 +582,46 @@ fn toolbar_marks_the_active_tool_off_the_model_mirror() {
         })
     };
     let glyph_tint = |id: &str| -> String {
-        let o = scene.objects.iter().find(|o| o.id == id).unwrap_or_else(|| panic!("no {id}"));
+        let o = scene
+            .objects
+            .iter()
+            .find(|o| o.id == id)
+            .unwrap_or_else(|| panic!("no {id}"));
         match &o.stroke.as_ref().expect("glyph stroke").paint {
             shape_renderer_core::render_object::RPaint::Token { name } => name.clone(),
             other => panic!("expected token stroke, got {other:?}"),
         }
     };
-    assert_eq!(body_fill("cmd:draw").as_deref(), Some("accent-soft"), "armed tool body is accent-soft");
-    assert_eq!(body_fill("cmd:select-move"), None, "unarmed tool body has no fill");
-    assert_eq!(glyph_tint("cmd:draw::icon"), "selection-ring", "armed tool glyph is accent-tinted");
-    assert_eq!(glyph_tint("cmd:select-move::icon"), "text", "unarmed tool glyph is text-tinted");
-    assert_eq!(body_fill("cmd:insert-ellipse").as_deref(), Some("accent-soft"), "armed insert is accent-soft");
-    assert_eq!(body_fill("cmd:insert-rectangle"), None, "unarmed insert body has no fill");
+    assert_eq!(
+        body_fill("cmd:draw").as_deref(),
+        Some("accent-soft"),
+        "armed tool body is accent-soft"
+    );
+    assert_eq!(
+        body_fill("cmd:select-move"),
+        None,
+        "unarmed tool body has no fill"
+    );
+    assert_eq!(
+        glyph_tint("cmd:draw::icon"),
+        "selection-ring",
+        "armed tool glyph is accent-tinted"
+    );
+    assert_eq!(
+        glyph_tint("cmd:select-move::icon"),
+        "text",
+        "unarmed tool glyph is text-tinted"
+    );
+    assert_eq!(
+        body_fill("cmd:insert-ellipse").as_deref(),
+        Some("accent-soft"),
+        "armed insert is accent-soft"
+    );
+    assert_eq!(
+        body_fill("cmd:insert-rectangle"),
+        None,
+        "unarmed insert body has no fill"
+    );
 }
 
 /// Collect every `Widget::Icon` id in the tree (the icon-only-toolbar guard reads
@@ -500,24 +662,39 @@ fn toolbar_draws_an_icon_per_command_not_a_text_label() {
             (c != "toggle-theme").then_some(c)
         })
         .collect();
-    assert!(!cmd_bodies.is_empty(), "the tray must surface command bodies");
+    assert!(
+        !cmd_bodies.is_empty(),
+        "the tray must surface command bodies"
+    );
 
     let mut icons = Vec::new();
     icon_ids(&tree, &mut icons);
     for c in &cmd_bodies {
         let icon = format!("cmd:{c}::icon");
-        assert!(icons.contains(&icon), "command {c} must draw a glyph (`{icon}`), not a label");
+        assert!(
+            icons.contains(&icon),
+            "command {c} must draw a glyph (`{icon}`), not a label"
+        );
     }
 
     // No rendered text run belongs to a tray command body's label.
     let scene = shape_ui_core::render(&tree, (1280.0, 800.0), false);
     for o in &scene.objects {
-        if let Some(c) = o.id.strip_prefix("cmd:").and_then(|s| s.strip_suffix("::label")) {
+        if let Some(c) =
+            o.id.strip_prefix("cmd:")
+                .and_then(|s| s.strip_suffix("::label"))
+        {
             if c == "toggle-theme" {
                 continue;
             }
-            let has_text = o.text.as_ref().is_some_and(|t| t.runs.iter().any(|r| !r.text.is_empty()));
-            assert!(!has_text, "tray command {c} must not render a text label run");
+            let has_text = o
+                .text
+                .as_ref()
+                .is_some_and(|t| t.runs.iter().any(|r| !r.text.is_empty()));
+            assert!(
+                !has_text,
+                "tray command {c} must not render a text label run"
+            );
         }
     }
 }
@@ -561,7 +738,13 @@ fn paint_and_number_text_commits_shape_their_wire_values() {
     let m = model(&catalog, &view);
 
     // text-color is a Paint control: a hex commit authors {kind:solid,color}.
-    let paint = resolve(&Action::TextChanged { id: "insp:text-color".to_string(), text: "#abcdef".to_string() }, &m);
+    let paint = resolve(
+        &Action::TextChanged {
+            id: "insp:text-color".to_string(),
+            text: "#abcdef".to_string(),
+        },
+        &m,
+    );
     match paint {
         Some(Intent::InspectorEdit { value, op_kind, .. }) => {
             assert_eq!(op_kind, "set-text");
@@ -572,12 +755,24 @@ fn paint_and_number_text_commits_shape_their_wire_values() {
     }
 
     // font-size is a Number control: "30" parses to 30.0; "abc" drops (no edit).
-    match resolve(&Action::TextChanged { id: "insp:font-size".to_string(), text: "30".to_string() }, &m) {
+    match resolve(
+        &Action::TextChanged {
+            id: "insp:font-size".to_string(),
+            text: "30".to_string(),
+        },
+        &m,
+    ) {
         Some(Intent::InspectorEdit { value, .. }) => assert_eq!(value.as_f64(), Some(30.0)),
         other => panic!("expected a font-size number edit, got {other:?}"),
     }
     assert_eq!(
-        resolve(&Action::TextChanged { id: "insp:font-size".to_string(), text: "abc".to_string() }, &m),
+        resolve(
+            &Action::TextChanged {
+                id: "insp:font-size".to_string(),
+                text: "abc".to_string()
+            },
+            &m
+        ),
         None,
         "a non-numeric font-size commit is dropped"
     );
@@ -595,8 +790,19 @@ fn rotation_number_commit_routes_to_set_transform() {
     let catalog = object_command_catalog();
     let m = model(&catalog, &view);
 
-    match resolve(&Action::TextChanged { id: "insp:rotation".to_string(), text: "45".to_string() }, &m) {
-        Some(Intent::InspectorEdit { op_kind, field, value, .. }) => {
+    match resolve(
+        &Action::TextChanged {
+            id: "insp:rotation".to_string(),
+            text: "45".to_string(),
+        },
+        &m,
+    ) {
+        Some(Intent::InspectorEdit {
+            op_kind,
+            field,
+            value,
+            ..
+        }) => {
             assert_eq!(op_kind, "set-transform");
             assert_eq!(field.as_deref(), Some("rotation"));
             assert_eq!(value.as_f64(), Some(45.0));
@@ -616,8 +822,14 @@ fn empty_selection_renders_toolbar_without_inspector() {
     let tree = build_root(&m);
     let mut ids = Vec::new();
     owner_ids(&tree, &mut ids);
-    assert!(ids.iter().any(|id| id.starts_with("cmd:")), "toolbar present");
-    assert!(!ids.iter().any(|id| id.starts_with("insp:")), "no inspector for an empty selection");
+    assert!(
+        ids.iter().any(|id| id.starts_with("cmd:")),
+        "toolbar present"
+    );
+    assert!(
+        !ids.iter().any(|id| id.starts_with("insp:")),
+        "no inspector for an empty selection"
+    );
 }
 
 // ============================================================================
@@ -662,20 +874,35 @@ fn settings_modal_emits_one_row_per_command_and_gesture_catalog_entry() {
     for cmd in &commands {
         let row = format!("settings::cmd::{}::row", cmd.id);
         let count = ids.iter().filter(|id| **id == row).count();
-        assert_eq!(count, 1, "command {} must have exactly one settings row", cmd.id);
+        assert_eq!(
+            count, 1,
+            "command {} must have exactly one settings row",
+            cmd.id
+        );
     }
     for gesture in &gestures {
         let row = format!("settings::gesture::{}::row", gesture.id);
         let count = ids.iter().filter(|id| **id == row).count();
-        assert_eq!(count, 1, "gesture {} must have exactly one settings row", gesture.id);
+        assert_eq!(
+            count, 1,
+            "gesture {} must have exactly one settings row",
+            gesture.id
+        );
     }
 
     // No settings command row exists for an id that ISN'T in the catalog (no leak).
     let cmd_rows: Vec<&str> = ids
         .iter()
-        .filter_map(|id| id.strip_prefix("settings::cmd::").and_then(|s| s.strip_suffix("::row")))
+        .filter_map(|id| {
+            id.strip_prefix("settings::cmd::")
+                .and_then(|s| s.strip_suffix("::row"))
+        })
         .collect();
-    assert_eq!(cmd_rows.len(), commands.len(), "no extra/duplicate command rows");
+    assert_eq!(
+        cmd_rows.len(),
+        commands.len(),
+        "no extra/duplicate command rows"
+    );
 }
 
 /// The modal is READ-ONLY: a press on ANY settings widget id (rows, labels, kbd
@@ -701,7 +928,10 @@ fn settings_modal_rows_are_read_only() {
         if id == "settings::scrim" {
             assert_eq!(intent, Some(Intent::Dismiss));
         } else {
-            assert_eq!(intent, None, "settings widget {id} must not resolve to an op");
+            assert_eq!(
+                intent, None,
+                "settings widget {id} must not resolve to an op"
+            );
         }
     }
 }
@@ -763,18 +993,29 @@ fn context_menu_items_resolve_to_catalog_commands() {
         title: Some("object:r".to_string()),
         items: vec![
             ctx_item("duplicate", "Duplicate"),
-            ContextMenuItem { command_id: None, label: String::new(), danger: false, disabled: false },
+            ContextMenuItem {
+                command_id: None,
+                label: String::new(),
+                danger: false,
+                disabled: false,
+            },
             ctx_item("delete", "Delete"),
         ],
     };
-    let m = UiModel { context_menu: Some(&menu), ..model(&commands, &view) };
+    let m = UiModel {
+        context_menu: Some(&menu),
+        ..model(&commands, &view)
+    };
     let tree = build_root(&m);
     let mut ids = Vec::new();
     owner_ids(&tree, &mut ids);
 
     for command_id in ["duplicate", "delete"] {
         let id = format!("cmd:{command_id}");
-        assert!(ids.contains(&id), "menu item {command_id} must bind cmd:{command_id}");
+        assert!(
+            ids.contains(&id),
+            "menu item {command_id} must bind cmd:{command_id}"
+        );
         assert_eq!(
             resolve(&Action::Pressed(id), &m),
             Some(Intent::Command(command_id.to_string())),
@@ -802,7 +1043,10 @@ fn disabled_context_menu_item_is_inert() {
             disabled: true,
         }],
     };
-    let m = UiModel { context_menu: Some(&menu), ..model(&commands, &view) };
+    let m = UiModel {
+        context_menu: Some(&menu),
+        ..model(&commands, &view)
+    };
     let tree = build_root(&m);
     let mut ids = Vec::new();
     owner_ids(&tree, &mut ids);
@@ -813,7 +1057,10 @@ fn disabled_context_menu_item_is_inert() {
     );
     // Pressing the inert id resolves to nothing — the gated action can't fire.
     assert_eq!(
-        resolve(&Action::Pressed("context-menu::disabled::ungroup".to_string()), &m),
+        resolve(
+            &Action::Pressed("context-menu::disabled::ungroup".to_string()),
+            &m
+        ),
         None,
         "a disabled menu item is inert"
     );
@@ -831,7 +1078,10 @@ fn context_menu_scrim_press_resolves_to_dismiss() {
         title: None,
         items: vec![ctx_item("duplicate", "Duplicate")],
     };
-    let m = UiModel { context_menu: Some(&menu), ..model(&commands, &view) };
+    let m = UiModel {
+        context_menu: Some(&menu),
+        ..model(&commands, &view)
+    };
     assert_eq!(
         resolve(&Action::Pressed("context-menu::scrim".to_string()), &m),
         Some(Intent::Dismiss)
@@ -854,7 +1104,10 @@ fn presence_cursor_paints_the_peer_literal_color_at_the_screen_point() {
         color: "#ff5733".to_string(),
         label: "Ada".to_string(),
     }];
-    let m = UiModel { peers: &peers, ..model(&commands, &view) };
+    let m = UiModel {
+        peers: &peers,
+        ..model(&commands, &view)
+    };
     let scene_objs = shape_ui_core::render(&build_root(&m), (1280.0, 800.0), false);
 
     // The label pill is a Solid fill of the peer color, not a token.
@@ -903,7 +1156,10 @@ fn theme_toggle_is_a_catalog_command() {
     let tree = build_root(&m);
     let mut ids = Vec::new();
     owner_ids(&tree, &mut ids);
-    assert!(ids.contains(&"cmd:toggle-theme".to_string()), "theme toggle binds cmd:toggle-theme");
+    assert!(
+        ids.contains(&"cmd:toggle-theme".to_string()),
+        "theme toggle binds cmd:toggle-theme"
+    );
     assert_eq!(
         resolve(&Action::Pressed("cmd:toggle-theme".to_string()), &m),
         Some(Intent::Command("toggle-theme".to_string()))
@@ -933,7 +1189,10 @@ fn theme_flip_across_all_new_uis_is_text_only_zero_rebake() {
         x: 400.0,
         y: 300.0,
         title: Some("object:p".to_string()),
-        items: vec![ctx_item("duplicate", "Duplicate"), ctx_item("delete", "Delete")],
+        items: vec![
+            ctx_item("duplicate", "Duplicate"),
+            ctx_item("delete", "Delete"),
+        ],
     };
     let base = UiModel {
         gesture_catalog: &gestures,
@@ -945,27 +1204,57 @@ fn theme_flip_across_all_new_uis_is_text_only_zero_rebake() {
         toast: Some("Copied"),
         ..model(&commands, &view)
     };
-    let light = shape_ui_core::render(&build_root(&UiModel { theme_dark: false, ..base }), (1280.0, 800.0), false);
-    let dark = shape_ui_core::render(&build_root(&UiModel { theme_dark: true, ..base }), (1280.0, 800.0), true);
+    let light = shape_ui_core::render(
+        &build_root(&UiModel {
+            theme_dark: false,
+            ..base
+        }),
+        (1280.0, 800.0),
+        false,
+    );
+    let dark = shape_ui_core::render(
+        &build_root(&UiModel {
+            theme_dark: true,
+            ..base
+        }),
+        (1280.0, 800.0),
+        true,
+    );
 
     // The theme toggle GLYPH legitimately changes (Sun↔Moon), so its label text run
     // text differs; exclude only that one object from the geometry-identity scan.
-    assert_eq!(light.objects.len(), dark.objects.len(), "same object count across theme");
+    assert_eq!(
+        light.objects.len(),
+        dark.objects.len(),
+        "same object count across theme"
+    );
     let mut text_changed = false;
     for (l, d) in light.objects.iter().zip(&dark.objects) {
         assert_eq!(l.id, d.id, "object order/ids identical across theme");
         if l.id == "cmd:toggle-theme::label" {
             continue; // the toggle glyph flips Sun/Moon by design.
         }
-        assert_eq!(l.geometry_d, d.geometry_d, "{}: geometry must not rebake on theme flip", l.id);
-        assert_eq!(fill_repr(l), fill_repr(d), "{}: token/literal fill must not change", l.id);
+        assert_eq!(
+            l.geometry_d, d.geometry_d,
+            "{}: geometry must not rebake on theme flip",
+            l.id
+        );
+        assert_eq!(
+            fill_repr(l),
+            fill_repr(d),
+            "{}: token/literal fill must not change",
+            l.id
+        );
         if let (Some(lt), Some(dt)) = (&l.text, &d.text) {
             if lt.runs.first().map(|r| &r.color) != dt.runs.first().map(|r| &r.color) {
                 text_changed = true;
             }
         }
     }
-    assert!(text_changed, "a theme flip must re-resolve at least one token text color");
+    assert!(
+        text_changed,
+        "a theme flip must re-resolve at least one token text color"
+    );
 }
 
 // ---- (St1) status strip presence is gated on busy / non-Ready ----
@@ -979,15 +1268,37 @@ fn status_chrome_is_gated_on_transient_state() {
     let scene = scene_with(vec![rect("r")]);
     let view = view_of(&scene, "r");
 
-    let steady = UiModel { busy: false, status: Some("Ready"), toast: None, ..model(&commands, &view) };
+    let steady = UiModel {
+        busy: false,
+        status: Some("Ready"),
+        toast: None,
+        ..model(&commands, &view)
+    };
     let steady_ids = rendered_ids(&build_root(&steady), false);
-    assert!(!steady_ids.iter().any(|id| id.starts_with("status::")), "no status chrome when steady");
+    assert!(
+        !steady_ids.iter().any(|id| id.starts_with("status::")),
+        "no status chrome when steady"
+    );
 
-    let busy = UiModel { busy: true, status: Some("Saving…"), toast: Some("Saved"), ..model(&commands, &view) };
+    let busy = UiModel {
+        busy: true,
+        status: Some("Saving…"),
+        toast: Some("Saved"),
+        ..model(&commands, &view)
+    };
     let busy_ids = rendered_ids(&build_root(&busy), false);
-    assert!(busy_ids.iter().any(|id| id == "status::strip-bg"), "busy shows the status strip");
-    assert!(busy_ids.iter().any(|id| id == "status::spinner"), "busy shows the spinner");
-    assert!(busy_ids.iter().any(|id| id == "status::toast-bg"), "a toast message shows the toast");
+    assert!(
+        busy_ids.iter().any(|id| id == "status::strip-bg"),
+        "busy shows the status strip"
+    );
+    assert!(
+        busy_ids.iter().any(|id| id == "status::spinner"),
+        "busy shows the spinner"
+    );
+    assert!(
+        busy_ids.iter().any(|id| id == "status::toast-bg"),
+        "a toast message shows the toast"
+    );
 }
 
 // ---- P3 review-fix: toolbar parity (erase, color, stroke, templates, switcher, diagnostics) ----
@@ -1021,11 +1332,23 @@ fn parity_model<'a>(
 fn toolbar_surfaces_the_erase_tool_and_marks_it_active() {
     let catalog = object_command_catalog();
     let view = view_of(&scene_with(vec![rect("r")]), "r");
-    let m = UiModel { active_tool: "erase", ..model(&catalog, &view) };
+    let m = UiModel {
+        active_tool: "erase",
+        ..model(&catalog, &view)
+    };
     let scene = shape_ui_core::render(&build_root(&m), (1280.0, 800.0), false);
 
-    let erase = scene.objects.iter().find(|o| o.id == "cmd:erase").expect("erase toolbar button");
-    match &erase.fill.as_ref().expect("armed eraser has an accent-soft body fill").paint {
+    let erase = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "cmd:erase")
+        .expect("erase toolbar button");
+    match &erase
+        .fill
+        .as_ref()
+        .expect("armed eraser has an accent-soft body fill")
+        .paint
+    {
         RPaint::Token { name } => assert_eq!(name, "accent-soft", "armed eraser reads active"),
         other => panic!("expected token fill, got {other:?}"),
     }
@@ -1049,13 +1372,25 @@ fn toolbar_emits_a_color_swatch_per_palette_entry() {
 
     let mut ids = Vec::new();
     owner_ids(&build_root(&m), &mut ids);
-    assert!(ids.iter().any(|id| id == "swatch:#ff0000"), "a chip for the first palette color");
-    assert!(ids.iter().any(|id| id == "swatch:#00ff00"), "a chip for the second palette color");
+    assert!(
+        ids.iter().any(|id| id == "swatch:#ff0000"),
+        "a chip for the first palette color"
+    );
+    assert!(
+        ids.iter().any(|id| id == "swatch:#00ff00"),
+        "a chip for the second palette color"
+    );
 
     // The selected color's chip is marked selected; the others are not.
     let tree = build_root(&m);
-    assert!(swatch_selected(&tree, "swatch:#ff0000"), "the selected color's chip is ringed");
-    assert!(!swatch_selected(&tree, "swatch:#00ff00"), "an unselected color's chip is not");
+    assert!(
+        swatch_selected(&tree, "swatch:#ff0000"),
+        "the selected color's chip is ringed"
+    );
+    assert!(
+        !swatch_selected(&tree, "swatch:#00ff00"),
+        "an unselected color's chip is not"
+    );
 
     // The chip press resolves to a pen-color selection.
     assert_eq!(
@@ -1088,12 +1423,22 @@ fn toolbar_emits_a_pen_width_chip_per_width_and_resolves() {
 
     let mut ids = Vec::new();
     owner_ids(&build_root(&m), &mut ids);
-    assert!(ids.iter().any(|id| id == "pen-width:2"), "a chip for width 2");
-    assert!(ids.iter().any(|id| id == "pen-width:8"), "a chip for width 8");
+    assert!(
+        ids.iter().any(|id| id == "pen-width:2"),
+        "a chip for width 2"
+    );
+    assert!(
+        ids.iter().any(|id| id == "pen-width:8"),
+        "a chip for width 8"
+    );
 
     // The active width (4.0 in parity_model) reads the accent-soft body fill.
     let scene = shape_ui_core::render(&build_root(&m), (1280.0, 800.0), false);
-    let active = scene.objects.iter().find(|o| o.id == "pen-width:4").expect("active width chip");
+    let active = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "pen-width:4")
+        .expect("active width chip");
     match &active.fill.as_ref().unwrap().paint {
         RPaint::Token { name } => assert_eq!(name, "accent-soft", "active width reads active"),
         other => panic!("expected token fill, got {other:?}"),
@@ -1113,19 +1458,41 @@ fn template_popup_emits_rows_and_resolves_apply() {
     let catalog = object_command_catalog();
     let view = view_of(&scene_with(vec![rect("r")]), "r");
     let templates = vec![
-        crate::TemplateEntry { id: "kanban".to_string(), title: "Kanban".to_string(), description: "A board".to_string() },
-        crate::TemplateEntry { id: "wire".to_string(), title: "Wireframe".to_string(), description: String::new() },
+        crate::TemplateEntry {
+            id: "kanban".to_string(),
+            title: "Kanban".to_string(),
+            description: "A board".to_string(),
+        },
+        crate::TemplateEntry {
+            id: "wire".to_string(),
+            title: "Wireframe".to_string(),
+            description: String::new(),
+        },
     ];
 
-    let closed = UiModel { template_open: false, templates: &templates, ..model(&catalog, &view) };
+    let closed = UiModel {
+        template_open: false,
+        templates: &templates,
+        ..model(&catalog, &view)
+    };
     let mut closed_ids = Vec::new();
     owner_ids(&build_root(&closed), &mut closed_ids);
-    assert!(!closed_ids.iter().any(|id| id.starts_with("template:")), "no rows when closed");
+    assert!(
+        !closed_ids.iter().any(|id| id.starts_with("template:")),
+        "no rows when closed"
+    );
 
-    let open = UiModel { template_open: true, templates: &templates, ..model(&catalog, &view) };
+    let open = UiModel {
+        template_open: true,
+        templates: &templates,
+        ..model(&catalog, &view)
+    };
     let mut open_ids = Vec::new();
     owner_ids(&build_root(&open), &mut open_ids);
-    assert!(open_ids.iter().any(|id| id == "template:kanban"), "a row per template");
+    assert!(
+        open_ids.iter().any(|id| id == "template:kanban"),
+        "a row per template"
+    );
     assert!(open_ids.iter().any(|id| id == "template:wire"));
 
     assert_eq!(
@@ -1134,9 +1501,20 @@ fn template_popup_emits_rows_and_resolves_apply() {
     );
     // The toolbar Templates toggle marks active off `template_open`.
     let scene = shape_ui_core::render(&build_root(&open), (1280.0, 800.0), false);
-    let toggle = scene.objects.iter().find(|o| o.id == "cmd:open-template-library").expect("templates toggle");
-    match &toggle.fill.as_ref().expect("open templates toggle has an accent-soft body fill").paint {
-        RPaint::Token { name } => assert_eq!(name, "accent-soft", "open templates toggle reads active"),
+    let toggle = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "cmd:open-template-library")
+        .expect("templates toggle");
+    match &toggle
+        .fill
+        .as_ref()
+        .expect("open templates toggle has an accent-soft body fill")
+        .paint
+    {
+        RPaint::Token { name } => {
+            assert_eq!(name, "accent-soft", "open templates toggle reads active")
+        }
         other => panic!("expected token fill, got {other:?}"),
     }
 }
@@ -1150,8 +1528,14 @@ fn canvas_switcher_emits_controls_and_resolves_intents() {
     let catalog = object_command_catalog();
     let view = view_of(&scene_with(vec![rect("r")]), "r");
     let canvases = vec![
-        crate::CanvasEntry { id: "c1".to_string(), title: "First".to_string() },
-        crate::CanvasEntry { id: "c2".to_string(), title: "Second".to_string() },
+        crate::CanvasEntry {
+            id: "c1".to_string(),
+            title: "First".to_string(),
+        },
+        crate::CanvasEntry {
+            id: "c2".to_string(),
+            title: "Second".to_string(),
+        },
     ];
     let m = parity_model(&catalog, &view, &[], &[], &canvases, &[]);
 
@@ -1160,19 +1544,40 @@ fn canvas_switcher_emits_controls_and_resolves_intents() {
     owner_ids(&tree, &mut ids);
     assert!(ids.iter().any(|id| id == "canvas:c1"), "a tab per canvas");
     assert!(ids.iter().any(|id| id == "canvas:c2"));
-    assert!(ids.iter().any(|id| id == "canvas-new"), "a new-canvas button");
-    assert!(ids.iter().any(|id| id == "canvas-delete:c2"), "a delete button for the active canvas");
+    assert!(
+        ids.iter().any(|id| id == "canvas-new"),
+        "a new-canvas button"
+    );
+    assert!(
+        ids.iter().any(|id| id == "canvas-delete:c2"),
+        "a delete button for the active canvas"
+    );
 
-    assert_eq!(resolve(&Action::Pressed("canvas:c1".to_string()), &m), Some(Intent::SelectCanvas("c1".to_string())));
-    assert_eq!(resolve(&Action::Pressed("canvas-new".to_string()), &m), Some(Intent::NewCanvas));
-    assert_eq!(resolve(&Action::Pressed("canvas-delete:c2".to_string()), &m), Some(Intent::DeleteCanvas("c2".to_string())));
+    assert_eq!(
+        resolve(&Action::Pressed("canvas:c1".to_string()), &m),
+        Some(Intent::SelectCanvas("c1".to_string()))
+    );
+    assert_eq!(
+        resolve(&Action::Pressed("canvas-new".to_string()), &m),
+        Some(Intent::NewCanvas)
+    );
+    assert_eq!(
+        resolve(&Action::Pressed("canvas-delete:c2".to_string()), &m),
+        Some(Intent::DeleteCanvas("c2".to_string()))
+    );
 
     // With only one canvas, the delete control is omitted (the ≤1 disabled rule).
-    let one = vec![crate::CanvasEntry { id: "c1".to_string(), title: "Only".to_string() }];
+    let one = vec![crate::CanvasEntry {
+        id: "c1".to_string(),
+        title: "Only".to_string(),
+    }];
     let m1 = parity_model(&catalog, &view, &[], &[], &one, &[]);
     let mut ids1 = Vec::new();
     owner_ids(&build_root(&m1), &mut ids1);
-    assert!(!ids1.iter().any(|id| id.starts_with("canvas-delete:")), "no delete with a single canvas");
+    assert!(
+        !ids1.iter().any(|id| id.starts_with("canvas-delete:")),
+        "no delete with a single canvas"
+    );
 }
 
 /// The diagnostics panel renders its five rows only when open; closed emits nothing.
@@ -1190,15 +1595,35 @@ fn diagnostics_panel_renders_rows_only_when_open() {
         camera: "0,0 @1.0".to_string(),
     };
 
-    let closed = UiModel { diagnostics_open: false, diagnostics: Some(&diag), ..model(&catalog, &view) };
+    let closed = UiModel {
+        diagnostics_open: false,
+        diagnostics: Some(&diag),
+        ..model(&catalog, &view)
+    };
     let closed_ids = rendered_ids(&build_root(&closed), false);
-    assert!(!closed_ids.iter().any(|id| id.starts_with("diagnostics::")), "no panel when closed");
+    assert!(
+        !closed_ids.iter().any(|id| id.starts_with("diagnostics::")),
+        "no panel when closed"
+    );
 
-    let open = UiModel { diagnostics_open: true, diagnostics: Some(&diag), ..model(&catalog, &view) };
+    let open = UiModel {
+        diagnostics_open: true,
+        diagnostics: Some(&diag),
+        ..model(&catalog, &view)
+    };
     let open_ids = rendered_ids(&build_root(&open), false);
-    assert!(open_ids.iter().any(|id| id == "diagnostics::bg"), "the panel renders when open");
-    assert!(open_ids.iter().any(|id| id == "diagnostics::objects"), "an objects row renders");
-    assert!(open_ids.iter().any(|id| id == "diagnostics::frame-ms"), "a frame-ms row renders");
+    assert!(
+        open_ids.iter().any(|id| id == "diagnostics::bg"),
+        "the panel renders when open"
+    );
+    assert!(
+        open_ids.iter().any(|id| id == "diagnostics::objects"),
+        "an objects row renders"
+    );
+    assert!(
+        open_ids.iter().any(|id| id == "diagnostics::frame-ms"),
+        "a frame-ms row renders"
+    );
 }
 
 // ============================================================================
@@ -1212,8 +1637,17 @@ fn diagnostics_panel_renders_rows_only_when_open() {
 /// The token name of a rendered object's FILL (panics if the object is missing or its
 /// fill isn't a Token).
 fn fill_token(scene: &shape_renderer_core::render_object::RenderObjectScene, id: &str) -> String {
-    let o = scene.objects.iter().find(|o| o.id == id).unwrap_or_else(|| panic!("no {id}"));
-    match &o.fill.as_ref().unwrap_or_else(|| panic!("{id} has no fill")).paint {
+    let o = scene
+        .objects
+        .iter()
+        .find(|o| o.id == id)
+        .unwrap_or_else(|| panic!("no {id}"));
+    match &o
+        .fill
+        .as_ref()
+        .unwrap_or_else(|| panic!("{id} has no fill"))
+        .paint
+    {
         RPaint::Token { name } => name.clone(),
         other => panic!("{id} fill must be a token, got {other:?}"),
     }
@@ -1221,8 +1655,17 @@ fn fill_token(scene: &shape_renderer_core::render_object::RenderObjectScene, id:
 
 /// The token name of a rendered object's STROKE (panics if missing / not a Token).
 fn stroke_token(scene: &shape_renderer_core::render_object::RenderObjectScene, id: &str) -> String {
-    let o = scene.objects.iter().find(|o| o.id == id).unwrap_or_else(|| panic!("no {id}"));
-    match &o.stroke.as_ref().unwrap_or_else(|| panic!("{id} has no stroke")).paint {
+    let o = scene
+        .objects
+        .iter()
+        .find(|o| o.id == id)
+        .unwrap_or_else(|| panic!("no {id}"));
+    match &o
+        .stroke
+        .as_ref()
+        .unwrap_or_else(|| panic!("{id} has no stroke"))
+        .paint
+    {
         RPaint::Token { name } => name.clone(),
         other => panic!("{id} stroke must be a token, got {other:?}"),
     }
@@ -1230,8 +1673,17 @@ fn stroke_token(scene: &shape_renderer_core::render_object::RenderObjectScene, i
 
 /// The first text run's color of a rendered Text object (panics if missing / no text).
 fn text_color(scene: &shape_renderer_core::render_object::RenderObjectScene, id: &str) -> String {
-    let o = scene.objects.iter().find(|o| o.id == id).unwrap_or_else(|| panic!("no {id}"));
-    o.text.as_ref().unwrap_or_else(|| panic!("{id} has no text")).runs[0].color.clone()
+    let o = scene
+        .objects
+        .iter()
+        .find(|o| o.id == id)
+        .unwrap_or_else(|| panic!("no {id}"));
+    o.text
+        .as_ref()
+        .unwrap_or_else(|| panic!("{id} has no text"))
+        .runs[0]
+        .color
+        .clone()
 }
 
 /// EVERY elevated panel paints in the macOS-material language: a `material` body fill +
@@ -1270,8 +1722,16 @@ fn every_surface_panel_uses_the_material_body_hairline_border_and_soft_shadow() 
 
     for prefix in ["inspector", "settings", "diagnostics", "template"] {
         let bg = format!("{prefix}::bg");
-        assert_eq!(fill_token(&scene, &bg), "material", "{prefix} panel body must be `material`");
-        assert_eq!(stroke_token(&scene, &bg), "hairline", "{prefix} panel border must be `hairline`");
+        assert_eq!(
+            fill_token(&scene, &bg),
+            "material",
+            "{prefix} panel body must be `material`"
+        );
+        assert_eq!(
+            stroke_token(&scene, &bg),
+            "hairline",
+            "{prefix} panel border must be `hairline`"
+        );
         // EXACTLY ONE soft-shadow underlay rect (theme-independent literal Solid black,
         // translucent, fill-only). A multi-layer stack of differently-offset rects read
         // as concentric hard rings with gaps — the QA#1 defect — so the panel must carry
@@ -1288,10 +1748,16 @@ fn every_surface_panel_uses_the_material_body_hairline_border_and_soft_shadow() 
             shadows.len()
         );
         let shadow = shadows[0];
-        assert_eq!(shadow.id, format!("{prefix}::shadow"), "the single layer is `{prefix}::shadow`");
+        assert_eq!(
+            shadow.id,
+            format!("{prefix}::shadow"),
+            "the single layer is `{prefix}::shadow`"
+        );
         let f = shadow.fill.as_ref().expect("shadow fill");
         match &f.paint {
-            RPaint::Solid { color } => assert_eq!(color, "#000000", "{} is literal black", shadow.id),
+            RPaint::Solid { color } => {
+                assert_eq!(color, "#000000", "{} is literal black", shadow.id)
+            }
             other => panic!("{} must be a literal Solid, got {other:?}", shadow.id),
         }
         assert!(
@@ -1301,7 +1767,11 @@ fn every_surface_panel_uses_the_material_body_hairline_border_and_soft_shadow() 
             f.opacity
         );
         // Fill-only: a stroked shadow re-introduces a hard ring edge.
-        assert!(shadow.stroke.is_none(), "{} must be fill-only (no stroke ring)", shadow.id);
+        assert!(
+            shadow.stroke.is_none(),
+            "{} must be fill-only (no stroke ring)",
+            shadow.id
+        );
     }
 }
 
@@ -1391,15 +1861,31 @@ fn context_menu_panel_uses_the_material_language() {
         title: Some("object:r".to_string()),
         items: vec![
             ctx_item("duplicate", "Duplicate"),
-            ContextMenuItem { command_id: None, label: String::new(), danger: false, disabled: false },
+            ContextMenuItem {
+                command_id: None,
+                label: String::new(),
+                danger: false,
+                disabled: false,
+            },
             ctx_item("delete", "Delete"),
         ],
     };
-    let m = UiModel { context_menu: Some(&menu), ..model(&commands, &view) };
+    let m = UiModel {
+        context_menu: Some(&menu),
+        ..model(&commands, &view)
+    };
     let scene = shape_ui_core::render(&build_root(&m), (1280.0, 800.0), false);
 
-    assert_eq!(fill_token(&scene, "context-menu::bg"), "material", "menu body must be `material`");
-    assert_eq!(stroke_token(&scene, "context-menu::bg"), "hairline", "menu border must be `hairline`");
+    assert_eq!(
+        fill_token(&scene, "context-menu::bg"),
+        "material",
+        "menu body must be `material`"
+    );
+    assert_eq!(
+        stroke_token(&scene, "context-menu::bg"),
+        "hairline",
+        "menu border must be `hairline`"
+    );
     // EXACTLY ONE soft-shadow underlay rect (theme-independent literal Solid black,
     // translucent, fill-only) — a multi-layer stack reads as concentric rings (QA#1).
     let shadows: Vec<&RenderObject> = scene
@@ -1407,14 +1893,26 @@ fn context_menu_panel_uses_the_material_language() {
         .iter()
         .filter(|o| o.id.starts_with("context-menu::shadow"))
         .collect();
-    assert_eq!(shadows.len(), 1, "the menu has exactly ONE shadow layer, got {}", shadows.len());
+    assert_eq!(
+        shadows.len(),
+        1,
+        "the menu has exactly ONE shadow layer, got {}",
+        shadows.len()
+    );
     let f = shadows[0].fill.as_ref().expect("shadow fill");
     match &f.paint {
         RPaint::Solid { color } => assert_eq!(color, "#000000", "the menu shadow is literal black"),
         other => panic!("the menu shadow must be a literal Solid, got {other:?}"),
     }
-    assert!(f.opacity > 0.0 && f.opacity < 1.0, "the menu shadow is translucent, got {}", f.opacity);
-    assert!(shadows[0].stroke.is_none(), "the menu shadow is fill-only (no ring)");
+    assert!(
+        f.opacity > 0.0 && f.opacity < 1.0,
+        "the menu shadow is translucent, got {}",
+        f.opacity
+    );
+    assert!(
+        shadows[0].stroke.is_none(),
+        "the menu shadow is fill-only (no ring)"
+    );
     // The divider between Duplicate and Delete is a `hairline` (index 1, the separator).
     assert_eq!(
         fill_token(&scene, "context-menu::sep::1"),
@@ -1442,11 +1940,18 @@ fn context_menu_scrim_resolves_fully_transparent_in_both_themes() {
         x: 400.0,
         y: 300.0,
         title: Some("object:r".to_string()),
-        items: vec![ctx_item("duplicate", "Duplicate"), ctx_item("delete", "Delete")],
+        items: vec![
+            ctx_item("duplicate", "Duplicate"),
+            ctx_item("delete", "Delete"),
+        ],
     };
 
     for (theme_dark, theme) in [(false, Theme::light()), (true, Theme::dark())] {
-        let m = UiModel { theme_dark, context_menu: Some(&menu), ..model(&commands, &view) };
+        let m = UiModel {
+            theme_dark,
+            context_menu: Some(&menu),
+            ..model(&commands, &view)
+        };
         let render = shape_ui_core::render(&build_root(&m), (1280.0, 800.0), theme_dark);
         let geometry = build_scene_geometry_themed(&render, theme);
 
@@ -1480,10 +1985,26 @@ fn status_strip_and_toast_read_in_the_material_language() {
     };
     let scene = shape_ui_core::render(&build_root(&m), (1280.0, 800.0), false);
 
-    assert_eq!(fill_token(&scene, "status::strip-bg"), "material", "the status strip is `material`");
-    assert_eq!(stroke_token(&scene, "status::strip-bg"), "hairline", "the strip border is `hairline`");
-    assert_eq!(fill_token(&scene, "status::toast-bg"), "surface-muted", "the toast is `surface-muted`");
-    assert_eq!(stroke_token(&scene, "status::toast-bg"), "hairline", "the toast border is `hairline`");
+    assert_eq!(
+        fill_token(&scene, "status::strip-bg"),
+        "material",
+        "the status strip is `material`"
+    );
+    assert_eq!(
+        stroke_token(&scene, "status::strip-bg"),
+        "hairline",
+        "the strip border is `hairline`"
+    );
+    assert_eq!(
+        fill_token(&scene, "status::toast-bg"),
+        "surface-muted",
+        "the toast is `surface-muted`"
+    );
+    assert_eq!(
+        stroke_token(&scene, "status::toast-bg"),
+        "hairline",
+        "the toast border is `hairline`"
+    );
 }
 
 /// The chrome theme toggle is now an ICON, not a text-glyph label: it keeps the
@@ -1502,7 +2023,10 @@ fn theme_toggle_is_an_icon_chrome_button_bound_to_the_catalog_command() {
     // The hit body keeps its catalog-command id.
     let mut owners = Vec::new();
     owner_ids(&tree, &mut owners);
-    assert!(owners.contains(&"cmd:toggle-theme".to_string()), "the toggle keeps its `cmd:toggle-theme` body");
+    assert!(
+        owners.contains(&"cmd:toggle-theme".to_string()),
+        "the toggle keeps its `cmd:toggle-theme` body"
+    );
     assert_eq!(
         resolve(&Action::Pressed("cmd:toggle-theme".to_string()), &m),
         Some(Intent::Command("toggle-theme".to_string())),
@@ -1511,10 +2035,16 @@ fn theme_toggle_is_an_icon_chrome_button_bound_to_the_catalog_command() {
     // It draws a glyph, not a text label.
     let mut icons = Vec::new();
     icon_ids(&tree, &mut icons);
-    assert!(icons.contains(&"cmd:toggle-theme::icon".to_string()), "the toggle draws a registry glyph");
+    assert!(
+        icons.contains(&"cmd:toggle-theme::icon".to_string()),
+        "the toggle draws a registry glyph"
+    );
     let scene = shape_ui_core::render(&tree, (1280.0, 800.0), false);
     assert!(
-        !scene.objects.iter().any(|o| o.id == "cmd:toggle-theme::label"),
+        !scene
+            .objects
+            .iter()
+            .any(|o| o.id == "cmd:toggle-theme::label"),
         "the toggle renders no text-glyph label"
     );
     // The glyph is stroked with the `text` token (a recolorable paint, not a literal).
@@ -1581,8 +2111,14 @@ fn canvas_switcher_controls_are_icon_buttons_keeping_their_ids() {
     let catalog = object_command_catalog();
     let view = view_of(&scene_with(vec![rect("r")]), "r");
     let canvases = vec![
-        crate::CanvasEntry { id: "c1".to_string(), title: "First".to_string() },
-        crate::CanvasEntry { id: "c2".to_string(), title: "Second".to_string() },
+        crate::CanvasEntry {
+            id: "c1".to_string(),
+            title: "First".to_string(),
+        },
+        crate::CanvasEntry {
+            id: "c2".to_string(),
+            title: "Second".to_string(),
+        },
     ];
     let m = parity_model(&catalog, &view, &[], &[], &canvases, &[]);
     let tree = build_root(&m);
@@ -1590,9 +2126,18 @@ fn canvas_switcher_controls_are_icon_buttons_keeping_their_ids() {
     // Both controls keep their hit ids and resolve to their intents.
     let mut owners = Vec::new();
     owner_ids(&tree, &mut owners);
-    assert!(owners.contains(&"canvas-new".to_string()), "New keeps its `canvas-new` body");
-    assert!(owners.contains(&"canvas-delete:c2".to_string()), "Delete keeps its `canvas-delete:<active>` body");
-    assert_eq!(resolve(&Action::Pressed("canvas-new".to_string()), &m), Some(Intent::NewCanvas));
+    assert!(
+        owners.contains(&"canvas-new".to_string()),
+        "New keeps its `canvas-new` body"
+    );
+    assert!(
+        owners.contains(&"canvas-delete:c2".to_string()),
+        "Delete keeps its `canvas-delete:<active>` body"
+    );
+    assert_eq!(
+        resolve(&Action::Pressed("canvas-new".to_string()), &m),
+        Some(Intent::NewCanvas)
+    );
     assert_eq!(
         resolve(&Action::Pressed("canvas-delete:c2".to_string()), &m),
         Some(Intent::DeleteCanvas("c2".to_string()))
@@ -1601,11 +2146,20 @@ fn canvas_switcher_controls_are_icon_buttons_keeping_their_ids() {
     // Each draws a registry glyph keyed off its `<id>::icon`, not a text label.
     let mut icons = Vec::new();
     icon_ids(&tree, &mut icons);
-    assert!(icons.contains(&"canvas-new::icon".to_string()), "New draws the `canvas-new` glyph");
-    assert!(icons.contains(&"canvas-delete:c2::icon".to_string()), "Delete draws the `canvas-delete` glyph");
+    assert!(
+        icons.contains(&"canvas-new::icon".to_string()),
+        "New draws the `canvas-new` glyph"
+    );
+    assert!(
+        icons.contains(&"canvas-delete:c2::icon".to_string()),
+        "Delete draws the `canvas-delete` glyph"
+    );
     let scene = shape_ui_core::render(&tree, (1280.0, 800.0), false);
     for label in ["canvas-new::label", "canvas-delete:c2::label"] {
-        assert!(!scene.objects.iter().any(|o| o.id == label), "{label} must not render (icon, not label)");
+        assert!(
+            !scene.objects.iter().any(|o| o.id == label),
+            "{label} must not render (icon, not label)"
+        );
     }
 }
 
@@ -1617,7 +2171,11 @@ fn watermark_reads_as_a_muted_caption() {
     let view = view_of(&scene_with(vec![rect("r")]), "r");
     let scene = shape_ui_core::render(&build_root(&model(&catalog, &view)), (1280.0, 800.0), false);
     // light `text-secondary` is `#8a8a8e`.
-    assert_eq!(text_color(&scene, "watermark"), "#8a8a8e", "the watermark is a muted `text-secondary` caption");
+    assert_eq!(
+        text_color(&scene, "watermark"),
+        "#8a8a8e",
+        "the watermark is a muted `text-secondary` caption"
+    );
 }
 
 /// The borderless watermark must not top-clip: its text box has to be taller than the
@@ -1631,9 +2189,16 @@ fn watermark_box_clears_the_caption_run_height() {
     let catalog = object_command_catalog();
     let view = view_of(&scene_with(vec![rect("r")]), "r");
     let scene = shape_ui_core::render(&build_root(&model(&catalog, &view)), (1280.0, 800.0), false);
-    let mark = scene.objects.iter().find(|o| o.id == "watermark").expect("watermark");
+    let mark = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "watermark")
+        .expect("watermark");
     // Borderless: a caption is fill-less + stroke-less (no bordered box around it).
-    assert!(mark.fill.is_none() && mark.stroke.is_none(), "the watermark is a borderless caption, not a bordered box");
+    assert!(
+        mark.fill.is_none() && mark.stroke.is_none(),
+        "the watermark is a borderless caption, not a bordered box"
+    );
     // The box's bottom-right `L {qw} {qh}` corner carries the quantized box height.
     let qh: f64 = mark
         .geometry_d
@@ -1661,7 +2226,12 @@ fn shown_value(scene: &shape_renderer_core::render_object::RenderObjectScene, id
         .iter()
         .find(|o| o.id == format!("{id}::value"))
         .unwrap_or_else(|| panic!("no {id}::value"));
-    o.text.as_ref().unwrap_or_else(|| panic!("{id}::value has no text")).runs[0].text.clone()
+    o.text
+        .as_ref()
+        .unwrap_or_else(|| panic!("{id}::value has no text"))
+        .runs[0]
+        .text
+        .clone()
 }
 
 /// (E) A non-integral Width must DISPLAY rounded to <=2 decimals, never the raw
@@ -1680,7 +2250,10 @@ fn inspector_rounds_a_non_integral_dimension_for_display() {
     let scene = shape_ui_core::render(&build_root(&model(&catalog, &view)), (1280.0, 800.0), false);
 
     let shown = shown_value(&scene, "insp:width");
-    assert_eq!(shown, "310.45", "a non-integral width displays rounded to <=2 decimals");
+    assert_eq!(
+        shown, "310.45",
+        "a non-integral width displays rounded to <=2 decimals"
+    );
     assert!(
         !shown.contains("310.447"),
         "the raw full-precision f64 ({shown}) must never reach the field"
@@ -1693,7 +2266,11 @@ fn inspector_rounds_a_non_integral_dimension_for_display() {
         (1280.0, 800.0),
         false,
     );
-    assert_eq!(shown_value(&scene, "insp:width"), "30", "a whole width has no trailing dot/zeros");
+    assert_eq!(
+        shown_value(&scene, "insp:width"),
+        "30",
+        "a whole width has no trailing dot/zeros"
+    );
 }
 
 /// (F) The inspector panel never overlaps the bottom toolbar: for a FULL inspector
@@ -1710,12 +2287,19 @@ fn inspector_panel_bottom_clears_the_bottom_toolbar() {
     let scene_obj = flow_scene();
     let view = view_of(&scene_obj, "c");
     let viewport = (1280.0, 360.0);
-    let m = UiModel { viewport, ..model(&catalog, &view) };
+    let m = UiModel {
+        viewport,
+        ..model(&catalog, &view)
+    };
     let scene = shape_ui_core::render(&build_root(&m), viewport, false);
 
     // The panel body (`inspector::bg`) carries the panel rect. Its transform y +
     // quantized box height = the painted bottom edge in screen px.
-    let bg = scene.objects.iter().find(|o| o.id == "inspector::bg").expect("inspector body");
+    let bg = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "inspector::bg")
+        .expect("inspector body");
     let top = bg.transform[1][2];
     let qh: f64 = bg
         .geometry_d
@@ -1734,18 +2318,53 @@ fn inspector_panel_bottom_clears_the_bottom_toolbar() {
         "inspector bottom ({panel_bottom}px) must clear the toolbar tray top ({tray_top}px)"
     );
 
-    // The full inspector is still SHOWN: the last (Actions) section title renders on
-    // top of the panel and within the panel band (it scrolled into view, not clipped
-    // off the top). FAILS if the cap dropped the section instead of scrolling it up.
+    // The full inspector is still SHOWN: the last (Actions) section title still
+    // renders (the cap bounds the body, it does not drop the section).
     let actions = scene
         .objects
         .iter()
         .find(|o| o.id == "inspector::section::action")
         .expect("the Actions section title still renders");
-    let actions_y = actions.transform[1][2];
+    assert!(actions.transform[1][2] >= top, "Actions sits below the panel top");
+}
+
+/// (F') The FIRST section header is never lifted above the panel's content-top inset:
+/// even when the inspector overflows the capped band, its top row sits AT/below
+/// `panel_top + PANEL_MARGIN`, below the body's rounded corner. Drives the live path:
+/// the tallest inspector on a short viewport (the overflow case) → render → read the
+/// first `inspector::section::*` title's screen y against the body top. FAILS against
+/// the old `y: PANEL_MARGIN - scroll_y`, which lifted the first row under the corner.
+#[test]
+fn inspector_first_section_clears_the_panel_top_inset() {
+    const PANEL_MARGIN: f64 = 16.0; // SPACE_LG, the inspector's content-top inset.
+    let catalog = object_command_catalog();
+    let scene_obj = flow_scene();
+    let view = view_of(&scene_obj, "c");
+    let viewport = (1280.0, 360.0); // short enough to force the overflow.
+    let m = UiModel {
+        viewport,
+        ..model(&catalog, &view)
+    };
+    let scene = shape_ui_core::render(&build_root(&m), viewport, false);
+
+    let top = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "inspector::bg")
+        .expect("inspector body")
+        .transform[1][2];
+
+    // The first section in the flow-child view is the object Header.
+    let first = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "inspector::section::header")
+        .expect("the first section title renders");
+    let first_top = first.transform[1][2];
     assert!(
-        actions_y >= top && actions_y <= panel_bottom,
-        "the Actions title ({actions_y}px) sits within the panel band [{top}, {panel_bottom}]"
+        first_top >= top + PANEL_MARGIN,
+        "first section top ({first_top}px) must sit at/below the content-top inset ({}px)",
+        top + PANEL_MARGIN
     );
 }
 
@@ -1768,9 +2387,16 @@ fn watermark_is_a_borderless_text_with_no_backing_rect() {
         .filter(|o| o.id.starts_with("watermark") && o.id != "watermark")
         .map(|o| o.id.as_str())
         .collect();
-    assert!(siblings.is_empty(), "the watermark has no backing rect sibling, got {siblings:?}");
+    assert!(
+        siblings.is_empty(),
+        "the watermark has no backing rect sibling, got {siblings:?}"
+    );
 
-    let mark = scene.objects.iter().find(|o| o.id == "watermark").expect("watermark");
+    let mark = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "watermark")
+        .expect("watermark");
     assert!(
         mark.fill.is_none() && mark.stroke.is_none(),
         "the watermark is a borderless caption, not a bordered box"
@@ -1799,9 +2425,9 @@ fn watermark_is_a_borderless_text_with_no_backing_rect() {
 /// to match the drift. Mirrors ui-core's `text_paint_token_matches_object_theme`.
 #[test]
 fn token_tables_resolve_byte_identically_across_scene_and_renderer_core() {
-    use shape_scene_core::object::catalog::theme::{resolve_token as scene_resolve, ALL_TOKENS};
-    use shape_scene_core::object::catalog::theme::Token;
     use shape_renderer_core::resolve_token as render_resolve;
+    use shape_scene_core::object::catalog::theme::Token;
+    use shape_scene_core::object::catalog::theme::{resolve_token as scene_resolve, ALL_TOKENS};
 
     // Every token in the canonical scene-core table must resolve identically in the
     // renderer-core mirror, both modes — covers the material-language tokens and all
@@ -1821,12 +2447,14 @@ fn token_tables_resolve_byte_identically_across_scene_and_renderer_core() {
 // ---- borderless + hover (QA #1/#2/#6) ----
 
 /// The resting (un-hovered) `RenderObject` for `id` in a freshly built root scene.
-fn resting_object(
-    m: &UiModel,
-    id: &str,
-) -> shape_renderer_core::render_object::RenderObject {
+fn resting_object(m: &UiModel, id: &str) -> shape_renderer_core::render_object::RenderObject {
     let scene = shape_ui_core::render(&build_root(m), (1280.0, 800.0), false);
-    scene.objects.iter().find(|o| o.id == id).unwrap_or_else(|| panic!("no {id}")).clone()
+    scene
+        .objects
+        .iter()
+        .find(|o| o.id == id)
+        .unwrap_or_else(|| panic!("no {id}"))
+        .clone()
 }
 
 /// Whether a body PAINTS no fill: either it carries no fill at all, or an EXPLICIT
@@ -1834,7 +2462,10 @@ fn resting_object(
 /// object pipeline reads as decorative-empty). The live box was an OPAQUE resolved
 /// fill, so a transparent declared fill is "no box" here.
 fn paints_no_fill(o: &RenderObject) -> bool {
-    o.fill.as_ref().map(|f| f.opacity <= f64::EPSILON).unwrap_or(true)
+    o.fill
+        .as_ref()
+        .map(|f| f.opacity <= f64::EPSILON)
+        .unwrap_or(true)
 }
 
 /// Whether the body `id` RESOLVES to a painted box the way the LIVE renderer does:
@@ -1854,7 +2485,11 @@ fn body_resolves_to_paint(m: &UiModel, id: &str) -> (bool, bool, bool) {
         .iter()
         .find(|d| d.id == id)
         .unwrap_or_else(|| panic!("no draw for {id}"));
-    (!draw.fill_range.is_empty(), !draw.stroke_range.is_empty(), !draw.shadow_range.is_empty())
+    (
+        !draw.fill_range.is_empty(),
+        !draw.stroke_range.is_empty(),
+        !draw.shadow_range.is_empty(),
+    )
 }
 
 /// EVERY interactive body — toolbar icon button, chrome icon button (theme toggle +
@@ -1871,8 +2506,14 @@ fn interactive_bodies_are_fully_transparent_at_rest() {
     let view = view_of(&scene_with(vec![rect("r")]), "r");
     // A canvas pair so the switcher draws (the New control is always present).
     let canvases = vec![
-        crate::CanvasEntry { id: "c1".to_string(), title: "First".to_string() },
-        crate::CanvasEntry { id: "c2".to_string(), title: "Second".to_string() },
+        crate::CanvasEntry {
+            id: "c1".to_string(),
+            title: "First".to_string(),
+        },
+        crate::CanvasEntry {
+            id: "c2".to_string(),
+            title: "Second".to_string(),
+        },
     ];
     let menu = ContextMenuModel {
         x: 100.0,
@@ -1896,7 +2537,10 @@ fn interactive_bodies_are_fully_transparent_at_rest() {
         ("cmd:duplicate", "a context-menu row"),
     ] {
         let body = resting_object(&m, id);
-        assert!(paints_no_fill(&body), "{what} ({id}) has a resting FILL (the boxes-in-boxes box)");
+        assert!(
+            paints_no_fill(&body),
+            "{what} ({id}) has a resting FILL (the boxes-in-boxes box)"
+        );
         assert!(body.stroke.is_none(), "{what} ({id}) has a resting BORDER");
     }
 
@@ -1915,8 +2559,11 @@ fn interactive_bodies_are_fully_transparent_at_rest() {
         "an inspector label has no backing rect paint"
     );
     assert!(
-        !scene.objects.iter().any(|o| o.id.starts_with("inspector::row::")
-            && (!paints_no_fill(o) || o.stroke.is_some())),
+        !scene
+            .objects
+            .iter()
+            .any(|o| o.id.starts_with("inspector::row::")
+                && (!paints_no_fill(o) || o.stroke.is_some())),
         "an inspector control row emits no painted body rect (labels are bare Text)"
     );
 }
@@ -1942,12 +2589,18 @@ fn hovering_a_button_swaps_its_body_fill_to_the_hover_token() {
         .iter()
         .find(|o| o.id == "cmd:hand-pan")
         .expect("hand-pan body");
-    assert!(paints_no_fill(body), "the button is fill-less at rest (precondition)");
+    assert!(
+        paints_no_fill(body),
+        "the button is fill-less at rest (precondition)"
+    );
     let bx = body.transform[0][2] + 16.0;
     let by = body.transform[1][2] + 16.0;
 
     let moved = rt.dispatch_pointer(PointerPhase::Move, (bx, by));
-    assert!(moved.dirty, "moving onto a fresh button is a visible (hover) change");
+    assert!(
+        moved.dirty,
+        "moving onto a fresh button is a visible (hover) change"
+    );
 
     let hovered = rt.render();
     let body = hovered
@@ -1955,24 +2608,49 @@ fn hovering_a_button_swaps_its_body_fill_to_the_hover_token() {
         .iter()
         .find(|o| o.id == "cmd:hand-pan")
         .expect("hand-pan body after hover");
-    match &body.fill.as_ref().expect("a hovered button takes a fill").paint {
-        RPaint::Token { name } => assert_eq!(name, "hover", "hovered body fills with the `hover` token"),
+    match &body
+        .fill
+        .as_ref()
+        .expect("a hovered button takes a fill")
+        .paint
+    {
+        RPaint::Token { name } => {
+            assert_eq!(name, "hover", "hovered body fills with the `hover` token")
+        }
         other => panic!("hovered body fill must be the `hover` token, got {other:?}"),
     }
 
     // Moving off the button drops the hover fill again (no sticky highlight).
     rt.dispatch_pointer(PointerPhase::Move, (5.0, 5.0));
     let off = rt.render();
-    let body = off.objects.iter().find(|o| o.id == "cmd:hand-pan").expect("body off-hover");
-    assert!(paints_no_fill(body), "moving off the button clears the hover fill");
+    let body = off
+        .objects
+        .iter()
+        .find(|o| o.id == "cmd:hand-pan")
+        .expect("body off-hover");
+    assert!(
+        paints_no_fill(body),
+        "moving off the button clears the hover fill"
+    );
 
     // The ACTIVE half of the contract: the armed tool (`select-move`, the model's
     // default `active_tool`) carries the `accent-soft` body fill at rest — through the
     // SAME real render()/projection path, not the resting builder alone. FAILS if the
     // active tint regresses (e.g. back to the old opaque bright-blue fill or to None).
-    let active = off.objects.iter().find(|o| o.id == "cmd:select-move").expect("active tool body");
-    match &active.fill.as_ref().expect("the armed tool keeps its accent-soft fill").paint {
-        RPaint::Token { name } => assert_eq!(name, "accent-soft", "the armed tool body tints accent-soft"),
+    let active = off
+        .objects
+        .iter()
+        .find(|o| o.id == "cmd:select-move")
+        .expect("active tool body");
+    match &active
+        .fill
+        .as_ref()
+        .expect("the armed tool keeps its accent-soft fill")
+        .paint
+    {
+        RPaint::Token { name } => {
+            assert_eq!(name, "accent-soft", "the armed tool body tints accent-soft")
+        }
         other => panic!("active body fill must be the `accent-soft` token, got {other:?}"),
     }
 }
@@ -1993,23 +2671,48 @@ fn hovering_a_context_menu_row_swaps_its_body_fill_to_the_hover_token() {
         title: None,
         items: vec![ctx_item("copy", "Copy")],
     };
-    let m = UiModel { context_menu: Some(&menu), ..model(&catalog, &view) };
+    let m = UiModel {
+        context_menu: Some(&menu),
+        ..model(&catalog, &view)
+    };
     let viewport = (1280.0, 800.0);
     let mut rt = UiRuntime::new(build_root(&m), viewport, false);
 
     let resting = rt.render();
-    let row = resting.objects.iter().find(|o| o.id == "cmd:copy").expect("copy row");
-    assert!(paints_no_fill(row), "the menu row is fill-less at rest (precondition)");
+    let row = resting
+        .objects
+        .iter()
+        .find(|o| o.id == "cmd:copy")
+        .expect("copy row");
+    assert!(
+        paints_no_fill(row),
+        "the menu row is fill-less at rest (precondition)"
+    );
     let cx = row.transform[0][2] + 20.0;
     let cy = row.transform[1][2] + 15.0;
 
     let moved = rt.dispatch_pointer(PointerPhase::Move, (cx, cy));
-    assert!(moved.dirty, "moving onto a fresh menu row is a visible (hover) change");
+    assert!(
+        moved.dirty,
+        "moving onto a fresh menu row is a visible (hover) change"
+    );
 
     let hovered = rt.render();
-    let row = hovered.objects.iter().find(|o| o.id == "cmd:copy").expect("copy row after hover");
-    match &row.fill.as_ref().expect("a hovered menu row takes a fill").paint {
-        RPaint::Token { name } => assert_eq!(name, "hover", "hovered menu row fills with the `hover` token"),
+    let row = hovered
+        .objects
+        .iter()
+        .find(|o| o.id == "cmd:copy")
+        .expect("copy row after hover");
+    match &row
+        .fill
+        .as_ref()
+        .expect("a hovered menu row takes a fill")
+        .paint
+    {
+        RPaint::Token { name } => assert_eq!(
+            name, "hover",
+            "hovered menu row fills with the `hover` token"
+        ),
         other => panic!("hovered menu row fill must be the `hover` token, got {other:?}"),
     }
 }
@@ -2061,8 +2764,14 @@ fn dark_mode_chrome_paints_resolve_to_legible_contrast() {
     let catalog = object_command_catalog();
     let view = view_of(&scene_with(vec![rect("r")]), "r");
     let canvases = vec![
-        crate::CanvasEntry { id: "c1".to_string(), title: "First".to_string() },
-        crate::CanvasEntry { id: "c2".to_string(), title: "Second".to_string() },
+        crate::CanvasEntry {
+            id: "c1".to_string(),
+            title: "First".to_string(),
+        },
+        crate::CanvasEntry {
+            id: "c2".to_string(),
+            title: "Second".to_string(),
+        },
     ];
     let m = parity_model(&catalog, &view, &[], &[], &canvases, &[]);
     // Render in DARK — the failing theme in the QA report.
@@ -2082,7 +2791,10 @@ fn dark_mode_chrome_paints_resolve_to_legible_contrast() {
     // faint/near-black idle-icon stroke (the QA #3c defect) fails here. (An ACTIVE tool
     // glyph tints `selection-ring` instead, so this pins the always-idle one.)
     let icon_stroke = stroke_token(&dark, "cmd:undo::icon");
-    assert_eq!(icon_stroke, "text", "an idle toolbar glyph strokes with the recolorable `text` token");
+    assert_eq!(
+        icon_stroke, "text",
+        "an idle toolbar glyph strokes with the recolorable `text` token"
+    );
     assert!(
         luma(&icon_stroke, true) > 200.0,
         "toolbar icon stroke `{icon_stroke}` must be HIGH-contrast in dark (luma {} <= 200)",
@@ -2095,7 +2807,10 @@ fn dark_mode_chrome_paints_resolve_to_legible_contrast() {
     // dark tray (the QA dark-contrast defect); pin the bound token NAME and assert its
     // resolved RGBA is actually dark, so a regression to a white-in-dark fill fails here.
     let tab_fill = fill_token(&dark, "canvas:c2");
-    assert_eq!(tab_fill, "surface-muted", "the active tab fills the opaque theme-aware `surface-muted`, not a translucent wash");
+    assert_eq!(
+        tab_fill, "surface-muted",
+        "the active tab fills the opaque theme-aware `surface-muted`, not a translucent wash"
+    );
     assert!(
         luma(&tab_fill, true) < 96.0,
         "the active tab fill `{tab_fill}` must resolve DARK in dark mode (luma {} >= 96), not a white-in-dark pill",
@@ -2111,7 +2826,10 @@ fn dark_mode_chrome_paints_resolve_to_legible_contrast() {
     // so it flips to a legible DARK pill in dark (the old fill-less button showed the
     // light panel `material` through and read near-white — the QA dark-contrast defect).
     let action_fill = fill_token(&dark, "insp:canonicalize");
-    assert_eq!(action_fill, "surface-muted", "the action button fills the opaque theme-aware `surface-muted`");
+    assert_eq!(
+        action_fill, "surface-muted",
+        "the action button fills the opaque theme-aware `surface-muted`"
+    );
     assert!(
         luma(&action_fill, true) < 96.0,
         "the action button fill `{action_fill}` must resolve DARK in dark mode (luma {} >= 96)",
@@ -2122,7 +2840,10 @@ fn dark_mode_chrome_paints_resolve_to_legible_contrast() {
     // once dark is reachable (defect B fixed) the sun/moon mark reads near-white on the
     // dark chrome. Pins the bound token NAME and its resolved legibility together.
     let toggle_stroke = stroke_token(&dark, "cmd:toggle-theme::icon");
-    assert_eq!(toggle_stroke, "text", "the theme-toggle glyph strokes the recolorable `text` token");
+    assert_eq!(
+        toggle_stroke, "text",
+        "the theme-toggle glyph strokes the recolorable `text` token"
+    );
     assert!(
         luma(&toggle_stroke, true) > 200.0,
         "the theme-toggle glyph `{toggle_stroke}` must read HIGH-contrast in dark (luma {})",
@@ -2137,10 +2858,17 @@ fn dark_mode_chrome_paints_resolve_to_legible_contrast() {
         .iter()
         .find(|o| o.id.starts_with("inspector::section::"))
         .expect("the inspector emits at least one section title");
-    let title_color = title.text.as_ref().expect("section title has text").runs[0].color.clone();
+    let title_color = title.text.as_ref().expect("section title has text").runs[0]
+        .color
+        .clone();
     assert_eq!(
         title_color.to_lowercase(),
-        format!("#{:02x}{:02x}{:02x}", resolve_token("text", true).unwrap()[0], resolve_token("text", true).unwrap()[1], resolve_token("text", true).unwrap()[2]),
+        format!(
+            "#{:02x}{:02x}{:02x}",
+            resolve_token("text", true).unwrap()[0],
+            resolve_token("text", true).unwrap()[1],
+            resolve_token("text", true).unwrap()[2]
+        ),
         "a section title is painted the dark `text` hex (primary text, not dark-on-dark)"
     );
     let [tr, tg, tb, _] = resolve_token("text", true).unwrap();
@@ -2168,18 +2896,42 @@ fn toolbar_icon_body_is_borderless_at_rest_and_active_keeps_its_bg() {
 
     // An idle tray button (`hand-pan` is never the default tool) paints NOTHING at
     // rest: no fill box, no stroke outline — the frosted tray is the only surface.
-    let idle = scene.objects.iter().find(|o| o.id == "cmd:hand-pan").expect("hand-pan body");
-    assert!(paints_no_fill(idle), "an idle toolbar icon body has a resting FILL (the always-on box)");
-    assert!(idle.stroke.is_none(), "an idle toolbar icon body has a resting STROKE (the always-on outline)");
+    let idle = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "cmd:hand-pan")
+        .expect("hand-pan body");
+    assert!(
+        paints_no_fill(idle),
+        "an idle toolbar icon body has a resting FILL (the always-on box)"
+    );
+    assert!(
+        idle.stroke.is_none(),
+        "an idle toolbar icon body has a resting STROKE (the always-on outline)"
+    );
 
     // The armed tool keeps its active background (`accent-soft`), so the active half of
     // the contract — a bg only on active/hover — still holds.
-    let armed = scene.objects.iter().find(|o| o.id == "cmd:select-move").expect("armed tool body");
-    match &armed.fill.as_ref().expect("the armed tool body keeps an active bg").paint {
-        RPaint::Token { name } => assert_eq!(name, "accent-soft", "the armed tool body tints accent-soft"),
+    let armed = scene
+        .objects
+        .iter()
+        .find(|o| o.id == "cmd:select-move")
+        .expect("armed tool body");
+    match &armed
+        .fill
+        .as_ref()
+        .expect("the armed tool body keeps an active bg")
+        .paint
+    {
+        RPaint::Token { name } => {
+            assert_eq!(name, "accent-soft", "the armed tool body tints accent-soft")
+        }
         other => panic!("active toolbar body fill must be the accent-soft token, got {other:?}"),
     }
-    assert!(armed.stroke.is_none(), "even the armed toolbar body draws no resting outline");
+    assert!(
+        armed.stroke.is_none(),
+        "even the armed toolbar body draws no resting outline"
+    );
 }
 
 /// (A) THE live-representative pin for "kill the toolbar icon box": it drives the real
@@ -2202,18 +2954,33 @@ fn toolbar_icon_body_draws_no_resting_box() {
     // An idle tray button resolves to nothing: the white default_fill, the dark
     // default_stroke ribbon, and the shadow that fill would cast must ALL be absent.
     let (idle_fill, idle_stroke, idle_shadow) = body_resolves_to_paint(&m, "cmd:hand-pan");
-    assert!(!idle_fill, "an idle toolbar icon body resolves to a FILL box (the default white box live)");
-    assert!(!idle_stroke, "an idle toolbar icon body resolves to a STROKE ribbon (the default dark border live)");
-    assert!(!idle_shadow, "an idle toolbar icon body resolves to a drop SHADOW (the box's elevation)");
+    assert!(
+        !idle_fill,
+        "an idle toolbar icon body resolves to a FILL box (the default white box live)"
+    );
+    assert!(
+        !idle_stroke,
+        "an idle toolbar icon body resolves to a STROKE ribbon (the default dark border live)"
+    );
+    assert!(
+        !idle_shadow,
+        "an idle toolbar icon body resolves to a drop SHADOW (the box's elevation)"
+    );
 
     // Guard against a vacuous pass: the frosted tray DOES resolve an opaque fill, so the
     // scene reaches the resolver and the idle assertion is meaningful.
     let (tray_fill, _, _) = body_resolves_to_paint(&m, "toolbar::tray");
-    assert!(tray_fill, "the tray bg must still resolve a fill (else the idle pin is vacuous)");
+    assert!(
+        tray_fill,
+        "the tray bg must still resolve a fill (else the idle pin is vacuous)"
+    );
 
     // The ARMED tool body DOES resolve its `accent-soft` fill — a bg on active is kept.
     let (armed_fill, _, _) = body_resolves_to_paint(&m, "cmd:select-move");
-    assert!(armed_fill, "the armed tool body must resolve its active accent-soft fill");
+    assert!(
+        armed_fill,
+        "the armed tool body must resolve its active accent-soft fill"
+    );
 }
 
 /// The number of DISTINCT text-baseline rows the object `id`'s glyph quads occupy in
@@ -2226,7 +2993,11 @@ fn label_line_rows(m: &UiModel, id: &str) -> usize {
 
     let scene = shape_ui_core::render(&build_root(m), (1280.0, 800.0), false);
     let geo = build_scene_geometry_themed(&scene, Theme::light());
-    let draw = geo.draws.iter().find(|d| d.id == id).unwrap_or_else(|| panic!("no draw for {id}"));
+    let draw = geo
+        .draws
+        .iter()
+        .find(|d| d.id == id)
+        .unwrap_or_else(|| panic!("no draw for {id}"));
     let start = usize::try_from(draw.text_range.start).unwrap();
     let end = usize::try_from(draw.text_range.end).unwrap();
     // Each glyph emits 6 vertices (tl, tr, br, tl, br, bl); the TOP-LEFT (the glyph
@@ -2274,8 +3045,18 @@ fn segment_labels_fit_their_cells_without_wrapping() {
     // The cell pitch (seg1 origin − seg0 origin) is the per-cell width; with the
     // full-width stacked segment it is ~116px (232/2), not the old 66px. A wide cell
     // is what keeps the 10-glyph label on one line.
-    let seg0_x = rendered.objects.iter().find(|o| o.id == "insp:axis::seg0::label").unwrap().transform[0][2];
-    let seg1_x = rendered.objects.iter().find(|o| o.id == "insp:axis::seg1::label").unwrap().transform[0][2];
+    let seg0_x = rendered
+        .objects
+        .iter()
+        .find(|o| o.id == "insp:axis::seg0::label")
+        .unwrap()
+        .transform[0][2];
+    let seg1_x = rendered
+        .objects
+        .iter()
+        .find(|o| o.id == "insp:axis::seg1::label")
+        .unwrap()
+        .transform[0][2];
     assert!(
         seg1_x - seg0_x > 100.0,
         "the segment cell pitch is only {}px — too narrow for the label",
@@ -2285,8 +3066,15 @@ fn segment_labels_fit_their_cells_without_wrapping() {
     // The track resolves a painted fill (the inactive cells' shared background): an
     // inactive cell reads against this `surface-muted` trough.
     let (track_fill, _, _) = body_resolves_to_paint(&m, "insp:axis");
-    assert!(track_fill, "the segment track must resolve a fill (the inactive cells' background)");
-    assert_eq!(fill_token(&rendered, "insp:axis"), "surface-muted", "the track fills `surface-muted`");
+    assert!(
+        track_fill,
+        "the segment track must resolve a fill (the inactive cells' background)"
+    );
+    assert_eq!(
+        fill_token(&rendered, "insp:axis"),
+        "surface-muted",
+        "the track fills `surface-muted`"
+    );
 }
 
 /// (D) A toolbar/chrome icon glyph strokes at the CRISP weight (1.8px), heavier than a
@@ -2332,7 +3120,171 @@ fn inspector_numeric_display_uses_a_period_not_a_comma() {
     let scene = shape_ui_core::render(&build_root(&model(&catalog, &view)), (1280.0, 800.0), false);
 
     let shown = shown_value(&scene, "insp:width");
-    assert!(shown.contains('.'), "a fractional dimension shows a PERIOD separator, got {shown:?}");
-    assert!(!shown.contains(','), "the inspector numeric display must never use a COMMA, got {shown:?}");
+    assert!(
+        shown.contains('.'),
+        "a fractional dimension shows a PERIOD separator, got {shown:?}"
+    );
+    assert!(
+        !shown.contains(','),
+        "the inspector numeric display must never use a COMMA, got {shown:?}"
+    );
     assert_eq!(shown, "310.45", "the fractional width reads with a period");
+}
+
+// ---- flex layout-system conversion (centralized scale + real flex containers) ----
+
+/// The screen-space top-left a render object is translated to (its `transform`
+/// column), the same origin `hit`/`layout_children` place it at.
+fn render_origin(
+    scene: &shape_renderer_core::render_object::RenderObjectScene,
+    id: &str,
+) -> (f64, f64) {
+    let o = scene
+        .objects
+        .iter()
+        .find(|o| o.id == id)
+        .unwrap_or_else(|| panic!("no render object {id}"));
+    (o.transform[0][2], o.transform[1][2])
+}
+
+/// FALSIFIABLE: after the Axis::None→flex conversion the settings modal's command
+/// rows are laid out by the engine with a UNIFORM gap — consecutive rows in a
+/// section differ in y by exactly `row_h + SPACE_XS`, the section's flex spacing.
+/// FAILS if a row reverts to the old hand-rolled `y += ROW_H` cursor (whose drift
+/// this conversion removes) or the spacing token changes out from under the layout.
+#[test]
+fn settings_section_rows_have_a_uniform_engine_gap() {
+    use shape_ui_core::SPACE_XS;
+    let catalog = object_command_catalog();
+    let gestures = object_gesture_catalog();
+    let view = view_of(&scene_with(vec![rect("r")]), "r");
+    let m = UiModel {
+        settings_open: true,
+        gesture_catalog: &gestures,
+        ..model(&catalog, &view)
+    };
+    let scene = shape_ui_core::render(&build_root(&m), (1280.0, 800.0), false);
+
+    // Three consecutive command rows in the first category (Tool group has ≥3).
+    let mut tool_rows: Vec<f64> = catalog
+        .iter()
+        .filter(|c| {
+            c.category == shape_scene_core::object::catalog::commands::ObjectCommandCategory::Tool
+        })
+        .map(|c| render_origin(&scene, &format!("settings::cmd::{}::label", c.id)).1)
+        .collect();
+    assert!(tool_rows.len() >= 2, "need ≥2 Tool rows to measure a gap");
+    tool_rows.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    // The kbd-pill body is `ROW_H - SPACE_XS` tall, so the row height the flex packs is
+    // the label height ROW_H(24); the gap between row labels is that height + SPACE_XS.
+    let row_h = 24.0;
+    let gap = tool_rows[1] - tool_rows[0];
+    assert!(
+        (gap - (row_h + SPACE_XS)).abs() < 1e-6,
+        "command rows must be a uniform engine gap apart, got {gap} (want {})",
+        row_h + SPACE_XS
+    );
+    // EVERY consecutive pair shares that one gap (no off-by-cursor row).
+    for pair in tool_rows.windows(2) {
+        assert!(
+            (pair[1] - pair[0] - gap).abs() < 1e-6,
+            "non-uniform gap: {pair:?}"
+        );
+    }
+}
+
+/// FALSIFIABLE: a settings command row is a HORIZONTAL SpaceBetween flex — the label
+/// pins to the leading edge and the kbd pill to the trailing edge, both cross-centered
+/// on the row. FAILS if the label|value row stops being cross-centered (the y-origins
+/// diverge) or the pill stops pinning right (it would sit mid-row under packed Start).
+#[test]
+fn settings_command_row_is_space_between_and_cross_centered() {
+    let catalog = object_command_catalog();
+    let view = view_of(&scene_with(vec![rect("r")]), "r");
+    let m = UiModel {
+        settings_open: true,
+        ..model(&catalog, &view)
+    };
+    let scene = shape_ui_core::render(&build_root(&m), (1280.0, 800.0), false);
+
+    // `undo` has a default shortcut, so its row has both a label and a kbd glyph.
+    let (label_x, label_y) = render_origin(&scene, "settings::cmd::undo::label");
+    let (kbd_x, _kbd_y) = render_origin(&scene, "settings::cmd::undo::kbd");
+
+    // The kbd pill is pinned to the trailing edge: its x is well to the RIGHT of the
+    // label's x (SpaceBetween split the slack, not a packed `spacing`).
+    assert!(
+        kbd_x > label_x + 100.0,
+        "kbd pill must pin right of the label (x {kbd_x} vs {label_x})"
+    );
+
+    // Cross-centered: the kbd pill body (ROW_H - SPACE_XS tall) is vertically centered
+    // inside the ROW_H row, so its top sits BELOW the (full-height) label's top.
+    let (_, kbd_bg_y) = render_origin(&scene, "settings::cmd::undo::kbd-bg");
+    assert!(
+        kbd_bg_y > label_y,
+        "the shorter kbd pill must be cross-centered, not top-aligned"
+    );
+}
+
+/// FALSIFIABLE (the sync invariant): after the inspector flex conversion, `hit` and
+/// the RENDERED box still agree for a nested control. We render the converted tree,
+/// read where `insp:name` actually paints (a control nested inside a flex row inside a
+/// flex section inside a flex content stack), and hit that exact point — both paths
+/// run through `layout_children`, so a drift between drawn and hit boxes fails HERE.
+#[test]
+fn inspector_flex_hit_agrees_with_rendered_box() {
+    let scene_obj = flow_scene();
+    let view = view_of(&scene_obj, "c");
+    let catalog = object_command_catalog();
+    let tree = build_root(&model(&catalog, &view));
+    let scene = shape_ui_core::render(&tree, (1280.0, 800.0), false);
+
+    // The Name field's body is the `insp:name` text-input owner (a deeply-nested flex
+    // child — the strongest sync probe in the converted tree).
+    let (sx, sy) = render_origin(&scene, "insp:name");
+    // Hit just inside the rendered top-left corner: drawn == hit means this lands on
+    // the owner, never a neighbor or a ::part.
+    assert_eq!(
+        shape_ui_core::hit(&tree, (sx + 2.0, sy + 2.0)),
+        Some("insp:name".to_string()),
+        "hit must resolve to the same owner the renderer drew at this point"
+    );
+}
+
+/// FALSIFIABLE: the relayout is GEOMETRY ONLY — every load-bearing id/prefix the
+/// intent resolver keys on survives the flex conversion. FAILS if a converted surface
+/// dropped or renamed an `insp:`/`cmd:`/`settings::` id (which would silently break
+/// the press round-trip the resolver depends on).
+#[test]
+fn flex_conversion_preserves_load_bearing_ids() {
+    let scene_obj = flow_scene();
+    let view = view_of(&scene_obj, "c");
+    let catalog = object_command_catalog();
+    let gestures = object_gesture_catalog();
+    let m = UiModel {
+        settings_open: true,
+        gesture_catalog: &gestures,
+        ..model(&catalog, &view)
+    };
+    let tree = build_root(&m);
+    let mut ids = Vec::new();
+    all_ids(&tree, &mut ids);
+
+    // The inspector name control still carries its `insp:` owner id.
+    assert!(
+        ids.iter().any(|id| id == "insp:name"),
+        "inspector lost insp:name"
+    );
+    // The toolbar command still carries its `cmd:` id.
+    assert!(
+        ids.iter().any(|id| id == "cmd:undo"),
+        "toolbar lost cmd:undo"
+    );
+    // The settings kbd glyph id is intact (the row converted to flex kept its parts).
+    assert!(
+        ids.iter().any(|id| id == "settings::cmd::undo::kbd"),
+        "settings row lost its kbd id"
+    );
 }

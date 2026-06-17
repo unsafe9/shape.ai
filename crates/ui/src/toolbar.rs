@@ -9,7 +9,8 @@
 
 use shape_scene_core::object::catalog::commands::{ObjectCommand, ObjectCommandCategory};
 use shape_ui_core::{
-    Axis, Button, Container, CrossAlign, Edges, Paint, Rect, RectStyle, Swatch, TextPaint, Widget,
+    Axis, Button, Container, CrossAlign, Edges, MainAlign, Paint, Rect, RectStyle, Swatch,
+    TextPaint, Widget, SPACE_SM, SPACE_XS,
 };
 
 use crate::composites::{button_style, soft_shadow};
@@ -32,7 +33,13 @@ pub(crate) const TOOLBAR_GROUPS: &[&[&str]] = &[
     // Tool group.
     &["select-move", "hand-pan", "draw", "erase"],
     // Insert group.
-    &["insert-rectangle", "insert-ellipse", "insert-line", "insert-text", "insert-frame"],
+    &[
+        "insert-rectangle",
+        "insert-ellipse",
+        "insert-line",
+        "insert-text",
+        "insert-frame",
+    ],
     // Edit group.
     &["duplicate", "delete", "group", "ungroup"],
     // History group.
@@ -46,9 +53,12 @@ pub(crate) const TOOLBAR_GROUPS: &[&[&str]] = &[
 const BTN: f64 = 32.0;
 const SWATCH_W: f64 = 24.0;
 const CHIP_W: f64 = 34.0;
-const SPACING: f64 = 4.0;
-/// The gap a group separator occupies (the hairline is centered in it).
-const SEP_GAP: f64 = 9.0;
+/// The icon-to-icon gap inside a group (the dense-row step on the shared scale).
+const SPACING: f64 = SPACE_XS;
+/// The gap a group separator occupies (the hairline is centered in it). On the scale
+/// (`SPACE_SM`) so the inter-group gap reads on the same 4px grid as everything else
+/// — the old `9.0` was the toolbar's one off-grid value.
+const SEP_GAP: f64 = SPACE_SM;
 const SEP_W: f64 = 1.0;
 const PADDING: f64 = 6.0;
 const TRAY_RADIUS: f64 = 14.0;
@@ -69,7 +79,10 @@ pub(crate) fn build(model: &UiModel) -> Widget {
     let group_extents: Vec<f64> = TOOLBAR_GROUPS
         .iter()
         .map(|g| {
-            let n = g.iter().filter(|id| command(model.command_catalog, id).is_some()).count();
+            let n = g
+                .iter()
+                .filter(|id| command(model.command_catalog, id).is_some())
+                .count();
             row_extent(n, BTN)
         })
         .collect();
@@ -78,7 +91,11 @@ pub(crate) fn build(model: &UiModel) -> Widget {
 
     let trailing = model.pen_widths.len() + model.pen_palette.len();
     // A separator divides the command row from the inline chips when either is shown.
-    let trail_sep = if trailing > 0 && cmd_w > 0.0 { SEP_GAP } else { 0.0 };
+    let trail_sep = if trailing > 0 && cmd_w > 0.0 {
+        SEP_GAP
+    } else {
+        0.0
+    };
     let chips_w = row_extent(model.pen_widths.len(), CHIP_W);
     let swatches_w = row_extent(model.pen_palette.len(), SWATCH_W);
     let chip_swatch_join = if !model.pen_widths.is_empty() && !model.pen_palette.is_empty() {
@@ -110,7 +127,9 @@ pub(crate) fn build(model: &UiModel) -> Widget {
             cx += SEP_GAP;
         }
         for id in group.iter() {
-            let Some(cmd) = command(model.command_catalog, id) else { continue };
+            let Some(cmd) = command(model.command_catalog, id) else {
+                continue;
+            };
             let active = is_active(model, &cmd.id);
             push_icon_button(&mut children, cmd, active, cx, cy);
             cx += BTN + SPACING;
@@ -149,6 +168,7 @@ pub(crate) fn build(model: &UiModel) -> Widget {
         h: tray_h,
         direction: Axis::None,
         spacing: 0.0,
+        main_align: MainAlign::Start,
         padding: Edges::all(0.0),
         align: CrossAlign::Start,
         children,
@@ -229,9 +249,15 @@ fn push_icon_button(out: &mut Vec<Widget>, cmd: &ObjectCommand, active: bool, x:
         hoverable: true,
     }));
     let tint = if active { "selection-ring" } else { "text" };
-    if let Some(icon) =
-        icon_in_box(format!("{body_id}::icon"), &cmd.id, x, y, BTN, BTN, Paint::Token(tint.to_string()))
-    {
+    if let Some(icon) = icon_in_box(
+        format!("{body_id}::icon"),
+        &cmd.id,
+        x,
+        y,
+        BTN,
+        BTN,
+        Paint::Token(tint.to_string()),
+    ) {
         out.push(icon);
     }
 }

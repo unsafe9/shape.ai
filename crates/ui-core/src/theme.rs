@@ -117,7 +117,11 @@ mod tests {
             for dark in [false, true] {
                 let rgba = resolve_token(token, dark).expect("known token");
                 let expected = format!("#{:02x}{:02x}{:02x}", rgba[0], rgba[1], rgba[2]);
-                assert_eq!(token_hex(token, dark), expected, "token {token} dark={dark}");
+                assert_eq!(
+                    token_hex(token, dark),
+                    expected,
+                    "token {token} dark={dark}"
+                );
             }
         }
     }

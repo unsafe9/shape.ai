@@ -1,7 +1,7 @@
 //! The ONE shared placement helper. Both `render` (emit) and `hit` (collect)
 //! call `layout_children`, so a drawn box and its hit box can never drift.
 
-use crate::widget::{Axis, Container, CrossAlign, Widget};
+use crate::widget::{Axis, Container, CrossAlign, MainAlign, Widget};
 
 /// Intrinsic box size of a widget for the layout cursor. Boxes carry explicit
 /// w/h (no text measurement in P2); a Container reports its own w/h.
@@ -26,8 +26,10 @@ pub(crate) fn measure(w: &Widget) -> (f64, f64) {
 /// of position render and hit share — drawn and hit boxes can never drift.
 /// - `Axis::None`: child kept at its own (child.x, child.y) (today's behavior).
 /// - `Horizontal`/`Vertical`: cursor starts at `padding.{l,t}`, advances by the
-///   child main-extent + spacing; the cross-offset comes from `align` over
-///   `(container cross-size − 2*padding − child cross-extent)`.
+///   child main-extent + the inter-child gap; the cross-offset comes from `align`
+///   over `(container cross-size − 2*padding − child cross-extent)`. The gap is the
+///   declared `spacing` under `MainAlign::Start`, or the slack split evenly between
+///   children under `SpaceBetween` (a label|value row pins to both edges).
 pub(crate) fn layout_children(c: &Container) -> Vec<(&Widget, f64, f64)> {
     match c.direction {
         Axis::None => c
@@ -41,26 +43,48 @@ pub(crate) fn layout_children(c: &Container) -> Vec<(&Widget, f64, f64)> {
         Axis::Horizontal => {
             let mut out = Vec::with_capacity(c.children.len());
             let cross_extent = c.h - c.padding.t - c.padding.b;
+            let main_extent = c.w - c.padding.l - c.padding.r;
+            let gap = main_gap(c, main_extent, |w| measure(w).0);
             let mut cursor = c.padding.l;
             for child in &c.children {
                 let (cw, ch) = measure(child);
                 let cross = c.padding.t + cross_offset(c.align, cross_extent, ch);
                 out.push((child, cursor, cross));
-                cursor += cw + c.spacing;
+                cursor += cw + gap;
             }
             out
         }
         Axis::Vertical => {
             let mut out = Vec::with_capacity(c.children.len());
             let cross_extent = c.w - c.padding.l - c.padding.r;
+            let main_extent = c.h - c.padding.t - c.padding.b;
+            let gap = main_gap(c, main_extent, |w| measure(w).1);
             let mut cursor = c.padding.t;
             for child in &c.children {
                 let (cw, ch) = measure(child);
                 let cross = c.padding.l + cross_offset(c.align, cross_extent, cw);
                 out.push((child, cross, cursor));
-                cursor += ch + c.spacing;
+                cursor += ch + gap;
             }
             out
+        }
+    }
+}
+
+/// The inter-child main-axis gap. `Start` uses the declared `spacing`; `SpaceBetween`
+/// spreads the leftover main-axis space (`main_extent − Σ child main-extents`) evenly
+/// across the `n−1` gaps, so the first child pins to the leading edge and the last to
+/// the trailing edge. With one child (no gap) it falls back to `spacing` (inert).
+fn main_gap(c: &Container, main_extent: f64, child_main: impl Fn(&Widget) -> f64) -> f64 {
+    match c.main_align {
+        MainAlign::Start => c.spacing,
+        MainAlign::SpaceBetween => {
+            let gaps = c.children.len().saturating_sub(1);
+            if gaps == 0 {
+                return c.spacing;
+            }
+            let used: f64 = c.children.iter().map(&child_main).sum();
+            ((main_extent - used) / gaps as f64).max(0.0)
         }
     }
 }
@@ -117,6 +141,7 @@ mod tests {
             h: 40.0,
             direction,
             spacing: 10.0,
+            main_align: MainAlign::Start,
             padding: Edges::all(8.0),
             align,
             children,
@@ -142,6 +167,29 @@ mod tests {
         assert_eq!(x1, 8.0 + 20.0 + 10.0);
 
         assert_eq!(measure(&rect("m", 20.0, 30.0)), (20.0, 30.0));
+    }
+
+    /// `SpaceBetween` pins the first child to the leading edge and the last to the
+    /// trailing edge, splitting the slack into the gap. FAILS if it ever regresses to
+    /// the packed `spacing` layout (the value would sit mid-row, not right-pinned).
+    #[test]
+    fn space_between_pins_children_to_both_main_edges() {
+        let mut c = container(
+            Axis::Horizontal,
+            CrossAlign::Center,
+            vec![rect("label", 40.0, 20.0), rect("value", 60.0, 20.0)],
+        );
+        c.main_align = MainAlign::SpaceBetween;
+        // padding 8 each side ⇒ main_extent = 200 - 16 = 184; used = 40 + 60 = 100;
+        // single gap = 84. label pins left at padding.l = 8.
+        let laid = layout_children(&c);
+        let (_, x0, _) = laid[0];
+        let (_, x1, _) = laid[1];
+        assert_eq!(x0, 8.0);
+        // value's RIGHT edge pins to the trailing inner edge: 200 - padding.r 8 = 192.
+        assert_eq!(x1 + 60.0, 192.0);
+        // the gap is the slack, not the declared spacing(10).
+        assert_eq!(x1 - (x0 + 40.0), 84.0);
     }
 
     #[test]

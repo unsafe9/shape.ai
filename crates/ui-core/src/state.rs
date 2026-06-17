@@ -101,7 +101,12 @@ pub struct UiRuntime {
 
 impl UiRuntime {
     pub fn new(tree: Widget, viewport: (f64, f64), theme_dark: bool) -> Self {
-        UiRuntime { tree, theme_dark, viewport, state: UiState::default() }
+        UiRuntime {
+            tree,
+            theme_dark,
+            viewport,
+            state: UiState::default(),
+        }
     }
 
     /// Replace the view tree (P4 re-derives UIs) while preserving interaction
@@ -166,23 +171,33 @@ impl UiRuntime {
             return DispatchResult::default();
         }
         let mut text = self.current_text(&focused);
-        let mut result = DispatchResult { consumed: true, dirty: true, ..Default::default() };
+        let mut result = DispatchResult {
+            consumed: true,
+            dirty: true,
+            ..Default::default()
+        };
         match key.key.as_str() {
             "Backspace" => {
                 text.pop();
                 self.state.text_values.insert(focused.clone(), text.clone());
-                result.actions.push(Action::TextChanged { id: focused, text });
+                result
+                    .actions
+                    .push(Action::TextChanged { id: focused, text });
             }
             "Enter" | "Escape" => {
                 // Commit: blur and emit the current text.
                 self.state.focused = None;
-                result.actions.push(Action::TextChanged { id: focused, text });
+                result
+                    .actions
+                    .push(Action::TextChanged { id: focused, text });
             }
             _ => match &key.text {
                 Some(s) => {
                     text.push_str(s);
                     self.state.text_values.insert(focused.clone(), text.clone());
-                    result.actions.push(Action::TextChanged { id: focused, text });
+                    result
+                        .actions
+                        .push(Action::TextChanged { id: focused, text });
                 }
                 // A non-printing key the field does not act on (e.g. an arrow) falls
                 // through unconsumed so it can reach the catalog — not swallowed.
@@ -207,12 +222,17 @@ impl UiRuntime {
         if !matches!(self.find_kind(&focused), Some(Kind::TextInput(_))) {
             return DispatchResult::default();
         }
-        self.state.text_values.insert(focused.clone(), value.clone());
+        self.state
+            .text_values
+            .insert(focused.clone(), value.clone());
         self.state.focused = None;
         DispatchResult {
             consumed: true,
             dirty: true,
-            actions: vec![Action::TextChanged { id: focused, text: value }],
+            actions: vec![Action::TextChanged {
+                id: focused,
+                text: value,
+            }],
             ..Default::default()
         }
     }
@@ -231,25 +251,37 @@ impl UiRuntime {
         let Some(id) = hit(&self.tree, pt) else {
             // Canvas fall-through; a previously focused field blurs.
             if self.state.focused.take().is_some() {
-                return DispatchResult { consumed: false, dirty: true, ..Default::default() };
+                return DispatchResult {
+                    consumed: false,
+                    dirty: true,
+                    ..Default::default()
+                };
             }
             return DispatchResult::default();
         };
 
-        let mut result = DispatchResult { consumed: true, dirty: true, ..Default::default() };
+        let mut result = DispatchResult {
+            consumed: true,
+            dirty: true,
+            ..Default::default()
+        };
         self.state.pressed = Some(id.clone());
         self.state.press_origin = Some(pt);
 
         // Read everything needed off the borrowed widget BEFORE mutating state.
         enum Down {
-            TextInput { rect: (f64, f64, f64, f64), size_px: f64 },
+            TextInput {
+                rect: (f64, f64, f64, f64),
+                size_px: f64,
+            },
             Slider(f64),
             Other,
         }
         let down = match self.find_kind(&id) {
-            Some(Kind::TextInput(ti)) => {
-                Down::TextInput { rect: (ti.x, ti.y, ti.w, ti.h), size_px: ti.size_px }
-            }
+            Some(Kind::TextInput(ti)) => Down::TextInput {
+                rect: (ti.x, ti.y, ti.w, ti.h),
+                size_px: ti.size_px,
+            },
             Some(Kind::Slider) => {
                 let (ox, _, w, _) = resolved_box(&self.tree, &id).unwrap_or((0.0, 0.0, 0.0, 0.0));
                 Down::Slider(slider_value_at(ox, w, pt.0))
@@ -262,7 +294,12 @@ impl UiRuntime {
                 let value = self.current_text(&id);
                 self.state.focused = Some(id.clone());
                 result.actions.push(Action::Focus(id.clone()));
-                result.edit = Some(EditRequest { id, rect, value, size_px });
+                result.edit = Some(EditRequest {
+                    id,
+                    rect,
+                    value,
+                    size_px,
+                });
             }
             Down::Slider(value) => {
                 self.state.slider_values.insert(id.clone(), value);
@@ -290,9 +327,15 @@ impl UiRuntime {
             if let Some(value) = value {
                 let changed = self.state.slider_values.get(&pressed) != Some(&value);
                 self.state.slider_values.insert(pressed.clone(), value);
-                let mut result = DispatchResult { consumed: true, dirty: changed, ..Default::default() };
+                let mut result = DispatchResult {
+                    consumed: true,
+                    dirty: changed,
+                    ..Default::default()
+                };
                 if changed {
-                    result.actions.push(Action::SliderChanged { id: pressed, value });
+                    result
+                        .actions
+                        .push(Action::SliderChanged { id: pressed, value });
                 }
                 return result;
             }
@@ -301,7 +344,11 @@ impl UiRuntime {
         let hovered = hit(&self.tree, pt);
         let changed = hovered != self.state.hovered;
         self.state.hovered = hovered.clone();
-        DispatchResult { consumed: hovered.is_some(), dirty: changed, ..Default::default() }
+        DispatchResult {
+            consumed: hovered.is_some(),
+            dirty: changed,
+            ..Default::default()
+        }
     }
 
     fn pointer_up(&mut self, pt: (f64, f64)) -> DispatchResult {
@@ -309,7 +356,11 @@ impl UiRuntime {
             return DispatchResult::default();
         };
         self.state.press_origin = None;
-        let mut result = DispatchResult { consumed: true, dirty: true, ..Default::default() };
+        let mut result = DispatchResult {
+            consumed: true,
+            dirty: true,
+            ..Default::default()
+        };
 
         // Standard cancel: up must land on the same owner the press started on.
         if hit(&self.tree, pt).as_ref() != Some(&pressed) {
@@ -340,11 +391,15 @@ impl UiRuntime {
             Up::Toggle => {
                 let on = !self.current_toggle(&pressed);
                 self.state.toggle_values.insert(pressed.clone(), on);
-                result.actions.push(Action::ToggleChanged { id: pressed, on });
+                result
+                    .actions
+                    .push(Action::ToggleChanged { id: pressed, on });
             }
             Up::Segment(index) => {
                 self.state.segment_values.insert(pressed.clone(), index);
-                result.actions.push(Action::SegmentChanged { id: pressed, index });
+                result
+                    .actions
+                    .push(Action::SegmentChanged { id: pressed, index });
             }
             Up::None => {}
         }
@@ -354,7 +409,11 @@ impl UiRuntime {
     fn pointer_cancel(&mut self) -> DispatchResult {
         let was_pressed = self.state.pressed.take().is_some();
         self.state.press_origin = None;
-        DispatchResult { consumed: was_pressed, dirty: was_pressed, ..Default::default() }
+        DispatchResult {
+            consumed: was_pressed,
+            dirty: was_pressed,
+            ..Default::default()
+        }
     }
 
     // ---- cache reads ----
@@ -504,7 +563,7 @@ fn segment_cell_at(s: &Segment, origin_x: f64, width: f64, screen_x: f64) -> usi
 mod tests {
     use super::*;
     use crate::widget::{
-        Axis, Button, Container, CrossAlign, Edges, Paint, RectStyle, Slider, TextPaint,
+        Axis, Button, Container, CrossAlign, Edges, MainAlign, Paint, RectStyle, Slider, TextPaint,
     };
 
     fn root(children: Vec<Widget>) -> Widget {
@@ -516,6 +575,7 @@ mod tests {
             h: 400.0,
             direction: Axis::None,
             spacing: 0.0,
+            main_align: MainAlign::Start,
             padding: Edges::all(0.0),
             align: CrossAlign::Start,
             children,
@@ -570,7 +630,12 @@ mod tests {
             y: 10.0,
             w: 36.0,
             h: 36.0,
-            style: RectStyle { fill: None, stroke: None, corner_radius: 8.0, opacity: 1.0 },
+            style: RectStyle {
+                fill: None,
+                stroke: None,
+                corner_radius: 8.0,
+                opacity: 1.0,
+            },
             hoverable: true,
         });
         let mut rt = runtime(vec![body]);
@@ -618,7 +683,10 @@ mod tests {
         rt.dispatch_pointer(PointerPhase::Down, (50.0, 30.0));
         let up = rt.dispatch_pointer(PointerPhase::Up, (300.0, 300.0));
         assert!(up.consumed);
-        assert!(!up.actions.iter().any(|a| matches!(a, Action::Pressed(_))), "no Pressed on cancel");
+        assert!(
+            !up.actions.iter().any(|a| matches!(a, Action::Pressed(_))),
+            "no Pressed on cancel"
+        );
     }
 
     #[test]
@@ -644,29 +712,70 @@ mod tests {
         });
         let mut rt = runtime(vec![slider]);
         let down = rt.dispatch_pointer(PointerPhase::Down, (25.0, 10.0));
-        assert_eq!(down.actions, vec![Action::SliderChanged { id: "s".to_string(), value: 0.25 }]);
+        assert_eq!(
+            down.actions,
+            vec![Action::SliderChanged {
+                id: "s".to_string(),
+                value: 0.25
+            }]
+        );
         let mv = rt.dispatch_pointer(PointerPhase::Move, (75.0, 10.0));
-        assert_eq!(mv.actions, vec![Action::SliderChanged { id: "s".to_string(), value: 0.75 }]);
+        assert_eq!(
+            mv.actions,
+            vec![Action::SliderChanged {
+                id: "s".to_string(),
+                value: 0.75
+            }]
+        );
         // out-of-range clamps.
         let mv = rt.dispatch_pointer(PointerPhase::Move, (200.0, 10.0));
-        assert_eq!(mv.actions, vec![Action::SliderChanged { id: "s".to_string(), value: 1.0 }]);
+        assert_eq!(
+            mv.actions,
+            vec![Action::SliderChanged {
+                id: "s".to_string(),
+                value: 1.0
+            }]
+        );
         // render reflects the cached value: filled width == 1.0*w == 100 ⇒ 800.
         let scene = rt.render();
-        let fill = scene.objects.iter().find(|o| o.id == "s::fill").expect("fill");
-        assert!(fill.geometry_d.contains("800"), "fill tracks cached value: {}", fill.geometry_d);
+        let fill = scene
+            .objects
+            .iter()
+            .find(|o| o.id == "s::fill")
+            .expect("fill");
+        assert!(
+            fill.geometry_d.contains("800"),
+            "fill tracks cached value: {}",
+            fill.geometry_d
+        );
     }
 
     #[test]
     fn toggle_and_segment_actuate_on_up() {
-        let toggle = Widget::Toggle(Toggle { id: "t".to_string(), x: 0.0, y: 0.0, w: 48.0, h: 24.0, on: false });
+        let toggle = Widget::Toggle(Toggle {
+            id: "t".to_string(),
+            x: 0.0,
+            y: 0.0,
+            w: 48.0,
+            h: 24.0,
+            on: false,
+        });
         let mut rt = runtime(vec![toggle]);
         rt.dispatch_pointer(PointerPhase::Down, (10.0, 10.0));
         let up = rt.dispatch_pointer(PointerPhase::Up, (10.0, 10.0));
-        assert_eq!(up.actions, vec![Action::ToggleChanged { id: "t".to_string(), on: true }]);
+        assert_eq!(
+            up.actions,
+            vec![Action::ToggleChanged {
+                id: "t".to_string(),
+                on: true
+            }]
+        );
         // render reflects the flipped state (track token = selection-ring).
         let scene = rt.render();
         match &scene.objects[0].fill.as_ref().unwrap().paint {
-            shape_renderer_core::render_object::RPaint::Token { name } => assert_eq!(name, "selection-ring"),
+            shape_renderer_core::render_object::RPaint::Token { name } => {
+                assert_eq!(name, "selection-ring")
+            }
             _ => panic!("token"),
         }
 
@@ -685,11 +794,24 @@ mod tests {
         rt.dispatch_pointer(PointerPhase::Down, (250.0, 15.0));
         let up = rt.dispatch_pointer(PointerPhase::Up, (250.0, 15.0));
         // 250 / (300/3=100) = cell 2.
-        assert_eq!(up.actions, vec![Action::SegmentChanged { id: "g".to_string(), index: 2 }]);
+        assert_eq!(
+            up.actions,
+            vec![Action::SegmentChanged {
+                id: "g".to_string(),
+                index: 2
+            }]
+        );
         let scene = rt.render();
-        let sel = scene.objects.iter().find(|o| o.id == "g::sel").expect("sel");
+        let sel = scene
+            .objects
+            .iter()
+            .find(|o| o.id == "g::sel")
+            .expect("sel");
         // cell 2 starts at 200; the selected pill is inset 2px within its cell, so 202.
-        assert_eq!(sel.transform[0][2], 202.0, "selected cell 2 pill is inset 2px from x=200");
+        assert_eq!(
+            sel.transform[0][2], 202.0,
+            "selected cell 2 pill is inset 2px from x=200"
+        );
     }
 
     #[test]
@@ -717,10 +839,22 @@ mod tests {
 
         let typed = rt.dispatch_key(&key_input("c", Some("c")));
         assert!(typed.consumed && typed.dirty);
-        assert_eq!(typed.actions, vec![Action::TextChanged { id: "ti".to_string(), text: "abc".to_string() }]);
+        assert_eq!(
+            typed.actions,
+            vec![Action::TextChanged {
+                id: "ti".to_string(),
+                text: "abc".to_string()
+            }]
+        );
 
         let back = rt.dispatch_key(&key_input("Backspace", None));
-        assert_eq!(back.actions, vec![Action::TextChanged { id: "ti".to_string(), text: "ab".to_string() }]);
+        assert_eq!(
+            back.actions,
+            vec![Action::TextChanged {
+                id: "ti".to_string(),
+                text: "ab".to_string()
+            }]
+        );
 
         let enter = rt.dispatch_key(&key_input("Enter", None));
         assert!(enter.consumed);
@@ -729,7 +863,11 @@ mod tests {
         // render reflects the cached edited value.
         // (re-focus to re-render with the cache; value text should be "ab")
         let scene = rt.render();
-        let value = scene.objects.iter().find(|o| o.id == "ti::value").expect("value");
+        let value = scene
+            .objects
+            .iter()
+            .find(|o| o.id == "ti::value")
+            .expect("value");
         assert_eq!(value.text.as_ref().unwrap().runs[0].text, "ab");
     }
 
@@ -759,12 +897,19 @@ mod tests {
         assert!(committed.consumed && committed.dirty);
         assert_eq!(
             committed.actions,
-            vec![Action::TextChanged { id: "ti".to_string(), text: "한".to_string() }]
+            vec![Action::TextChanged {
+                id: "ti".to_string(),
+                text: "한".to_string()
+            }]
         );
         assert!(!rt.has_text_focus(), "commit blurs the field");
 
         let scene = rt.render();
-        let value = scene.objects.iter().find(|o| o.id == "ti::value").expect("value");
+        let value = scene
+            .objects
+            .iter()
+            .find(|o| o.id == "ti::value")
+            .expect("value");
         assert_eq!(value.text.as_ref().unwrap().runs[0].text, "한");
     }
 
@@ -815,16 +960,38 @@ mod tests {
 
     #[test]
     fn set_tree_preserves_value_caches() {
-        let slider = Widget::Slider(Slider { id: "s".to_string(), x: 0.0, y: 0.0, w: 100.0, h: 20.0, value: 0.0 });
+        let slider = Widget::Slider(Slider {
+            id: "s".to_string(),
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 20.0,
+            value: 0.0,
+        });
         let mut rt = runtime(vec![slider]);
         rt.dispatch_pointer(PointerPhase::Down, (50.0, 10.0));
         // a re-derived identical tree keeps the dragged value in render().
-        let slider2 = Widget::Slider(Slider { id: "s".to_string(), x: 0.0, y: 0.0, w: 100.0, h: 20.0, value: 0.0 });
+        let slider2 = Widget::Slider(Slider {
+            id: "s".to_string(),
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 20.0,
+            value: 0.0,
+        });
         rt.set_tree(root(vec![slider2]));
         let scene = rt.render();
-        let fill = scene.objects.iter().find(|o| o.id == "s::fill").expect("fill");
+        let fill = scene
+            .objects
+            .iter()
+            .find(|o| o.id == "s::fill")
+            .expect("fill");
         // 0.5*100 = 50 ⇒ 400.
-        assert!(fill.geometry_d.contains("400"), "cache preserved across set_tree: {}", fill.geometry_d);
+        assert!(
+            fill.geometry_d.contains("400"),
+            "cache preserved across set_tree: {}",
+            fill.geometry_d
+        );
     }
 
     /// A slider/segment nested in an OFFSET container maps pt.x→value against its
@@ -842,6 +1009,7 @@ mod tests {
                 h: 0.0,
                 direction: Axis::None,
                 spacing: 0.0,
+                main_align: MainAlign::Start,
                 padding: Edges::all(0.0),
                 align: CrossAlign::Start,
                 children,
@@ -850,17 +1018,33 @@ mod tests {
 
         // Slider declared at x=0 (renders at screen x=100). Press at screen x=110 is
         // 10px into the 100px track ⇒ value 0.10, NOT 1.0.
-        let slider = Widget::Slider(Slider { id: "s".to_string(), x: 0.0, y: 0.0, w: 100.0, h: 20.0, value: 0.0 });
+        let slider = Widget::Slider(Slider {
+            id: "s".to_string(),
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 20.0,
+            value: 0.0,
+        });
         let mut rt = runtime(vec![offset(vec![slider])]);
         let down = rt.dispatch_pointer(PointerPhase::Down, (110.0, 10.0));
         assert_eq!(
             down.actions,
-            vec![Action::SliderChanged { id: "s".to_string(), value: 0.10 }],
+            vec![Action::SliderChanged {
+                id: "s".to_string(),
+                value: 0.10
+            }],
             "value reads the resolved screen origin (100), not declared x (0)"
         );
         // A drag streams against the same resolved origin.
         let mv = rt.dispatch_pointer(PointerPhase::Move, (150.0, 10.0));
-        assert_eq!(mv.actions, vec![Action::SliderChanged { id: "s".to_string(), value: 0.5 }]);
+        assert_eq!(
+            mv.actions,
+            vec![Action::SliderChanged {
+                id: "s".to_string(),
+                value: 0.5
+            }]
+        );
 
         // Segment declared at x=0 (renders at x=100), 3 cells over 300px. Press at
         // screen x=350 is 250px into the track ⇒ cell 2, NOT cell index off declared x.
@@ -880,7 +1064,10 @@ mod tests {
         let up = rt.dispatch_pointer(PointerPhase::Up, (350.0, 15.0));
         assert_eq!(
             up.actions,
-            vec![Action::SegmentChanged { id: "g".to_string(), index: 2 }],
+            vec![Action::SegmentChanged {
+                id: "g".to_string(),
+                index: 2
+            }],
             "cell reads the resolved screen origin (100), not declared x (0)"
         );
     }
@@ -908,24 +1095,75 @@ mod tests {
         assert!(rt.has_text_focus());
 
         for chord in [
-            KeyInput { key: "z".to_string(), text: None, ctrl: false, meta: true, alt: false }, // Cmd+Z undo
-            KeyInput { key: "c".to_string(), text: None, ctrl: true, meta: false, alt: false }, // Ctrl+C copy
-            KeyInput { key: "v".to_string(), text: None, ctrl: false, meta: true, alt: false }, // Cmd+V paste
-            KeyInput { key: "a".to_string(), text: None, ctrl: false, meta: true, alt: false }, // Cmd+A select-all
+            KeyInput {
+                key: "z".to_string(),
+                text: None,
+                ctrl: false,
+                meta: true,
+                alt: false,
+            }, // Cmd+Z undo
+            KeyInput {
+                key: "c".to_string(),
+                text: None,
+                ctrl: true,
+                meta: false,
+                alt: false,
+            }, // Ctrl+C copy
+            KeyInput {
+                key: "v".to_string(),
+                text: None,
+                ctrl: false,
+                meta: true,
+                alt: false,
+            }, // Cmd+V paste
+            KeyInput {
+                key: "a".to_string(),
+                text: None,
+                ctrl: false,
+                meta: true,
+                alt: false,
+            }, // Cmd+A select-all
         ] {
             let r = rt.dispatch_key(&chord);
-            assert!(!r.consumed, "a {chord:?} chord must fall through to the catalog");
-            assert!(r.actions.is_empty(), "a chord emits no TextChanged: {chord:?}");
+            assert!(
+                !r.consumed,
+                "a {chord:?} chord must fall through to the catalog"
+            );
+            assert!(
+                r.actions.is_empty(),
+                "a chord emits no TextChanged: {chord:?}"
+            );
         }
         // The field still holds focus and its value is untouched by the chords.
         assert!(rt.has_text_focus());
-        assert_eq!(rt.dispatch_key(&key_input("c", Some("c"))).actions, vec![Action::TextChanged { id: "ti".to_string(), text: "abc".to_string() }]);
+        assert_eq!(
+            rt.dispatch_key(&key_input("c", Some("c"))).actions,
+            vec![Action::TextChanged {
+                id: "ti".to_string(),
+                text: "abc".to_string()
+            }]
+        );
 
         // Option/Alt composes a PRINTABLE on macOS (Alt+e ⇒ "é"); it is text the field
         // owns, NOT a chord — it inserts. (No catalog shortcut binds Alt without Mod.)
-        let alt = KeyInput { key: "é".to_string(), text: Some("é".to_string()), ctrl: false, meta: false, alt: true };
+        let alt = KeyInput {
+            key: "é".to_string(),
+            text: Some("é".to_string()),
+            ctrl: false,
+            meta: false,
+            alt: true,
+        };
         let r = rt.dispatch_key(&alt);
-        assert!(r.consumed, "an Alt-composed printable is the field's text, not a chord");
-        assert_eq!(r.actions, vec![Action::TextChanged { id: "ti".to_string(), text: "abcé".to_string() }]);
+        assert!(
+            r.consumed,
+            "an Alt-composed printable is the field's text, not a chord"
+        );
+        assert_eq!(
+            r.actions,
+            vec![Action::TextChanged {
+                id: "ti".to_string(),
+                text: "abcé".to_string()
+            }]
+        );
     }
 }
